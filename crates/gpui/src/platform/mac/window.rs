@@ -14,9 +14,9 @@ use block::ConcreteBlock;
 use cocoa::{
     appkit::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
-        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard, NSScreen,
-        NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
-        NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowButton,
+        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSMenu, NSMenuItem,
+        NSPasteboard, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
+        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowButton,
         NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
         NSWindowStyleMask, NSWindowTitleVisibility,
     },
@@ -1612,6 +1612,73 @@ impl PlatformWindow for MacWindow {
             let mut event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn show_context_menu(
+        &self,
+        items: Vec<(String, bool)>,
+        position: Point<Pixels>,
+    ) -> Option<futures::channel::oneshot::Receiver<usize>> {
+        use futures::channel::oneshot;
+
+        let this = self.0.lock();
+        let window = this.native_window.clone();
+        let view = this.native_view;
+        let executor = this.executor.clone();
+        let window_height = this.content_size().height;
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = std::cell::Cell::new(Some(done_tx));
+
+        executor.spawn(async move {
+            unsafe {
+                let menu = NSMenu::new(nil);
+                let _: () = msg_send![menu, setAutoenablesItems: NO];
+
+                for (idx, (label, enabled)) in items.iter().enumerate() {
+                    let item = NSMenuItem::alloc(nil)
+                        .initWithTitle_action_keyEquivalent_(
+                            ns_string(label),
+                            sel!(dummyAction:),
+                            ns_string(""),
+                        )
+                        .autorelease();
+
+                    let tag = idx as NSInteger;
+                    let _: () = msg_send![item, setTag: tag];
+                    let _: () = msg_send![item, setEnabled: if *enabled { YES } else { NO }];
+
+                    menu.addItem_(item);
+                }
+
+                let block = ConcreteBlock::new(move |chosen_item: id| {
+                    if let Some(done_tx) = done_tx.take() {
+                        let tag: NSInteger = if chosen_item.is_null() {
+                            -1
+                        } else {
+                            msg_send![chosen_item, tag]
+                        };
+                        let _ = done_tx.send(tag as usize);
+                    }
+                });
+                let block = block.copy();
+
+                let screen_point = NSPoint {
+                    x: position.x.0 as f64,
+                    y: window_height.0 as f64 - position.y.0 as f64,
+                };
+
+                let _: () = msg_send![
+                    menu,
+                    popUpMenuPositioningItem: nil
+                    atLocation: screen_point
+                    inView: view
+                ];
+            }
+        }).detach();
+
+        Some(done_rx)
     }
 
     #[cfg(any(test, feature = "test-support"))]

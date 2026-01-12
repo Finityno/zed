@@ -1891,6 +1891,17 @@ impl Window {
         self.platform_window.show_window_menu(position)
     }
 
+    /// Show a native context menu at the specified position.
+    /// Returns a receiver that will be signaled when the menu is dismissed.
+    #[cfg(target_os = "macos")]
+    pub fn show_context_menu(
+        &self,
+        items: Vec<(String, bool)>,
+        position: Point<Pixels>,
+    ) -> Option<futures::channel::oneshot::Receiver<usize>> {
+        self.platform_window.show_context_menu(items, position)
+    }
+
     /// Handle window movement for Linux and macOS.
     /// Tells the compositor to take control of window movement (Wayland and X11)
     ///

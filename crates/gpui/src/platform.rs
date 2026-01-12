@@ -570,6 +570,19 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
+    /// Show a native context menu at the specified position.
+    /// Returns a receiver that will be signaled when the menu is dismissed.
+    /// The menu items are provided as a vector of (label, enabled) tuples.
+    /// On platforms that don't support native context menus, this does nothing.
+    #[cfg(target_os = "macos")]
+    fn show_context_menu(
+        &self,
+        _items: Vec<(String, bool)>,
+        _position: Point<Pixels>,
+    ) -> Option<futures::channel::oneshot::Receiver<usize>> {
+        None
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     #[cfg(any(test, feature = "test-support"))]
