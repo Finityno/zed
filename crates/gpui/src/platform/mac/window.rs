@@ -58,6 +58,37 @@ use util::ResultExt;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 
+/// Parse a shortcut string (e.g. "⌘N", "⇧⌘N", "⌥⌘C") into key and modifier mask
+/// Returns (key_char, NSEventModifierFlags)
+fn parse_shortcut_for_menu(shortcut: &str) -> (String, NSUInteger) {
+    use cocoa::appkit::NSEventModifierFlags;
+    
+    let mut modifiers: NSUInteger = 0;
+    let mut key = String::new();
+    
+    for c in shortcut.chars() {
+        match c {
+            '⌘' => modifiers |= NSEventModifierFlags::NSCommandKeyMask.bits(),
+            '⇧' | '⬆' => modifiers |= NSEventModifierFlags::NSShiftKeyMask.bits(),
+            '⌥' | '⎇' => modifiers |= NSEventModifierFlags::NSAlternateKeyMask.bits(),
+            '⌃' => modifiers |= NSEventModifierFlags::NSControlKeyMask.bits(),
+            '⏎' | '↩' => key = "\r".to_string(), // Enter/Return
+            '⌫' => key = "\u{7f}".to_string(), // Backspace/Delete
+            '⎋' => key = "\u{1b}".to_string(), // Escape
+            _ => {
+                // Regular character - use lowercase for key equivalent
+                if c.is_alphabetic() {
+                    key = c.to_lowercase().to_string();
+                } else {
+                    key = c.to_string();
+                }
+            }
+        }
+    }
+    
+    (key, modifiers)
+}
+
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
@@ -1617,9 +1648,10 @@ impl PlatformWindow for MacWindow {
     #[cfg(target_os = "macos")]
     fn show_context_menu(
         &self,
-        items: Vec<(String, bool)>,
+        items: Vec<crate::ContextMenuItem>,
         position: Point<Pixels>,
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
+        use crate::ContextMenuItem;
         use futures::channel::oneshot;
 
         let this = self.0.lock();
@@ -1635,46 +1667,68 @@ impl PlatformWindow for MacWindow {
             unsafe {
                 let menu = NSMenu::new(nil);
                 let _: () = msg_send![menu, setAutoenablesItems: NO];
+                // Set minimum width for the menu (250 points)
+                let _: () = msg_send![menu, setMinimumWidth: 250.0f64];
 
-                for (idx, (label, enabled)) in items.iter().enumerate() {
-                    let item = NSMenuItem::alloc(nil)
-                        .initWithTitle_action_keyEquivalent_(
-                            ns_string(label),
-                            sel!(dummyAction:),
-                            ns_string(""),
-                        )
-                        .autorelease();
+                let mut item_index = 0usize;
+                for menu_item in items.iter() {
+                    match menu_item {
+                        ContextMenuItem::Item { label, enabled, shortcut } => {
+                            let item = NSMenuItem::alloc(nil)
+                                .initWithTitle_action_keyEquivalent_(
+                                    ns_string(label),
+                                    sel!(dummyAction:),
+                                    ns_string(""),
+                                )
+                                .autorelease();
 
-                    let tag = idx as NSInteger;
-                    let _: () = msg_send![item, setTag: tag];
-                    let _: () = msg_send![item, setEnabled: if *enabled { YES } else { NO }];
+                            let tag = item_index as NSInteger;
+                            let _: () = msg_send![item, setTag: tag];
+                            let _: () = msg_send![item, setEnabled: if *enabled { YES } else { NO }];
 
-                    menu.addItem_(item);
-                }
+                            // Set keyboard shortcut if provided
+                            if let Some(shortcut_str) = shortcut {
+                                // Parse shortcut and set proper key equivalent for right-aligned display
+                                let (key, modifiers) = parse_shortcut_for_menu(shortcut_str);
+                                if !key.is_empty() {
+                                    let _: () = msg_send![item, setKeyEquivalent: ns_string(&key)];
+                                    let _: () = msg_send![item, setKeyEquivalentModifierMask: modifiers];
+                                }
+                            }
 
-                let block = ConcreteBlock::new(move |chosen_item: id| {
-                    if let Some(done_tx) = done_tx.take() {
-                        let tag: NSInteger = if chosen_item.is_null() {
-                            -1
-                        } else {
-                            msg_send![chosen_item, tag]
-                        };
-                        let _ = done_tx.send(tag as usize);
+                            menu.addItem_(item);
+                            item_index += 1;
+                        }
+                        ContextMenuItem::Separator => {
+                            let separator: id = msg_send![class!(NSMenuItem), separatorItem];
+                            menu.addItem_(separator);
+                        }
                     }
-                });
-                let block = block.copy();
+                }
 
                 let screen_point = NSPoint {
                     x: position.x.0 as f64,
                     y: window_height.0 as f64 - position.y.0 as f64,
                 };
 
-                let _: () = msg_send![
+                // popUpMenuPositioningItem is synchronous - it blocks until menu is dismissed
+                let selected: BOOL = msg_send![
                     menu,
                     popUpMenuPositioningItem: nil
                     atLocation: screen_point
                     inView: view
                 ];
+
+                // Get the highlighted item after menu closes
+                if let Some(done_tx) = done_tx.take() {
+                    let highlighted_item: id = msg_send![menu, highlightedItem];
+                    let tag: NSInteger = if highlighted_item.is_null() || selected == NO {
+                        -1
+                    } else {
+                        msg_send![highlighted_item, tag]
+                    };
+                    let _ = done_tx.send(tag as usize);
+                }
             }
         }).detach();
 

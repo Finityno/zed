@@ -1896,7 +1896,7 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn show_context_menu(
         &self,
-        items: Vec<(String, bool)>,
+        items: Vec<crate::ContextMenuItem>,
         position: Point<Pixels>,
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
         self.platform_window.show_context_menu(items, position)

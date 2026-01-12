@@ -90,6 +90,49 @@ pub use linux::layer_shell;
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
+/// A menu item for native context menus
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub enum ContextMenuItem {
+    /// A regular menu item with label, enabled state, and optional keyboard shortcut
+    Item {
+        /// The label text for the menu item
+        label: String,
+        /// Whether the menu item is enabled
+        enabled: bool,
+        /// Keyboard shortcut (e.g. "⌘C" or "⇧⌘N")
+        shortcut: Option<String>,
+    },
+    /// A separator line
+    Separator,
+}
+
+#[cfg(target_os = "macos")]
+impl ContextMenuItem {
+    /// Create a new menu item
+    pub fn item(label: impl Into<String>, enabled: bool) -> Self {
+        Self::Item {
+            label: label.into(),
+            enabled,
+            shortcut: None,
+        }
+    }
+
+    /// Create a new menu item with a keyboard shortcut
+    pub fn item_with_shortcut(label: impl Into<String>, enabled: bool, shortcut: impl Into<String>) -> Self {
+        Self::Item {
+            label: label.into(),
+            enabled,
+            shortcut: Some(shortcut.into()),
+        }
+    }
+
+    /// Create a separator
+    pub fn separator() -> Self {
+        Self::Separator
+    }
+}
+
 /// Returns a background executor for the current platform.
 pub fn background_executor() -> BackgroundExecutor {
     // For standalone background executor, use a dead liveness since there's no App.
@@ -572,12 +615,11 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     /// Show a native context menu at the specified position.
     /// Returns a receiver that will be signaled when the menu is dismissed.
-    /// The menu items are provided as a vector of (label, enabled) tuples.
     /// On platforms that don't support native context menus, this does nothing.
     #[cfg(target_os = "macos")]
     fn show_context_menu(
         &self,
-        _items: Vec<(String, bool)>,
+        _items: Vec<ContextMenuItem>,
         _position: Point<Pixels>,
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
         None
