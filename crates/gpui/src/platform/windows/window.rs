@@ -915,6 +915,16 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
+    fn start_window_move(&self) {
+        let hwnd = self.0.hwnd;
+        unsafe {
+            // Release any mouse capture first
+            let _ = ReleaseCapture();
+            // Send WM_NCLBUTTONDOWN with HTCAPTION to initiate window drag
+            let _ = PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+        }
+    }
+
     fn draw(&self, scene: &Scene) {
         self.state
             .renderer
