@@ -1661,7 +1661,7 @@ impl PlatformWindow for MacWindow {
         let this = self.0.lock();
         let window = this.native_window.clone();
         let view = this.native_view;
-        let executor = this.executor.clone();
+        let executor = this.foreground_executor.clone();
         let window_height = this.content_size().height;
 
         let (done_tx, done_rx) = oneshot::channel();
