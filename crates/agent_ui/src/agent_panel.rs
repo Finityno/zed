@@ -545,7 +545,11 @@ impl AgentPanel {
                         if let Some(kind) = panel.read(cx).history_kind_for_selected_agent(cx) {
                             menu =
                                 Self::populate_recently_updated_menu_section(menu, panel, kind, cx);
-                            menu = menu.action("View All", Box::new(OpenHistory));
+                            let view_all_label = match kind {
+                                HistoryKind::AgentThreads => "View All",
+                                HistoryKind::TextThreads => "View All Text Threads",
+                            };
+                            menu = menu.action(view_all_label, Box::new(OpenHistory));
                         }
                     }
 
@@ -1335,7 +1339,7 @@ impl AgentPanel {
                     return menu;
                 }
 
-                menu = menu.header("Recently Updated");
+                menu = menu.header("Recent Text Threads");
 
                 for entry in entries {
                     let title = if entry.title.is_empty() {
@@ -1735,7 +1739,7 @@ impl AgentPanel {
             ActiveView::History { kind } => {
                 let title = match kind {
                     HistoryKind::AgentThreads => "History",
-                    HistoryKind::TextThreads => "Text Threads",
+                    HistoryKind::TextThreads => "Text Thread History",
                 };
                 Label::new(title).truncate().into_any_element()
             }
@@ -2042,9 +2046,15 @@ impl AgentPanel {
                             })
                             .item(
                                 ContextMenuEntry::new("Zed Agent")
-                                    .when(is_agent_selected(AgentType::NativeAgent) | is_agent_selected(AgentType::TextThread) , |this| {
-                                        this.action(Box::new(NewExternalAgentThread { agent: None }))
-                                    })
+                                    .when(
+                                        is_agent_selected(AgentType::NativeAgent)
+                                            | is_agent_selected(AgentType::TextThread),
+                                        |this| {
+                                            this.action(Box::new(NewExternalAgentThread {
+                                                agent: None,
+                                            }))
+                                        },
+                                    )
                                     .icon(IconName::ZedAgent)
                                     .icon_color(Color::Muted)
                                     .handler({
@@ -2099,7 +2109,9 @@ impl AgentPanel {
                             .item(
                                 ContextMenuEntry::new("Claude Code")
                                     .when(is_agent_selected(AgentType::ClaudeCode), |this| {
-                                        this.action(Box::new(NewExternalAgentThread { agent: None }))
+                                        this.action(Box::new(NewExternalAgentThread {
+                                            agent: None,
+                                        }))
                                     })
                                     .icon(IconName::AiClaude)
                                     .disabled(is_via_collab)
@@ -2128,7 +2140,9 @@ impl AgentPanel {
                             .item(
                                 ContextMenuEntry::new("Codex CLI")
                                     .when(is_agent_selected(AgentType::Codex), |this| {
-                                        this.action(Box::new(NewExternalAgentThread { agent: None }))
+                                        this.action(Box::new(NewExternalAgentThread {
+                                            agent: None,
+                                        }))
                                     })
                                     .icon(IconName::AiOpenAi)
                                     .disabled(is_via_collab)
@@ -2157,7 +2171,9 @@ impl AgentPanel {
                             .item(
                                 ContextMenuEntry::new("Gemini CLI")
                                     .when(is_agent_selected(AgentType::Gemini), |this| {
-                                        this.action(Box::new(NewExternalAgentThread { agent: None }))
+                                        this.action(Box::new(NewExternalAgentThread {
+                                            agent: None,
+                                        }))
                                     })
                                     .icon(IconName::AiGemini)
                                     .icon_color(Color::Muted)
@@ -2214,7 +2230,9 @@ impl AgentPanel {
                                                 name: agent_name.0.clone(),
                                             }),
                                             |this| {
-                                                this.action(Box::new(NewExternalAgentThread { agent: None }))
+                                                this.action(Box::new(NewExternalAgentThread {
+                                                    agent: None,
+                                                }))
                                             },
                                         )
                                         .icon_color(Color::Muted)
@@ -2257,12 +2275,10 @@ impl AgentPanel {
                                     .icon_color(Color::Muted)
                                     .handler({
                                         move |window, cx| {
-                                            window.dispatch_action(Box::new(zed_actions::Extensions {
-                                                category_filter: Some(
-                                                    zed_actions::ExtensionCategoryFilter::AgentServers,
-                                                ),
-                                                id: None,
-                                            }), cx)
+                                            window.dispatch_action(
+                                                Box::new(zed_actions::AgentRegistry),
+                                                cx,
+                                            )
                                         }
                                     }),
                             )

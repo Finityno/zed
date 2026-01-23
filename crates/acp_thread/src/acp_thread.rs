@@ -2333,11 +2333,8 @@ impl AcpThread {
                 let format_on_save = buffer.update(cx, |buffer, cx| {
                     buffer.edit(edits, None, cx);
 
-                    let settings = language::language_settings::language_settings(
-                        buffer.language().map(|l| l.name()),
-                        buffer.file(),
-                        cx,
-                    );
+                    let settings =
+                        language::language_settings::LanguageSettings::for_buffer(buffer, cx);
 
                     settings.format_on_save != FormatOnSave::Off
                 });
@@ -2633,6 +2630,8 @@ mod tests {
                 ::terminal::terminal_settings::AlternateScroll::On,
                 None,
                 0,
+                cx.background_executor(),
+                PathStyle::local(),
             )
             .unwrap();
             builder.subscribe(cx)
@@ -2706,6 +2705,8 @@ mod tests {
                 ::terminal::terminal_settings::AlternateScroll::On,
                 None,
                 0,
+                cx.background_executor(),
+                PathStyle::local(),
             )
             .unwrap();
             builder.subscribe(cx)
@@ -2792,6 +2793,7 @@ mod tests {
                     Some(completion_tx),
                     cx,
                     vec![],
+                    PathStyle::local(),
                 )
             })
             .await
@@ -4080,6 +4082,8 @@ mod tests {
                 ::terminal::terminal_settings::AlternateScroll::On,
                 None,
                 0,
+                cx.background_executor(),
+                PathStyle::local(),
             )
             .unwrap();
             builder.subscribe(cx)
@@ -4125,6 +4129,8 @@ mod tests {
                 ::terminal::terminal_settings::AlternateScroll::On,
                 None,
                 0,
+                cx.background_executor(),
+                PathStyle::local(),
             )
             .unwrap();
             builder.subscribe(cx)
@@ -4184,6 +4190,8 @@ mod tests {
                 ::terminal::terminal_settings::AlternateScroll::On,
                 None,
                 0,
+                cx.background_executor(),
+                PathStyle::local(),
             )
             .unwrap();
             builder.subscribe(cx)
