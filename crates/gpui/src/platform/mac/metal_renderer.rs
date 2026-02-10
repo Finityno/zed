@@ -43,6 +43,18 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
 
+#[inline]
+fn cpu_write_buffer_options(unified_memory: bool) -> MTLResourceOptions {
+    if unified_memory {
+        MTLResourceOptions::StorageModeShared
+            // Buffers are write only which can benefit from the combined cache
+            // https://developer.apple.com/documentation/metal/mtlresourceoptions/cpucachemodewritecombined
+            | MTLResourceOptions::CPUCacheModeWriteCombined
+    } else {
+        MTLResourceOptions::StorageModeManaged
+    }
+}
+
 pub unsafe fn new_renderer(
     context: self::Context,
     _native_window: *mut c_void,
@@ -78,12 +90,14 @@ impl InstanceBufferPool {
         self.buffers.clear();
     }
 
-    pub(crate) fn acquire(&mut self, device: &metal::Device) -> InstanceBuffer {
+    pub(crate) fn acquire(
+        &mut self,
+        device: &metal::Device,
+        unified_memory: bool,
+    ) -> InstanceBuffer {
         let buffer = self.buffers.pop().unwrap_or_else(|| {
-            device.new_buffer(
-                self.buffer_size as u64,
-                MTLResourceOptions::StorageModeManaged,
-            )
+            let options = cpu_write_buffer_options(unified_memory);
+            device.new_buffer(self.buffer_size as u64, options)
         });
         InstanceBuffer {
             metal_buffer: buffer,
@@ -101,6 +115,7 @@ impl InstanceBufferPool {
 pub(crate) struct MetalRenderer {
     device: metal::Device,
     layer: metal::MetalLayer,
+    unified_memory: bool,
     presents_with_transaction: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
@@ -186,6 +201,15 @@ impl MetalRenderer {
             output
         }
 
+        // Shared memory can be used only if CPU and GPU share the same memory space.
+        // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
+        let unified_memory = device.has_unified_memory();
+        if !unified_memory {
+            log::warn!(
+                "Metal unified memory unavailable; this path is tuned for Apple Silicon and may perform worse"
+            );
+        }
+
         let unit_vertices = [
             to_float2_bits(point(0., 0.)),
             to_float2_bits(point(1., 0.)),
@@ -197,7 +221,7 @@ impl MetalRenderer {
         let unit_vertices = device.new_buffer_with_data(
             unit_vertices.as_ptr() as *const c_void,
             mem::size_of_val(&unit_vertices) as u64,
-            MTLResourceOptions::StorageModeManaged,
+            cpu_write_buffer_options(unified_memory),
         );
 
         let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
@@ -275,6 +299,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            unified_memory,
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -344,14 +369,23 @@ impl MetalRenderer {
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
         texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         texture_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
 
         if self.path_sample_count > 1 {
+            // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
+            // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
+            let storage_mode = if self.unified_memory {
+                metal::MTLStorageMode::Memoryless
+            } else {
+                metal::MTLStorageMode::Private
+            };
+
             let mut msaa_descriptor = texture_descriptor;
             msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-            msaa_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            msaa_descriptor.set_storage_mode(storage_mode);
             msaa_descriptor.set_sample_count(self.path_sample_count as _);
             self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
         } else {
@@ -385,7 +419,10 @@ impl MetalRenderer {
         };
 
         loop {
-            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+            let mut instance_buffer = self
+                .instance_buffer_pool
+                .lock()
+                .acquire(&self.device, self.unified_memory);
 
             let command_buffer =
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
@@ -449,7 +486,10 @@ impl MetalRenderer {
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
 
         loop {
-            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+            let mut instance_buffer = self
+                .instance_buffer_pool
+                .lock()
+                .acquire(&self.device, self.unified_memory);
 
             let command_buffer =
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
@@ -646,10 +686,14 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
 
-        instance_buffer.metal_buffer.did_modify_range(NSRange {
-            location: 0,
-            length: instance_offset as NSUInteger,
-        });
+        if !self.unified_memory {
+            // Sync the instance buffer to the GPU
+            instance_buffer.metal_buffer.did_modify_range(NSRange {
+                location: 0,
+                length: instance_offset as NSUInteger,
+            });
+        }
+
         Ok(command_buffer.to_owned())
     }
 
