@@ -122,7 +122,11 @@ impl ContextMenuItem {
     }
 
     /// Create a new menu item with a keyboard shortcut
-    pub fn item_with_shortcut(label: impl Into<String>, enabled: bool, shortcut: impl Into<String>) -> Self {
+    pub fn item_with_shortcut(
+        label: impl Into<String>,
+        enabled: bool,
+        shortcut: impl Into<String>,
+    ) -> Self {
         Self::Item {
             label: label.into(),
             enabled,

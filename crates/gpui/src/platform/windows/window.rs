@@ -921,7 +921,12 @@ impl PlatformWindow for WindowsWindow {
             // Release any mouse capture first
             let _ = ReleaseCapture();
             // Send WM_NCLBUTTONDOWN with HTCAPTION to initiate window drag
-            let _ = PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_NCLBUTTONDOWN,
+                WPARAM(HTCAPTION as usize),
+                LPARAM(0),
+            );
         }
     }
 

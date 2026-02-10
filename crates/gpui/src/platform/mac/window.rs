@@ -63,10 +63,10 @@ const WINDOW_STATE_IVAR: &str = "windowState";
 /// Returns (key_char, NSEventModifierFlags)
 fn parse_shortcut_for_menu(shortcut: &str) -> (String, NSUInteger) {
     use cocoa::appkit::NSEventModifierFlags;
-    
+
     let mut modifiers: NSUInteger = 0;
     let mut key = String::new();
-    
+
     for c in shortcut.chars() {
         match c {
             '⌘' => modifiers |= NSEventModifierFlags::NSCommandKeyMask.bits(),
@@ -74,8 +74,8 @@ fn parse_shortcut_for_menu(shortcut: &str) -> (String, NSUInteger) {
             '⌥' | '⎇' => modifiers |= NSEventModifierFlags::NSAlternateKeyMask.bits(),
             '⌃' => modifiers |= NSEventModifierFlags::NSControlKeyMask.bits(),
             '⏎' | '↩' => key = "\r".to_string(), // Enter/Return
-            '⌫' => key = "\u{7f}".to_string(), // Backspace/Delete
-            '⎋' => key = "\u{1b}".to_string(), // Escape
+            '⌫' => key = "\u{7f}".to_string(),   // Backspace/Delete
+            '⎋' => key = "\u{1b}".to_string(),   // Escape
             _ => {
                 // Regular character - use lowercase for key equivalent
                 if c.is_alphabetic() {
@@ -86,7 +86,7 @@ fn parse_shortcut_for_menu(shortcut: &str) -> (String, NSUInteger) {
             }
         }
     }
-    
+
     (key, modifiers)
 }
 

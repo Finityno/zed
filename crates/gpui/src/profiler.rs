@@ -151,8 +151,11 @@ impl<'a> SerializedThreadTaskTimings<'a> {
     }
 }
 
-// Allow 20mb of task timing entries
-const MAX_TASK_TIMINGS: usize = (20 * 1024 * 1024) / core::mem::size_of::<TaskTiming>();
+// Task timing circular buffer size.
+// Reduced from 20MB to 64KB per thread — still retains recent timings but
+// avoids the ~40MB overhead (20MB x 2 threads) for applications that don't
+// use the profiler UI.
+const MAX_TASK_TIMINGS: usize = (64 * 1024) / core::mem::size_of::<TaskTiming>();
 
 pub(crate) type TaskTimings = circular_buffer::CircularBuffer<MAX_TASK_TIMINGS, TaskTiming>;
 pub(crate) type GuardedTaskTimings = spin::Mutex<ThreadTimings>;

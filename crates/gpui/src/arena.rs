@@ -106,6 +106,14 @@ impl Arena {
         for chunk_index in 0..=self.current_chunk_index {
             self.chunks[chunk_index].reset();
         }
+        // Release excess chunks to prevent unbounded arena growth.
+        // Keep up to 4 chunks (4 MB at default 1 MB chunk size) to avoid
+        // repeated allocation/deallocation for normal renders, but free
+        // the rest that may have been allocated for a peak render (e.g. large diff).
+        const MAX_RETAINED_CHUNKS: usize = 4;
+        if self.chunks.len() > MAX_RETAINED_CHUNKS {
+            self.chunks.truncate(MAX_RETAINED_CHUNKS);
+        }
         self.current_chunk_index = 0;
     }
 
