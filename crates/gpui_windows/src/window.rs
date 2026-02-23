@@ -442,6 +442,10 @@ impl WindowsWindow {
 
             (dwexstyle, dwstyle)
         };
+        if params.kind == WindowKind::Floating {
+            // Keep `Floating` windows above normal windows, matching macOS/Linux behavior.
+            dwexstyle |= WS_EX_TOPMOST;
+        }
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
