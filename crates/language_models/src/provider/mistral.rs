@@ -280,6 +280,10 @@ impl LanguageModel for MistralLanguageModel {
         self.model.supports_tools()
     }
 
+    fn supports_streaming_tools(&self) -> bool {
+        true
+    }
+
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
         self.model.supports_tools()
     }
@@ -629,6 +633,23 @@ impl MistralEventMapper {
                         entry.arguments.push_str(&arguments);
                     }
                 }
+
+                if !entry.id.is_empty() && !entry.name.is_empty() {
+                    if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                        &partial_json_fixer::fix_json(&entry.arguments),
+                    ) {
+                        events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                            LanguageModelToolUse {
+                                id: entry.id.clone().into(),
+                                name: entry.name.as_str().into(),
+                                is_input_complete: false,
+                                input,
+                                raw_input: entry.arguments.clone(),
+                                thought_signature: None,
+                            },
+                        )));
+                    }
+                }
             }
         }
 
@@ -883,6 +904,7 @@ mod tests {
             stop: vec![],
             thinking_allowed: true,
             thinking_effort: None,
+            speed: Default::default(),
         };
 
         let (mistral_request, affinity) =
@@ -919,6 +941,7 @@ mod tests {
             stop: vec![],
             thinking_allowed: true,
             thinking_effort: None,
+            speed: None,
         };
 
         let (mistral_request, _) = into_mistral(request, mistral::Model::Pixtral12BLatest, None);
