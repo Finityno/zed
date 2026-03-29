@@ -832,6 +832,11 @@ impl MacWindow {
             match kind {
                 WindowKind::Normal | WindowKind::Floating => {
                     if kind == WindowKind::Floating {
+                        // NSPanel defaults to hiding when the app deactivates. Clear that so
+                        // floating windows stay visible above normal windows when focus moves to
+                        // another app, matching the expected "always on top" behavior.
+                        let _: () = msg_send![native_window, setFloatingPanel: YES];
+                        let _: () = msg_send![native_window, setHidesOnDeactivate: NO];
                         // Let the window float keep above normal windows.
                         native_window.setLevel_(NSFloatingWindowLevel);
                     } else {
