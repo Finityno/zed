@@ -16,7 +16,19 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::Arc,
+    sync::LazyLock,
+    time::{Duration, Instant},
 };
+
+static SHIMMER_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn shimmer_delta(duration: Duration) -> f32 {
+    let period = duration.as_secs_f32();
+    if period <= 0.0 {
+        return 0.0;
+    }
+    (SHIMMER_EPOCH.elapsed().as_secs_f32() / period) % 1.0
+}
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -376,6 +388,135 @@ impl IntoElement for StyledText {
     }
 }
 
+/// Renders text with a moving shimmer highlight using a shared GPUI text layout.
+///
+/// The element uses the current window text style for layout and font metrics,
+/// while `base_color` overrides the text color used for the underlying glyphs.
+pub struct ShimmerText {
+    text: SharedString,
+    base_color: Option<crate::Hsla>,
+    highlight_color: Option<crate::Hsla>,
+    duration: Duration,
+    spread: f32,
+    layout: TextLayout,
+}
+
+impl ShimmerText {
+    /// Construct a shimmer text element from the given string.
+    pub fn new(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            base_color: None,
+            highlight_color: None,
+            duration: Duration::from_secs_f32(1.5),
+            spread: 3.0,
+            layout: TextLayout::default(),
+        }
+    }
+
+    /// Override the base glyph color used for the shimmered text.
+    pub fn base_color(mut self, color: crate::Hsla) -> Self {
+        self.base_color = Some(color);
+        self
+    }
+
+    /// Set the highlight color that sweeps across the text.
+    pub fn highlight_color(mut self, color: crate::Hsla) -> Self {
+        self.highlight_color = Some(color);
+        self
+    }
+
+    /// Set the shimmer cycle duration.
+    pub fn duration(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    /// Set the highlight band width in average character widths.
+    pub fn spread(mut self, spread: f32) -> Self {
+        self.spread = spread;
+        self
+    }
+}
+
+impl Element for ShimmerText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut text_style = window.text_style();
+        if let Some(base_color) = self.base_color {
+            text_style.color = base_color;
+        }
+
+        let layout_id = self.layout.layout(
+            self.text.clone(),
+            Some(vec![text_style.to_run(self.text.len())]),
+            window,
+            cx,
+        );
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+        self.layout.prepaint(bounds, &self.text);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(highlight_color) = self.highlight_color {
+            self.layout.paint_shimmer(
+                &self.text,
+                highlight_color,
+                self.duration,
+                self.spread,
+                window,
+                cx,
+            );
+        } else {
+            self.layout.paint(&self.text, window, cx);
+        }
+    }
+}
+
+impl IntoElement for ShimmerText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
@@ -553,6 +694,97 @@ impl TextLayout {
             .log_err();
             line_origin.y += line.size(line_height).height;
         }
+    }
+
+    fn paint_shimmer(
+        &self,
+        text: &str,
+        highlight_color: crate::Hsla,
+        duration: Duration,
+        spread: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .with_context(|| format!("measurement has not been performed on {text}"))
+            .unwrap();
+        let bounds = element_state
+            .bounds
+            .with_context(|| format!("prepaint has not been performed on {text}"))
+            .unwrap();
+
+        let text_size = element_state.size.unwrap_or(bounds.size);
+        let line_height = element_state.line_height;
+        let text_style = window.text_style();
+        let mut line_origin = bounds.origin;
+        if text_size.width <= Pixels::ZERO {
+            for line in &element_state.lines {
+                line.paint_background(
+                    line_origin,
+                    line_height,
+                    text_style.text_align,
+                    Some(bounds),
+                    window,
+                    cx,
+                )
+                .log_err();
+                line.paint(
+                    line_origin,
+                    line_height,
+                    text_style.text_align,
+                    Some(bounds),
+                    window,
+                    cx,
+                )
+                .log_err();
+                line_origin.y += line.size(line_height).height;
+            }
+            return;
+        }
+
+        let char_count = text.chars().count().max(1) as f32;
+        let average_char_width = text_size.width * (1.0 / char_count);
+        let band_width = (average_char_width * (spread.max(1.0) * 2.0)).max(average_char_width);
+        let travel_width = text_size.width + band_width * 2.0;
+        let band_origin = travel_width * shimmer_delta(duration) - band_width;
+        let shimmer_bounds = Bounds {
+            origin: bounds.origin,
+            size: text_size,
+        };
+
+        window.with_text_shimmer(
+            crate::window::TextShimmerStyle {
+                bounds: shimmer_bounds,
+                highlight_color,
+                band_origin,
+                band_width,
+            },
+            |window| {
+                for line in &element_state.lines {
+                    line.paint_background(
+                        line_origin,
+                        line_height,
+                        text_style.text_align,
+                        Some(bounds),
+                        window,
+                        cx,
+                    )
+                    .log_err();
+                    line.paint(
+                        line_origin,
+                        line_height,
+                        text_style.text_align,
+                        Some(bounds),
+                        window,
+                        cx,
+                    )
+                    .log_err();
+                    line_origin.y += line.size(line_height).height;
+                }
+            },
+        );
     }
 
     /// Get the byte index into the input of the pixel position.

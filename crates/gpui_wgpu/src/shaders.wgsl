@@ -1185,12 +1185,23 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
 // --- monochrome sprites --- //
 
+struct SpriteEffect {
+    kind: u32,
+    pad: vec3<u32>,
+    bounds: Bounds,
+    highlight_color: Hsla,
+    band_origin: f32,
+    band_width: f32,
+    band_padding: vec2<f32>,
+}
+
 struct MonochromeSprite {
     order: u32,
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
+    effect: SpriteEffect,
     tile: AtlasTile,
     transformation: TransformationMatrix,
 }
@@ -1199,8 +1210,27 @@ struct MonochromeSprite {
 struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
-    @location(1) @interpolate(flat) color: vec4<f32>,
-    @location(3) clip_distances: vec4<f32>,
+    @location(1) local_position: vec2<f32>,
+    @location(2) @interpolate(flat) color: vec4<f32>,
+    @location(3) @interpolate(flat) sprite_id: u32,
+    @location(4) clip_distances: vec4<f32>,
+}
+
+fn sprite_effect_intensity(effect: SpriteEffect, local_position: vec2<f32>) -> f32 {
+    switch (effect.kind) {
+        default: {
+            return 0.0;
+        }
+        case 1u: {
+            let band_width = max(effect.band_width, 1.0);
+            let band_start = effect.bounds.origin.x + effect.band_origin;
+            let band_end = band_start + band_width;
+            let feather = min(max(band_width * 0.125, 0.75), band_width * 0.5);
+            let leading = saturate((local_position.x - band_start) / feather);
+            let trailing = saturate((band_end - local_position.x) / feather);
+            return min(leading, trailing);
+        }
+    }
 }
 
 @vertex
@@ -1212,22 +1242,41 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    out.local_position = vec2<f32>(
+        sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.width,
+        sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.height,
+    );
     out.color = hsla_to_rgba(sprite.color);
+    out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
 
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
+    let sprite = b_mono_sprites[input.sprite_id];
+    let base_color = input.color;
+    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
-    let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    let alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    let base_alpha = base_color.a * alpha_corrected;
+    let overlay_alpha = highlight_color.a * intensity * alpha_corrected;
+    let combined_alpha = overlay_alpha + base_alpha * (1.0 - overlay_alpha);
+    var combined_rgb = base_color.rgb;
+    if (combined_alpha > 0.0) {
+        combined_rgb =
+            (highlight_color.rgb * overlay_alpha +
+             base_color.rgb * base_alpha * (1.0 - overlay_alpha)) /
+            combined_alpha;
+    }
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    return blend_color(vec4<f32>(combined_rgb, 1.0), combined_alpha);
 }
 
 // --- polychrome sprites --- //

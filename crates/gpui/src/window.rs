@@ -12,12 +12,12 @@ use crate::{
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    ScaledPixels, Scene, Shadow, SharedString, Size, SpriteEffect, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -931,6 +931,7 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -1451,6 +1452,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            text_shimmer_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -1530,6 +1532,25 @@ impl ContentMask<Pixels> {
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
         ContentMask { bounds }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextShimmerStyle {
+    pub bounds: Bounds<Pixels>,
+    pub highlight_color: Hsla,
+    pub band_origin: Pixels,
+    pub band_width: Pixels,
+}
+
+impl TextShimmerStyle {
+    fn scale(self, factor: f32) -> SpriteEffect {
+        SpriteEffect::shimmer(
+            self.bounds.scale(factor),
+            self.highlight_color,
+            self.band_origin.0 * factor,
+            self.band_width.0 * factor,
+        )
     }
 }
 
@@ -2803,6 +2824,26 @@ impl Window {
         }
     }
 
+    pub(crate) fn with_text_shimmer<R>(
+        &mut self,
+        shimmer: TextShimmerStyle,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.text_shimmer_stack.push(shimmer);
+        let result = f(self);
+        self.text_shimmer_stack.pop();
+        result
+    }
+
+    fn current_text_effect(&self) -> SpriteEffect {
+        self.text_shimmer_stack
+            .last()
+            .copied()
+            .map(|shimmer| shimmer.scale(self.scale_factor()))
+            .unwrap_or_default()
+    }
+
     /// Updates the global element offset relative to the current offset. This is used to implement
     /// scrolling. This method should only be called during the prepaint phase of element drawing.
     pub fn with_element_offset<R>(
@@ -3400,6 +3441,7 @@ impl Window {
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
+                    effect: self.current_text_effect(),
                     tile,
                     transformation: TransformationMatrix::unit(),
                 });
@@ -3410,6 +3452,7 @@ impl Window {
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
+                    effect: self.current_text_effect(),
                     tile,
                     transformation: TransformationMatrix::unit(),
                 });
@@ -3457,6 +3500,7 @@ impl Window {
                 bounds,
                 content_mask,
                 color: color.opacity(element_opacity),
+                effect: self.current_text_effect(),
                 tile,
                 transformation: TransformationMatrix::unit(),
             });
@@ -3650,6 +3694,7 @@ impl Window {
                 .map_size(|size| size.ceil()),
             content_mask,
             color: color.opacity(element_opacity),
+            effect: SpriteEffect::default(),
             tile,
             transformation,
         });

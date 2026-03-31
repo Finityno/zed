@@ -608,16 +608,33 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
 struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
+  float2 local_position;
   float4 color [[flat]];
+  uint sprite_id [[flat]];
   float4 clip_distance;
 };
 
 struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
+  float2 local_position;
   float4 color [[flat]];
+  uint sprite_id [[flat]];
   float4 clip_distance;
 };
+
+float sprite_effect_intensity(SpriteEffect effect, float2 local_position) {
+  if (effect.kind == 1u) {
+    float band_width = max(effect.band_width, 1.0);
+    float band_start = effect.bounds.origin.x + effect.band_origin;
+    float band_end = band_start + band_width;
+    float feather = min(max(band_width * 0.125, 0.75), band_width * 0.5);
+    float leading = saturate((local_position.x - band_start) / feather);
+    float trailing = saturate((band_end - local_position.x) / feather);
+    return min(leading, trailing);
+  }
+  return 0.0;
+}
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
@@ -634,11 +651,16 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  float2 local_position = float2(
+      sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.width,
+      sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.height);
   float4 color = hsla_to_rgba(sprite.color);
   return MonochromeSpriteVertexOutput{
       device_position,
       tile_position,
+      local_position,
       color,
+      sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -654,9 +676,23 @@ fragment float4 monochrome_sprite_fragment(
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
-  float4 color = input.color;
-  color.a *= sample.a;
-  return color;
+  float intensity = sprite_effect_intensity(
+      sprites[input.sprite_id].effect,
+      input.local_position);
+  float4 base_color = input.color;
+  float4 highlight_color = hsla_to_rgba(sprites[input.sprite_id].effect.highlight_color);
+  float glyph_alpha = sample.a;
+  float base_alpha = base_color.a * glyph_alpha;
+  float overlay_alpha = highlight_color.a * intensity * glyph_alpha;
+  float combined_alpha = overlay_alpha + base_alpha * (1.0 - overlay_alpha);
+  float3 combined_rgb = base_color.rgb;
+  if (combined_alpha > 0.0) {
+    combined_rgb =
+        (highlight_color.rgb * overlay_alpha +
+         base_color.rgb * base_alpha * (1.0 - overlay_alpha)) /
+        combined_alpha;
+  }
+  return float4(combined_rgb, combined_alpha);
 }
 
 struct PolychromeSpriteVertexOutput {

@@ -655,12 +655,61 @@ impl Default for TransformationMatrix {
 #[derive(Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
+pub struct SpriteEffect {
+    pub kind: u32,
+    pub pad: [u32; 3],
+    pub bounds: Bounds<ScaledPixels>,
+    pub highlight_color: Hsla,
+    pub band_origin: f32,
+    pub band_width: f32,
+    pub band_padding: [f32; 2],
+}
+
+impl SpriteEffect {
+    pub(crate) const SHIMMER_KIND: u32 = 1;
+
+    pub(crate) fn shimmer(
+        bounds: Bounds<ScaledPixels>,
+        highlight_color: Hsla,
+        band_origin: f32,
+        band_width: f32,
+    ) -> Self {
+        Self {
+            kind: Self::SHIMMER_KIND,
+            pad: [0; 3],
+            bounds,
+            highlight_color,
+            band_origin,
+            band_width,
+            band_padding: [0.0; 2],
+        }
+    }
+}
+
+impl Default for SpriteEffect {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            pad: [0; 3],
+            bounds: Bounds::default(),
+            highlight_color: Hsla::default(),
+            band_origin: 0.0,
+            band_width: 0.0,
+            band_padding: [0.0; 2],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[repr(C)]
+#[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
     pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
+    pub effect: SpriteEffect,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }
@@ -680,6 +729,7 @@ pub struct SubpixelSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
+    pub effect: SpriteEffect,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }
