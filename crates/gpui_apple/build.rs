@@ -56,6 +56,7 @@ mod macos_build {
             "Quad".into(),
             "BorderStyle".into(),
             "SpriteInputIndex".into(),
+            "SpriteEffect".into(),
             "MonochromeSprite".into(),
             "PolychromeSprite".into(),
             "PathSprite".into(),

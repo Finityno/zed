@@ -1,11 +1,16 @@
 // --- subpixel sprites --- //
 
+// `SpriteEffect` and `sprite_effect_intensity` come from `shaders.wgsl`: this
+// file is only ever compiled appended to that module, so redeclaring them here
+// is a WGSL redefinition error.
+
 struct SubpixelSprite {
     order: u32,
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
+    effect: SpriteEffect,
     tile: AtlasTile,
     transformation: TransformationMatrix,
 }
@@ -14,8 +19,11 @@ struct SubpixelSprite {
 struct SubpixelSpriteOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
-    @location(1) @interpolate(flat) color: vec4<f32>,
-    @location(3) clip_distances: vec4<f32>,
+    @location(1) local_position: vec2<f32>,
+    @location(2) @interpolate(flat) color: vec4<f32>,
+    @location(3) @interpolate(flat) sprite_id: u32,
+    @location(4) clip_distances: vec4<f32>,
+    @location(5) @interpolate(flat) effect_kind: u32,
 }
 
 struct SubpixelSpriteFragmentOutput {
@@ -31,26 +39,66 @@ fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     var out = SubpixelSpriteOutput();
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    out.local_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
     out.color = hsla_to_rgba(sprite.color);
+    out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.effect_kind = sprite.effect.kind;
     return out;
 }
 
 @fragment
 fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutput {
+    let base_color = input.color;
     var sample = textureSample(t_sprite, s_sprite, input.tile_position).rgb;
     if (gamma_params.is_bgr != 0u) {
         sample = sample.bgr;
     }
-    let alpha_corrected = apply_contrast_and_gamma_correction3(sample, input.color.rgb, gamma_params.subpixel_enhanced_contrast, gamma_params.gamma_ratios);
+    let base_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        base_color.rgb,
+        gamma_params.subpixel_enhanced_contrast,
+        gamma_params.gamma_ratios,
+    );
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
     }
 
+    // Unshimmered text is the overwhelmingly common case, and the shimmer path
+    // below costs it a second full `apply_contrast_and_gamma_correction3` pass
+    // (per subpixel channel) plus a storage-buffer read per fragment. Bail out
+    // before any of it.
+    if (input.effect_kind == 0u) {
+        var plain = SubpixelSpriteFragmentOutput();
+        plain.foreground = vec4<f32>(base_color.rgb, 1.0);
+        plain.alpha = vec4<f32>(base_color.a * base_alpha_corrected, 1.0);
+        return plain;
+    }
+
+    let sprite = b_subpixel_sprites[input.sprite_id];
+    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
+    let highlight_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        highlight_color.rgb,
+        gamma_params.subpixel_enhanced_contrast,
+        gamma_params.gamma_ratios,
+    );
+    let base_alpha = base_color.a * base_alpha_corrected;
+    let overlay_alpha = highlight_color.a * intensity * highlight_alpha_corrected;
+    let combined_alpha = overlay_alpha + base_alpha * (vec3<f32>(1.0) - overlay_alpha);
+    var combined_rgb = base_color.rgb;
+    if (any(combined_alpha > vec3<f32>(0.0))) {
+        combined_rgb =
+            (highlight_color.rgb * overlay_alpha +
+             base_color.rgb * base_alpha * (vec3<f32>(1.0) - overlay_alpha)) /
+            combined_alpha;
+    }
+
     var out = SubpixelSpriteFragmentOutput();
-    out.foreground = vec4<f32>(input.color.rgb, 1.0);
-    out.alpha = vec4<f32>(input.color.a * alpha_corrected, 1.0);
+    out.foreground = vec4<f32>(combined_rgb, 1.0);
+    out.alpha = vec4<f32>(combined_alpha, 1.0);
     return out;
 }
