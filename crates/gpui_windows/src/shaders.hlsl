@@ -1137,12 +1137,23 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 **
 */
 
+struct SpriteEffect {
+    uint kind;
+    uint3 pad;
+    Bounds bounds;
+    Hsla highlight_color;
+    float band_origin;
+    float band_width;
+    float2 band_padding;
+};
+
 struct MonochromeSprite {
     uint order;
     uint pad;
     Bounds bounds;
     Bounds content_mask;
     Hsla color;
+    SpriteEffect effect;
     AtlasTile tile;
     TransformationMatrix transformation;
 };
@@ -1150,18 +1161,35 @@ struct MonochromeSprite {
 struct MonochromeSpriteVertexOutput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
+    float2 local_position: TEXCOORD1;
     nointerpolation float4 color: COLOR;
+    nointerpolation uint sprite_id: TEXCOORD0;
     float4 clip_distance: SV_ClipDistance;
 };
 
 struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
+    float2 local_position: TEXCOORD1;
     nointerpolation float4 color: COLOR;
+    nointerpolation uint sprite_id: TEXCOORD0;
     float4 clip_distance: SV_ClipDistance;
 };
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
+
+float sprite_effect_intensity(SpriteEffect effect, float2 local_position) {
+    if (effect.kind == 1u) {
+        float band_width = max(effect.band_width, 1.0f);
+        float band_start = effect.bounds.origin.x + effect.band_origin;
+        float band_end = band_start + band_width;
+        float feather = min(max(band_width * 0.125f, 0.75f), band_width * 0.5f);
+        float leading = saturate((local_position.x - band_start) / feather);
+        float trailing = saturate((band_end - local_position.x) / feather);
+        return min(leading, trailing);
+    }
+    return 0.0f;
+}
 
 MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
@@ -1176,15 +1204,33 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     MonochromeSpriteVertexOutput output;
     output.position = device_position;
     output.tile_position = tile_position;
+    output.local_position = float2(
+        sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.x,
+        sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.y);
     output.color = color;
+    output.sprite_id = sprite_id;
     output.clip_distance = clip_distance;
     return output;
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
+    MonochromeSprite sprite = mono_sprites[input.sprite_id];
+    float4 base_color = input.color;
+    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
-    float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+    float alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+    float base_alpha = base_color.a * alpha_corrected;
+    float overlay_alpha = highlight_color.a * intensity * alpha_corrected;
+    float combined_alpha = overlay_alpha + base_alpha * (1.0f - overlay_alpha);
+    float3 combined_rgb = base_color.rgb;
+    if (combined_alpha > 0.0f) {
+        combined_rgb =
+            (highlight_color.rgb * overlay_alpha +
+             base_color.rgb * base_alpha * (1.0f - overlay_alpha)) /
+            combined_alpha;
+    }
+    return float4(combined_rgb, combined_alpha);
 }
 
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1192,15 +1238,38 @@ MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID,
 }
 
 SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentInput input) {
+    MonochromeSprite sprite = mono_sprites[input.sprite_id];
+    float4 base_color = input.color;
+    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float3 sample = t_sprite.Sample(s_sprite, input.tile_position).rgb;
     if (is_bgr) {
         sample = sample.bgr;
     }
-    float3 alpha_corrected = apply_contrast_and_gamma_correction3(sample, input.color.rgb, subpixel_enhanced_contrast, gamma_ratios);
+    float3 base_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        base_color.rgb,
+        subpixel_enhanced_contrast,
+        gamma_ratios);
+    float3 highlight_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        highlight_color.rgb,
+        subpixel_enhanced_contrast,
+        gamma_ratios);
+    float3 base_alpha = base_color.a * base_alpha_corrected;
+    float3 overlay_alpha = highlight_color.a * intensity * highlight_alpha_corrected;
+    float3 combined_alpha = overlay_alpha + base_alpha * (1.0f - overlay_alpha);
+    float3 combined_rgb = base_color.rgb;
+    if (any(combined_alpha > 0.0f)) {
+        combined_rgb =
+            (highlight_color.rgb * overlay_alpha +
+             base_color.rgb * base_alpha * (1.0f - overlay_alpha)) /
+            combined_alpha;
+    }
 
     SubpixelSpriteFragmentOutput output;
-    output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    output.foreground = float4(combined_rgb, 1.0f);
+    output.alpha = float4(combined_alpha, 1.0f);
     return output;
 }
 
