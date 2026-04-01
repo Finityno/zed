@@ -1169,8 +1169,8 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.position = device_position;
     output.tile_position = tile_position;
     output.local_position = float2(
-        sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.width,
-        sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.height);
+        sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.x,
+        sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.y);
     output.color = color;
     output.sprite_id = sprite_id;
     output.clip_distance = clip_distance;
