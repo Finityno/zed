@@ -1197,26 +1197,40 @@ float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Targe
     return float4(combined_rgb, combined_alpha);
 }
 
-float4 apply_sprite_effect(float4 color, SpriteEffect effect, float2 local_position) {
-    float intensity = sprite_effect_intensity(effect, local_position);
-    float4 highlight_color = hsla_to_rgba(effect.highlight_color);
-    color.rgb = lerp(color.rgb, highlight_color.rgb, intensity * highlight_color.a);
-    return color;
-}
-
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
     return monochrome_sprite_vertex(vertex_id, sprite_id);
 }
 
 SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentInput input) {
     MonochromeSprite sprite = mono_sprites[input.sprite_id];
-    float4 color = apply_sprite_effect(input.color, sprite.effect, input.local_position);
+    float4 base_color = input.color;
+    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float3 sample = t_sprite.Sample(s_sprite, input.tile_position).rgb;
-    float3 alpha_corrected = apply_contrast_and_gamma_correction3(sample, color.rgb, subpixel_enhanced_contrast, gamma_ratios);
+    float3 base_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        base_color.rgb,
+        subpixel_enhanced_contrast,
+        gamma_ratios);
+    float3 highlight_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        highlight_color.rgb,
+        subpixel_enhanced_contrast,
+        gamma_ratios);
+    float3 base_alpha = base_color.a * base_alpha_corrected;
+    float3 overlay_alpha = highlight_color.a * intensity * highlight_alpha_corrected;
+    float3 combined_alpha = overlay_alpha + base_alpha * (1.0f - overlay_alpha);
+    float3 combined_rgb = base_color.rgb;
+    if (any(combined_alpha > 0.0f)) {
+        combined_rgb =
+            (highlight_color.rgb * overlay_alpha +
+             base_color.rgb * base_alpha * (1.0f - overlay_alpha)) /
+            combined_alpha;
+    }
 
     SubpixelSpriteFragmentOutput output;
-    output.foreground = float4(color.rgb, 1.0f);
-    output.alpha = float4(color.a * alpha_corrected, 1.0f);
+    output.foreground = float4(combined_rgb, 1.0f);
+    output.alpha = float4(combined_alpha, 1.0f);
     return output;
 }
 

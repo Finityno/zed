@@ -71,18 +71,35 @@ fn sprite_effect_intensity(effect: SpriteEffect, local_position: vec2<f32>) -> f
     }
 }
 
-fn apply_sprite_effect(color: vec4<f32>, effect: SpriteEffect, local_position: vec2<f32>) -> vec4<f32> {
-    let intensity = sprite_effect_intensity(effect, local_position);
-    let highlight_color = hsla_to_rgba(effect.highlight_color);
-    return vec4<f32>(mix(color.rgb, highlight_color.rgb, intensity * highlight_color.a), color.a);
-}
-
 @fragment
 fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutput {
     let sprite = b_subpixel_sprites[input.sprite_id];
-    let color = apply_sprite_effect(input.color, sprite.effect, input.local_position);
+    let base_color = input.color;
+    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).rgb;
-    let alpha_corrected = apply_contrast_and_gamma_correction3(sample, color.rgb, gamma_params.subpixel_enhanced_contrast, gamma_params.gamma_ratios);
+    let base_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        base_color.rgb,
+        gamma_params.subpixel_enhanced_contrast,
+        gamma_params.gamma_ratios,
+    );
+    let highlight_alpha_corrected = apply_contrast_and_gamma_correction3(
+        sample,
+        highlight_color.rgb,
+        gamma_params.subpixel_enhanced_contrast,
+        gamma_params.gamma_ratios,
+    );
+    let base_alpha = base_color.a * base_alpha_corrected;
+    let overlay_alpha = highlight_color.a * intensity * highlight_alpha_corrected;
+    let combined_alpha = overlay_alpha + base_alpha * (vec3<f32>(1.0) - overlay_alpha);
+    var combined_rgb = base_color.rgb;
+    if (any(combined_alpha > vec3<f32>(0.0))) {
+        combined_rgb =
+            (highlight_color.rgb * overlay_alpha +
+             base_color.rgb * base_alpha * (vec3<f32>(1.0) - overlay_alpha)) /
+            combined_alpha;
+    }
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
@@ -90,7 +107,7 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
     }
 
     var out = SubpixelSpriteFragmentOutput();
-    out.foreground = vec4<f32>(color.rgb, 1.0);
-    out.alpha = vec4<f32>(color.a * alpha_corrected, 1.0);
+    out.foreground = vec4<f32>(combined_rgb, 1.0);
+    out.alpha = vec4<f32>(combined_alpha, 1.0);
     return out;
 }
