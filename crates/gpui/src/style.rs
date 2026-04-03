@@ -673,7 +673,8 @@ impl Style {
                 Some(color) => match color.tag {
                     BackgroundTag::Solid
                     | BackgroundTag::PatternSlash
-                    | BackgroundTag::Checkerboard => color.solid,
+                    | BackgroundTag::Checkerboard
+                    | BackgroundTag::PatternStripe => color.solid,
 
                     BackgroundTag::LinearGradient => color
                         .colors

@@ -50,6 +50,8 @@ struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
+    // 3u is Checkerboard
+    // 4u is PatternStripe
     uint tag;
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -427,6 +429,18 @@ float4 gradient_color(Background background,
             
             color = solid_color;
             color.a *= saturate(should_be_colored);
+            break;
+        }
+        case 4: {
+            float stripe_width = max(background.colors[0].percentage, 0.0);
+            float stripe_interval = max(background.colors[1].percentage, 0.0);
+            float pattern_period = max(stripe_width + stripe_interval, 1.0);
+            float2 relative_position = position - bounds.origin;
+            float pattern = fmod(relative_position.y, pattern_period);
+            float distance =
+                min(pattern, pattern_period - pattern) - min(stripe_width, pattern_period) * 0.5;
+            color = solid_color;
+            color.a *= saturate(0.5 - distance);
             break;
         }
     }

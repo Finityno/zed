@@ -659,6 +659,7 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    PatternStripe = 4,
 }
 
 /// A color space for color interpolation.
@@ -717,6 +718,11 @@ impl std::fmt::Debug for Background {
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
             ),
+            BackgroundTag::PatternStripe => write!(
+                f,
+                "PatternStripe({:?}, {}, {})",
+                self.solid, self.colors[0].percentage, self.colors[1].percentage
+            ),
         }
     }
 }
@@ -755,6 +761,28 @@ pub fn checkerboard(color: impl Into<Hsla>, size: f32) -> Background {
         tag: BackgroundTag::Checkerboard,
         solid: color.into(),
         gradient_angle_or_pattern_height: size,
+        ..Default::default()
+    }
+}
+
+/// Creates a stripe pattern background.
+///
+/// The stripe runs along the X axis and repeats along the Y axis using
+/// `width + interval` as the period.
+pub fn pattern_stripe(color: impl Into<Hsla>, width: f32, interval: f32) -> Background {
+    Background {
+        tag: BackgroundTag::PatternStripe,
+        solid: color.into(),
+        colors: [
+            LinearColorStop {
+                percentage: width.max(0.0),
+                ..Default::default()
+            },
+            LinearColorStop {
+                percentage: interval.max(0.0),
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     }
 }
@@ -855,6 +883,7 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            BackgroundTag::PatternStripe => self.solid.is_transparent(),
         }
     }
 }
@@ -950,6 +979,20 @@ mod tests {
 
         assert_eq!(background.opacity(0.5).colors[0], from.opacity(0.5));
         assert_eq!(background.opacity(0.5).colors[1], to.opacity(0.5));
+        assert!(!background.is_transparent());
+        assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn test_background_pattern_stripe() {
+        let color = Hsla::from(rgba(0xff0099ff));
+        let background = pattern_stripe(color, 3.0, 5.0);
+        assert_eq!(background.tag, BackgroundTag::PatternStripe);
+        assert_eq!(background.solid, color);
+        assert_eq!(background.colors[0].percentage, 3.0);
+        assert_eq!(background.colors[1].percentage, 5.0);
+
+        assert_eq!(background.opacity(0.5).solid, color.opacity(0.5));
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
     }
