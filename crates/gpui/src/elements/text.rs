@@ -818,16 +818,43 @@ impl TextLayout {
 
                 // Only use cached layout if:
                 // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
+                // 2. wrap_width matches EXACTLY (including None == None)
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
+                //
+                // FINCODE FORK: upstream's check here was
+                // `wrap_width.is_none() || wrap_width == text_layout.wrap_width`,
+                // which answers intrinsic-sizing probes (Taffy min-/max-content,
+                // wrap_width == None) with a size shaped at whatever definite
+                // width happened to be cached. That poisons flex sizing: if one
+                // transient frame shaped this text at a collapsed width (the
+                // cached size is then ~one glyph wide and very tall), the next
+                // probe is answered with that collapsed size, the parent flex
+                // node is sized around it, and the definite width handed back
+                // re-creates the collapsed shape — a self-perpetuating fixpoint
+                // that paints transcript text one character per line until some
+                // unrelated change rebuilds the element. Probes must therefore
+                // only reuse a layout produced under the same wrap_width.
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && wrap_width == text_layout.wrap_width
                     && truncate_width.is_none()
                 {
                     return size;
                 }
+
+                // FINCODE FORK: when an intrinsic probe (wrap_width == None)
+                // misses the cache above, it shapes unwrapped below — the
+                // correct intrinsic answer. But it must NOT overwrite a cached
+                // definite-width layout: paint() draws whatever lines are
+                // stored here into the assigned bounds without re-wrapping, so
+                // clobbering the wrapped lines with an unwrapped probe shape
+                // would paint the text as one long unwrapped line. Probes
+                // compute their answer and leave the stored layout untouched.
+                let preserve_cached_layout = wrap_width.is_none()
+                    && element_state.0.borrow().as_ref().is_some_and(|cached| {
+                        cached.wrap_width.is_some() && cached.size.is_some()
+                    });
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if truncate_width.is_some() {
@@ -867,14 +894,16 @@ impl TextLayout {
                     )
                     .log_err()
                 else {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines: Default::default(),
-                        len: 0,
-                        line_height,
-                        wrap_width,
-                        size: Some(Size::default()),
-                        bounds: None,
-                    });
+                    if !preserve_cached_layout {
+                        element_state.0.borrow_mut().replace(TextLayoutInner {
+                            lines: Default::default(),
+                            len: 0,
+                            line_height,
+                            wrap_width,
+                            size: Some(Size::default()),
+                            bounds: None,
+                        });
+                    }
                     return Size::default();
                 };
 
@@ -885,14 +914,16 @@ impl TextLayout {
                     size.width = size.width.max(line_size.width).ceil();
                 }
 
-                element_state.0.borrow_mut().replace(TextLayoutInner {
-                    lines,
-                    len,
-                    line_height,
-                    wrap_width,
-                    size: Some(size),
-                    bounds: None,
-                });
+                if !preserve_cached_layout {
+                    element_state.0.borrow_mut().replace(TextLayoutInner {
+                        lines,
+                        len,
+                        line_height,
+                        wrap_width,
+                        size: Some(size),
+                        bounds: None,
+                    });
+                }
 
                 size
             }
