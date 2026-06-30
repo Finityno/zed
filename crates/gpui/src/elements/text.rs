@@ -1138,12 +1138,6 @@ impl TextLayout {
         let element_state = element_state
             .as_ref()
             .expect("measurement has not been performed");
-        let bounds = element_state
-            .bounds
-            .expect("prepaint has not been performed");
-        let line_height = element_state.line_height;
-
-        let mut line_origin = bounds.origin;
         let mut line_start_ix = 0;
 
         for line in &element_state.lines {
@@ -1151,7 +1145,6 @@ impl TextLayout {
             if index < line_start_ix {
                 break;
             } else if index > line_end_ix {
-                line_origin.y += line.size(line_height).height;
                 line_start_ix = line_end_ix + 1;
                 continue;
             } else {
@@ -1160,6 +1153,18 @@ impl TextLayout {
         }
 
         None
+    }
+
+    /// Retrieve all line layouts in source order.
+    pub fn line_layouts(&self) -> SmallVec<[Arc<WrappedLineLayout>; 1]> {
+        self.0
+            .borrow()
+            .as_ref()
+            .expect("measurement has not been performed")
+            .lines
+            .iter()
+            .map(|line| line.layout.clone())
+            .collect()
     }
 
     /// The bounds of this layout.
