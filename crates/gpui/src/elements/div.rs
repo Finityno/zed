@@ -2732,15 +2732,25 @@ impl Interactivity {
                     .cloned()
             });
             let current_view = window.current_view();
+            // The window's hit test is recomputed against this frame's
+            // hitboxes just before paint, so this snapshot is the hover state
+            // of the frame the listener belongs to. Comparing against it
+            // detects transitions without persistent element state, so hover
+            // styling re-renders on transitions (and only on transitions)
+            // even for elements without an id. Several mouse moves can
+            // dispatch against the same frame, so update the snapshot after
+            // each transition rather than comparing every event against the
+            // state at paint time.
+            let mut was_hovered = hitbox.is_hovered(window);
 
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = hitbox.is_hovered(window);
-                let was_hovered = hover_state
-                    .as_ref()
-                    .is_some_and(|state| state.borrow().element);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    if let Some(hover_state) = &hover_state {
-                        hover_state.borrow_mut().element = hovered;
+                if phase == DispatchPhase::Capture {
+                    let hovered = hitbox.is_hovered(window);
+                    if hovered != was_hovered {
+                        was_hovered = hovered;
+                        if let Some(hover_state) = &hover_state {
+                            hover_state.borrow_mut().element = hovered;
+                        }
                         cx.notify(current_view);
                     }
                 }
@@ -2754,15 +2764,18 @@ impl Interactivity {
                     .and_then(|element| element.hover_state.as_ref())
                     .cloned();
                 let current_view = window.current_view();
+                // Paint-time snapshot, updated per observed transition; see
+                // the element-hover listener above.
+                let mut was_group_hovered = group_hitbox_id.is_hovered(window);
 
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                    let group_hovered = group_hitbox_id.is_hovered(window);
-                    let was_group_hovered = hover_state
-                        .as_ref()
-                        .is_some_and(|state| state.borrow().group);
-                    if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
-                        if let Some(hover_state) = &hover_state {
-                            hover_state.borrow_mut().group = group_hovered;
+                    if phase == DispatchPhase::Capture {
+                        let group_hovered = group_hitbox_id.is_hovered(window);
+                        if group_hovered != was_group_hovered {
+                            was_group_hovered = group_hovered;
+                            if let Some(hover_state) = &hover_state {
+                                hover_state.borrow_mut().group = group_hovered;
+                            }
                             cx.notify(current_view);
                         }
                     }
@@ -4250,8 +4263,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
+        MouseMoveEvent, PlatformInput, TestAppContext, canvas, size, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -5098,6 +5111,218 @@ mod tests {
         key_up(&mut cx, window, "cmd-enter");
 
         assert!(clicks.borrow().is_empty(), "clicks: {:?}", clicks.borrow());
+    }
+
+    struct HoverRenderCountView {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for HoverRenderCountView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(100.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .flex()
+                    .group("hover-test-group")
+                    .child(
+                        // Deliberately no id: hover styling must still update
+                        // through transition-triggered re-renders.
+                        div()
+                            .w(px(50.))
+                            .h(px(100.))
+                            .hover(|style| style.opacity(0.5)),
+                    )
+                    .child(
+                        // Deliberately no id: group hover must notify only on
+                        // group transitions, not on every mouse move inside
+                        // the hovered group.
+                        div()
+                            .w(px(50.))
+                            .h(px(100.))
+                            .group_hover("hover-test-group", |style| style.opacity(0.5)),
+                    ),
+            )
+        }
+    }
+
+    /// Hover and group-hover styles on elements without an id re-render the
+    /// view exactly once per hover transition. Regression test for id-less
+    /// `group_hover` elements re-rendering on every mouse move while their
+    /// group was hovered (a full-window redraw per mouse event), and for
+    /// id-less `hover` elements never triggering a re-render at all.
+    #[gpui::test]
+    fn hover_transitions_rerender_once_without_element_id(cx: &mut TestAppContext) {
+        let renders: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        let window = cx.open_window(size(px(400.), px(400.)), {
+            let renders = renders.clone();
+            move |_, _| HoverRenderCountView { renders }
+        });
+        cx.run_until_parked();
+
+        let mut move_mouse = |x: f32, y: f32| {
+            window
+                .update(cx, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: point(px(x), px(y)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        // Prime input modality and mouse position outside the group.
+        move_mouse(10., 10.);
+        let base = renders.get();
+
+        // Moving around outside the group does not re-render.
+        move_mouse(20., 10.);
+        move_mouse(30., 20.);
+        assert_eq!(renders.get(), base, "moves outside the group re-rendered");
+
+        // Entering the group (over the id-less hover child) re-renders once.
+        move_mouse(110., 150.);
+        assert_eq!(renders.get(), base + 1, "hover transition did not re-render exactly once");
+
+        // Moving within the hovered child/group does not re-render again.
+        move_mouse(120., 150.);
+        move_mouse(115., 160.);
+        move_mouse(125., 145.);
+        assert_eq!(renders.get(), base + 1, "moves inside the hovered group re-rendered");
+
+        // Crossing onto the group_hover child re-renders once (hover child
+        // un-hovers); moving within it stays quiet.
+        move_mouse(175., 150.);
+        let after_cross = renders.get();
+        assert!(
+            after_cross > base + 1,
+            "crossing between children did not re-render"
+        );
+        move_mouse(180., 155.);
+        move_mouse(170., 160.);
+        assert_eq!(
+            renders.get(),
+            after_cross,
+            "moves inside the hovered group_hover child re-rendered"
+        );
+
+        // Leaving the group re-renders again.
+        move_mouse(10., 10.);
+        assert!(renders.get() > after_cross, "leaving the group did not re-render");
+    }
+
+    struct HoverWidthView {
+        group_hover: bool,
+        measured_width: Rc<Cell<Pixels>>,
+    }
+
+    impl Render for HoverWidthView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let measured_width = self.measured_width.clone();
+            let group_hover = self.group_hover;
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(100.))
+                    .group("hover-width-group")
+                    .on_children_prepainted(move |bounds, _, _| {
+                        if let Some(first) = bounds.first() {
+                            measured_width.set(first.size.width);
+                        }
+                    })
+                    .child(
+                        div()
+                            .id("hover-width-target")
+                            .w(px(50.))
+                            .h(px(100.))
+                            .when(!group_hover, |element| {
+                                element.hover(|style| style.w(px(60.)))
+                            })
+                            .when(group_hover, |element| {
+                                element.group_hover("hover-width-group", |style| style.w(px(60.)))
+                            }),
+                    ),
+            )
+        }
+    }
+
+    fn assert_hover_state_tracks_enter_and_leave_between_draws(
+        group_hover: bool,
+        cx: &mut TestAppContext,
+    ) {
+        let measured_width: Rc<Cell<Pixels>> = Rc::new(Cell::new(px(0.)));
+        let window = cx.open_window(size(px(400.), px(400.)), {
+            let measured_width = measured_width.clone();
+            move |_, _| HoverWidthView {
+                group_hover,
+                measured_width,
+            }
+        });
+        cx.run_until_parked();
+
+        let mouse_move = |x: f32, y: f32| {
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: point(px(x), px(y)),
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            })
+        };
+
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(mouse_move(10., 10.), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(measured_width.get(), px(50.));
+
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(mouse_move(125., 150.), cx);
+                window.dispatch_event(mouse_move(10., 10.), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            measured_width.get(),
+            px(50.),
+            "a leave dispatched against the same frame as the enter was missed"
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(mouse_move(125., 150.), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(measured_width.get(), px(60.));
+    }
+
+    /// A fast sweep can deliver the enter and the leave against the same
+    /// rendered frame (mouse events outpace redraws). The listener must diff
+    /// each event against the last observed state, not a snapshot frozen at
+    /// paint time: with a frozen snapshot the leave compares equal to it and
+    /// is dropped, stranding the layout-time hover flag until the element
+    /// happens to repaint. Regression test for hover styling sticking to
+    /// transcript rows while sweeping the mouse across them quickly.
+    #[gpui::test]
+    fn hover_state_tracks_enter_and_leave_between_draws(cx: &mut TestAppContext) {
+        assert_hover_state_tracks_enter_and_leave_between_draws(false, cx);
+    }
+
+    #[gpui::test]
+    fn group_hover_state_tracks_enter_and_leave_between_draws(cx: &mut TestAppContext) {
+        assert_hover_state_tracks_enter_and_leave_between_draws(true, cx);
     }
 
     /// Two sibling tab groups, each a focusable container that is *not* itself a
