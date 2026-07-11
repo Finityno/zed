@@ -1609,39 +1609,8 @@ impl Window {
             let mut cx = cx.to_async();
             move |active| {
                 handle
-                    .update(&mut cx, |_, window, cx| {
+                    .update(&mut cx, |_, window, _| {
                         window.hovered.set(active);
-                        // The mouse can leave the window without a final
-                        // in-window mouse move (e.g. Windows only sends
-                        // WM_MOUSELEAVE), so `mouse_position` still holds the
-                        // last in-window point and every hover hit test keeps
-                        // treating the element under it as hovered — hover
-                        // styling stays stuck on it until the mouse re-enters.
-                        // Deliver the exit as a mouse move to a point outside
-                        // every hitbox so all hover consumers (hover styles,
-                        // on_hover listeners, tooltips, cursor styles) observe
-                        // the transition through the normal event path. Skip
-                        // during drags: a synthetic unpressed move could
-                        // disturb drag tracking, and drag hit tests follow the
-                        // captured hitbox rather than the hover hit test.
-                        if !active && cx.active_drag.is_none() {
-                            let exit_position = point(px(-1.), px(-1.));
-                            if window.mouse_position != exit_position {
-                                // A synthetic move must not count as user
-                                // mouse input for focus-visible styling, so
-                                // preserve the input modality across it.
-                                let last_input_modality = window.last_input_modality;
-                                window.dispatch_event(
-                                    PlatformInput::MouseMove(MouseMoveEvent {
-                                        position: exit_position,
-                                        pressed_button: None,
-                                        modifiers: window.modifiers,
-                                    }),
-                                    cx,
-                                );
-                                window.last_input_modality = last_input_modality;
-                            }
-                        }
                         window.refresh();
                     })
                     .log_err();

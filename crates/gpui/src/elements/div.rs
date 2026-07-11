@@ -2562,32 +2562,11 @@ impl Interactivity {
             // of the frame the listener belongs to. Comparing against it
             // detects transitions without persistent element state, so hover
             // styling re-renders on transitions (and only on transitions)
-            // even for elements without an id. The listener updates it after
-            // each observed transition: several mouse moves can dispatch
-            // against the same frame (fast sweeps outpace redraws), and
-            // diffing them all against a frozen snapshot would miss the
-            // leave in an enter+leave pair, stranding the hovered style.
+            // even for elements without an id. Several mouse moves can
+            // dispatch against the same frame, so update the snapshot after
+            // each transition rather than comparing every event against the
+            // state at paint time.
             let mut was_hovered = hitbox.is_hovered(window);
-
-            // The persistent hover state drives layout-time hover styling
-            // (e.g. hovered text color is resolved before this frame's hitbox
-            // exists), but it is only written by the mouse-move listener
-            // below. When the hit test changes without a mouse move — content
-            // re-layouts under a stationary cursor after a click, a list
-            // grows, a transcript auto-scrolls — the flag goes stale and
-            // every later re-render keeps baking the hovered style until the
-            // user happens to hover and leave again. Reconcile it with the
-            // live hit test whenever the element paints, and schedule one
-            // corrective re-render so the style catches up. This converges:
-            // the corrected state matches the hit test on the next paint.
-            if let Some(hover_state) = &hover_state {
-                let mut hover_state = hover_state.borrow_mut();
-                if hover_state.element != was_hovered {
-                    hover_state.element = was_hovered;
-                    drop(hover_state);
-                    window.on_next_frame(move |_, cx| cx.notify(current_view));
-                }
-            }
 
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture {
@@ -2611,25 +2590,8 @@ impl Interactivity {
                     .cloned();
                 let current_view = window.current_view();
                 // Paint-time snapshot, updated per observed transition; see
-                // the element-hover listener above. Without it, elements
-                // lacking an id had no way to remember the previous
-                // group-hover state, treated every mouse move inside a
-                // hovered group as a transition, and re-rendered their view
-                // on every event.
+                // the element-hover listener above.
                 let mut was_group_hovered = group_hitbox_id.is_hovered(window);
-
-                // Reconcile the persistent group-hover flag with the live hit
-                // test; see the element-hover reconciliation above for why
-                // (missed transitions when layout shifts under a stationary
-                // cursor leave layout-time group-hover styling stuck).
-                if let Some(hover_state) = &hover_state {
-                    let mut hover_state = hover_state.borrow_mut();
-                    if hover_state.group != was_group_hovered {
-                        hover_state.group = was_group_hovered;
-                        drop(hover_state);
-                        window.on_next_frame(move |_, cx| cx.notify(current_view));
-                    }
-                }
 
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     if phase == DispatchPhase::Capture {
@@ -4066,8 +4028,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
-        MouseMoveEvent, PlatformInput, TestAppContext, WindowHandle, size,
-        util::FluentBuilder as _,
+        MouseMoveEvent, PlatformInput, TestAppContext, size, util::FluentBuilder as _,
     };
     use std::cell::Cell;
     use std::rc::Weak;
@@ -4713,151 +4674,53 @@ mod tests {
         assert!(renders.get() > after_cross, "leaving the group did not re-render");
     }
 
-    struct ShiftingHoverView {
-        offset_x: f32,
+    struct HoverWidthView {
+        group_hover: bool,
         measured_width: Rc<Cell<Pixels>>,
     }
 
-    impl Render for ShiftingHoverView {
+    impl Render for HoverWidthView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
-            div()
-                .size_full()
-                .on_children_prepainted(move |bounds, _, _| {
-                    if let Some(first) = bounds.first() {
-                        measured_width.set(first.size.width);
-                    }
-                })
-                .child(
-                    // The id gives the element persistent hover state, which
-                    // is what layout-time hover styling (text color, width)
-                    // is resolved from.
-                    div()
-                        .id("shifting-hover-target")
-                        .absolute()
-                        .left(px(self.offset_x))
-                        .top(px(100.))
-                        .w(px(50.))
-                        .h(px(100.))
-                        .hover(|style| style.w(px(60.))),
-                )
+            let group_hover = self.group_hover;
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(100.))
+                    .group("hover-width-group")
+                    .on_children_prepainted(move |bounds, _, _| {
+                        if let Some(first) = bounds.first() {
+                            measured_width.set(first.size.width);
+                        }
+                    })
+                    .child(
+                        div()
+                            .id("hover-width-target")
+                            .w(px(50.))
+                            .h(px(100.))
+                            .when(!group_hover, |element| {
+                                element.hover(|style| style.w(px(60.)))
+                            })
+                            .when(group_hover, |element| {
+                                element.group_hover("hover-width-group", |style| style.w(px(60.)))
+                            }),
+                    ),
+            )
         }
     }
 
-    fn move_mouse_to(
-        window: WindowHandle<ShiftingHoverView>,
+    fn assert_hover_state_tracks_enter_and_leave_between_draws(
+        group_hover: bool,
         cx: &mut TestAppContext,
-        x: f32,
-        y: f32,
     ) {
-        window
-            .update(cx, |_, window, cx| {
-                window.dispatch_event(
-                    PlatformInput::MouseMove(MouseMoveEvent {
-                        position: point(px(x), px(y)),
-                        pressed_button: None,
-                        modifiers: Modifiers::default(),
-                    }),
-                    cx,
-                );
-            })
-            .unwrap();
-        cx.run_until_parked();
-    }
-
-    /// Persistent hover state must reconcile with the live hit test when the
-    /// layout shifts under a stationary cursor (click-driven re-layouts,
-    /// growing lists, auto-scroll). Regression test for hover styling staying
-    /// stuck after the hovered element moved away from under the mouse: the
-    /// mouse-move listeners never saw a transition, so the layout-time hover
-    /// flag stayed set and every later re-render re-baked the hovered style
-    /// until the user hovered and left the element again.
-    #[gpui::test]
-    fn stale_hover_state_reconciles_after_layout_shift(cx: &mut TestAppContext) {
         let measured_width: Rc<Cell<Pixels>> = Rc::new(Cell::new(px(0.)));
         let window = cx.open_window(size(px(400.), px(400.)), {
             let measured_width = measured_width.clone();
-            move |_, _| ShiftingHoverView { offset_x: 100., measured_width }
-        });
-        cx.run_until_parked();
-
-        // The test platform never fires frame callbacks, so the corrective
-        // re-render scheduled via `on_next_frame` is delivered here by
-        // notifying the view directly; only the persistent hover state (the
-        // subject of this test) determines what that re-render lays out.
-        let pump_draw = |cx: &mut TestAppContext| {
-            window
-                .update(cx, |_, _, cx| cx.notify())
-                .unwrap();
-            cx.run_until_parked();
-        };
-
-        // Prime input modality and mouse position outside the target.
-        move_mouse_to(window, cx, 10., 10.);
-        assert_eq!(measured_width.get(), px(50.));
-
-        // Hovering applies the layout-time hover style.
-        move_mouse_to(window, cx, 125., 150.);
-        assert_eq!(measured_width.get(), px(60.), "hover style did not apply");
-
-        // Shift the element away from under the stationary cursor. This
-        // render still lays out with the stale hover flag (the transition was
-        // never observed by a mouse move), but its paint reconciles the flag
-        // against the live hit test.
-        window
-            .update(cx, |view, _, cx| {
-                view.offset_x = 300.;
-                cx.notify();
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        pump_draw(cx);
-        assert_eq!(
-            measured_width.get(),
-            px(50.),
-            "hover style stayed stuck after the element moved out from under the cursor"
-        );
-        // Converged: further renders stay un-hovered.
-        pump_draw(cx);
-        assert_eq!(measured_width.get(), px(50.));
-
-        // Shift the element back under the stationary cursor: the same
-        // reconciliation applies the hover style without requiring a mouse
-        // move.
-        window
-            .update(cx, |view, _, cx| {
-                view.offset_x = 100.;
-                cx.notify();
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        pump_draw(cx);
-        assert_eq!(
-            measured_width.get(),
-            px(60.),
-            "hover style did not apply after the element moved under the cursor"
-        );
-
-        // A real mouse-move transition still clears it.
-        move_mouse_to(window, cx, 10., 10.);
-        assert_eq!(measured_width.get(), px(50.), "leaving the element did not clear hover");
-    }
-
-    /// A fast sweep can deliver the enter and the leave against the same
-    /// rendered frame (mouse events outpace redraws). The listener must diff
-    /// each event against the last observed state, not a snapshot frozen at
-    /// paint time: with a frozen snapshot the leave compares equal to it and
-    /// is dropped, stranding the layout-time hover flag until the element
-    /// happens to repaint. Regression test for hover styling sticking to
-    /// transcript rows while sweeping the mouse across them quickly.
-    #[gpui::test]
-    fn hover_state_tracks_enter_and_leave_between_draws(cx: &mut TestAppContext) {
-        let measured_width: Rc<Cell<Pixels>> = Rc::new(Cell::new(px(0.)));
-        let window = cx.open_window(size(px(400.), px(400.)), {
-            let measured_width = measured_width.clone();
-            move |_, _| ShiftingHoverView { offset_x: 100., measured_width }
+            move |_, _| HoverWidthView {
+                group_hover,
+                measured_width,
+            }
         });
         cx.run_until_parked();
 
@@ -4869,7 +4732,6 @@ mod tests {
             })
         };
 
-        // Prime input modality and mouse position outside the target.
         window
             .update(cx, |_, window, cx| {
                 window.dispatch_event(mouse_move(10., 10.), cx);
@@ -4878,8 +4740,6 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(measured_width.get(), px(50.));
 
-        // The enter and the leave both dispatch against the same rendered
-        // frame: no draw runs between them.
         window
             .update(cx, |_, window, cx| {
                 window.dispatch_event(mouse_move(125., 150.), cx);
@@ -4893,7 +4753,6 @@ mod tests {
             "a leave dispatched against the same frame as the enter was missed"
         );
 
-        // Hover behavior is intact afterwards.
         window
             .update(cx, |_, window, cx| {
                 window.dispatch_event(mouse_move(125., 150.), cx);
@@ -4903,36 +4762,20 @@ mod tests {
         assert_eq!(measured_width.get(), px(60.));
     }
 
-    /// The mouse can leave the window without a final in-window mouse move
-    /// (Windows sends only WM_MOUSELEAVE). The stale mouse position kept the
-    /// hover hit test asserting the last-hovered element was still hovered,
-    /// so neither the mouse-move listeners nor the paint-time reconciliation
-    /// ever cleared its hover styling until the mouse re-entered the window.
+    /// A fast sweep can deliver the enter and the leave against the same
+    /// rendered frame (mouse events outpace redraws). The listener must diff
+    /// each event against the last observed state, not a snapshot frozen at
+    /// paint time: with a frozen snapshot the leave compares equal to it and
+    /// is dropped, stranding the layout-time hover flag until the element
+    /// happens to repaint. Regression test for hover styling sticking to
+    /// transcript rows while sweeping the mouse across them quickly.
     #[gpui::test]
-    fn hover_clears_when_mouse_leaves_window(cx: &mut TestAppContext) {
-        let measured_width: Rc<Cell<Pixels>> = Rc::new(Cell::new(px(0.)));
-        let window = cx.open_window(size(px(400.), px(400.)), {
-            let measured_width = measured_width.clone();
-            move |_, _| ShiftingHoverView { offset_x: 100., measured_width }
-        });
-        cx.run_until_parked();
+    fn hover_state_tracks_enter_and_leave_between_draws(cx: &mut TestAppContext) {
+        assert_hover_state_tracks_enter_and_leave_between_draws(false, cx);
+    }
 
-        move_mouse_to(window, cx, 10., 10.);
-        assert_eq!(measured_width.get(), px(50.));
-        move_mouse_to(window, cx, 125., 150.);
-        assert_eq!(measured_width.get(), px(60.), "hover style did not apply");
-
-        // The platform reports the mouse left the window. No in-window mouse
-        // move accompanies it, so only the hover-status change can clear the
-        // hover styling.
-        let any_window: AnyWindowHandle = window.into();
-        cx.test_window(any_window)
-            .simulate_hover_status_change(false);
-        cx.run_until_parked();
-        assert_eq!(
-            measured_width.get(),
-            px(50.),
-            "hover style stayed stuck after the mouse left the window"
-        );
+    #[gpui::test]
+    fn group_hover_state_tracks_enter_and_leave_between_draws(cx: &mut TestAppContext) {
+        assert_hover_state_tracks_enter_and_leave_between_draws(true, cx);
     }
 }
