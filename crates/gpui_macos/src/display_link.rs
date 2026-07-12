@@ -9,6 +9,8 @@ use std::ffi::c_void;
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: DispatchRetained<DispatchSource>,
+    display_id: CGDirectDisplayID,
+    running: bool,
 }
 
 impl DisplayLink {
@@ -52,21 +54,39 @@ impl DisplayLink {
             Ok(Self {
                 display_link: Some(display_link),
                 frame_requests,
+                display_id,
+                running: false,
             })
         }
     }
 
+    /// The display this link was created for. Callers pause and reuse a link
+    /// while the window stays on the same display, because dropping a
+    /// `DisplayLink` leaks its `CVDisplayLink` (see `Drop` below) — one leaked
+    /// link per window activation adds up over a long-running session.
+    pub fn display_id(&self) -> CGDirectDisplayID {
+        self.display_id
+    }
+
     pub fn start(&mut self) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
         unsafe {
             self.display_link.as_mut().unwrap().start()?;
         }
+        self.running = true;
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        if !self.running {
+            return Ok(());
+        }
         unsafe {
             self.display_link.as_mut().unwrap().stop()?;
         }
+        self.running = false;
         Ok(())
     }
 }

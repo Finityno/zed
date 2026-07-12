@@ -645,17 +645,28 @@ impl MacWindowState {
     }
 
     fn start_display_link(&mut self) {
-        self.stop_display_link();
         unsafe {
             if !self
                 .native_window
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
+                self.stop_display_link();
                 return;
             }
         }
         let display_id = unsafe { display_id_for_screen(self.native_window.screen()) };
+        // Resume the existing link while the window stays on the same display.
+        // Dropping a DisplayLink intentionally leaks its CVDisplayLink (see
+        // display_link.rs), so recreating one per key/occlusion transition
+        // leaks hundreds of them over a long-running session.
+        if let Some(display_link) = self.display_link.as_mut()
+            && display_link.display_id() == display_id
+        {
+            display_link.start().log_err();
+            return;
+        }
+        self.display_link = None;
         if let Some(mut display_link) =
             DisplayLink::new(display_id, self.native_view.as_ptr() as *mut c_void, step).log_err()
         {
@@ -665,7 +676,9 @@ impl MacWindowState {
     }
 
     fn stop_display_link(&mut self) {
-        self.display_link = None;
+        if let Some(display_link) = self.display_link.as_mut() {
+            display_link.stop().log_err();
+        }
     }
 
     fn is_maximized(&self) -> bool {
