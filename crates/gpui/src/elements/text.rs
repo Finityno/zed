@@ -759,6 +759,7 @@ struct TextLayoutInner {
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
+    truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -821,8 +822,11 @@ impl TextLayout {
                 // 2. wrap_width matches EXACTLY (including None == None)
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
+                // 4. the cached layout was not truncated (a truncated layout answers an
+                //    unconstrained probe with the truncated size, which poisons intrinsic
+                //    sizing with whatever width some earlier measure pass happened to use)
                 //
-                // FINCODE FORK: upstream's check here was
+                // FINCODE FORK: upstream's check here is
                 // `wrap_width.is_none() || wrap_width == text_layout.wrap_width`,
                 // which answers intrinsic-sizing probes (Taffy min-/max-content,
                 // wrap_width == None) with a size shaped at whatever definite
@@ -839,6 +843,7 @@ impl TextLayout {
                     && let Some(size) = text_layout.size
                     && wrap_width == text_layout.wrap_width
                     && truncate_width.is_none()
+                    && text_layout.truncate_width.is_none()
                 {
                     return size;
                 }
@@ -857,7 +862,7 @@ impl TextLayout {
                     });
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let (text, runs) = if truncate_width.is_some() {
+                let (text, runs) = if let Some(truncate_width) = truncate_width {
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
@@ -869,10 +874,25 @@ impl TextLayout {
                             &runs,
                             truncate_from,
                         )
+                    } else if let Some(unclipped) = window
+                        .text_system()
+                        .shape_text(text.clone(), font_size, &runs, None, None)
+                        .log_err()
+                        && unclipped
+                            .iter()
+                            .all(|line| line.size(line_height).width <= truncate_width)
+                    {
+                        // The truncation decision below sums per-character advances,
+                        // which overestimates the shaped width (no kerning), truncating
+                        // text that fits exactly in its measured width. Skip truncation
+                        // whenever the honestly-shaped text fits; the shaping result
+                        // comes from the line layout cache when the same text was
+                        // already measured untruncated this frame.
+                        (text.clone(), Cow::Borrowed(&*runs))
                     } else {
                         line_wrapper.truncate_line(
                             text.clone(),
-                            truncate_width.unwrap_or(Pixels::MAX),
+                            truncate_width,
                             &truncation_affix,
                             &runs,
                             truncate_from,
@@ -900,6 +920,7 @@ impl TextLayout {
                             len: 0,
                             line_height,
                             wrap_width,
+                            truncate_width,
                             size: Some(Size::default()),
                             bounds: None,
                         });
@@ -920,6 +941,7 @@ impl TextLayout {
                         len,
                         line_height,
                         wrap_width,
+                        truncate_width,
                         size: Some(size),
                         bounds: None,
                     });
