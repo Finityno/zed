@@ -6,6 +6,10 @@
 // buffer its own entry points read.
 
 @group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
+// The quad pipelines' second binding: the scene's partition index table
+// (blended indices followed by opaque indices), which the depth-buffer
+// passes resolve `instance_id` through.
+@group(1) @binding(1) var<storage, read> b_quad_indices: array<u32>;
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
@@ -15,6 +19,10 @@
 
 fn load_quad(instance_id: u32) -> Quad {
     return b_quads[instance_id];
+}
+
+fn quad_index(instance_id: u32) -> u32 {
+    return b_quad_indices[instance_id];
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
