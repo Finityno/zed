@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    ops::Range,
     rc::Rc,
     slice,
     sync::{Arc, OnceLock},
@@ -48,6 +49,7 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    frame_scratch: FrameScratch,
 
     width: u32,
     height: u32,
@@ -79,14 +81,12 @@ struct DirectXResources {
     swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
-
-    // Path intermediate textures (with MSAA)
     path_intermediate_texture: ID3D11Texture2D,
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
-
-    // Cached viewport
+    depth_stencil_texture: ID3D11Texture2D,
+    depth_stencil_view: Option<ID3D11DepthStencilView>,
     viewport: D3D11_VIEWPORT,
 
     /// Render into an owned offscreen texture instead of the swap chain back buffer. A
@@ -107,12 +107,19 @@ struct DirectXRenderPipelines {
     /// Alpha-preserving blend for glass-content quads, used instead of
     /// `quad_pipeline`'s blend state for quads marked as glass content.
     quad_glass_blend_state: ID3D11BlendState,
+    opaque_quad_pipeline: OpaqueQuadPipeline,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+}
+
+#[derive(Default)]
+struct FrameScratch {
+    path_vertices: Vec<PathRasterizationSprite>,
+    path_sprites: Vec<PathSprite>,
 }
 
 struct DirectXGlobalElements {
@@ -228,6 +235,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            frame_scratch: FrameScratch::default(),
             width: 1,
             height: 1,
             headless: false,
@@ -261,7 +269,12 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition: None,
+            // Overlays exist to compose native child views under the window's DirectComposition
+            // tree, which a headless renderer has no window for. Rendering to an owned texture
+            // never needs one.
+            overlay_resources: None,
             font_info: Self::get_font_info(),
+            frame_scratch: FrameScratch::default(),
             width: 1,
             height: 1,
             headless: true,
@@ -366,7 +379,19 @@ impl DirectXRenderer {
                     .context("missing render target view")?,
                 clear_color,
             );
-            device_context.OMSetRenderTargets(Some(slice::from_ref(render_target_view)), None);
+            device_context.ClearDepthStencilView(
+                resources
+                    .depth_stencil_view
+                    .as_ref()
+                    .context("missing depth stencil view")?,
+                D3D11_CLEAR_DEPTH.0,
+                0.0,
+                0,
+            );
+            device_context.OMSetRenderTargets(
+                Some(slice::from_ref(render_target_view)),
+                resources.depth_stencil_view.as_ref(),
+            );
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             device_context
                 .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
@@ -464,9 +489,10 @@ impl DirectXRenderer {
             .handle_device_lost(&devices.device, &devices.device_context);
 
         unsafe {
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices.device_context.OMSetRenderTargets(
+                Some(slice::from_ref(&resources.render_target_view)),
+                resources.depth_stencil_view.as_ref(),
+            );
         }
         self.devices = Some(devices);
         self.resources = Some(resources);
@@ -588,21 +614,61 @@ impl DirectXRenderer {
 
     fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
         self.upload_scene_buffers(scene)?;
+        self.update_quad_indices(scene)?;
 
         let annotation = self
             .devices
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+
+        if !scene.opaque_quad_indices.is_empty() {
+            let _annotation = annotation.as_ref().map(|annotation| {
+                Annotation::new(
+                    annotation,
+                    HSTRING::from(format!(
+                        "opaque quads ({})",
+                        scene.opaque_quad_indices.len()
+                    )),
+                )
+            });
+            self.draw_opaque_quads(
+                scene.blended_quad_indices.len(),
+                scene.opaque_quad_indices.len(),
+            )?;
+        }
+
+        self.pipelines.opaque_quad_pipeline.enable_depth_test(
+            &self
+                .devices
+                .as_ref()
+                .context("devices missing")?
+                .device_context,
+        );
+
+        let mut quad_cursor: u32 = 0;
         for batch in scene.batches() {
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
+
+            // Quad shaders assign each quad its own depth.
+            // In every other batch type, the depth is fixed to the position of the quad cursor.
+            if matches!(&batch, PrimitiveBatch::Quads { .. }) {
+                self.set_viewport_depth_range(0.0, 1.0)?;
+            } else {
+                let depth = quad_depth(quad_cursor);
+                self.set_viewport_depth_range(depth, depth)?;
+            }
+
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
-                PrimitiveBatch::Quads(range) => {
-                    let base = range.start;
-                    self.draw_quads_segmented(&scene.quads[range], base)
+                PrimitiveBatch::Quads {
+                    range,
+                    blended_range,
+                } => {
+                    quad_cursor += range.len() as u32;
+                    self.draw_blended_quads_segmented(scene, blended_range)
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
@@ -636,6 +702,17 @@ impl DirectXRenderer {
                 )
             })?;
         }
+
+        self.pipelines.opaque_quad_pipeline.disable_depth(
+            &self
+                .devices
+                .as_ref()
+                .context("devices missing")?
+                .device_context,
+        );
+
+        // Presenting is the caller's job: `draw_layered` renders the base and
+        // overlay scenes through here before presenting either swap chain.
         Ok(())
     }
 
@@ -723,6 +800,50 @@ impl DirectXRenderer {
             .context("Failed to build RgbaImage from staging readback")
     }
 
+    fn set_viewport_depth_range(&self, minimum_depth: f32, maximum_depth: f32) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        // Equal endpoints collapse every shader depth to the same value.
+        let viewport = D3D11_VIEWPORT {
+            MinDepth: minimum_depth,
+            MaxDepth: maximum_depth,
+            ..resources.viewport
+        };
+        unsafe {
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&viewport)))
+        };
+        Ok(())
+    }
+
+    fn update_quad_indices(&mut self, scene: &Scene) -> Result<()> {
+        if scene.blended_quad_indices.is_empty() && scene.opaque_quad_indices.is_empty() {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.pipelines.opaque_quad_pipeline.update_quad_indices(
+            &devices.device,
+            &devices.device_context,
+            &scene.blended_quad_indices,
+            &scene.opaque_quad_indices,
+        )
+    }
+
+    fn draw_opaque_quads(&self, quad_indices_start: usize, quad_count: usize) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.pipelines.opaque_quad_pipeline.draw(
+            &devices.device_context,
+            &self.pipelines.quad_pipeline.view,
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            quad_indices_start,
+            quad_count,
+        )
+    }
+
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
@@ -763,9 +884,10 @@ impl DirectXRenderer {
         }
 
         unsafe {
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices.device_context.OMSetRenderTargets(
+                Some(slice::from_ref(&resources.render_target_view)),
+                resources.depth_stencil_view.as_ref(),
+            );
         }
 
         Ok(())
@@ -836,44 +958,77 @@ impl DirectXRenderer {
                 .batch_params_buffer
                 .as_ref()
                 .context("batch params buffer missing")?,
+            4,
             start as u32,
             len as u32,
             None,
         )
     }
 
-    fn draw_quads(&mut self, start: usize, len: usize, glass: bool) -> Result<()> {
-        if len == 0 {
+    fn draw_blended_quads(
+        &mut self,
+        quad_indices_start: usize,
+        quad_count: usize,
+        glass: bool,
+    ) -> Result<()> {
+        if quad_count == 0 {
             return Ok(());
         }
         let devices = self.devices.as_ref().context("devices missing")?;
-        // Glass-content quads use the alpha-preserving blend so their
-        // anti-aliased edges don't punch through a translucent glass surface.
-        let blend_override = glass.then_some(&self.pipelines.quad_glass_blend_state);
-        self.pipelines.quad_pipeline.draw_range(
+        let quad_pipeline = &self.pipelines.quad_pipeline;
+        let opaque_quad_pipeline = &self.pipelines.opaque_quad_pipeline;
+        let views = [
+            quad_pipeline.view.clone(),
+            opaque_quad_pipeline.quad_indices_range(quad_indices_start, quad_count)?,
+        ];
+        update_batch_start(
             &devices.device_context,
             self.globals
                 .batch_params_buffer
                 .as_ref()
                 .context("batch params buffer missing")?,
-            start as u32,
-            len as u32,
-            blend_override,
-        )
+            quad_indices_start as u32,
+        )?;
+        // Glass-content quads use the alpha-preserving blend so their
+        // anti-aliased edges don't punch through a translucent glass surface.
+        let blend_state = if glass {
+            &self.pipelines.quad_glass_blend_state
+        } else {
+            &quad_pipeline.blend_state
+        };
+        set_pipeline_state(
+            &devices.device_context,
+            &views,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            &quad_pipeline.vertex,
+            &quad_pipeline.fragment,
+            blend_state,
+        );
+        unsafe {
+            devices
+                .device_context
+                .DrawInstanced(4, quad_count as u32, 0, 0);
+        }
+        Ok(())
     }
 
-    /// Draw a range of quads, splitting it into runs that share the same glass
-    /// flag so glass-content quads use the alpha-preserving blend. Splitting by
-    /// run keeps draw order intact.
-    fn draw_quads_segmented(&mut self, quads: &[Quad], base: usize) -> Result<()> {
-        let mut i = 0;
-        while i < quads.len() {
-            let is_glass = quads[i].background.is_glass_content();
-            let seg_start = i;
-            while i < quads.len() && quads[i].background.is_glass_content() == is_glass {
-                i += 1;
+    /// Draw a range of the frame's quad index buffer, splitting it into runs
+    /// that share the same glass flag so glass-content quads use the
+    /// alpha-preserving blend. Splitting by run keeps draw order intact.
+    fn draw_blended_quads_segmented(
+        &mut self,
+        scene: &Scene,
+        blended_range: Range<usize>,
+    ) -> Result<()> {
+        let mut start = blended_range.start;
+        while start < blended_range.end {
+            let is_glass = blended_quad_is_glass(scene, start);
+            let mut end = start + 1;
+            while end < blended_range.end && blended_quad_is_glass(scene, end) == is_glass {
+                end += 1;
             }
-            self.draw_quads(base + seg_start, i - seg_start, is_glass)?;
+            self.draw_blended_quads(start, end - start, is_glass)?;
+            start = end;
         }
         Ok(())
     }
@@ -892,6 +1047,9 @@ impl DirectXRenderer {
                 &[0.0; 4],
             );
             // Set intermediate MSAA texture as render target
+            self.pipelines
+                .opaque_quad_pipeline
+                .disable_depth(&devices.device_context);
             devices.device_context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
                 None,
@@ -899,8 +1057,8 @@ impl DirectXRenderer {
         }
 
         // Collect all vertices and sprites for a single draw call
-        let mut vertices = Vec::new();
-
+        let vertices = &mut self.frame_scratch.path_vertices;
+        vertices.clear();
         for path in paths {
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
                 xy_position: v.xy_position,
@@ -913,7 +1071,7 @@ impl DirectXRenderer {
         self.pipelines.path_rasterization_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
-            &vertices,
+            vertices,
         )?;
 
         self.pipelines.path_rasterization_pipeline.draw(
@@ -933,9 +1091,13 @@ impl DirectXRenderer {
                 RENDER_TARGET_FORMAT,
             );
             // Restore main render target
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices.device_context.OMSetRenderTargets(
+                Some(slice::from_ref(&resources.render_target_view)),
+                resources.depth_stencil_view.as_ref(),
+            );
+            self.pipelines
+                .opaque_quad_pipeline
+                .enable_depth_test(&devices.device_context);
         }
 
         Ok(())
@@ -953,27 +1115,26 @@ impl DirectXRenderer {
         // disjoint, so we can copy each path's bounds individually. If this
         // batch combines different draw orders, we perform a single copy
         // for a minimal spanning rect.
-        let sprites = if paths.last().unwrap().order == first_path.order {
-            paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect::<Vec<_>>()
+        let sprites = &mut self.frame_scratch.path_sprites;
+        sprites.clear();
+        if paths.last().unwrap().order == first_path.order {
+            sprites.extend(paths.iter().map(|path| PathSprite {
+                bounds: path.clipped_bounds(),
+            }));
         } else {
             let mut bounds = first_path.clipped_bounds();
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
-        };
+            sprites.push(PathSprite { bounds });
+        }
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
-            &sprites,
+            sprites,
         )?;
 
         // Draw the sprites with the path texture
@@ -996,6 +1157,7 @@ impl DirectXRenderer {
                 .batch_params_buffer
                 .as_ref()
                 .context("batch params buffer missing")?,
+            4,
             start as u32,
             len as u32,
             None,
@@ -1154,6 +1316,8 @@ impl DirectXResources {
         let (
             render_target,
             render_target_view,
+            depth_stencil_texture,
+            depth_stencil_view,
             path_intermediate_texture,
             path_intermediate_srv,
             path_intermediate_msaa_texture,
@@ -1167,6 +1331,8 @@ impl DirectXResources {
             headless,
             render_target: Some(render_target),
             render_target_view,
+            depth_stencil_texture,
+            depth_stencil_view,
             path_intermediate_texture,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
@@ -1185,6 +1351,8 @@ impl DirectXResources {
         let (
             render_target,
             render_target_view,
+            depth_stencil_texture,
+            depth_stencil_view,
             path_intermediate_texture,
             path_intermediate_srv,
             path_intermediate_msaa_texture,
@@ -1193,6 +1361,8 @@ impl DirectXResources {
         ) = create_resources(devices, &self.swap_chain, width, height, self.headless)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
+        self.depth_stencil_texture = depth_stencil_texture;
+        self.depth_stencil_view = depth_stencil_view;
         self.path_intermediate_texture = path_intermediate_texture;
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
@@ -1261,11 +1431,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
 
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
             quad_glass_blend_state,
+            opaque_quad_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1396,8 +1568,10 @@ impl OverlayResources {
             width,
             height,
         )?;
+        // Never headless: an overlay always has a real composition swap chain to draw into, so
+        // its render target comes from that swap chain's buffer rather than an owned texture.
         let (render_target, render_target_view) =
-            create_render_target_and_its_view(&swap_chain, &devices.device)?;
+            create_render_target_and_its_view(&swap_chain, &devices.device, width, height, false)?;
         Ok(Self {
             swap_chain,
             render_target: Some(render_target),
@@ -1417,8 +1591,13 @@ impl OverlayResources {
                 DXGI_SWAP_CHAIN_FLAG(0),
             )?;
         }
-        let (render_target, render_target_view) =
-            create_render_target_and_its_view(&self.swap_chain, &devices.device)?;
+        let (render_target, render_target_view) = create_render_target_and_its_view(
+            &self.swap_chain,
+            &devices.device,
+            width,
+            height,
+            false,
+        )?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         Ok(())
@@ -1601,6 +1780,7 @@ impl<T> PipelineState<T> {
         &self,
         device_context: &ID3D11DeviceContext,
         batch_params_buffer: &ID3D11Buffer,
+        vertex_count: u32,
         first_instance: u32,
         instance_count: u32,
         blend_override: Option<&ID3D11BlendState>,
@@ -1617,11 +1797,10 @@ impl<T> PipelineState<T> {
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             &self.vertex,
             &self.fragment,
-            global_params,
             blend_override.unwrap_or(&self.blend_state),
         );
         unsafe {
-            device_context.DrawInstanced(4, instance_count, 0, 0);
+            device_context.DrawInstanced(vertex_count, instance_count, 0, 0);
         }
         Ok(())
     }
@@ -1656,6 +1835,167 @@ impl<T> PipelineState<T> {
             device_context.DrawInstanced(4, instance_count, 0, 0);
         }
         Ok(())
+    }
+}
+
+struct OpaqueQuadPipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    quad_indices_buffer: ID3D11Buffer,
+    quad_indices_view: Option<ID3D11ShaderResourceView>,
+    quad_indices_buffer_size: usize,
+    quad_index_count: usize,
+    blend_state: ID3D11BlendState,
+    depth_write_state: ID3D11DepthStencilState,
+    depth_test_state: ID3D11DepthStencilState,
+    depth_disabled_state: ID3D11DepthStencilState,
+}
+
+impl OpaqueQuadPipeline {
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        let vertex = {
+            let raw_shader = RawShaderBytes::new(ShaderModule::OpaqueQuad, ShaderTarget::Vertex)?;
+            create_vertex_shader(device, raw_shader.as_bytes())?
+        };
+        let fragment = {
+            let raw_shader = RawShaderBytes::new(ShaderModule::OpaqueQuad, ShaderTarget::Fragment)?;
+            create_fragment_shader(device, raw_shader.as_bytes())?
+        };
+        let quad_indices_buffer_size = 512;
+        let quad_indices_buffer =
+            create_buffer(device, std::mem::size_of::<u32>(), quad_indices_buffer_size)?;
+        let quad_indices_view = create_buffer_view(device, &quad_indices_buffer)?;
+        Ok(OpaqueQuadPipeline {
+            vertex,
+            fragment,
+            quad_indices_buffer,
+            quad_indices_view,
+            quad_indices_buffer_size,
+            quad_index_count: 0,
+            blend_state: create_opaque_blend_state(device)?,
+            depth_write_state: create_depth_stencil_state(
+                device,
+                true,
+                D3D11_DEPTH_WRITE_MASK_ALL,
+            )?,
+            depth_test_state: create_depth_stencil_state(
+                device,
+                true,
+                D3D11_DEPTH_WRITE_MASK_ZERO,
+            )?,
+            depth_disabled_state: create_depth_stencil_state(
+                device,
+                false,
+                D3D11_DEPTH_WRITE_MASK_ZERO,
+            )?,
+        })
+    }
+
+    fn update_quad_indices(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        blended_quad_indices: &[u32],
+        opaque_quad_indices: &[u32],
+    ) -> Result<()> {
+        let quad_index_count = blended_quad_indices.len() + opaque_quad_indices.len();
+        if self.quad_indices_buffer_size < quad_index_count {
+            let element_size = std::mem::size_of::<u32>();
+            let required_size = element_size
+                .checked_mul(quad_index_count)
+                .context("DirectX quad index buffer size overflow")?;
+            anyhow::ensure!(
+                required_size <= MAX_INSTANCE_BUFFER_SIZE,
+                "quad index buffer needs {required_size} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE}"
+            );
+            let new_buffer_size = quad_index_count
+                .checked_next_power_of_two()
+                .context("DirectX quad index count is too large")?
+                .min(MAX_INSTANCE_BUFFER_SIZE / element_size);
+            self.quad_indices_buffer = create_buffer(device, element_size, new_buffer_size)?;
+            self.quad_indices_view = create_buffer_view(device, &self.quad_indices_buffer)?;
+            self.quad_indices_buffer_size = new_buffer_size;
+        }
+        self.quad_index_count = quad_index_count;
+        unsafe {
+            let mut destination = std::mem::zeroed();
+            device_context.Map(
+                &self.quad_indices_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut destination),
+            )?;
+            let destination = destination.pData as *mut u32;
+            std::ptr::copy_nonoverlapping(
+                blended_quad_indices.as_ptr(),
+                destination,
+                blended_quad_indices.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                opaque_quad_indices.as_ptr(),
+                destination.add(blended_quad_indices.len()),
+                opaque_quad_indices.len(),
+            );
+            device_context.Unmap(&self.quad_indices_buffer, 0);
+        }
+        Ok(())
+    }
+
+    /// The whole index buffer stays bound; the batch's starting offset reaches the
+    /// shader through the batch params constant buffer, so no ranged view — and
+    /// therefore no `FirstElement` — is ever needed.
+    fn quad_indices_range(
+        &self,
+        quad_indices_start: usize,
+        quad_count: usize,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let range_end = quad_indices_start
+            .checked_add(quad_count)
+            .context("DirectX quad index range overflow")?;
+        anyhow::ensure!(
+            range_end <= self.quad_index_count,
+            "DirectX quad index range exceeds the {} uploaded quad indices",
+            self.quad_index_count
+        );
+        Ok(self.quad_indices_view.clone())
+    }
+
+    fn draw(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        quad_instances_view: &Option<ID3D11ShaderResourceView>,
+        batch_params_buffer: &ID3D11Buffer,
+        quad_indices_start: usize,
+        quad_count: usize,
+    ) -> Result<()> {
+        if quad_count == 0 {
+            return Ok(());
+        }
+        let views = [
+            quad_instances_view.clone(),
+            self.quad_indices_range(quad_indices_start, quad_count)?,
+        ];
+        update_batch_start(device_context, batch_params_buffer, quad_indices_start as u32)?;
+        unsafe { device_context.OMSetDepthStencilState(&self.depth_write_state, 0) };
+        set_pipeline_state(
+            device_context,
+            &views,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            &self.vertex,
+            &self.fragment,
+            &self.blend_state,
+        );
+        unsafe { device_context.DrawInstanced(4, quad_count as u32, 0, 0) };
+        Ok(())
+    }
+
+    fn enable_depth_test(&self, device_context: &ID3D11DeviceContext) {
+        unsafe { device_context.OMSetDepthStencilState(&self.depth_test_state, 0) };
+    }
+
+    fn disable_depth(&self, device_context: &ID3D11DeviceContext) {
+        unsafe { device_context.OMSetDepthStencilState(&self.depth_disabled_state, 0) };
     }
 }
 
@@ -1756,6 +2096,8 @@ fn create_resources(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
     ID3D11Texture2D,
+    Option<ID3D11DepthStencilView>,
+    ID3D11Texture2D,
     Option<ID3D11ShaderResourceView>,
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
@@ -1763,6 +2105,8 @@ fn create_resources(
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device, width, height, headless)?;
+    let (depth_stencil_texture, depth_stencil_view) =
+        create_depth_stencil_texture_and_view(&devices.device, width, height)?;
     let (path_intermediate_texture, path_intermediate_srv) =
         create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
@@ -1778,6 +2122,8 @@ fn create_resources(
     Ok((
         render_target,
         render_target_view,
+        depth_stencil_texture,
+        depth_stencil_view,
         path_intermediate_texture,
         path_intermediate_srv,
         path_intermediate_msaa_texture,
@@ -1819,6 +2165,37 @@ fn create_render_target_and_its_view(
     let mut render_target_view = None;
     unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
     Ok((render_target, render_target_view))
+}
+
+#[inline]
+fn create_depth_stencil_texture_and_view(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, Option<ID3D11DepthStencilView>)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+    let mut view = None;
+    unsafe { device.CreateDepthStencilView(&texture, None, Some(&mut view))? };
+    Ok((texture, view))
 }
 
 #[inline]
@@ -1908,7 +2285,6 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
     Ok(())
 }
 
-// https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
 #[inline]
 fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
@@ -1950,6 +2326,53 @@ fn create_glass_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
 }
 
 #[inline]
+fn create_opaque_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = false.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
+fn create_depth_stencil_state(
+    device: &ID3D11Device,
+    depth_enable: bool,
+    write_mask: D3D11_DEPTH_WRITE_MASK,
+) -> Result<ID3D11DepthStencilState> {
+    let stencil_op = D3D11_DEPTH_STENCILOP_DESC {
+        StencilFailOp: D3D11_STENCIL_OP_KEEP,
+        StencilDepthFailOp: D3D11_STENCIL_OP_KEEP,
+        StencilPassOp: D3D11_STENCIL_OP_KEEP,
+        StencilFunc: D3D11_COMPARISON_ALWAYS,
+    };
+    let desc = D3D11_DEPTH_STENCIL_DESC {
+        DepthEnable: depth_enable.into(),
+        DepthWriteMask: write_mask,
+        DepthFunc: D3D11_COMPARISON_GREATER,
+        StencilEnable: false.into(),
+        StencilReadMask: D3D11_DEFAULT_STENCIL_READ_MASK as u8,
+        StencilWriteMask: D3D11_DEFAULT_STENCIL_WRITE_MASK as u8,
+        FrontFace: stencil_op,
+        BackFace: stencil_op,
+    };
+    unsafe {
+        let mut state = None;
+        device.CreateDepthStencilState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
 fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
@@ -1972,8 +2395,6 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
 
 #[inline]
 fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
     desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -1992,8 +2413,6 @@ fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID
 
 #[inline]
 fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
     desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -2089,6 +2508,17 @@ fn update_buffer<T>(
 }
 
 #[inline]
+/// Whether the quad named at `position` in [`Scene::blended_quad_indices`] is
+/// glass content. Out-of-range positions report `false` rather than panicking;
+/// the caller only ever walks a range the batch iterator produced.
+fn blended_quad_is_glass(scene: &Scene, position: usize) -> bool {
+    scene
+        .blended_quad_indices
+        .get(position)
+        .and_then(|&quad_id| scene.quads.get(quad_id as usize))
+        .is_some_and(|quad| quad.background.is_glass_content())
+}
+
 fn update_batch_start(
     device_context: &ID3D11DeviceContext,
     buffer: &ID3D11Buffer,
@@ -2139,16 +2569,14 @@ pub(crate) mod shader_resources {
 
     #[cfg(debug_assertions)]
     use windows::{
-        Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
-            ID3DBlob,
-        },
+        Win32::Graphics::Direct3D::{Fxc::*, ID3DBlob},
         core::{HSTRING, PCSTR},
     };
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
         Quad,
+        OpaqueQuad,
         Shadow,
         Underline,
         PathRasterization,
@@ -2201,6 +2629,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::Quad => match target {
                     ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
+                },
+                ShaderModule::OpaqueQuad => match target {
+                    ShaderTarget::Vertex => OPAQUE_QUAD_VERTEX_BYTES,
+                    ShaderTarget::Fragment => OPAQUE_QUAD_FRAGMENT_BYTES,
                 },
                 ShaderModule::Shadow => match target {
                     ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
@@ -2313,6 +2745,7 @@ pub(crate) mod shader_resources {
         pub fn as_str(self) -> &'static str {
             match self {
                 ShaderModule::Quad => "quad",
+                ShaderModule::OpaqueQuad => "opaque_quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",

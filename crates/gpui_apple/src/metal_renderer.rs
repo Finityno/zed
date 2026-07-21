@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, Quad, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, ScaledPixels, Scene, Size, point, quad_depth, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -20,7 +20,8 @@ use core_video::{
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
+    CAMetalLayer, CommandQueue, MTLCompareFunction, MTLGPUFamily, MTLPixelFormat,
+    MTLResourceOptions, NSRange,
 };
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
@@ -37,6 +38,9 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+/// Every bit of this format's mantissa is needed, since [`quad_depth`] maps
+/// each quad in the scene onto its own depth.
+const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -129,15 +133,19 @@ pub struct MetalRenderer {
     // Same as `quads_pipeline_state` but preserves the destination alpha, used
     // for quads painted as glass content (see `Styled::glass`).
     quads_glass_pipeline_state: metal::RenderPipelineState,
+    opaque_quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    depth_write_state: metal::DepthStencilState,
+    depth_test_state: metal::DepthStencilState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    depth_texture: Option<metal::Texture>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -334,6 +342,14 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             metal::MTLBlendFactor::Zero,
         );
+        let opaque_quads_pipeline_state = build_opaque_quads_pipeline_state(
+            &device,
+            &library,
+            "opaque_quads",
+            "opaque_quad_vertex",
+            "opaque_quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let underlines_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -367,6 +383,9 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let depth_write_state = build_depth_stencil_state(&device, true);
+        let depth_test_state = build_depth_stencil_state(&device, false);
+
         let command_queue = device.new_command_queue();
         let sprite_atlas = shared_sprite_atlas
             .unwrap_or_else(|| Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu)));
@@ -386,14 +405,18 @@ impl MetalRenderer {
             shadows_pipeline_state,
             quads_pipeline_state,
             quads_glass_pipeline_state,
+            opaque_quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            depth_write_state,
+            depth_test_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            depth_texture: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -437,18 +460,30 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
+        self.update_intermediate_textures(size);
     }
 
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+    fn update_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.depth_texture = None;
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
             return;
         }
+
+        let depth_descriptor = metal::TextureDescriptor::new();
+        depth_descriptor.set_width(size.width.0 as u64);
+        depth_descriptor.set_height(size.height.0 as u64);
+        depth_descriptor.set_pixel_format(DEPTH_FORMAT);
+        // Path batches end the main render pass and start a new one, so unlike
+        // the MSAA texture below this cannot be memoryless: its contents have
+        // to survive from one encoder to the next.
+        depth_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        depth_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        self.depth_texture = Some(self.device.new_texture(&depth_descriptor));
 
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
@@ -543,7 +578,7 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let instances = upload_frame_instances(scene, &mut writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -557,7 +592,7 @@ impl MetalRenderer {
         })?;
         let command_buffer = self.draw_primitives_to_texture(
             scene,
-            &instance_bindings,
+            &instances,
             &mut writer,
             texture,
             viewport_size,
@@ -620,8 +655,8 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
 
-        // Update path intermediate textures for this size
-        self.update_path_intermediate_textures(size);
+        // Update intermediate textures for this size
+        self.update_intermediate_textures(size);
 
         // Create an offscreen texture as render target
         let texture_descriptor = metal::TextureDescriptor::new();
@@ -664,7 +699,7 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
 
-        self.update_path_intermediate_textures(size);
+        self.update_intermediate_textures(size);
 
         let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
             texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
@@ -696,11 +731,15 @@ impl MetalRenderer {
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
-        instance_bindings: &InstanceBindings,
+        instances: &FrameInstances,
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        let depth_texture = self
+            .depth_texture
+            .clone()
+            .context("missing depth texture")?;
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
@@ -708,22 +747,73 @@ impl MetalRenderer {
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
+            &depth_texture,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        command_encoder.set_depth_stencil_state(&self.depth_write_state);
+        let opaque_quad_indices = scene.blended_quad_indices.len()
+            ..scene.blended_quad_indices.len() + scene.opaque_quad_indices.len();
+        self.draw_quads(
+            &self.opaque_quads_pipeline_state,
+            opaque_quad_indices,
+            instances,
+            viewport_size,
+            command_encoder,
+        );
+        command_encoder.set_depth_stencil_state(&self.depth_test_state);
+
+        let mut quad_cursor: u32 = 0;
         for batch in scene.batches() {
+            // Quads carry their own depth. Every other batch is flattened onto
+            // the depth of the quad cursor by collapsing the viewport's depth
+            // range onto a single value.
+            let batch_depth = quad_depth(quad_cursor) as f64;
+            if matches!(batch, PrimitiveBatch::Quads { .. }) {
+                set_viewport(command_encoder, viewport_size, 0., 1.);
+            } else {
+                set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
+            }
+
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+                    self.draw_shadows(range, instances, viewport_size, command_encoder)
                 }
-                PrimitiveBatch::Quads(range) => self.draw_quads(
+                PrimitiveBatch::Quads {
                     range,
-                    &scene.quads,
-                    instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
+                    blended_range,
+                } => {
+                    quad_cursor += range.len() as u32;
+                    // Paint runs of consecutive quads that share the same glass
+                    // flag, so glass-content quads use the alpha-preserving
+                    // pipeline while ordinary quads use the standard one.
+                    // Splitting by run keeps draw order intact.
+                    let mut start = blended_range.start;
+                    while start < blended_range.end {
+                        let is_glass = blended_quad_is_glass(scene, start);
+                        let mut end = start + 1;
+                        while end < blended_range.end
+                            && blended_quad_is_glass(scene, end) == is_glass
+                        {
+                            end += 1;
+                        }
+
+                        let pipeline = if is_glass {
+                            &self.quads_glass_pipeline_state
+                        } else {
+                            &self.quads_pipeline_state
+                        };
+                        self.draw_quads(
+                            pipeline,
+                            start..end,
+                            instances,
+                            viewport_size,
+                            command_encoder,
+                        );
+                        start = end;
+                    }
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -738,9 +828,12 @@ impl MetalRenderer {
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         texture,
+                        &depth_texture,
                         viewport_size,
                         None,
                     );
+                    command_encoder.set_depth_stencil_state(&self.depth_test_state);
+                    set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
 
                     if did_draw {
                         if let Err(error) = self.draw_paths_from_intermediate(
@@ -755,13 +848,13 @@ impl MetalRenderer {
                     }
                 }
                 PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
+                    self.draw_underlines(range, instances, viewport_size, command_encoder)
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
-                        instance_bindings,
+                        instances,
                         viewport_size,
                         command_encoder,
                     ),
@@ -769,14 +862,14 @@ impl MetalRenderer {
                     .draw_polychrome_sprites(
                         texture_id,
                         range,
-                        instance_bindings,
+                        instances,
                         viewport_size,
                         command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     range.start,
-                    instance_bindings,
+                    instances,
                     viewport_size,
                     command_encoder,
                 ),
@@ -804,17 +897,6 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-            }));
-        }
-        let vertex_instance_bindings = writer.write(&vertices)?;
-
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
             .color_attachments()
@@ -834,10 +916,21 @@ impl MetalRenderer {
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+
+        let mut vertices = Vec::new();
+        for path in paths {
+            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                xy_position: v.xy_position,
+                st_position: v.st_position,
+                color: path.color,
+                bounds: path.bounds.intersect(&path.content_mask.bounds),
+            }));
+        }
+        let vertex_instances = writer.write(&vertices)?;
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
-            Some(&vertex_instance_bindings.buffer),
-            vertex_instance_bindings.offset as u64,
+            Some(&vertex_instances.buffer),
+            vertex_instances.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
@@ -846,8 +939,8 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
-            Some(&vertex_instance_bindings.buffer),
-            vertex_instance_bindings.offset as u64,
+            Some(&vertex_instances.buffer),
+            vertex_instances.offset as u64,
         );
         command_encoder.draw_primitives(
             metal::MTLPrimitiveType::Triangle,
@@ -862,7 +955,7 @@ impl MetalRenderer {
     fn draw_shadows(
         &self,
         shadows: Range<usize>,
-        instance_bindings: &InstanceBindings,
+        instances: &FrameInstances,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -878,13 +971,13 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Shadows as u64,
-            Some(&instance_bindings.shadows.buffer),
-            instance_bindings.shadows.offset as u64,
+            Some(&instances.shadows.buffer),
+            instances.shadows.offset as u64,
         );
         command_encoder.set_fragment_buffer(
             ShadowInputIndex::Shadows as u64,
-            Some(&instance_bindings.shadows.buffer),
-            instance_bindings.shadows.offset as u64,
+            Some(&instances.shadows.buffer),
+            instances.shadows.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             ShadowInputIndex::ViewportSize as u64,
@@ -901,18 +994,21 @@ impl MetalRenderer {
         );
     }
 
+    /// Draws the quads named by `quad_indices`, a range of the frame's quad
+    /// index buffer, through the blended or the opaque quad pipeline.
     fn draw_quads(
         &self,
-        quads: Range<usize>,
-        scene_quads: &[Quad],
-        instance_bindings: &InstanceBindings,
+        pipeline_state: &metal::RenderPipelineState,
+        quad_indices: Range<usize>,
+        instances: &FrameInstances,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
-        if quads.is_empty() {
+        if quad_indices.is_empty() {
             return;
         }
 
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -920,13 +1016,18 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Quads as u64,
-            Some(&instance_bindings.quads.buffer),
-            instance_bindings.quads.offset as u64,
+            Some(&instances.quads.buffer),
+            instances.quads.offset as u64,
+        );
+        command_encoder.set_vertex_buffer(
+            QuadInputIndex::QuadIndices as u64,
+            Some(&instances.quad_indices.buffer),
+            instances.quad_indices.offset as u64,
         );
         command_encoder.set_fragment_buffer(
             QuadInputIndex::Quads as u64,
-            Some(&instance_bindings.quads.buffer),
-            instance_bindings.quads.offset as u64,
+            Some(&instances.quads.buffer),
+            instances.quads.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             QuadInputIndex::ViewportSize as u64,
@@ -934,33 +1035,13 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
-        // Paint runs of consecutive quads that share the same glass flag, so
-        // glass-content quads use the alpha-preserving pipeline while ordinary
-        // quads use the standard one. Splitting by run keeps draw order intact.
-        let mut start = quads.start;
-        while start < quads.end {
-            let is_glass = scene_quads[start].background.is_glass_content();
-            let mut end = start + 1;
-            while end < quads.end && scene_quads[end].background.is_glass_content() == is_glass {
-                end += 1;
-            }
-
-            let pipeline = if is_glass {
-                &self.quads_glass_pipeline_state
-            } else {
-                &self.quads_pipeline_state
-            };
-            command_encoder.set_render_pipeline_state(pipeline);
-            command_encoder.draw_primitives_instanced_base_instance(
-                metal::MTLPrimitiveType::Triangle,
-                0,
-                6,
-                (end - start) as u64,
-                start as u64,
-            );
-
-            start = end;
-        }
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            quad_indices.len() as u64,
+            quad_indices.start as u64,
+        );
     }
 
     fn draw_paths_from_intermediate(
@@ -1018,11 +1099,12 @@ impl MetalRenderer {
             sprites = vec![PathSprite { bounds }];
         }
 
-        let sprite_instance_bindings = writer.write(&sprites)?;
+        let sprite_instances = writer.write(&sprites)?;
+
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&sprite_instance_bindings.buffer),
-            sprite_instance_bindings.offset as u64,
+            Some(&sprite_instances.buffer),
+            sprite_instances.offset as u64,
         );
 
         command_encoder.draw_primitives_instanced(
@@ -1037,7 +1119,7 @@ impl MetalRenderer {
     fn draw_underlines(
         &self,
         underlines: Range<usize>,
-        instance_bindings: &InstanceBindings,
+        instances: &FrameInstances,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -1053,13 +1135,13 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Underlines as u64,
-            Some(&instance_bindings.underlines.buffer),
-            instance_bindings.underlines.offset as u64,
+            Some(&instances.underlines.buffer),
+            instances.underlines.offset as u64,
         );
         command_encoder.set_fragment_buffer(
             UnderlineInputIndex::Underlines as u64,
-            Some(&instance_bindings.underlines.buffer),
-            instance_bindings.underlines.offset as u64,
+            Some(&instances.underlines.buffer),
+            instances.underlines.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             UnderlineInputIndex::ViewportSize as u64,
@@ -1080,7 +1162,7 @@ impl MetalRenderer {
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
-        instance_bindings: &InstanceBindings,
+        instances: &FrameInstances,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -1101,8 +1183,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&instance_bindings.monochrome_sprites.buffer),
-            instance_bindings.monochrome_sprites.offset as u64,
+            Some(&instances.monochrome_sprites.buffer),
+            instances.monochrome_sprites.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
@@ -1116,8 +1198,8 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&instance_bindings.monochrome_sprites.buffer),
-            instance_bindings.monochrome_sprites.offset as u64,
+            Some(&instances.monochrome_sprites.buffer),
+            instances.monochrome_sprites.offset as u64,
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
 
@@ -1134,7 +1216,7 @@ impl MetalRenderer {
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
-        instance_bindings: &InstanceBindings,
+        instances: &FrameInstances,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -1155,8 +1237,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&instance_bindings.polychrome_sprites.buffer),
-            instance_bindings.polychrome_sprites.offset as u64,
+            Some(&instances.polychrome_sprites.buffer),
+            instances.polychrome_sprites.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
@@ -1170,8 +1252,8 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&instance_bindings.polychrome_sprites.buffer),
-            instance_bindings.polychrome_sprites.offset as u64,
+            Some(&instances.polychrome_sprites.buffer),
+            instances.polychrome_sprites.offset as u64,
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
 
@@ -1188,7 +1270,7 @@ impl MetalRenderer {
         &mut self,
         surfaces: &[PaintSurface],
         first_surface: usize,
-        instance_bindings: &InstanceBindings,
+        instances: &FrameInstances,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -1204,8 +1286,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Surfaces as u64,
-            Some(&instance_bindings.surfaces.buffer),
-            instance_bindings.surfaces.offset as u64,
+            Some(&instances.surfaces.buffer),
+            instances.surfaces.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
@@ -1276,6 +1358,7 @@ impl MetalRenderer {
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
+    depth_texture: &metal::TextureRef,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
@@ -1286,23 +1369,42 @@ fn new_command_encoder_for_texture<'a>(
         .unwrap();
     color_attachment.set_texture(Some(texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+    let depth_attachment = render_pass_descriptor.depth_attachment().unwrap();
+    depth_attachment.set_texture(Some(depth_texture));
+    depth_attachment.set_store_action(metal::MTLStoreAction::Store);
+
     if let Some(clear_color) = clear_color {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(clear_color);
+        depth_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        // Zero is reserved by `quad_depth` for the cleared buffer, so nothing
+        // is occluded until an opaque quad writes over it.
+        depth_attachment.set_clear_depth(0.0);
     } else {
         color_attachment.set_load_action(metal::MTLLoadAction::Load);
+        depth_attachment.set_load_action(metal::MTLLoadAction::Load);
     }
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+    set_viewport(command_encoder, viewport_size, 0.0, 1.0);
+    command_encoder
+}
+
+fn set_viewport(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    viewport_size: Size<DevicePixels>,
+    near_depth: f64,
+    far_depth: f64,
+) {
     command_encoder.set_viewport(metal::MTLViewport {
         originX: 0.0,
         originY: 0.0,
         width: i32::from(viewport_size.width) as f64,
         height: i32::from(viewport_size.height) as f64,
-        znear: 0.0,
-        zfar: 1.0,
+        znear: near_depth,
+        zfar: far_depth,
     });
-    command_encoder
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -1376,6 +1478,7 @@ fn build_pipeline_state_with_blend(
     descriptor.set_label(label);
     descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
     descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    descriptor.set_depth_attachment_pixel_format(DEPTH_FORMAT);
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(true);
@@ -1392,6 +1495,45 @@ fn build_pipeline_state_with_blend(
     device
         .new_render_pipeline_state(&descriptor)
         .expect("could not create render pipeline state")
+}
+
+fn build_opaque_quads_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    descriptor.set_depth_attachment_pixel_format(DEPTH_FORMAT);
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+fn build_depth_stencil_state(
+    device: &metal::DeviceRef,
+    write_depth: bool,
+) -> metal::DepthStencilState {
+    let descriptor = metal::DepthStencilDescriptor::new();
+    descriptor.set_depth_compare_function(MTLCompareFunction::Greater);
+    descriptor.set_depth_write_enabled(write_depth);
+    device.new_depth_stencil_state(&descriptor)
 }
 
 fn build_path_sprite_pipeline_state(
@@ -1413,6 +1555,7 @@ fn build_path_sprite_pipeline_state(
     descriptor.set_label(label);
     descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
     descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    descriptor.set_depth_attachment_pixel_format(DEPTH_FORMAT);
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(true);
@@ -1468,23 +1611,42 @@ fn build_path_rasterization_pipeline_state(
 }
 
 #[derive(Clone)]
-struct InstanceBinding {
+struct BufferRegion {
     buffer: metal::Buffer,
     offset: usize,
 }
 
-struct InstanceBindings {
-    quads: InstanceBinding,
-    shadows: InstanceBinding,
-    underlines: InstanceBinding,
-    monochrome_sprites: InstanceBinding,
-    polychrome_sprites: InstanceBinding,
-    surfaces: InstanceBinding,
+struct FrameInstances {
+    quads: BufferRegion,
+    quad_indices: BufferRegion,
+    shadows: BufferRegion,
+    underlines: BufferRegion,
+    monochrome_sprites: BufferRegion,
+    polychrome_sprites: BufferRegion,
+    surfaces: BufferRegion,
 }
 
-fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
-    Ok(InstanceBindings {
+/// Whether the quad named at `position` in [`Scene::blended_quad_indices`] is
+/// glass content. Out-of-range positions report `false` rather than panicking;
+/// the caller only ever walks a range the batch iterator produced.
+fn blended_quad_is_glass(scene: &Scene, position: usize) -> bool {
+    scene
+        .blended_quad_indices
+        .get(position)
+        .and_then(|&quad_id| scene.quads.get(quad_id as usize))
+        .is_some_and(|quad| quad.background.is_glass_content())
+}
+
+fn upload_frame_instances(
+    scene: &Scene,
+    writer: &mut InstanceBufferWriter,
+) -> Result<FrameInstances> {
+    Ok(FrameInstances {
         quads: writer.write(&scene.quads)?,
+        quad_indices: writer.write_slices(&[
+            &scene.blended_quad_indices,
+            &scene.opaque_quad_indices,
+        ])?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
@@ -1496,10 +1658,13 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
     })
 }
 
+/// Packs a frame's instance data into pooled Metal buffers.
+/// When the current buffer runs out of room the writer moves on to a larger one.
 struct InstanceBufferWriter {
     device: metal::Device,
     pool: Arc<Mutex<InstanceBufferPool>>,
     unified_memory: bool,
+    /// Buffers the frame has finished with, and how many bytes each holds.
     filled: Vec<(InstanceBuffer, usize)>,
     current: InstanceBuffer,
     offset: usize,
@@ -1522,7 +1687,7 @@ impl InstanceBufferWriter {
         }
     }
 
-    fn allocate<T>(&mut self, count: usize) -> Result<(InstanceBinding, &mut [MaybeUninit<T>])> {
+    fn allocate<T>(&mut self, count: usize) -> Result<(BufferRegion, &mut [MaybeUninit<T>])> {
         let size = mem::size_of::<T>() * count;
         let mut offset = self.offset.next_multiple_of(INSTANCE_BUFFER_ALIGNMENT);
         if offset + size > self.current.size {
@@ -1531,7 +1696,7 @@ impl InstanceBufferWriter {
         }
         self.offset = offset + size;
 
-        let binding = InstanceBinding {
+        let region = BufferRegion {
             buffer: self.current.metal_buffer.clone(),
             offset,
         };
@@ -1541,11 +1706,11 @@ impl InstanceBufferWriter {
             let start = (self.current.metal_buffer.contents() as *mut u8).add(offset);
             slice::from_raw_parts_mut(start.cast::<MaybeUninit<T>>(), count)
         };
-        Ok((binding, values))
+        Ok((region, values))
     }
 
-    fn write<T>(&mut self, values: &[T]) -> Result<InstanceBinding> {
-        let (binding, destination) = self.allocate::<T>(values.len())?;
+    fn write<T>(&mut self, values: &[T]) -> Result<BufferRegion> {
+        let (region, destination) = self.allocate::<T>(values.len())?;
         unsafe {
             ptr::copy_nonoverlapping(
                 values.as_ptr(),
@@ -1553,20 +1718,37 @@ impl InstanceBufferWriter {
                 values.len(),
             );
         }
-        Ok(binding)
+        Ok(region)
     }
 
-    fn write_iter<T>(
-        &mut self,
-        values: impl ExactSizeIterator<Item = T>,
-    ) -> Result<InstanceBinding> {
-        let (binding, destination) = self.allocate::<T>(values.len())?;
+    /// Packs several slices end to end into a single reservation, so the shader
+    /// can index across all of them with one binding.
+    fn write_slices<T>(&mut self, slices: &[&[T]]) -> Result<BufferRegion> {
+        let count = slices.iter().map(|slice| slice.len()).sum();
+        let (region, destination) = self.allocate::<T>(count)?;
+        let mut written = 0;
+        for slice in slices {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    slice.as_ptr(),
+                    destination.as_mut_ptr().add(written).cast::<T>(),
+                    slice.len(),
+                );
+            }
+            written += slice.len();
+        }
+        Ok(region)
+    }
+
+    fn write_iter<T>(&mut self, values: impl ExactSizeIterator<Item = T>) -> Result<BufferRegion> {
+        let (region, destination) = self.allocate::<T>(values.len())?;
         for (slot, value) in destination.iter_mut().zip(values) {
             slot.write(value);
         }
-        Ok(binding)
+        Ok(region)
     }
 
+    /// Replaces the current buffer with one large enough for a `required`-byte reservation.
     fn grow(&mut self, required: usize) -> Result<()> {
         let mut pool = self.pool.lock();
         let buffer_size = (pool.buffer_size * 2)
@@ -1576,14 +1758,9 @@ impl InstanceBufferWriter {
             buffer_size >= required,
             "instance buffer needs {required} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE}"
         );
-        anyhow::ensure!(
-            buffer_size > self.current.size,
-            "frame instance data exceeds the {MAX_INSTANCE_BUFFER_SIZE}-byte maximum"
-        );
-        if buffer_size != pool.buffer_size {
-            log::info!("increased instance buffer size to {buffer_size}");
-            pool.reset(buffer_size);
-        }
+        log::info!("increased instance buffer size to {buffer_size}");
+
+        pool.reset(buffer_size);
         let buffer = pool.acquire(&self.device, self.unified_memory);
         drop(pool);
 
@@ -1593,17 +1770,21 @@ impl InstanceBufferWriter {
         Ok(())
     }
 
+    /// Flushes the frame's writes and returns the buffer worth recycling.
     fn finish(self) -> InstanceBuffer {
         let Self {
             unified_memory,
-            filled,
+            mut filled,
             current,
             offset,
             ..
         } = self;
+        filled.push((current, offset));
 
         if !unified_memory {
             for (buffer, written) in &filled {
+                // An allocation larger than the whole buffer retires it before
+                // anything has been written to it.
                 if *written == 0 {
                     continue;
                 }
@@ -1612,17 +1793,9 @@ impl InstanceBufferWriter {
                     length: *written as NSUInteger,
                 });
             }
-            if offset > 0 {
-                current.metal_buffer.did_modify_range(NSRange {
-                    location: 0,
-                    length: offset as NSUInteger,
-                });
-            }
         }
 
-        // Metal retains encoded resources until the command buffer completes.
-        // Only the final, largest buffer is worth keeping in the pool.
-        drop(filled);
+        let (current, _) = filled.pop().expect("the current buffer was just pushed");
         current
     }
 }
@@ -1639,6 +1812,7 @@ enum QuadInputIndex {
     Vertices = 0,
     Quads = 1,
     ViewportSize = 2,
+    QuadIndices = 3,
 }
 
 #[repr(C)]
