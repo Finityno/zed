@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, get_gamma_correction_ratios, quad_depth,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -123,8 +123,11 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    opaque_quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -159,6 +162,7 @@ struct InstanceBindings {
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
+    quads: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
 }
@@ -190,6 +194,8 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
+    depth_texture: Option<wgpu::Texture>,
+    depth_view: Option<wgpu::TextureView>,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
@@ -203,6 +209,8 @@ struct CachedTextureBindGroup {
 
 impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
+        self.depth_texture = None;
+        self.depth_view = None;
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
@@ -542,6 +550,31 @@ impl WgpuRendererCore {
             entries: &[instance_data_entry],
         });
 
+        // The quad pipelines read the partition index table through a second
+        // storage binding. The WebGL texture transport has no storage buffers
+        // and no index table (partitioning is disabled there), so its quad
+        // pipelines bind plain instance data.
+        let storage_buffer_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let webgl_quad_entries = [instance_data_entry];
+        let storage_quad_entries = [storage_buffer_entry(0), storage_buffer_entry(1)];
+        let quads = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("quads_layout"),
+            entries: if uses_webgl_instance_data {
+                &webgl_quad_entries
+            } else {
+                &storage_quad_entries
+            },
+        });
+
         let texture = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture_layout"),
             entries: &[
@@ -611,6 +644,7 @@ impl WgpuRendererCore {
         WgpuBindGroupLayouts {
             globals,
             instances,
+            quads,
             texture,
             surfaces,
         }
@@ -718,6 +752,16 @@ impl WgpuRendererCore {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
+        let depth_stencil = |depth_write_enabled: bool| {
+            Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write_enabled),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            })
+        };
+
         let create_pipeline = |name: &str,
                                vs_entry: &str,
                                fs_entry: &str,
@@ -726,13 +770,14 @@ impl WgpuRendererCore {
                                texture_layout: Option<&wgpu::BindGroupLayout>,
                                topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
+                               depth_stencil: Option<wgpu::DepthStencilState>,
                                sample_count: u32,
                                module: &wgpu::ShaderModule| {
-            let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
+            let mut group_layouts = vec![Some(globals_layout), Some(data_layout)];
+            group_layouts.extend(texture_layout.map(Some));
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &bind_group_layouts,
+                bind_group_layouts: &group_layouts,
                 immediate_size: 0,
             });
 
@@ -760,7 +805,7 @@ impl WgpuRendererCore {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: None,
+                depth_stencil,
                 multisample: wgpu::MultisampleState {
                     count: sample_count,
                     mask: !0,
@@ -776,10 +821,29 @@ impl WgpuRendererCore {
             "vs_quad",
             "fs_quad",
             &layouts.globals,
-            &layouts.instances,
+            &layouts.quads,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
+            depth_stencil(false),
+            1,
+            &shader_module,
+        );
+
+        let opaque_quads = create_pipeline(
+            "opaque_quads",
+            "vs_opaque_quad",
+            "fs_opaque_quad",
+            &layouts.globals,
+            &layouts.quads,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            depth_stencil(true),
             1,
             &shader_module,
         );
@@ -793,6 +857,7 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
+            depth_stencil(false),
             1,
             &shader_module,
         );
@@ -810,6 +875,7 @@ impl WgpuRendererCore {
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
+            None,
             path_sample_count,
             &shader_module,
         );
@@ -840,6 +906,7 @@ impl WgpuRendererCore {
                 blend: Some(paths_blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
+            depth_stencil(false),
             1,
             &shader_module,
         );
@@ -853,6 +920,7 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
+            depth_stencil(false),
             1,
             &shader_module,
         );
@@ -866,6 +934,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
+            depth_stencil(false),
             1,
             &shader_module,
         );
@@ -897,6 +966,7 @@ impl WgpuRendererCore {
                     blend: Some(subpixel_blend),
                     write_mask: wgpu::ColorWrites::COLOR,
                 })],
+                depth_stencil(false),
                 1,
                 subpixel_module,
             ))
@@ -913,6 +983,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
+            depth_stencil(false),
             1,
             &shader_module,
         );
@@ -926,12 +997,14 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
+            depth_stencil(false),
             1,
             &shader_module,
         );
 
         WgpuPipelines {
             quads,
+            opaque_quads,
             shadows,
             path_rasterization,
             paths,
@@ -941,6 +1014,29 @@ impl WgpuRendererCore {
             poly_sprites,
             surfaces,
         }
+    }
+
+    fn create_depth_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
     }
 
     fn create_path_intermediate(
@@ -1033,6 +1129,9 @@ impl WgpuRenderer {
         }
 
         // Destroy old textures before allocating new ones to avoid GPU memory spikes
+        if let Some(ref texture) = resources.depth_texture {
+            texture.destroy();
+        }
         if let Some(ref texture) = resources.path_intermediate_texture {
             texture.destroy();
         }
@@ -1223,6 +1322,13 @@ impl WgpuRendererCore {
         let queue = Arc::clone(&context.queue);
         let rendering_params = RenderingParameters::new(&context.adapter, target_format);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
+        if uses_webgl_instance_data {
+            // The texture transport cannot express the quad index indirection
+            // the opaque depth prepass draws through, so scenes for this
+            // process fall back to painter's-order quads (empty opaque bucket,
+            // every quad on the blended pass), which renders identically.
+            gpui::disable_opaque_quad_partitioning();
+        }
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
         let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
@@ -1349,6 +1455,8 @@ impl WgpuRendererCore {
                 globals_bind_group,
                 path_globals_bind_group,
                 instance_data,
+                depth_texture: None,
+                depth_view: None,
                 path_intermediate_texture: None,
                 path_intermediate_view: None,
                 path_msaa_texture: None,
@@ -1383,11 +1491,14 @@ impl WgpuRendererCore {
     fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
+        let matches_size =
+            |texture: &wgpu::Texture| texture.width() == width && texture.height() == height;
         if self
             .resources
             .path_intermediate_texture
             .as_ref()
-            .is_some_and(|texture| texture.width() == width && texture.height() == height)
+            .is_some_and(matches_size)
+            && self.resources.depth_texture.as_ref().is_some_and(matches_size)
         {
             return;
         }
@@ -1395,6 +1506,11 @@ impl WgpuRendererCore {
         let format = self.target_format;
         let path_sample_count = self.rendering_params.path_sample_count;
         let resources = &mut self.resources;
+
+        let (depth_texture, depth_view) =
+            Self::create_depth_texture(&resources.device, width, height);
+        resources.depth_texture = Some(depth_texture);
+        resources.depth_view = Some(depth_view);
 
         let (texture, view) =
             Self::create_path_intermediate(&resources.device, format, width, height);
@@ -1468,7 +1584,13 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        let depth_view = self
+            .resources
+            .depth_view
+            .clone()
+            .context("depth buffer missing after ensuring intermediate textures")?;
+
+        self.record_frame(scene, target_view, &depth_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1479,9 +1601,11 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
-        let mut instance_offset = 0;
+        let mut instance_offset: u64 = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
@@ -1517,18 +1641,50 @@ impl WgpuRendererCore {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 ..Default::default()
             });
 
+            self.draw_instances(
+                &instance_bindings.quads,
+                &self.resources().pipelines.opaque_quads,
+                scene.blended_quad_indices.len() as u32
+                    ..(scene.blended_quad_indices.len() + scene.opaque_quad_indices.len()) as u32,
+                &mut pass,
+            );
+
+            let mut quad_cursor: u32 = 0;
             for batch in scene.batches() {
+                // Quad shaders assign each quad its own depth. Every other batch
+                // is flattened onto the depth of the quad cursor by collapsing
+                // the viewport's depth range onto a single value.
+                let batch_depth = quad_depth(quad_cursor);
+                if matches!(batch, PrimitiveBatch::Quads { .. }) {
+                    Self::set_pass_depth_range(&mut pass, size, 0.0, 1.0);
+                } else {
+                    Self::set_pass_depth_range(&mut pass, size, batch_depth, batch_depth);
+                }
+
                 match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
-                        &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
-                        instance_range(range),
-                        &mut pass,
-                    ),
+                    PrimitiveBatch::Quads {
+                        range,
+                        blended_range,
+                    } => {
+                        quad_cursor += range.len() as u32;
+                        self.draw_instances(
+                            &instance_bindings.quads,
+                            &self.resources().pipelines.quads,
+                            instance_range(blended_range),
+                            &mut pass,
+                        );
+                    }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
@@ -1559,9 +1715,19 @@ impl WgpuRendererCore {
                                 },
                                 depth_slice: None,
                             })],
-                            depth_stencil_attachment: None,
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
                             ..Default::default()
                         });
+                        Self::set_pass_depth_range(&mut pass, size, batch_depth, batch_depth);
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
@@ -1629,11 +1795,7 @@ impl WgpuRendererCore {
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
         Ok(InstanceBindings {
-            quads: self.write_instance_binding(
-                "quads_bind_group",
-                instance_offset,
-                &scene.quads,
-            )?,
+            quads: self.write_quad_binding(instance_offset, scene)?,
             shadows: self.write_instance_binding(
                 "shadows_bind_group",
                 instance_offset,
@@ -1659,6 +1821,91 @@ impl WgpuRendererCore {
                 instance_offset,
                 &scene.polychrome_sprites,
             )?,
+        })
+    }
+
+    /// Uploads the frame's quads plus the partition index table the quad
+    /// shaders resolve `instance_id` through, bound together as the quad
+    /// pipelines' two-binding instance group.
+    ///
+    /// The WebGL texture transport cannot express the index indirection, so
+    /// there the quads travel like every other primitive and `quad_index` in
+    /// `shaders_webgl.wgsl` is the identity: partitioning is disabled under
+    /// that transport (see [`WgpuRendererCore::new`]), which makes the blended
+    /// walk cover every quad in paint order.
+    fn write_quad_binding(
+        &mut self,
+        instance_offset: &mut u64,
+        scene: &Scene,
+    ) -> Result<InstanceBinding> {
+        if self.uses_webgl_instance_data {
+            return self.write_instance_binding("quads_bind_group", instance_offset, &scene.quads);
+        }
+
+        let quad_bytes = unsafe { Self::instance_bytes(&scene.quads) };
+        let blended_bytes: &[u8] = bytemuck::cast_slice(&scene.blended_quad_indices);
+        let opaque_bytes: &[u8] = bytemuck::cast_slice(&scene.opaque_quad_indices);
+
+        // Both bindings live in one allocation so a mid-upload buffer growth
+        // cannot strand the quad data in a discarded buffer. wgpu rejects
+        // zero-sized bindings, so empty arrays still reserve the 16-byte
+        // minimum, and the index binding's inner offset must satisfy the
+        // storage binding alignment.
+        let alignment = self.instance_data_alignment.max(1);
+        let quads_size = (quad_bytes.len() as u64).max(16);
+        let indices_size = ((blended_bytes.len() + opaque_bytes.len()) as u64).max(16);
+        let indices_inner_offset = quads_size.next_multiple_of(alignment);
+        let total_size = indices_inner_offset + indices_size;
+
+        let mut offset = (*instance_offset).next_multiple_of(alignment);
+        if offset + total_size > self.instance_data_capacity {
+            self.grow_instance_data(total_size)?;
+            offset = 0;
+        }
+        *instance_offset = offset + total_size;
+
+        let resources = self.resources();
+        let InstanceData::Storage(buffer) = &resources.instance_data else {
+            anyhow::bail!("quad index upload requested on the WebGL texture transport");
+        };
+        if !quad_bytes.is_empty() {
+            resources.queue.write_buffer(buffer, offset, quad_bytes);
+        }
+        let mut index_offset = offset + indices_inner_offset;
+        for part in [blended_bytes, opaque_bytes] {
+            if !part.is_empty() {
+                resources.queue.write_buffer(buffer, index_offset, part);
+                index_offset += part.len() as u64;
+            }
+        }
+
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("quads_bind_group"),
+                layout: &resources.bind_group_layouts.quads,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset,
+                            size: NonZeroU64::new(quads_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: offset + indices_inner_offset,
+                            size: NonZeroU64::new(indices_size),
+                        }),
+                    },
+                ],
+            });
+        Ok(InstanceBinding {
+            bind_group,
+            first_instance: 0,
         })
     }
 
@@ -1730,6 +1977,22 @@ impl WgpuRendererCore {
                 },
             );
         }
+    }
+
+    fn set_pass_depth_range(
+        pass: &mut wgpu::RenderPass<'_>,
+        size: Size<DevicePixels>,
+        min_depth: f32,
+        max_depth: f32,
+    ) {
+        pass.set_viewport(
+            0.0,
+            0.0,
+            size.width.0 as f32,
+            size.height.0 as f32,
+            min_depth,
+            max_depth,
+        );
     }
 
     fn draw_instances(

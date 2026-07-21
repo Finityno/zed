@@ -6145,7 +6145,6 @@ mod tests {
                     ..Default::default()
                 },
                 touch_phase: crate::TouchPhase::Moved,
-                ..Default::default()
             });
         }
 
