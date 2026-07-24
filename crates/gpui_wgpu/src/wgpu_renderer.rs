@@ -2236,8 +2236,61 @@ mod tests {
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 44 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 44 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+    }
+
+    /// The WGSL declarations are hand-written mirrors of the `#[repr(C)]`
+    /// structs the renderer uploads, and nothing forces the two to agree.
+    /// When they drift, wgpu either rejects the bind group ("bound with size N
+    /// where the shader expects M", which invalidates the whole command buffer
+    /// and blanks the window) or, for batches large enough to clear the
+    /// minimum, silently strides through the instance buffer at the wrong
+    /// pitch. WGSL's alignment rules are the trap: `vec3<u32>` aligns to 16
+    /// where Rust's `[u32; 3]` aligns to 4, and one such field re-pads every
+    /// struct that contains it.
+    #[test]
+    fn sprite_layouts_match_rust() {
+        use naga::proc::Layouter;
+
+        let module =
+            naga::front::wgsl::parse_str(SUBPIXEL_SHADERS).expect("shaders parse");
+        let mut layouter = Layouter::default();
+        layouter
+            .update(module.to_ctx())
+            .expect("shader types have a layout");
+
+        let expected: &[(&str, usize)] = &[
+            ("Hsla", size_of::<gpui::Hsla>()),
+            ("Background", size_of::<gpui::Background>()),
+            ("AtlasTile", size_of::<gpui::AtlasTile>()),
+            (
+                "TransformationMatrix",
+                size_of::<gpui::TransformationMatrix>(),
+            ),
+            ("SpriteEffect", size_of::<gpui::SpriteEffect>()),
+            ("Quad", size_of::<Quad>()),
+            ("Shadow", size_of::<Shadow>()),
+            ("Underline", size_of::<Underline>()),
+            ("MonochromeSprite", size_of::<MonochromeSprite>()),
+            ("PolychromeSprite", size_of::<PolychromeSprite>()),
+            ("SubpixelSprite", size_of::<SubpixelSprite>()),
+        ];
+
+        for (name, rust_size) in expected {
+            let handle = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some(name))
+                .map(|(handle, _)| handle)
+                .unwrap_or_else(|| panic!("no `{name}` struct in the WGSL modules"));
+            let wgsl_size = layouter[handle].size as usize;
+            assert_eq!(
+                wgsl_size, *rust_size,
+                "WGSL `{name}` is {wgsl_size} bytes but the Rust struct the \
+                 renderer uploads is {rust_size}"
+            );
+        }
     }
 }

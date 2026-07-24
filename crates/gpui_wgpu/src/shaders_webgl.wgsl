@@ -135,6 +135,14 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
     );
 }
 
+// The texture transport cannot express the depth prepass's index
+// indirection, so quad partitioning is disabled under it (see
+// `disable_opaque_quad_partitioning`): the blended index list is the identity
+// mapping and quads draw in painter's order.
+fn quad_index(instance_id: u32) -> u32 {
+    return instance_id;
+}
+
 fn load_quad(instance_id: u32) -> Quad {
     var cursor = instance_cursor(instance_id * 40u);
     return Quad(
@@ -193,14 +201,29 @@ fn load_underline(instance_id: u32) -> Underline {
     );
 }
 
+fn read_sprite_effect(cursor: ptr<function, InstanceCursor>) -> SpriteEffect {
+    return SpriteEffect(
+        read_word(cursor),
+        read_word(cursor),
+        read_word(cursor),
+        read_word(cursor),
+        read_bounds(cursor),
+        read_hsla(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_vec2_f32(cursor),
+    );
+}
+
 fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 44u);
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_hsla(&cursor),
+        read_sprite_effect(&cursor),
         read_atlas_tile(&cursor),
         read_transformation(&cursor),
     );
