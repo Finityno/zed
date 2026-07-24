@@ -1947,17 +1947,33 @@ pub(crate) struct TextShimmerStyle {
     pub highlight_color: Hsla,
     pub band_origin: Pixels,
     pub band_width: Pixels,
+    pub direction: [f32; 2],
 }
 
 impl TextShimmerStyle {
     fn scale(self, factor: f32) -> SpriteEffect {
+        // `direction` is a unit vector, so it is scale-invariant; only the
+        // band's position and width along it convert to device pixels.
         SpriteEffect::shimmer(
             self.bounds.scale(factor),
             self.highlight_color,
             self.band_origin.0 * factor,
             self.band_width.0 * factor,
+            self.direction,
         )
     }
+}
+
+/// `GPUI_DISABLE_TEXT_SHIMMER=1` paints shimmered text as plain text without
+/// changing anything else about the scene. The primitive stream keeps the same
+/// shape and count, so an A/B of the same binary isolates exactly what the
+/// shimmer costs on the GPU (see fincode's `docs/gpu-profiling.md`).
+fn text_shimmer_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("GPUI_DISABLE_TEXT_SHIMMER")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 impl Window {
@@ -3603,6 +3619,9 @@ impl Window {
     }
 
     fn current_text_effect(&self) -> SpriteEffect {
+        if self.text_shimmer_stack.is_empty() || text_shimmer_disabled() {
+            return SpriteEffect::default();
+        }
         self.text_shimmer_stack
             .last()
             .copied()
