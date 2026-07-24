@@ -4200,7 +4200,7 @@ mod tests {
         });
         let window = AnyWindowHandle::from(window);
 
-        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         assert_eq!(anonymous_paint_count.get(), 0);
         assert_eq!(stateful_width.get(), px(10.));
@@ -4400,7 +4400,7 @@ mod tests {
 
         test_app
             .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
             })
             .unwrap();
 
@@ -4420,7 +4420,7 @@ mod tests {
 
         test_app
             .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
             })
             .unwrap();
 
@@ -4592,7 +4592,7 @@ mod tests {
 
         test_app
             .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
             })
             .unwrap();
 
@@ -4609,7 +4609,7 @@ mod tests {
                 let _receiver =
                     window.prompt(crate::PromptLevel::Warning, "message", None, &["Ok"], cx);
                 assert!(window.has_active_prompt());
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
             })
             .unwrap();
 
@@ -4707,7 +4707,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         cx.update_window(window, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
     }
@@ -5111,7 +5111,7 @@ mod tests {
                 }
             })
             .into();
-        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
 
         // Focus the *second* group's container, then advance like Tab would.
