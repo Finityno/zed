@@ -624,6 +624,7 @@ struct MonochromeSpriteVertexOutput {
   float2 local_position;
   float4 color [[flat]];
   uint sprite_id [[flat]];
+  uint effect_kind [[flat]];
   float4 clip_distance;
 };
 
@@ -633,20 +634,27 @@ struct MonochromeSpriteFragmentInput {
   float2 local_position;
   float4 color [[flat]];
   uint sprite_id [[flat]];
+  uint effect_kind [[flat]];
   float4 clip_distance;
 };
 
+// Highlight profile of the shimmer band: a symmetric ramp peaking at the band
+// center and falling to zero at both edges, matching the CSS
+// `linear-gradient(<angle>, transparent 40%, highlight 50%, transparent 60%)`
+// sheen. The smoothstep easing removes the crease a bare linear ramp leaves at
+// the peak, and the projection onto `effect.direction` is what makes the band
+// diagonal rather than axis-aligned.
+//
+// Callers must check `kind` first (via the flat `effect_kind` varying) so
+// unshimmered text never reaches this function or the storage read it needs.
 float sprite_effect_intensity(SpriteEffect effect, float2 local_position) {
-  if (effect.kind == 1u) {
-    float band_width = max(effect.band_width, 1.0);
-    float band_start = effect.bounds.origin.x + effect.band_origin;
-    float band_end = band_start + band_width;
-    float feather = min(max(band_width * 0.125, 0.75), band_width * 0.5);
-    float leading = saturate((local_position.x - band_start) / feather);
-    float trailing = saturate((band_end - local_position.x) / feather);
-    return min(leading, trailing);
-  }
-  return 0.0;
+  float2 direction = float2(effect.direction[0], effect.direction[1]);
+  float2 offset =
+      local_position - float2(effect.bounds.origin.x, effect.bounds.origin.y);
+  float half_width = max(effect.band_width, 1.0) * 0.5;
+  float center = effect.band_origin + half_width;
+  float ramp = saturate(1.0 - fabs(dot(offset, direction) - center) / half_width);
+  return ramp * ramp * (3.0 - 2.0 * ramp);
 }
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
@@ -674,6 +682,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       local_position,
       color,
       sprite_id,
+      sprite.effect.kind,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -689,10 +698,20 @@ fragment float4 monochrome_sprite_fragment(
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float4 base_color = input.color;
+
+  // Virtually every glyph in the window is unshimmered, so bail out before
+  // touching the sprite storage buffer at all. Reading `sprites[sprite_id]`
+  // from the fragment stage is a dependent memory load per fragment, and the
+  // overlay blend below ends in a divide; neither is worth paying on all text
+  // for an effect a handful of labels use.
+  if (input.effect_kind == 0u) {
+    return float4(base_color.rgb, base_color.a * sample.a);
+  }
+
   float intensity = sprite_effect_intensity(
       sprites[input.sprite_id].effect,
       input.local_position);
-  float4 base_color = input.color;
   float4 highlight_color = hsla_to_rgba(sprites[input.sprite_id].effect.highlight_color);
   float glyph_alpha = sample.a;
   float base_alpha = base_color.a * glyph_alpha;

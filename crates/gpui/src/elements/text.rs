@@ -3,7 +3,7 @@ use crate::{
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -22,12 +22,23 @@ use std::{
 
 static SHIMMER_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// Sweep angle of the shimmer highlight, in CSS `linear-gradient` degrees
+/// (0 = upward, growing clockwise). 120° matches the diagonal sheen used by
+/// the web `linear-gradient(120deg, ...)` shiny-text idiom.
+pub const DEFAULT_SHIMMER_ANGLE: f32 = 120.0;
+
 fn shimmer_delta(duration: Duration) -> f32 {
     let period = duration.as_secs_f32();
     if period <= 0.0 {
         return 0.0;
     }
     (SHIMMER_EPOCH.elapsed().as_secs_f32() / period) % 1.0
+}
+
+/// Unit sweep vector for a CSS gradient angle, in y-down screen space.
+fn shimmer_direction(angle_degrees: f32) -> [f32; 2] {
+    let (sin, cos) = angle_degrees.to_radians().sin_cos();
+    [sin, -cos]
 }
 
 /// An [`Element`] that renders text.
@@ -631,6 +642,7 @@ pub struct ShimmerText {
     highlight_color: Option<crate::Hsla>,
     duration: Duration,
     spread: f32,
+    angle: f32,
     layout: TextLayout,
 }
 
@@ -643,6 +655,7 @@ impl ShimmerText {
             highlight_color: None,
             duration: Duration::from_secs_f32(1.5),
             spread: 3.0,
+            angle: DEFAULT_SHIMMER_ANGLE,
             layout: TextLayout::default(),
         }
     }
@@ -668,6 +681,13 @@ impl ShimmerText {
     /// Set the highlight band width in average character widths.
     pub fn spread(mut self, spread: f32) -> Self {
         self.spread = spread;
+        self
+    }
+
+    /// Set the sweep angle in CSS `linear-gradient` degrees. Defaults to
+    /// [`DEFAULT_SHIMMER_ANGLE`]; 90° gives a vertical (non-slanted) band.
+    pub fn angle(mut self, degrees: f32) -> Self {
+        self.angle = degrees;
         self
     }
 }
@@ -733,6 +753,7 @@ impl Element for ShimmerText {
                 highlight_color,
                 self.duration,
                 self.spread,
+                self.angle,
                 window,
                 cx,
             );
@@ -998,12 +1019,14 @@ impl TextLayout {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_shimmer(
         &self,
         text: &str,
         highlight_color: crate::Hsla,
         duration: Duration,
         spread: f32,
+        angle: f32,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1049,8 +1072,17 @@ impl TextLayout {
         let char_count = text.chars().count().max(1) as f32;
         let average_char_width = text_size.width * (1.0 / char_count);
         let band_width = (average_char_width * (spread.max(1.0) * 2.0)).max(average_char_width);
-        let travel_width = text_size.width + band_width * 2.0;
-        let band_origin = travel_width * shimmer_delta(duration) - band_width;
+
+        // The band sweeps along `direction`, so it has to enter and exit at the
+        // projected extremes of the text box, not the horizontal ones —
+        // otherwise a slanted band clips in on one corner and out on another.
+        let direction = shimmer_direction(angle);
+        let projected_width = direction[0] * text_size.width.0;
+        let projected_height = direction[1] * text_size.height.0;
+        let axis_min = projected_width.min(0.0) + projected_height.min(0.0);
+        let axis_max = projected_width.max(0.0) + projected_height.max(0.0);
+        let travel = px(axis_max - axis_min) + band_width * 2.0;
+        let band_origin = px(axis_min) - band_width + travel * shimmer_delta(duration);
         let shimmer_bounds = Bounds {
             origin: bounds.origin,
             size: text_size,
@@ -1062,6 +1094,7 @@ impl TextLayout {
                 highlight_color,
                 band_origin,
                 band_width,
+                direction,
             },
             |window| {
                 for line in &element_state.lines {
