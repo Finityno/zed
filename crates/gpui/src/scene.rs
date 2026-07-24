@@ -713,9 +713,15 @@ pub struct SpriteEffect {
     pub pad: [u32; 3],
     pub bounds: Bounds<ScaledPixels>,
     pub highlight_color: Hsla,
+    /// Leading edge of the highlight band, measured along `direction` from
+    /// `bounds.origin`. Sweeping this past the projected extent of `bounds`
+    /// animates the shimmer.
     pub band_origin: f32,
+    /// Width of the highlight band along `direction`.
     pub band_width: f32,
-    pub band_padding: [f32; 2],
+    /// Unit vector the band sweeps along, in y-down screen space. A CSS
+    /// `linear-gradient(<angle>, ...)` maps to `(sin angle, -cos angle)`.
+    pub direction: [f32; 2],
 }
 
 impl SpriteEffect {
@@ -726,6 +732,7 @@ impl SpriteEffect {
         highlight_color: Hsla,
         band_origin: f32,
         band_width: f32,
+        direction: [f32; 2],
     ) -> Self {
         Self {
             kind: Self::SHIMMER_KIND,
@@ -734,7 +741,7 @@ impl SpriteEffect {
             highlight_color,
             band_origin,
             band_width,
-            band_padding: [0.0; 2],
+            direction,
         }
     }
 }
@@ -748,7 +755,7 @@ impl Default for SpriteEffect {
             highlight_color: Hsla::default(),
             band_origin: 0.0,
             band_width: 0.0,
-            band_padding: [0.0; 2],
+            direction: [1.0, 0.0],
         }
     }
 }

@@ -48,6 +48,10 @@ js-sys = "0.3"
 
 [dev-dependencies]
 criterion.workspace = true
+# Validates shaders.wgsl / shaders_subpixel.wgsl at test time. wgpu only
+# compiles them when a device is created, so without this a shader edit is
+# only caught at runtime, on hardware the author may not have.
+naga = { version = "29", features = ["wgsl-in"] }
 
 [[bench]]
 name = "layout_line"

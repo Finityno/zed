@@ -1233,7 +1233,7 @@ struct SpriteEffect {
     highlight_color: Hsla,
     band_origin: f32,
     band_width: f32,
-    band_padding: vec2<f32>,
+    direction: vec2<f32>,
 }
 
 struct MonochromeSprite {
@@ -1255,23 +1255,24 @@ struct MonoSpriteVarying {
     @location(2) @interpolate(flat) color: vec4<f32>,
     @location(3) @interpolate(flat) sprite_id: u32,
     @location(4) clip_distances: vec4<f32>,
+    @location(5) @interpolate(flat) effect_kind: u32,
 }
 
+// Highlight profile of the shimmer band: a symmetric ramp peaking at the band
+// center and falling to zero at both edges, matching the CSS
+// `linear-gradient(<angle>, transparent 40%, highlight 50%, transparent 60%)`
+// sheen. The smoothstep easing removes the crease a bare linear ramp leaves at
+// the peak, and the projection onto `effect.direction` is what makes the band
+// diagonal rather than axis-aligned.
+//
+// Callers must check `kind` first (via the flat `effect_kind` varying) so
+// unshimmered text never reaches this function or the storage read it needs.
 fn sprite_effect_intensity(effect: SpriteEffect, local_position: vec2<f32>) -> f32 {
-    switch (effect.kind) {
-        default: {
-            return 0.0;
-        }
-        case 1u: {
-            let band_width = max(effect.band_width, 1.0);
-            let band_start = effect.bounds.origin.x + effect.band_origin;
-            let band_end = band_start + band_width;
-            let feather = min(max(band_width * 0.125, 0.75), band_width * 0.5);
-            let leading = saturate((local_position.x - band_start) / feather);
-            let trailing = saturate((band_end - local_position.x) / feather);
-            return min(leading, trailing);
-        }
-    }
+    let offset = local_position - effect.bounds.origin;
+    let half_width = max(effect.band_width, 1.0) * 0.5;
+    let center = effect.band_origin + half_width;
+    let ramp = saturate(1.0 - abs(dot(offset, effect.direction) - center) / half_width);
+    return ramp * ramp * (3.0 - 2.0 * ramp);
 }
 
 @vertex
@@ -1283,24 +1284,37 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
-    out.local_position = vec2<f32>(
-        sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.width,
-        sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.height,
-    );
+    out.local_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
     out.color = hsla_to_rgba(sprite.color);
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.effect_kind = sprite.effect.kind;
     return out;
 }
 
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
-    let sprite = b_mono_sprites[input.sprite_id];
     let base_color = input.color;
-    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
-    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    // Virtually every glyph in the window is unshimmered, so bail out before
+    // touching the sprite storage buffer at all. Reading `b_mono_sprites` from
+    // the fragment stage is a dependent memory load per fragment, and the
+    // overlay blend below ends in a divide; neither is worth paying on all
+    // text for an effect a handful of labels use.
+    if (input.effect_kind == 0u) {
+        return blend_color(vec4<f32>(base_color.rgb, 1.0), base_color.a * alpha_corrected);
+    }
+
+    let sprite = b_mono_sprites[input.sprite_id];
+    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     let base_alpha = base_color.a * alpha_corrected;
     let overlay_alpha = highlight_color.a * intensity * alpha_corrected;
     let combined_alpha = overlay_alpha + base_alpha * (1.0 - overlay_alpha);
@@ -1310,11 +1324,6 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
             (highlight_color.rgb * overlay_alpha +
              base_color.rgb * base_alpha * (1.0 - overlay_alpha)) /
             combined_alpha;
-    }
-
-    // Alpha clip after using the derivatives.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
     }
 
     return blend_color(vec4<f32>(combined_rgb, 1.0), combined_alpha);

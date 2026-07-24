@@ -1150,7 +1150,7 @@ struct SpriteEffect {
     Hsla highlight_color;
     float band_origin;
     float band_width;
-    float2 band_padding;
+    float2 direction;
 };
 
 struct MonochromeSprite {
@@ -1170,6 +1170,7 @@ struct MonochromeSpriteVertexOutput {
     float2 local_position: TEXCOORD1;
     nointerpolation float4 color: COLOR;
     nointerpolation uint sprite_id: TEXCOORD0;
+    nointerpolation uint effect_kind: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1179,22 +1180,28 @@ struct MonochromeSpriteFragmentInput {
     float2 local_position: TEXCOORD1;
     nointerpolation float4 color: COLOR;
     nointerpolation uint sprite_id: TEXCOORD0;
+    nointerpolation uint effect_kind: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
 
+// Highlight profile of the shimmer band: a symmetric ramp peaking at the band
+// center and falling to zero at both edges, matching the CSS
+// `linear-gradient(<angle>, transparent 40%, highlight 50%, transparent 60%)`
+// sheen. The smoothstep easing removes the crease a bare linear ramp leaves at
+// the peak, and the projection onto `effect.direction` is what makes the band
+// diagonal rather than axis-aligned.
+//
+// Callers must check `kind` first (via the nointerpolation `effect_kind`
+// varying) so unshimmered text never reaches this function or the structured
+// buffer read it needs.
 float sprite_effect_intensity(SpriteEffect effect, float2 local_position) {
-    if (effect.kind == 1u) {
-        float band_width = max(effect.band_width, 1.0f);
-        float band_start = effect.bounds.origin.x + effect.band_origin;
-        float band_end = band_start + band_width;
-        float feather = min(max(band_width * 0.125f, 0.75f), band_width * 0.5f);
-        float leading = saturate((local_position.x - band_start) / feather);
-        float trailing = saturate((band_end - local_position.x) / feather);
-        return min(leading, trailing);
-    }
-    return 0.0f;
+    float2 offset = local_position - effect.bounds.origin;
+    float half_width = max(effect.band_width, 1.0f) * 0.5f;
+    float center = effect.band_origin + half_width;
+    float ramp = saturate(1.0f - abs(dot(offset, effect.direction) - center) / half_width);
+    return ramp * ramp * (3.0f - 2.0f * ramp);
 }
 
 MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
@@ -1214,17 +1221,27 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
         sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.y);
     output.color = color;
     output.sprite_id = sprite_id;
+    output.effect_kind = sprite.effect.kind;
     output.clip_distance = clip_distance;
     return output;
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
-    MonochromeSprite sprite = mono_sprites[input.sprite_id];
     float4 base_color = input.color;
-    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
-    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+
+    // Virtually every glyph in the window is unshimmered, so bail out before
+    // touching the sprite structured buffer at all: reading it from the pixel
+    // stage is a dependent memory load per fragment, and the overlay blend
+    // below ends in a divide.
+    if (input.effect_kind == 0u) {
+        return float4(base_color.rgb, base_color.a * alpha_corrected);
+    }
+
+    MonochromeSprite sprite = mono_sprites[input.sprite_id];
+    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float base_alpha = base_color.a * alpha_corrected;
     float overlay_alpha = highlight_color.a * intensity * alpha_corrected;
     float combined_alpha = overlay_alpha + base_alpha * (1.0f - overlay_alpha);
@@ -1243,10 +1260,7 @@ MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID,
 }
 
 SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentInput input) {
-    MonochromeSprite sprite = mono_sprites[input.sprite_id];
     float4 base_color = input.color;
-    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
-    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float3 sample = t_sprite.Sample(s_sprite, input.tile_position).rgb;
     if (is_bgr) {
         sample = sample.bgr;
@@ -1256,6 +1270,19 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
         base_color.rgb,
         subpixel_enhanced_contrast,
         gamma_ratios);
+
+    // As above, and the shimmer path additionally costs unshimmered text a
+    // second full `apply_contrast_and_gamma_correction3` pass per channel.
+    if (input.effect_kind == 0u) {
+        SubpixelSpriteFragmentOutput plain;
+        plain.foreground = float4(base_color.rgb, 1.0f);
+        plain.alpha = float4(base_color.a * base_alpha_corrected, 1.0f);
+        return plain;
+    }
+
+    MonochromeSprite sprite = mono_sprites[input.sprite_id];
+    float4 highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    float intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     float3 highlight_alpha_corrected = apply_contrast_and_gamma_correction3(
         sample,
         highlight_color.rgb,

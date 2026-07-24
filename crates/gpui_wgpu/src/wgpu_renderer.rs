@@ -1911,3 +1911,42 @@ impl RenderingParameters {
         }
     }
 }
+
+#[cfg(test)]
+mod shader_tests {
+    /// `create_shader_module` only runs when a real device exists, so a typo or
+    /// a duplicated declaration in the WGSL is otherwise invisible until the
+    /// app starts on hardware with the matching capabilities. These two modules
+    /// are built exactly the way `WgpuRenderer` builds them.
+    fn validate(label: &str, source: &str) {
+        let module = match naga::front::wgsl::parse_str(source) {
+            Ok(module) => module,
+            Err(error) => panic!("{label} failed to parse:\n{}", error.emit_to_string(source)),
+        };
+        if let Err(error) = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        {
+            panic!("{label} failed validation:\n{}", error.emit_to_string(source));
+        }
+    }
+
+    #[test]
+    fn base_shaders_are_valid_wgsl() {
+        validate("shaders.wgsl", include_str!("shaders.wgsl"));
+    }
+
+    #[test]
+    fn subpixel_shaders_are_valid_wgsl() {
+        // Mirrors the concatenation in `WgpuRenderer::new`: the subpixel file
+        // is never compiled on its own, it is appended to the base module.
+        let base = include_str!("shaders.wgsl");
+        let subpixel = include_str!("shaders_subpixel.wgsl");
+        validate(
+            "shaders_subpixel.wgsl",
+            &format!("enable dual_source_blending;\n{base}\n{subpixel}"),
+        );
+    }
+}

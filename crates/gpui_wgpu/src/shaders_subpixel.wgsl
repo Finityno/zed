@@ -1,14 +1,8 @@
 // --- subpixel sprites --- //
 
-struct SpriteEffect {
-    kind: u32,
-    pad: vec3<u32>,
-    bounds: Bounds,
-    highlight_color: Hsla,
-    band_origin: f32,
-    band_width: f32,
-    band_padding: vec2<f32>,
-}
+// `SpriteEffect` and `sprite_effect_intensity` come from `shaders.wgsl`: this
+// file is only ever compiled appended to that module, so redeclaring them here
+// is a WGSL redefinition error.
 
 struct SubpixelSprite {
     order: u32,
@@ -29,6 +23,7 @@ struct SubpixelSpriteOutput {
     @location(2) @interpolate(flat) color: vec4<f32>,
     @location(3) @interpolate(flat) sprite_id: u32,
     @location(4) clip_distances: vec4<f32>,
+    @location(5) @interpolate(flat) effect_kind: u32,
 }
 
 struct SubpixelSpriteFragmentOutput {
@@ -44,39 +39,17 @@ fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     var out = SubpixelSpriteOutput();
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
-    out.local_position = vec2<f32>(
-        sprite.bounds.origin.x + unit_vertex.x * sprite.bounds.size.width,
-        sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.height,
-    );
+    out.local_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
     out.color = hsla_to_rgba(sprite.color);
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.effect_kind = sprite.effect.kind;
     return out;
-}
-
-fn sprite_effect_intensity(effect: SpriteEffect, local_position: vec2<f32>) -> f32 {
-    switch (effect.kind) {
-        default: {
-            return 0.0;
-        }
-        case 1u: {
-            let band_width = max(effect.band_width, 1.0);
-            let band_start = effect.bounds.origin.x + effect.band_origin;
-            let band_end = band_start + band_width;
-            let feather = min(max(band_width * 0.125, 0.75), band_width * 0.5);
-            let leading = saturate((local_position.x - band_start) / feather);
-            let trailing = saturate((band_end - local_position.x) / feather);
-            return min(leading, trailing);
-        }
-    }
 }
 
 @fragment
 fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutput {
-    let sprite = b_subpixel_sprites[input.sprite_id];
     let base_color = input.color;
-    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
-    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     var sample = textureSample(t_sprite, s_sprite, input.tile_position).rgb;
     if (gamma_params.is_bgr != 0u) {
         sample = sample.bgr;
@@ -87,6 +60,26 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
         gamma_params.subpixel_enhanced_contrast,
         gamma_params.gamma_ratios,
     );
+
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
+    }
+
+    // Unshimmered text is the overwhelmingly common case, and the shimmer path
+    // below costs it a second full `apply_contrast_and_gamma_correction3` pass
+    // (per subpixel channel) plus a storage-buffer read per fragment. Bail out
+    // before any of it.
+    if (input.effect_kind == 0u) {
+        var plain = SubpixelSpriteFragmentOutput();
+        plain.foreground = vec4<f32>(base_color.rgb, 1.0);
+        plain.alpha = vec4<f32>(base_color.a * base_alpha_corrected, 1.0);
+        return plain;
+    }
+
+    let sprite = b_subpixel_sprites[input.sprite_id];
+    let highlight_color = hsla_to_rgba(sprite.effect.highlight_color);
+    let intensity = sprite_effect_intensity(sprite.effect, input.local_position);
     let highlight_alpha_corrected = apply_contrast_and_gamma_correction3(
         sample,
         highlight_color.rgb,
@@ -102,11 +95,6 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
             (highlight_color.rgb * overlay_alpha +
              base_color.rgb * base_alpha * (vec3<f32>(1.0) - overlay_alpha)) /
             combined_alpha;
-    }
-
-    // Alpha clip after using the derivatives.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
     }
 
     var out = SubpixelSpriteFragmentOutput();
