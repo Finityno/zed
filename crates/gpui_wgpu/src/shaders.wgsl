@@ -1226,9 +1226,16 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
 // --- monochrome sprites --- //
 
+// Mirrors `gpui::SpriteEffect`, whose `pad` is `[u32; 3]`. Spelling that as
+// `vec3<u32>` here would NOT be equivalent: a WGSL vector has 16-byte
+// alignment where an array of scalars has 4, which inflates this struct to 80
+// bytes and `MonochromeSprite`/`SubpixelSprite` to 208 against the 64/176 the
+// Rust side writes. `sprite_layouts_match_rust` guards the sizes.
 struct SpriteEffect {
     kind: u32,
-    pad: vec3<u32>,
+    pad_0: u32,
+    pad_1: u32,
+    pad_2: u32,
     bounds: Bounds,
     highlight_color: Hsla,
     band_origin: f32,
