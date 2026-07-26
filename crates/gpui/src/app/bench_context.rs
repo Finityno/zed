@@ -92,6 +92,49 @@ pub struct ForegroundWorkSummary {
     pub frame_budget_overruns_max: u64,
 }
 
+/// Runs one benchmark iteration inside its own Objective-C autorelease pool.
+///
+/// A frame creates a lot of autoreleased Objective-C state on macOS — Metal
+/// command buffers, render-pass descriptors, command encoders, texture
+/// descriptors — and each of those retains what it references, including the
+/// render target and sprite-atlas textures. A running app drains the thread's
+/// pool on every run-loop turn, so this never accumulates. A benchmark has no
+/// run loop: Criterion calls the iteration closure thousands of times inside a
+/// single Rust call, and without a pool of our own *every* command buffer the
+/// run ever created stays alive until the process exits. That grows into tens
+/// of GB of Metal-backed memory over a full `cargo bench` — invisible to
+/// `ps`-style RSS, because it is accounted to IOKit rather than the process's
+/// resident set, but plainly visible as the process's memory footprint in
+/// Activity Monitor.
+///
+/// Pushing and popping around each iteration keeps that bounded to one frame's
+/// worth. `objc_autoreleasePool{Push,Pop}` come from libobjc, which is always
+/// present on Apple platforms, so this needs no dependency in `gpui` core.
+#[cfg(target_os = "macos")]
+fn with_autorelease_pool<R>(f: impl FnOnce() -> R) -> R {
+    unsafe extern "C" {
+        fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
+        fn objc_autoreleasePoolPop(pool: *mut std::ffi::c_void);
+    }
+
+    // A guard rather than a plain pop so an iteration that panics still drains
+    // its pool while unwinding.
+    struct PoolGuard(*mut std::ffi::c_void);
+    impl Drop for PoolGuard {
+        fn drop(&mut self) {
+            unsafe { objc_autoreleasePoolPop(self.0) };
+        }
+    }
+
+    let _guard = PoolGuard(unsafe { objc_autoreleasePoolPush() });
+    f()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_autorelease_pool<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// A small report produced by GPUI benchmarks.
 #[derive(Clone)]
 pub struct BenchReport {
@@ -634,7 +677,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
     pub fn bench_iter(&mut self, mut benchmark: impl FnMut(&mut Self)) {
         let bencher = self.take_bencher("bench_iter");
         let collector = TraceScope::start(self.foreground_journal_collector());
-        let mut benchmark = || benchmark(self);
+        let mut benchmark = || with_autorelease_pool(|| benchmark(self));
         bencher.iter(&mut benchmark);
         let events = collector.finish();
         self.report.record_frame_timings(events.frame_events.iter());
@@ -748,23 +791,25 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         let collector = TraceScope::start(self.foreground_journal_collector());
 
         let mut benchmark = || {
-            // Work already queued at frame start delays the frame in
-            // production too, so run it inside the measured interval.
-            dispatcher
-                .as_threaded()
-                .expect("validated in BenchAppContext::build")
-                .run_ready_main_tasks();
-            self.with_window(view.entity_id(), |window, cx| {
-                view.update(cx, |view, cx| update(view, window, cx));
-            })
-            .expect("cannot benchmark renderer for entity without a current window");
-            // Submit the frame drawn by the update's effect flush, mirroring
-            // production where every drawn frame is presented. With a headless
-            // renderer this includes scene submission to the GPU.
-            self.with_window(view.entity_id(), |window, _| {
-                window.present_if_needed();
-            })
-            .expect("cannot benchmark renderer for entity without a current window");
+            with_autorelease_pool(|| {
+                // Work already queued at frame start delays the frame in
+                // production too, so run it inside the measured interval.
+                dispatcher
+                    .as_threaded()
+                    .expect("validated in BenchAppContext::build")
+                    .run_ready_main_tasks();
+                self.with_window(view.entity_id(), |window, cx| {
+                    view.update(cx, |view, cx| update(view, window, cx));
+                })
+                .expect("cannot benchmark renderer for entity without a current window");
+                // Submit the frame drawn by the update's effect flush, mirroring
+                // production where every drawn frame is presented. With a headless
+                // renderer this includes scene submission to the GPU.
+                self.with_window(view.entity_id(), |window, _| {
+                    window.present_if_needed();
+                })
+                .expect("cannot benchmark renderer for entity without a current window");
+            });
         };
         bencher.iter(&mut benchmark);
 
