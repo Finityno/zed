@@ -1630,6 +1630,21 @@ impl PlatformWindow for MacWindow {
                     let blur_view: id = if let Some(glass_class) = glass_class {
                         let view: id = msg_send![glass_class, alloc];
                         NSView::initWithFrame_(view, frame)
+                    } else if opaque_window {
+                        // Mica: a plain, natively-configured visual effect
+                        // view with the real sidebar material. BlurredView's
+                        // Selection material + stripped backdrop layers are
+                        // tuned for the colorless non-opaque blur; what
+                        // remains of them in an opaque window renders as a
+                        // glowing wash instead of glass.
+                        let view: id = msg_send![class!(NSVisualEffectView), alloc];
+                        let view: id = NSView::initWithFrame_(view, frame);
+                        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Sidebar);
+                        NSVisualEffectView::setState_(
+                            view,
+                            NSVisualEffectState::FollowsWindowActiveState,
+                        );
+                        view
                     } else {
                         let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
                         NSView::initWithFrame_(view, frame)
