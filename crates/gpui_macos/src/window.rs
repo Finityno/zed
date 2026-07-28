@@ -1314,6 +1314,18 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        unsafe {
+            let native_appearance: id = match appearance {
+                Some(appearance) => {
+                    crate::window_appearance::window_appearance_to_native(appearance)
+                }
+                None => nil,
+            };
+            let _: () = msg_send![self.0.lock().native_window, setAppearance: native_appearance];
+        }
+    }
+
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         unsafe {
             let screen = self.0.lock().native_window.screen();
