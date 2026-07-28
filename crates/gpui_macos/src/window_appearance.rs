@@ -4,7 +4,7 @@ use cocoa::{
     foundation::NSString,
 };
 use gpui::WindowAppearance;
-use objc::{msg_send, sel, sel_impl};
+use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::CStr;
 
 pub(crate) unsafe fn window_appearance_from_native(appearance: id) -> WindowAppearance {
@@ -25,6 +25,20 @@ pub(crate) unsafe fn window_appearance_from_native(appearance: id) -> WindowAppe
             );
             WindowAppearance::Light
         }
+    }
+}
+
+/// Returns the retained `NSAppearance` for the given appearance, for
+/// `-[NSWindow setAppearance:]`.
+pub(crate) unsafe fn window_appearance_to_native(appearance: WindowAppearance) -> id {
+    unsafe {
+        let name: id = match appearance {
+            WindowAppearance::Light => NSAppearanceNameAqua,
+            WindowAppearance::Dark => NSAppearanceNameDarkAqua,
+            WindowAppearance::VibrantLight => NSAppearanceNameVibrantLight,
+            WindowAppearance::VibrantDark => NSAppearanceNameVibrantDark,
+        };
+        msg_send![class!(NSAppearance), appearanceNamed: name]
     }
 }
 
