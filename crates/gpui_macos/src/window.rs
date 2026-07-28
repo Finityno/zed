@@ -2973,13 +2973,13 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
 }
 
 extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
-    unsafe {
-        let state = get_window_state(this);
-        let appearance_changed_callback = {
-            let mut lock = state.as_ref().lock();
-            lock.appearance_changed_callback.take()
-        };
-
+    // `setAppearance:` fires this observer synchronously, so a programmatic
+    // appearance change made while GPUI is mid-update (e.g. deferred from a
+    // draw) would re-enter the app and hit an already-borrowed RefCell.
+    // Deliver the notification on the next main-queue turn instead.
+    extern "C" fn notify_appearance_changed(context: *mut c_void) {
+        let state = unsafe { Arc::from_raw(context as *const Mutex<MacWindowState>) };
+        let appearance_changed_callback = state.lock().appearance_changed_callback.take();
         if let Some(mut callback) = appearance_changed_callback {
             callback();
             state.lock().appearance_changed_callback = Some(callback);
@@ -2989,6 +2989,11 @@ extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
         // applying a new appearance. Reapply GPUI's custom position after
         // notifying appearance observers.
         state.lock().move_traffic_light();
+    }
+
+    unsafe {
+        let state = get_window_state(this);
+        DispatchQueue::main().exec_async_f(Arc::into_raw(state) as *mut c_void, notify_appearance_changed);
     }
 }
 
