@@ -2654,6 +2654,15 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Pins the window's system appearance (macOS `NSWindow.appearance`) to
+    /// the given value, or restores following the system when `None`. System
+    /// materials embedded in the window follow it — notably the glass/blur
+    /// background view, so a dark-themed window over a light system keeps a
+    /// dark glass material. No-op on platforms without per-window appearance.
+    pub fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        self.platform_window.set_appearance_override(appearance);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

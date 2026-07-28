@@ -1448,6 +1448,23 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        // `setAppearance:` synchronously notifies effective-appearance
+        // observers (`view_did_change_effective_appearance`), which take this
+        // window's state lock — holding it across the call deadlocks the main
+        // thread on the first application.
+        let native_window = self.0.lock().native_window;
+        unsafe {
+            let native_appearance: id = match appearance {
+                Some(appearance) => {
+                    crate::window_appearance::window_appearance_to_native(appearance)
+                }
+                None => nil,
+            };
+            let _: () = msg_send![native_window, setAppearance: native_appearance];
+        }
+    }
+
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         unsafe {
             let screen = self.0.lock().native_window.screen();

@@ -847,6 +847,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Pins the window's system appearance (macOS `NSWindow.appearance`) to
+    /// the given value, or restores following the system when `None`.
+    /// This also drives system materials embedded in the window — notably the
+    /// glass/blur background view, so a dark-themed window over a light
+    /// system keeps a dark glass material. Default is a no-op on platforms
+    /// without per-window appearance.
+    fn set_appearance_override(&self, _appearance: Option<WindowAppearance>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
