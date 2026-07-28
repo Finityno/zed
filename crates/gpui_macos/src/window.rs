@@ -1315,6 +1315,11 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        // `setAppearance:` synchronously notifies effective-appearance
+        // observers (`view_did_change_effective_appearance`), which take this
+        // window's state lock — holding it across the call deadlocks the main
+        // thread on the first application.
+        let native_window = self.0.lock().native_window;
         unsafe {
             let native_appearance: id = match appearance {
                 Some(appearance) => {
@@ -1322,7 +1327,7 @@ impl PlatformWindow for MacWindow {
                 }
                 None => nil,
             };
-            let _: () = msg_send![self.0.lock().native_window, setAppearance: native_appearance];
+            let _: () = msg_send![native_window, setAppearance: native_appearance];
         }
     }
 
