@@ -39,7 +39,7 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, Font, FontId, FontMetrics,
     FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
     PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
+    RenderImageParams, RenderSvgParams, Rgba, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
     SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -827,6 +827,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// system keeps a dark glass material. Default is a no-op on platforms
     /// without per-window appearance.
     fn set_appearance_override(&self, _appearance: Option<WindowAppearance>) {}
+    /// Tints the system glass backdrop (macOS 26+ `NSGlassEffectView`) with
+    /// the given color, or restores the untinted adaptive material when
+    /// `None`. The light glass material aggressively brightens its backdrop;
+    /// a tint replaces that adaptive wash while keeping the backdrop
+    /// translucent. Default is a no-op on platforms without a tintable glass
+    /// backdrop.
+    fn set_background_glass_tint(&self, _tint: Option<Rgba>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
