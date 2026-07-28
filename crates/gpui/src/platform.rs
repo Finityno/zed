@@ -834,6 +834,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// translucent. Default is a no-op on platforms without a tintable glass
     /// backdrop.
     fn set_background_glass_tint(&self, _tint: Option<Rgba>) {}
+    /// Selects the system glass backdrop style (macOS 26+
+    /// `NSGlassEffectView`). Default is a no-op on platforms without a
+    /// styleable glass backdrop.
+    fn set_background_glass_style(&self, _style: WindowGlassStyle) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -2049,6 +2053,20 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// The style of the system glass backdrop used by
+/// [`WindowBackgroundAppearance::Blurred`] on macOS 26+.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WindowGlassStyle {
+    /// The standard adaptive material. In light appearance it composites a
+    /// strong brightening wash over the backdrop (pure black behind it reads
+    /// as ~52% grey).
+    #[default]
+    Regular,
+    /// The clearer variant of the material: far less wash, so much more of
+    /// the backdrop shows through (pure black behind it reads as ~28% grey).
+    Clear,
 }
 
 /// The text rendering mode to use for drawing glyphs.

@@ -30,7 +30,8 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
     PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle, WindowKind,
+    WindowParams, point,
     px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -497,6 +498,8 @@ struct MacWindowState {
     // Requested glass backdrop tint; applied to `blurred_view` when it is an
     // `NSGlassEffectView`, remembered here so recreations reapply it.
     glass_tint: Option<Rgba>,
+    // Requested glass backdrop style, remembered like `glass_tint`.
+    glass_style: WindowGlassStyle,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -893,6 +896,7 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 glass_tint: None,
+                glass_style: WindowGlassStyle::Regular,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1654,6 +1658,7 @@ impl PlatformWindow for MacWindow {
                         NSView::initWithFrame_(view, frame)
                     };
                     blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                    apply_glass_style(blur_view, this.glass_style);
                     apply_glass_tint(blur_view, this.glass_tint);
 
                     let _: () = msg_send![
@@ -1680,6 +1685,17 @@ impl PlatformWindow for MacWindow {
         };
         if let Some(blurred_view) = blurred_view {
             unsafe { apply_glass_tint(blurred_view, tint) };
+        }
+    }
+
+    fn set_background_glass_style(&self, style: WindowGlassStyle) {
+        let blurred_view = {
+            let mut this = self.0.as_ref().lock();
+            this.glass_style = style;
+            this.blurred_view
+        };
+        if let Some(blurred_view) = blurred_view {
+            unsafe { apply_glass_style(blurred_view, style) };
         }
     }
 
@@ -2053,6 +2069,23 @@ unsafe fn is_gpui_window(window: id) -> bool {
     unsafe {
         msg_send![window, isKindOfClass: WINDOW_CLASS]
             || msg_send![window, isKindOfClass: PANEL_CLASS]
+    }
+}
+
+/// Applies `style` to a glass backdrop view. Only `NSGlassEffectView`
+/// responds to `setStyle:`; the plain visual-effect fallbacks are left
+/// untouched. Raw values: 0 = regular, 1 = clear (verified by reading the
+/// property back).
+unsafe fn apply_glass_style(view: id, style: WindowGlassStyle) {
+    unsafe {
+        let responds: BOOL = msg_send![view, respondsToSelector: sel!(setStyle:)];
+        if responds == YES {
+            let style_value: NSInteger = match style {
+                WindowGlassStyle::Regular => 0,
+                WindowGlassStyle::Clear => 1,
+            };
+            let _: () = msg_send![view, setStyle: style_value];
+        }
     }
 }
 

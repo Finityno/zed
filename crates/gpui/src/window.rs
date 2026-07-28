@@ -17,6 +17,7 @@ use crate::{
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowGlassStyle,
     WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
     prelude::*, profiler, px, rems, size, transparent_black,
 };
@@ -2602,6 +2603,14 @@ impl Window {
     /// tintable glass backdrop.
     pub fn set_background_glass_tint(&self, tint: Option<Rgba>) {
         self.platform_window.set_background_glass_tint(tint);
+    }
+
+    /// Selects the system glass backdrop style (macOS 26+
+    /// `NSGlassEffectView`): the standard adaptive material, or the clearer
+    /// variant that composites far less wash over the backdrop. No-op on
+    /// platforms without a styleable glass backdrop.
+    pub fn set_background_glass_style(&self, style: WindowGlassStyle) {
+        self.platform_window.set_background_glass_style(style);
     }
 
     /// Mark the window as dirty at the platform level.
