@@ -1680,37 +1680,89 @@ impl PlatformWindow for MacWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
+        let appearance_changed = this.background_appearance != background_appearance;
         this.background_appearance = background_appearance;
 
-        let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
-        this.renderer.update_transparency(!opaque);
+        // `MicaBackdrop` on macOS is a Finder-style backdrop: the WINDOW
+        // stays opaque to the window server — whole-window compositing
+        // (shadow, color handling) matches a normal opaque window exactly —
+        // while the Metal layer goes transparent, so translucent regions
+        // reveal a behind-window `NSVisualEffectView` beneath it (its
+        // behind-window sampling works in opaque windows). `Blurred` keeps
+        // the fully non-opaque window with the Liquid Glass material.
+        let opaque_window = matches!(
+            background_appearance,
+            WindowBackgroundAppearance::Opaque
+                | WindowBackgroundAppearance::MicaBackdrop
+                | WindowBackgroundAppearance::MicaAltBackdrop
+        );
+        let transparent_layer = background_appearance != WindowBackgroundAppearance::Opaque;
+        this.renderer.update_transparency(transparent_layer);
 
         unsafe {
-            this.native_window.setOpaque_(opaque as BOOL);
-            let background_color = if opaque {
+            this.native_window.setOpaque_(opaque_window as BOOL);
+            let background_color = if background_appearance == WindowBackgroundAppearance::Opaque
+            {
                 NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64)
+            } else if opaque_window {
+                // Behind the backdrop view; an opaque window needs an opaque
+                // fallback fill.
+                msg_send![class!(NSColor), windowBackgroundColor]
             } else {
                 // Not using `+[NSColor clearColor]` to avoid broken shadow.
                 NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
             };
             this.native_window.setBackgroundColor_(background_color);
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
+            let wants_backdrop_view = matches!(
+                background_appearance,
+                WindowBackgroundAppearance::Blurred
+                    | WindowBackgroundAppearance::MicaBackdrop
+                    | WindowBackgroundAppearance::MicaAltBackdrop
+            );
+            // Recreate on appearance changes so Blurred ↔ Mica switches
+            // swap the backing view class (glass vs visual-effect).
+            if appearance_changed || !wants_backdrop_view {
                 if let Some(blur_view) = this.blurred_view {
                     NSView::removeFromSuperview(blur_view);
                     this.blurred_view = None;
                 }
-            } else if this.blurred_view.is_none() {
+            }
+            if wants_backdrop_view && this.blurred_view.is_none() {
                 let content_view = this.native_window.contentView();
                 let frame = NSView::bounds(content_view);
                 // On macOS 26+ use the native Liquid Glass material
                 // (`NSGlassEffectView`), which refracts the window's
                 // backdrop with edge lensing and highlights instead of the
                 // plain frosted blur of `NSVisualEffectView`. Fall back to
-                // the blurred view when the class isn't available.
-                let blur_view: id = if let Some(glass_class) = Class::get("NSGlassEffectView") {
+                // the blurred view when the class isn't available, and use
+                // it always for the opaque-window Mica modes (the glass
+                // view needs a non-opaque window to sample the desktop).
+                let glass_class = if background_appearance
+                    == WindowBackgroundAppearance::Blurred
+                {
+                    Class::get("NSGlassEffectView")
+                } else {
+                    None
+                };
+                let blur_view: id = if let Some(glass_class) = glass_class {
                     let view: id = msg_send![glass_class, alloc];
                     NSView::initWithFrame_(view, frame)
+                } else if opaque_window {
+                    // Mica: a plain, natively-configured visual effect
+                    // view with the real sidebar material. BlurredView's
+                    // Selection material + stripped backdrop layers are
+                    // tuned for the colorless non-opaque blur; what
+                    // remains of them in an opaque window renders as a
+                    // glowing wash instead of glass.
+                    let view: id = msg_send![class!(NSVisualEffectView), alloc];
+                    let view: id = NSView::initWithFrame_(view, frame);
+                    NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Sidebar);
+                    NSVisualEffectView::setState_(
+                        view,
+                        NSVisualEffectState::FollowsWindowActiveState,
+                    );
+                    view
                 } else {
                     let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
                     NSView::initWithFrame_(view, frame)
