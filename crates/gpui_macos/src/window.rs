@@ -29,9 +29,9 @@ use gpui::{
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle,
+    WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -593,6 +593,11 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    // Requested glass backdrop tint; applied to `blurred_view` when it is an
+    // `NSGlassEffectView`, remembered here so recreations reapply it.
+    glass_tint: Option<Rgba>,
+    // Requested glass backdrop style, remembered like `glass_tint`.
+    glass_style: WindowGlassStyle,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -1020,6 +1025,8 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                glass_tint: None,
+                glass_style: WindowGlassStyle::Regular,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1738,9 +1745,7 @@ impl PlatformWindow for MacWindow {
                 // the blurred view when the class isn't available, and use
                 // it always for the opaque-window Mica modes (the glass
                 // view needs a non-opaque window to sample the desktop).
-                let glass_class = if background_appearance
-                    == WindowBackgroundAppearance::Blurred
-                {
+                let glass_class = if background_appearance == WindowBackgroundAppearance::Blurred {
                     Class::get("NSGlassEffectView")
                 } else {
                     None
@@ -1768,6 +1773,8 @@ impl PlatformWindow for MacWindow {
                     NSView::initWithFrame_(view, frame)
                 };
                 blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                apply_glass_style(blur_view, this.glass_style);
+                apply_glass_tint(blur_view, this.glass_tint);
 
                 let _: () = msg_send![
                     content_view,
@@ -1782,6 +1789,28 @@ impl PlatformWindow for MacWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.0.as_ref().lock().background_appearance
+    }
+
+    fn set_background_glass_tint(&self, tint: Option<Rgba>) {
+        let blurred_view = {
+            let mut this = self.0.as_ref().lock();
+            this.glass_tint = tint;
+            this.blurred_view
+        };
+        if let Some(blurred_view) = blurred_view {
+            unsafe { apply_glass_tint(blurred_view, tint) };
+        }
+    }
+
+    fn set_background_glass_style(&self, style: WindowGlassStyle) {
+        let blurred_view = {
+            let mut this = self.0.as_ref().lock();
+            this.glass_style = style;
+            this.blurred_view
+        };
+        if let Some(blurred_view) = blurred_view {
+            unsafe { apply_glass_style(blurred_view, style) };
+        }
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -2326,6 +2355,45 @@ unsafe fn is_gpui_window(window: id) -> bool {
     unsafe {
         msg_send![window, isKindOfClass: WINDOW_CLASS]
             || msg_send![window, isKindOfClass: PANEL_CLASS]
+    }
+}
+
+/// Applies `style` to a glass backdrop view. Only `NSGlassEffectView`
+/// responds to `setStyle:`; the plain visual-effect fallbacks are left
+/// untouched. Raw values: 0 = regular, 1 = clear (verified by reading the
+/// property back).
+unsafe fn apply_glass_style(view: id, style: WindowGlassStyle) {
+    unsafe {
+        let responds: BOOL = msg_send![view, respondsToSelector: sel!(setStyle:)];
+        if responds == YES {
+            let style_value: NSInteger = match style {
+                WindowGlassStyle::Regular => 0,
+                WindowGlassStyle::Clear => 1,
+            };
+            let _: () = msg_send![view, setStyle: style_value];
+        }
+    }
+}
+
+/// Applies `tint` to a glass backdrop view. Only `NSGlassEffectView` responds
+/// to `setTintColor:`; the plain visual-effect fallbacks are left untouched.
+/// `None` restores the untinted adaptive material.
+unsafe fn apply_glass_tint(view: id, tint: Option<Rgba>) {
+    unsafe {
+        let responds: BOOL = msg_send![view, respondsToSelector: sel!(setTintColor:)];
+        if responds == YES {
+            let color: id = match tint {
+                Some(tint) => NSColor::colorWithSRGBRed_green_blue_alpha_(
+                    nil,
+                    tint.r as f64,
+                    tint.g as f64,
+                    tint.b as f64,
+                    tint.a as f64,
+                ),
+                None => nil,
+            };
+            let _: () = msg_send![view, setTintColor: color];
+        }
     }
 }
 
@@ -3282,6 +3350,11 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
 }
 
 extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
+    // The reentrancy hazard here (`setAppearance:` fires this observer
+    // synchronously, so a programmatic appearance change made while GPUI holds
+    // an `App` borrow would re-enter it) is handled upstream in
+    // `gpui::Window`'s `on_appearance_changed` callback, which defers the
+    // update onto the foreground executor.
     unsafe {
         let state = get_window_state(this);
         let appearance_changed_callback = {

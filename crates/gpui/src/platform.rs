@@ -39,8 +39,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
-    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    RenderImage, RenderImageParams, RenderSvgParams, Rgba, Scene, ShapedGlyph, ShapedRun,
+    SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point,
+    px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -854,6 +855,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// system keeps a dark glass material. Default is a no-op on platforms
     /// without per-window appearance.
     fn set_appearance_override(&self, _appearance: Option<WindowAppearance>) {}
+    /// Tints the system glass backdrop (macOS 26+ `NSGlassEffectView`) with
+    /// the given color, or restores the untinted adaptive material when
+    /// `None`. The light glass material aggressively brightens its backdrop;
+    /// a tint replaces that adaptive wash while keeping the backdrop
+    /// translucent. Default is a no-op on platforms without a tintable glass
+    /// backdrop.
+    fn set_background_glass_tint(&self, _tint: Option<Rgba>) {}
+    /// Selects the system glass backdrop style (macOS 26+
+    /// `NSGlassEffectView`). Default is a no-op on platforms without a
+    /// styleable glass backdrop.
+    fn set_background_glass_style(&self, _style: WindowGlassStyle) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -2247,6 +2259,20 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// The style of the system glass backdrop used by
+/// [`WindowBackgroundAppearance::Blurred`] on macOS 26+.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WindowGlassStyle {
+    /// The standard adaptive material. In light appearance it composites a
+    /// strong brightening wash over the backdrop (pure black behind it reads
+    /// as ~52% grey).
+    #[default]
+    Regular,
+    /// The clearer variant of the material: far less wash, so much more of
+    /// the backdrop shows through (pure black behind it reads as ~28% grey).
+    Clear,
 }
 
 /// The text rendering mode to use for drawing glyphs.

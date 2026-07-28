@@ -15,15 +15,15 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    WindowBounds, WindowControls, WindowDecorations, WindowGlassStyle, WindowOptions, WindowParams,
+    WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -2661,6 +2661,23 @@ impl Window {
     /// dark glass material. No-op on platforms without per-window appearance.
     pub fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
         self.platform_window.set_appearance_override(appearance);
+    }
+
+    /// Tints the system glass backdrop (macOS 26+ `NSGlassEffectView`) with
+    /// the given color, or restores the untinted adaptive material when
+    /// `None`. The tint replaces the material's adaptive brightening wash
+    /// while keeping the backdrop translucent. No-op on platforms without a
+    /// tintable glass backdrop.
+    pub fn set_background_glass_tint(&self, tint: Option<Rgba>) {
+        self.platform_window.set_background_glass_tint(tint);
+    }
+
+    /// Selects the system glass backdrop style (macOS 26+
+    /// `NSGlassEffectView`): the standard adaptive material, or the clearer
+    /// variant that composites far less wash over the backdrop. No-op on
+    /// platforms without a styleable glass backdrop.
+    pub fn set_background_glass_style(&self, style: WindowGlassStyle) {
+        self.platform_window.set_background_glass_style(style);
     }
 
     /// Mark the window as dirty at the platform level.
