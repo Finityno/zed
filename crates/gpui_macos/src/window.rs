@@ -9,12 +9,11 @@ use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
-        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard,
-        NSRequestUserAttentionType, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
-        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-        NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-        NSWindowStyleMask, NSWindowTitleVisibility,
+        NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags, NSEventType,
+        NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
+        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
+        NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -25,14 +24,13 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalPaths,
-    FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle, WindowKind,
-    WindowParams, point,
-    px, size,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle,
+    WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -51,7 +49,7 @@ use objc::{
     runtime::{BOOL, Class, NO, Object, Protocol, Sel, YES},
     sel, sel_impl,
 };
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::AnyObject as Objc2Object};
 use objc2_app_kit::{
     NSBeep, NSButton as Objc2NSButton, NSView as Objc2NSView, NSWindow as Objc2NSWindow,
     NSWindowButton as Objc2NSWindowButton,
@@ -62,9 +60,10 @@ use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
     cell::Cell,
-    ffi::{CStr, c_void},
+    ffi::{CStr, CString, c_void},
     mem,
     ops::Range,
+    os::unix::ffi::OsStrExt,
     path::PathBuf,
     ptr::{self, NonNull},
     rc::Rc,
@@ -110,6 +109,10 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+#[allow(non_upper_case_globals)]
+const NSDragOperationMove: NSDragOperation = 16;
+const NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION: NSInteger = 0;
+const NSDRAGGING_CONTEXT_WITHIN_APPLICATION: NSInteger = 1;
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -117,17 +120,12 @@ pub enum UserTabbingPreference {
     InFullScreen,
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
+#[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
-    // Widely used private APIs; Apple uses them for their Terminal.app.
-    fn CGSMainConnectionID() -> id;
-    fn CGSSetWindowBackgroundBlurRadius(
-        connection_id: id,
-        window_id: NSInteger,
-        radius: i64,
-    ) -> i32;
+    // AppKit constant naming the icon component of an NSDraggingImageComponent.
+    #[allow(non_upper_case_globals)]
+    static NSDraggingImageComponentIconKey: id;
 }
-
 #[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
@@ -441,6 +439,17 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             conclude_drag_operation as extern "C" fn(&Object, Sel, id),
         );
 
+        decl.add_protocol(Protocol::get("NSDraggingSource").unwrap());
+        decl.add_method(
+            sel!(draggingSession:sourceOperationMaskForDraggingContext:),
+            dragging_session_source_operation_mask
+                as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
+        );
+        decl.add_method(
+            sel!(draggingSession:endedAtPoint:operation:),
+            dragging_session_ended as extern "C" fn(&Object, Sel, id, NSPoint, NSDragOperation),
+        );
+
         decl.add_method(
             sel!(addTitlebarAccessoryViewController:),
             add_titlebar_accessory_view_controller as extern "C" fn(&Object, Sel, id),
@@ -515,6 +524,7 @@ struct MacWindowState {
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     last_key_equivalent: Option<KeyDownEvent>,
+    last_left_mouse_down_event: Option<Retained<Objc2Object>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
     traffic_light_frames: Option<TrafficLightFrames>,
@@ -918,6 +928,7 @@ impl MacWindow {
                 appearance_changed_callback: None,
                 input_handler: None,
                 last_key_equivalent: None,
+                last_left_mouse_down_event: None,
                 synthetic_drag_counter: 0,
                 traffic_light_position: titlebar
                     .as_ref()
@@ -1588,87 +1599,68 @@ impl PlatformWindow for MacWindow {
             };
             this.native_window.setBackgroundColor_(background_color);
 
-            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 {
-                // Whether `-[NSVisualEffectView respondsToSelector:@selector(_updateProxyLayer)]`.
-                // On macOS Catalina/Big Sur `NSVisualEffectView` doesn’t own concrete sublayers
-                // but uses a `CAProxyLayer`. Use the legacy WindowServer API.
-                let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
-                    80
+            let wants_backdrop_view = matches!(
+                background_appearance,
+                WindowBackgroundAppearance::Blurred
+                    | WindowBackgroundAppearance::MicaBackdrop
+                    | WindowBackgroundAppearance::MicaAltBackdrop
+            );
+            // Recreate on appearance changes so Blurred ↔ Mica switches
+            // swap the backing view class (glass vs visual-effect).
+            if appearance_changed || !wants_backdrop_view {
+                if let Some(blur_view) = this.blurred_view {
+                    NSView::removeFromSuperview(blur_view);
+                    this.blurred_view = None;
+                }
+            }
+            if wants_backdrop_view && this.blurred_view.is_none() {
+                let content_view = this.native_window.contentView();
+                let frame = NSView::bounds(content_view);
+                // On macOS 26+ use the native Liquid Glass material
+                // (`NSGlassEffectView`), which refracts the window's
+                // backdrop with edge lensing and highlights instead of the
+                // plain frosted blur of `NSVisualEffectView`. Fall back to
+                // the blurred view when the class isn't available, and use
+                // it always for the opaque-window Mica modes (the glass
+                // view needs a non-opaque window to sample the desktop).
+                let glass_class = if background_appearance == WindowBackgroundAppearance::Blurred {
+                    Class::get("NSGlassEffectView")
                 } else {
-                    0
+                    None
                 };
+                let blur_view: id = if let Some(glass_class) = glass_class {
+                    let view: id = msg_send![glass_class, alloc];
+                    NSView::initWithFrame_(view, frame)
+                } else if opaque_window {
+                    // Mica: a plain, natively-configured visual effect
+                    // view with the real sidebar material. BlurredView's
+                    // Selection material + stripped backdrop layers are
+                    // tuned for the colorless non-opaque blur; what
+                    // remains of them in an opaque window renders as a
+                    // glowing wash instead of glass.
+                    let view: id = msg_send![class!(NSVisualEffectView), alloc];
+                    let view: id = NSView::initWithFrame_(view, frame);
+                    NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Sidebar);
+                    NSVisualEffectView::setState_(
+                        view,
+                        NSVisualEffectState::FollowsWindowActiveState,
+                    );
+                    view
+                } else {
+                    let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+                    NSView::initWithFrame_(view, frame)
+                };
+                blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                apply_glass_style(blur_view, this.glass_style);
+                apply_glass_tint(blur_view, this.glass_tint);
 
-                let window_number = this.native_window.windowNumber();
-                CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, blur_radius);
-            } else {
-                // On newer macOS `NSVisualEffectView` manages the effect layer directly. Using it
-                // could have a better performance (it downsamples the backdrop) and more control
-                // over the effect layer.
-                let wants_backdrop_view = matches!(
-                    background_appearance,
-                    WindowBackgroundAppearance::Blurred
-                        | WindowBackgroundAppearance::MicaBackdrop
-                        | WindowBackgroundAppearance::MicaAltBackdrop
-                );
-                // Recreate on appearance changes so Blurred ↔ Mica switches
-                // swap the backing view class (glass vs visual-effect).
-                if appearance_changed || !wants_backdrop_view {
-                    if let Some(blur_view) = this.blurred_view {
-                        NSView::removeFromSuperview(blur_view);
-                        this.blurred_view = None;
-                    }
-                }
-                if wants_backdrop_view && this.blurred_view.is_none() {
-                    let content_view = this.native_window.contentView();
-                    let frame = NSView::bounds(content_view);
-                    // On macOS 26+ use the native Liquid Glass material
-                    // (`NSGlassEffectView`), which refracts the window's
-                    // backdrop with edge lensing and highlights instead of the
-                    // plain frosted blur of `NSVisualEffectView`. Fall back to
-                    // the blurred view when the class isn't available, and use
-                    // it always for the opaque-window Mica modes (the glass
-                    // view needs a non-opaque window to sample the desktop).
-                    let glass_class = if background_appearance
-                        == WindowBackgroundAppearance::Blurred
-                    {
-                        Class::get("NSGlassEffectView")
-                    } else {
-                        None
-                    };
-                    let blur_view: id = if let Some(glass_class) = glass_class {
-                        let view: id = msg_send![glass_class, alloc];
-                        NSView::initWithFrame_(view, frame)
-                    } else if opaque_window {
-                        // Mica: a plain, natively-configured visual effect
-                        // view with the real sidebar material. BlurredView's
-                        // Selection material + stripped backdrop layers are
-                        // tuned for the colorless non-opaque blur; what
-                        // remains of them in an opaque window renders as a
-                        // glowing wash instead of glass.
-                        let view: id = msg_send![class!(NSVisualEffectView), alloc];
-                        let view: id = NSView::initWithFrame_(view, frame);
-                        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Sidebar);
-                        NSVisualEffectView::setState_(
-                            view,
-                            NSVisualEffectState::FollowsWindowActiveState,
-                        );
-                        view
-                    } else {
-                        let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
-                        NSView::initWithFrame_(view, frame)
-                    };
-                    blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
-                    apply_glass_style(blur_view, this.glass_style);
-                    apply_glass_tint(blur_view, this.glass_tint);
-
-                    let _: () = msg_send![
-                        content_view,
-                        addSubview: blur_view
-                        positioned: NSWindowOrderingMode::NSWindowBelow
-                        relativeTo: nil
-                    ];
-                    this.blurred_view = Some(blur_view.autorelease());
-                }
+                let _: () = msg_send![
+                    content_view,
+                    addSubview: blur_view
+                    positioned: NSWindowOrderingMode::NSWindowBelow
+                    relativeTo: nil
+                ];
+                this.blurred_view = Some(blur_view.autorelease());
             }
         }
     }
@@ -1962,6 +1954,135 @@ impl PlatformWindow for MacWindow {
             let app = NSApplication::sharedApplication(nil);
             let event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
+        }
+    }
+
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        let ExternalDragPayload::Files(paths) = payload;
+        if paths.entries().is_empty() {
+            log::warn!("start_external_drag declined: no paths");
+            return false;
+        }
+
+        let (native_view, native_window, last_left_mouse_down_event) = {
+            let state = self.0.lock();
+            (
+                state.native_view.as_ptr(),
+                state.native_window,
+                state.last_left_mouse_down_event.clone(),
+            )
+        };
+
+        let Some(last_left_mouse_down_event) = last_left_mouse_down_event else {
+            log::warn!("start_external_drag declined: no retained left mouse down event");
+            return false;
+        };
+
+        // SAFETY: This method runs on the AppKit/foreground path during drag initiation. The
+        // native view/window are retained by MacWindowState, copied out under a short lock above,
+        // and Objective-C results that may be nil are checked before use.
+        unsafe {
+            let event: id = Retained::as_ptr(&last_left_mouse_down_event)
+                .cast_mut()
+                .cast();
+            let dragging_items: id = msg_send![class!(NSMutableArray), array];
+            // AppKit keeps this frame's distance from the event's location as the drag image's
+            // offset from the cursor, so it has to stay anchored on `event`.
+            let location: NSPoint = msg_send![event, locationInWindow];
+            let frame = NSRect::new(
+                NSPoint::new(location.x - 16., location.y - 16.),
+                NSSize::new(32., 32.),
+            );
+
+            for (path, is_directory) in paths.entries() {
+                // Preserve non-UTF-8 paths
+                let Ok(path_bytes) = CString::new(path.as_os_str().as_bytes()) else {
+                    log::warn!("start_external_drag skipped path containing an interior nul byte");
+                    continue;
+                };
+
+                let url: id = msg_send![
+                    class!(NSURL),
+                    fileURLWithFileSystemRepresentation: path_bytes.as_ptr()
+                    isDirectory: is_directory.to_objc()
+                    relativeToURL: nil
+                ];
+
+                if url.is_null() {
+                    log::warn!("start_external_drag skipped path with nil NSURL");
+                    continue;
+                }
+
+                let item: id = msg_send![class!(NSDraggingItem), alloc];
+                let item: id = msg_send![item, initWithPasteboardWriter: url];
+                if item.is_null() {
+                    log::warn!("start_external_drag declined: NSDraggingItem allocation failed");
+                    continue;
+                }
+
+                // Resolve drag images lazily via `imageComponentsProvider` (Apple's
+                // recommendation for large item counts), and by file *type* rather than
+                // `iconForFile:`, which can synchronously hit LaunchServices, network
+                // mounts, or iCloud for every selected path and beachball drag startup.
+                // `iconForFileType:` is deprecated in favor of `iconForContentType:`,
+                // but the replacement requires macOS 11 and we target 10.15.
+                let file_type = if *is_directory {
+                    "public.folder".to_string()
+                } else {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| extension.to_string())
+                        .unwrap_or_else(|| "public.data".to_string())
+                };
+                let provider = ConcreteBlock::new(move || -> id {
+                    let component: id = msg_send![
+                        class!(NSDraggingImageComponent),
+                        draggingImageComponentWithKey: NSDraggingImageComponentIconKey
+                    ];
+                    let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+                    let icon: id = msg_send![workspace, iconForFileType: ns_string(&file_type)];
+                    let _: () = msg_send![component, setContents: icon];
+                    // Component frames are relative to the item's dragging frame.
+                    let _: () = msg_send![
+                        component,
+                        setFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(32., 32.))
+                    ];
+                    msg_send![class!(NSArray), arrayWithObject: component]
+                });
+                let provider = provider.copy();
+                let _: () = msg_send![item, setDraggingFrame: frame];
+                let _: () = msg_send![item, setImageComponentsProvider: provider];
+                let _: () = msg_send![dragging_items, addObject: item];
+                let _: () = msg_send![item, release];
+            }
+
+            let count: NSUInteger = msg_send![dragging_items, count];
+            if count == 0 {
+                log::warn!("start_external_drag declined: no dragging items");
+                return false;
+            }
+
+            let session: id = msg_send![
+                native_view,
+                beginDraggingSessionWithItems: dragging_items
+                event: event
+                source: native_window
+            ];
+
+            let started = !session.is_null();
+            if started {
+                self.0.lock().synthetic_drag_counter += 1;
+            }
+            log::debug!(
+                "start_external_drag completed: started={}, item_count={}",
+                started,
+                count
+            );
+            started
         }
     }
 
@@ -2419,6 +2540,19 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
     let window_height = lock.content_size().height;
+    let native_event_type = unsafe { native_event.eventType() };
+    match native_event_type {
+        NSEventType::NSLeftMouseDown => {
+            // AppKit owns `native_event` for the callback; retain it so the drag session can still
+            // be started later, once the pointer leaves the window.
+            lock.last_left_mouse_down_event =
+                unsafe { Retained::retain(native_event.cast::<Objc2Object>()) };
+        }
+        NSEventType::NSLeftMouseUp => {
+            lock.last_left_mouse_down_event = None;
+        }
+        _ => {}
+    }
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
@@ -3044,27 +3178,26 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
 }
 
 extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
-    // `setAppearance:` fires this observer synchronously, so a programmatic
-    // appearance change made while GPUI is mid-update (e.g. deferred from a
-    // draw) would re-enter the app and hit an already-borrowed RefCell.
-    // Deliver the notification on the next main-queue turn instead.
-    extern "C" fn notify_appearance_changed(context: *mut c_void) {
-        let state = unsafe { Arc::from_raw(context as *const Mutex<MacWindowState>) };
-        let appearance_changed_callback = state.lock().appearance_changed_callback.take();
+    // The reentrancy hazard here (`setAppearance:` fires this observer
+    // synchronously, so a programmatic appearance change made while GPUI holds
+    // an `App` borrow would re-enter it) is handled upstream in
+    // `gpui::Window`'s `on_appearance_changed` callback, which defers the
+    // update onto the foreground executor.
+    unsafe {
+        let state = get_window_state(this);
+        let appearance_changed_callback = {
+            let mut lock = state.as_ref().lock();
+            lock.appearance_changed_callback.take()
+        };
+
         if let Some(mut callback) = appearance_changed_callback {
             callback();
             state.lock().appearance_changed_callback = Some(callback);
         }
 
         // AppKit can relayout the standard traffic light buttons as part of
-        // applying a new appearance. Reapply GPUI's custom position after
-        // notifying appearance observers.
+        // applying a new appearance, so reapply GPUI's custom position.
         state.lock().move_traffic_light();
-    }
-
-    unsafe {
-        let state = get_window_state(this);
-        DispatchQueue::main().exec_async_f(Arc::into_raw(state) as *mut c_void, notify_appearance_changed);
     }
 }
 
@@ -3112,7 +3245,15 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
     point(px(window_x as f32), px(window_y as f32))
 }
 
+fn is_drag_from_this_window(this: &Object, dragging_info: id) -> bool {
+    let source: id = unsafe { msg_send![dragging_info, draggingSource] };
+    std::ptr::eq(source as *const Object, this as *const Object)
+}
+
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+    if is_drag_from_this_window(this, dragging_info) {
+        return NSDragOperationNone;
+    }
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
     let paths = external_paths_from_event(dragging_info);
@@ -3125,6 +3266,9 @@ extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDr
 }
 
 extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+    if is_drag_from_this_window(this, dragging_info) {
+        return NSDragOperationNone;
+    }
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
     if send_file_drop_event(window_state, FileDropEvent::Pending { position }) {
@@ -3134,12 +3278,18 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     }
 }
 
-extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
+extern "C" fn dragging_exited(this: &Object, _: Sel, dragging_info: id) {
+    if is_drag_from_this_window(this, dragging_info) {
+        return;
+    }
     let window_state = unsafe { get_window_state(this) };
     send_file_drop_event(window_state, FileDropEvent::Exited);
 }
 
 extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
+    if is_drag_from_this_window(this, dragging_info) {
+        return NO;
+    }
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
     send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
@@ -3165,6 +3315,41 @@ fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     send_file_drop_event(window_state, FileDropEvent::Exited);
+}
+
+extern "C" fn dragging_session_source_operation_mask(
+    _: &Object,
+    _: Sel,
+    _: id,
+    context: NSInteger,
+) -> NSDragOperation {
+    let operation = match context {
+        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => NSDragOperationCopy,
+        NSDRAGGING_CONTEXT_WITHIN_APPLICATION => NSDragOperationCopy | NSDragOperationMove,
+        _ => NSDragOperationCopy | NSDragOperationMove,
+    };
+    log::debug!(
+        "dragging_session_source_operation_mask: context={}, operation={}",
+        context,
+        operation
+    );
+    operation
+}
+
+extern "C" fn dragging_session_ended(
+    this: &Object,
+    _: Sel,
+    _: id,
+    _: NSPoint,
+    operation: NSDragOperation,
+) {
+    log::debug!("dragging_session_ended operation={operation}");
+    // SAFETY: AppKit invokes this selector on the GPUIWindow instance registered in build_classes,
+    // which always has WINDOW_STATE_IVAR initialized to the owning MacWindowState.
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.lock();
+    lock.synthetic_drag_counter += 1;
+    lock.last_left_mouse_down_event = None;
 }
 
 async fn synthetic_drag(
