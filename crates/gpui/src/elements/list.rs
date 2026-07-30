@@ -1725,8 +1725,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div,
+        list, point, px, size,
     };
 
     #[gpui::test]
@@ -2969,5 +2969,91 @@ mod test {
              the bottom of its track, even when content has grown during the drag \
              (so frozen_bottom < live_bottom)"
         );
+    }
+
+    struct ListWithItemHandler {
+        state: ListState,
+        on_item_scroll: Rc<dyn Fn(&mut gpui::App)>,
+    }
+
+    impl Render for ListWithItemHandler {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let on_item_scroll = Rc::clone(&self.on_item_scroll);
+            list(self.state.clone(), move |_, _, _| {
+                let on_item_scroll = Rc::clone(&on_item_scroll);
+                div()
+                    .h(px(50.))
+                    .w_full()
+                    .child(
+                        div()
+                            .size_full()
+                            .block_mouse_except_scroll()
+                            .on_scroll_wheel(move |_, _, cx| on_item_scroll(cx)),
+                    )
+                    .into_any()
+            })
+            .w_full()
+            .h_full()
+        }
+    }
+
+    /// Draws a scrollable list whose items each carry a bubble-phase wheel handler, then
+    /// wheels over the first item. Returns whether the list moved.
+    fn scroll_over_item_handler(
+        cx: &mut TestAppContext,
+        on_item_scroll: impl Fn(&mut gpui::App) + 'static,
+    ) -> bool {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(8, crate::ListAlignment::Top, px(10.));
+        let view_state = state.clone();
+        let on_item_scroll = Rc::new(on_item_scroll);
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(100.)), |_, cx| {
+            cx.new(|_| ListWithItemHandler {
+                state: view_state,
+                on_item_scroll,
+            })
+            .into_any_element()
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(10.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            ..Default::default()
+        });
+        let top = state.logical_scroll_top();
+        top.item_ix > 0 || top.offset_in_item > px(0.)
+    }
+
+    /// The list registers its wheel listener before painting items, so a nested scrollable can
+    /// claim an event in the bubble phase. Without that ordering the list scrolls first and
+    /// `stop_propagation` from inside an item arrives too late.
+    #[gpui::test]
+    fn test_item_stop_propagation_prevents_list_scroll(cx: &mut TestAppContext) {
+        let observed = Rc::new(Cell::new(false));
+        let scrolled = scroll_over_item_handler(cx, {
+            let observed = Rc::clone(&observed);
+            move |cx| {
+                observed.set(true);
+                cx.stop_propagation();
+            }
+        });
+
+        assert!(observed.get(), "the item's handler should see the event");
+        assert!(
+            !scrolled,
+            "an item that stops propagation must keep the list still"
+        );
+    }
+
+    /// The complement: an item that observes without consuming still chains to the list.
+    #[gpui::test]
+    fn test_unconsumed_item_scroll_chains_to_list(cx: &mut TestAppContext) {
+        let observed = Rc::new(Cell::new(false));
+        let scrolled = scroll_over_item_handler(cx, {
+            let observed = Rc::clone(&observed);
+            move |_| observed.set(true)
+        });
+
+        assert!(observed.get(), "the item's handler should see the event");
+        assert!(scrolled, "an unconsumed event must still scroll the list");
     }
 }
