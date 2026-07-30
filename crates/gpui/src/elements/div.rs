@@ -3317,18 +3317,18 @@ impl Interactivity {
                         cx.notify(current_view);
                     }
                     if propagate_scroll_at_bounds_only {
-                        // A gesture already committed to an axis this element scrolls stays with
-                        // this element for its whole duration, even after the content runs out.
-                        // Handing it over at the bound would make a sideways flick that reaches
-                        // the end of a long line suddenly scroll the document underneath, and
-                        // the ancestor would jump mid-swipe. Breaking the lock is what releases
-                        // the gesture: push hard enough on the other axis and the filter unlocks,
-                        // the element stops matching, and the event chains normally.
-                        let owns_gesture = match locked_axis {
-                            Some(Axis::Horizontal) => overflow.x == Overflow::Scroll,
-                            Some(Axis::Vertical) => overflow.y == Overflow::Scroll,
-                            None => false,
-                        };
+                        // A gesture locked to the horizontal axis stays with a horizontal
+                        // scroller for its whole duration, even once the content runs out.
+                        // The asymmetry with the vertical axis is deliberate: vertical is the
+                        // ambient axis of almost every layout, so a vertical gesture that
+                        // exhausts a nested list should carry on in the document behind it,
+                        // which is what every platform does. Horizontal has no such ambient
+                        // meaning — chaining a sideways flick that reached the end of a long
+                        // line hands it to an ancestor that only scrolls vertically, and the
+                        // document jumps mid-swipe. Pushing hard enough on the other axis is
+                        // what releases the gesture: the filter unlocks, and the event chains.
+                        let owns_gesture =
+                            locked_axis == Some(Axis::Horizontal) && overflow.x == Overflow::Scroll;
                         if moved || owns_gesture {
                             cx.stop_propagation();
                         }
@@ -5547,5 +5547,66 @@ mod tests {
 
         assert_eq!(strip, px(-30.), "the vertical magnitude drives the strip");
         assert_eq!(document, Pixels::ZERO);
+    }
+
+    struct VerticalListInDocument {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+    }
+
+    impl Render for VerticalListInDocument {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("document")
+                .size(px(100.))
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    div()
+                        .id("nested-list")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.inner)
+                        .restrict_scroll_to_axis()
+                        .propagate_scroll_at_bounds_only()
+                        .child(div().w(px(100.)).h(px(100.))),
+                )
+                .child(div().w(px(100.)).h(px(400.)))
+        }
+    }
+
+    /// The other half of the asymmetry: vertical is the ambient axis, so a vertical gesture that
+    /// exhausts a nested vertical scroller must carry on in the document behind it. Only the
+    /// horizontal axis holds a gesture past its bound.
+    #[gpui::test]
+    fn test_vertical_gesture_chains_once_the_nested_list_is_exhausted(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let outer = ScrollHandle::new();
+        let inner = ScrollHandle::new();
+        let (view_outer, view_inner) = (outer.clone(), inner.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| VerticalListInDocument {
+                outer: view_outer,
+                inner: view_inner,
+            })
+            .into_any_element()
+        });
+
+        for _ in 0..3 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(10.), px(10.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                touch_phase: crate::TouchPhase::Moved,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(inner.offset().y, px(-50.), "the nested list is exhausted");
+        assert!(
+            outer.offset().y < Pixels::ZERO,
+            "the document must pick the gesture up, got {:?}",
+            outer.offset().y
+        );
     }
 }
