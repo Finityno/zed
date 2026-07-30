@@ -694,9 +694,8 @@ impl UniformList {
     ///
     /// See [`Style::restrict_scroll_to_axis`](crate::Style::restrict_scroll_to_axis).
     pub fn scroll_axis_lock(mut self, tuning: ScrollAxisLock) -> Self {
-        let base_style = &mut self.interactivity.base_style;
-        base_style.restrict_scroll_to_axis = Some(true);
-        base_style.scroll_axis_lock = Some(tuning);
+        self.interactivity.base_style.restrict_scroll_to_axis = Some(true);
+        self.interactivity.scroll_axis_lock = Some(tuning);
         self
     }
 

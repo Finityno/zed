@@ -8,8 +8,8 @@ use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, ScrollAxisLock, SharedString, Size, SizeRefinement, Styled, TextRun,
-    Window, black, phi, point, px, quad, rems, size,
+    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -218,10 +218,6 @@ pub struct Style {
     /// Ideally we would match the web's behavior and not have a need for this, but right now we're adding this opt-in
     /// style property to limit the potential blast radius.
     pub restrict_scroll_to_axis: bool,
-
-    /// How eagerly [`Style::restrict_scroll_to_axis`] commits a gesture to one axis, and how
-    /// hard the user has to push to break that lock. Ignored unless that flag is set.
-    pub scroll_axis_lock: ScrollAxisLock,
 
     /// Whether a wheel event this element actually scrolled should stop propagating.
     ///
@@ -809,7 +805,6 @@ impl Default for Style {
             },
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
-            scroll_axis_lock: ScrollAxisLock::BALANCED,
             propagate_scroll_at_bounds_only: false,
             scrollbar_width: AbsoluteLength::default(),
             position: Position::Relative,

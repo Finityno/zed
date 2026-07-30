@@ -1476,9 +1476,9 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     ///
     /// See [`ScrollAxisLock`](crate::ScrollAxisLock) for the shipped presets.
     fn scroll_axis_lock(mut self, tuning: ScrollAxisLock) -> Self {
-        let base_style = &mut self.interactivity().base_style;
-        base_style.restrict_scroll_to_axis = Some(true);
-        base_style.scroll_axis_lock = Some(tuning);
+        let interactivity = self.interactivity();
+        interactivity.base_style.restrict_scroll_to_axis = Some(true);
+        interactivity.scroll_axis_lock = Some(tuning);
         self
     }
 
@@ -2045,8 +2045,11 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
-    pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    pub(crate) ongoing_scroll: Option<Rc<Cell<OngoingScroll>>>,
     pub(crate) scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
+    /// Kept out of `Style`: a tuning is per scroll container, and `Style` is rebuilt and
+    /// refined for every element on every frame, so a 32-byte field there is paid app-wide.
+    pub(crate) scroll_axis_lock: Option<ScrollAxisLock>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2185,7 +2188,7 @@ impl Interactivity {
                     self.ongoing_scroll = Some(
                         element_state
                             .ongoing_scroll
-                            .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
+                            .get_or_insert_with(Rc::default)
                             .clone(),
                     );
                     self.scroll_max = Some(
@@ -3239,7 +3242,7 @@ impl Interactivity {
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
-            let scroll_axis_lock = style.scroll_axis_lock;
+            let scroll_axis_lock = self.scroll_axis_lock.unwrap_or(ScrollAxisLock::BALANCED);
             let propagate_scroll_at_bounds_only = style.propagate_scroll_at_bounds_only;
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
@@ -3255,7 +3258,7 @@ impl Interactivity {
                         && event.delta.precise()
                         && let Some(ongoing_scroll) = &ongoing_scroll
                     {
-                        let mut ongoing_scroll = ongoing_scroll.borrow_mut();
+                        let mut gesture = ongoing_scroll.get();
                         if event.modifiers.shift && overflow.x == Overflow::Scroll {
                             // Shift names the axis outright. Platforms only remap the axes for
                             // line-based wheels, so a Shift-modified trackpad swipe arrives with
@@ -3266,11 +3269,12 @@ impl Interactivity {
                                 delta.y
                             };
                             delta = point(magnitude, Pixels::ZERO);
-                            ongoing_scroll.lock_to(Axis::Horizontal);
+                            gesture.lock_to(Axis::Horizontal);
                         } else {
-                            ongoing_scroll.filter(&scroll_axis_lock, &mut delta, event.touch_phase);
+                            gesture.filter(&scroll_axis_lock, &mut delta, event.touch_phase);
                         }
-                        locked_axis = ongoing_scroll.axis();
+                        locked_axis = gesture.axis();
+                        ongoing_scroll.set(gesture);
                     }
 
                     let mut delta_x = match overflow.x {
@@ -3568,7 +3572,7 @@ pub struct InteractiveElementState {
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
-    ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    ongoing_scroll: Option<Rc<Cell<OngoingScroll>>>,
     scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
@@ -4105,7 +4109,7 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
-    ongoing_scroll: Rc<RefCell<OngoingScroll>>,
+    ongoing_scroll: Rc<Cell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     /// Shared so the paint-time scroll listener can clamp against the live bounds. Written
     /// during prepaint, read while dispatching a wheel event later in the same frame.

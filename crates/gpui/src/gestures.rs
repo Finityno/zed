@@ -21,11 +21,9 @@ use crate::{Axis, IsZero, Pixels, Point, TouchPhase, px};
 /// horizontally-scrolling region embedded in a long vertical document has to pick up sideways
 /// intent almost immediately or it feels stuck, while a viewer that fills the pane must not let
 /// an incidental sideways drift derail vertical reading. Pick the tuning per scroll container
-/// with [`Styled::scroll_axis_lock`](crate::Styled::scroll_axis_lock); users notice changes to
+/// with `scroll_axis_lock` on the container; users notice changes to
 /// these numbers, so prefer a named constant over an inline literal.
-#[derive(
-    Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollAxisLock {
     /// Gap after which an event begins a new gesture instead of continuing the current one.
     ///
