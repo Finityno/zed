@@ -16,13 +16,13 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    PinchEvent, Pixels, Point, Render, ScrollAxisLock, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     size,
 };
@@ -32,7 +32,7 @@ use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -1488,6 +1488,28 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Restrict scrolling to the input gesture's axis, with an explicit tuning for how eagerly
+    /// the gesture commits to an axis and how hard the user must push to break the lock.
+    ///
+    /// See [`ScrollAxisLock`](crate::ScrollAxisLock) for the shipped presets.
+    fn scroll_axis_lock(mut self, tuning: ScrollAxisLock) -> Self {
+        let interactivity = self.interactivity();
+        interactivity.base_style.restrict_scroll_to_axis = Some(true);
+        interactivity.scroll_axis_lock = Some(tuning);
+        self
+    }
+
+    /// Consume wheel events this element actually scrolled, so the gesture only chains to an
+    /// ancestor scroller once this element reaches the end of its content.
+    ///
+    /// See [`Style::propagate_scroll_at_bounds_only`](crate::Style::propagate_scroll_at_bounds_only).
+    fn propagate_scroll_at_bounds_only(mut self) -> Self {
+        self.interactivity()
+            .base_style
+            .propagate_scroll_at_bounds_only = Some(true);
+        self
+    }
+
     /// Track the scroll state of this element with the given handle.
     fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
         self.interactivity().tracked_scroll_handle = Some(scroll_handle.clone());
@@ -2045,7 +2067,11 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
-    pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    pub(crate) ongoing_scroll: Option<Rc<Cell<OngoingScroll>>>,
+    pub(crate) scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
+    /// Kept out of `Style`: a tuning is per scroll container, and `Style` is rebuilt and
+    /// refined for every element on every frame, so a 32-byte field there is paid app-wide.
+    pub(crate) scroll_axis_lock: Option<ScrollAxisLock>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2170,6 +2196,7 @@ impl Interactivity {
                     let scroll_handle_state = scroll_handle.0.borrow();
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
+                    self.scroll_max = Some(scroll_handle_state.max_offset.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
@@ -2183,7 +2210,13 @@ impl Interactivity {
                     self.ongoing_scroll = Some(
                         element_state
                             .ongoing_scroll
-                            .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
+                            .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
+                    self.scroll_max = Some(
+                        element_state
+                            .scroll_max
+                            .get_or_insert_with(Rc::default)
                             .clone(),
                     );
                 }
@@ -2369,8 +2402,14 @@ impl Interactivity {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
 
+            // Publish the live bounds so the paint-time wheel listener can tell an event it
+            // actually consumed from one that ran into the end of the content. Covers the
+            // untracked case too, where there is no `ScrollHandle` to read from.
+            if let Some(scroll_max_cell) = self.scroll_max.as_ref() {
+                scroll_max_cell.set(scroll_max);
+            }
+
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
-                scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
             }
 
@@ -2471,13 +2510,20 @@ impl Interactivity {
                                                 );
                                             }
 
+                                            // Registered ahead of the user's own listeners so
+                                            // that bubble dispatch (reverse registration order)
+                                            // gives `on_scroll_wheel` first refusal: a handler
+                                            // that stops propagation now prevents the scroll
+                                            // instead of merely observing one that already
+                                            // happened, and `propagate_scroll_at_bounds_only`
+                                            // cannot swallow the element's own handlers.
+                                            self.paint_scroll_listener(hitbox, &style, window, cx);
                                             self.paint_mouse_listeners(
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);
@@ -3225,9 +3271,12 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let scroll_max = self.scroll_max.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
+            let scroll_axis_lock = self.scroll_axis_lock.unwrap_or(ScrollAxisLock::BALANCED);
+            let propagate_scroll_at_bounds_only = style.propagate_scroll_at_bounds_only;
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
@@ -3237,19 +3286,42 @@ impl Interactivity {
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
 
+                    let mut locked_axis = None;
                     if restrict_scroll_to_axis
                         && event.delta.precise()
                         && let Some(ongoing_scroll) = &ongoing_scroll
                     {
-                        ongoing_scroll
-                            .borrow_mut()
-                            .filter(&mut delta, event.touch_phase);
+                        let mut gesture = ongoing_scroll.get();
+                        if event.modifiers.shift && overflow.x == Overflow::Scroll {
+                            // Shift names the axis outright. Platforms only remap the axes for
+                            // line-based wheels, so a Shift-modified trackpad swipe arrives with
+                            // its magnitude still on whichever axis the fingers moved along.
+                            let magnitude = if delta.x.abs() > delta.y.abs() {
+                                delta.x
+                            } else {
+                                delta.y
+                            };
+                            delta = point(magnitude, Pixels::ZERO);
+                            gesture.lock_to(Axis::Horizontal);
+                        } else {
+                            gesture.filter(&scroll_axis_lock, &mut delta, event.touch_phase);
+                        }
+                        locked_axis = gesture.axis();
+                        ongoing_scroll.set(gesture);
                     }
 
+                    // A container that scrolls one way takes the *other* axis's delta as a
+                    // fallback, which is the only way a wheel with no horizontal notch can
+                    // drive a horizontal strip. It is wrong for a trackpad: both axes are
+                    // already there, so remapping turns a sideways swipe into vertical travel
+                    // on every frame the platform happens to report an exact zero on the minor
+                    // axis. Restricting to the gesture's axis opts out of it entirely.
+                    let cross_axis_wheel_fallback =
+                        !restrict_scroll_to_axis && !event.delta.precise();
                     let mut delta_x = match overflow.x {
                         Overflow::Scroll if !delta.x.is_zero() => delta.x,
                         Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
+                            if cross_axis_wheel_fallback && overflow.y != Overflow::Scroll =>
                         {
                             delta.y
                         }
@@ -3258,7 +3330,7 @@ impl Interactivity {
                     let mut delta_y = match overflow.y {
                         Overflow::Scroll if !delta.y.is_zero() => delta.y,
                         Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
+                            if cross_axis_wheel_fallback && overflow.x != Overflow::Scroll =>
                         {
                             delta.x
                         }
@@ -3271,10 +3343,40 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    // Clamp here rather than leaving it to the next prepaint: whether the offset
+                    // actually changed is the signal for `propagate_scroll_at_bounds_only`, and
+                    // an unclamped offset reports movement even at the end of the content.
+                    if let Some(scroll_max) = scroll_max.as_ref().map(|scroll_max| scroll_max.get())
+                    {
+                        scroll_offset.x =
+                            (scroll_offset.x + delta_x).clamp(-scroll_max.x, Pixels::ZERO);
+                        scroll_offset.y =
+                            (scroll_offset.y + delta_y).clamp(-scroll_max.y, Pixels::ZERO);
+                    } else {
+                        scroll_offset.x += delta_x;
+                        scroll_offset.y += delta_y;
+                    }
+
+                    let moved = *scroll_offset != old_scroll_offset;
+                    if moved {
                         cx.notify(current_view);
+                    }
+                    if propagate_scroll_at_bounds_only {
+                        // A gesture locked to the horizontal axis stays with a horizontal
+                        // scroller for its whole duration, even once the content runs out.
+                        // The asymmetry with the vertical axis is deliberate: vertical is the
+                        // ambient axis of almost every layout, so a vertical gesture that
+                        // exhausts a nested list should carry on in the document behind it,
+                        // which is what every platform does. Horizontal has no such ambient
+                        // meaning — chaining a sideways flick that reached the end of a long
+                        // line hands it to an ancestor that only scrolls vertically, and the
+                        // document jumps mid-swipe. Pushing hard enough on the other axis is
+                        // what releases the gesture: the filter unlocks, and the event chains.
+                        let owns_gesture =
+                            locked_axis == Some(Axis::Horizontal) && overflow.x == Overflow::Scroll;
+                        if moved || owns_gesture {
+                            cx.stop_propagation();
+                        }
                     }
                 }
             });
@@ -3516,7 +3618,8 @@ pub struct InteractiveElementState {
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
-    ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    ongoing_scroll: Option<Rc<Cell<OngoingScroll>>>,
+    scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
 
@@ -4052,9 +4155,11 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
-    ongoing_scroll: Rc<RefCell<OngoingScroll>>,
+    ongoing_scroll: Rc<Cell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
-    max_offset: Point<Pixels>,
+    /// Shared so the paint-time scroll listener can clamp against the live bounds. Written
+    /// during prepaint, read while dispatching a wheel event later in the same frame.
+    max_offset: Rc<Cell<Point<Pixels>>>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
@@ -4099,7 +4204,7 @@ impl ScrollHandle {
 
     /// Get the maximum scroll offset.
     pub fn max_offset(&self) -> Point<Pixels> {
-        self.0.borrow().max_offset
+        self.0.borrow().max_offset.get()
     }
 
     /// Get the top child that's scrolled into view.
@@ -4275,9 +4380,11 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
-        MouseMoveEvent, PlatformInput, TestAppContext, canvas, size, util::FluentBuilder as _,
+        MouseMoveEvent, PlatformInput, ScrollDelta, TestAppContext, canvas, size,
+        util::FluentBuilder as _,
     };
-    use std::{cell::Cell, rc::Weak};
+    use std::cell::Cell;
+    use std::rc::Weak;
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,
@@ -5202,13 +5309,21 @@ mod tests {
 
         // Entering the group (over the id-less hover child) re-renders once.
         move_mouse(110., 150.);
-        assert_eq!(renders.get(), base + 1, "hover transition did not re-render exactly once");
+        assert_eq!(
+            renders.get(),
+            base + 1,
+            "hover transition did not re-render exactly once"
+        );
 
         // Moving within the hovered child/group does not re-render again.
         move_mouse(120., 150.);
         move_mouse(115., 160.);
         move_mouse(125., 145.);
-        assert_eq!(renders.get(), base + 1, "moves inside the hovered group re-rendered");
+        assert_eq!(
+            renders.get(),
+            base + 1,
+            "moves inside the hovered group re-rendered"
+        );
 
         // Crossing onto the group_hover child re-renders once (hover child
         // un-hovers); moving within it stays quiet.
@@ -5228,7 +5343,10 @@ mod tests {
 
         // Leaving the group re-renders again.
         move_mouse(10., 10.);
-        assert!(renders.get() > after_cross, "leaving the group did not re-render");
+        assert!(
+            renders.get() > after_cross,
+            "leaving the group did not re-render"
+        );
     }
 
     struct HoverWidthView {
@@ -5438,5 +5556,410 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+
+    struct NestedScrollers {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+        chain_at_bounds_only: bool,
+    }
+
+    impl Render for NestedScrollers {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("outer")
+                .size(px(100.))
+                .overflow_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    div()
+                        .id("inner")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_scroll()
+                        .track_scroll(&self.inner)
+                        .when(self.chain_at_bounds_only, |this| {
+                            this.propagate_scroll_at_bounds_only()
+                        })
+                        // Twice the inner viewport's height, so the inner has room to scroll.
+                        .child(div().w(px(100.)).h(px(100.))),
+                )
+                // Taller than the outer viewport, so the outer has room too.
+                .child(div().w(px(100.)).h(px(400.)))
+        }
+    }
+
+    /// Wheels twice over the nested scroller: enough to exhaust the inner's 50px of travel,
+    /// then once more. Returns (inner offset, outer offset).
+    fn scroll_nested(
+        cx: &mut TestAppContext,
+        chain_at_bounds_only: bool,
+        wheels: usize,
+    ) -> (Pixels, Pixels) {
+        let cx = cx.add_empty_window();
+        let outer = ScrollHandle::new();
+        let inner = ScrollHandle::new();
+        let (view_outer, view_inner) = (outer.clone(), inner.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| NestedScrollers {
+                outer: view_outer,
+                inner: view_inner,
+                chain_at_bounds_only,
+            })
+            .into_any_element()
+        });
+
+        for _ in 0..wheels {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(10.), px(10.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                ..Default::default()
+            });
+        }
+
+        (inner.offset().y, outer.offset().y)
+    }
+
+    /// GPUI's default: the event keeps bubbling, so both scrollers move on every wheel.
+    #[gpui::test]
+    fn test_nested_scroll_propagates_by_default(cx: &mut TestAppContext) {
+        let (inner, outer) = scroll_nested(cx, false, 1);
+
+        assert_eq!(inner, px(-40.));
+        assert_eq!(outer, px(-40.), "the ancestor scrolls at the same time");
+    }
+
+    /// With the opt-in, the inner scroller consumes what it can act on and the outer stays put.
+    #[gpui::test]
+    fn test_nested_scroll_consumed_when_inner_can_move(cx: &mut TestAppContext) {
+        let (inner, outer) = scroll_nested(cx, true, 1);
+
+        assert_eq!(inner, px(-40.));
+        assert_eq!(outer, Pixels::ZERO, "the ancestor must not move");
+    }
+
+    /// ...and once the inner runs out of content, the gesture chains to the outer.
+    #[gpui::test]
+    fn test_nested_scroll_chains_once_inner_is_at_its_bound(cx: &mut TestAppContext) {
+        let (inner, outer) = scroll_nested(cx, true, 3);
+
+        assert_eq!(inner, px(-50.), "inner is clamped to its own max offset");
+        assert!(
+            outer < Pixels::ZERO,
+            "wheels the inner could not consume must reach the outer, got {outer:?}"
+        );
+    }
+
+    /// A wheel event is clamped as it is handled, not a frame later, so the offset never
+    /// transiently exceeds the scrollable range.
+    #[gpui::test]
+    fn test_scroll_offset_is_clamped_at_event_time(cx: &mut TestAppContext) {
+        let (inner, _) = scroll_nested(cx, false, 5);
+
+        assert_eq!(inner, px(-50.));
+    }
+
+    struct AxisLockedRegion {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+    }
+
+    impl Render for AxisLockedRegion {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("outer")
+                .size(px(100.))
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    // A horizontally scrollable strip embedded in the vertical document, the
+                    // shape a code block or a wide table takes inside a transcript.
+                    div()
+                        .id("strip")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.inner)
+                        .scroll_axis_lock(ScrollAxisLock::EAGER_HORIZONTAL)
+                        .propagate_scroll_at_bounds_only()
+                        .child(div().w(px(400.)).h(px(50.))),
+                )
+                .child(div().w(px(100.)).h(px(400.)))
+        }
+    }
+
+    /// Wheels `deltas` over the embedded horizontal strip. Returns (strip offset, document
+    /// offset). `shift` is held for every event.
+    fn scroll_axis_locked_region(
+        cx: &mut TestAppContext,
+        shift: bool,
+        deltas: &[ScrollDelta],
+    ) -> (Pixels, Pixels) {
+        let cx = cx.add_empty_window();
+        let outer = ScrollHandle::new();
+        let inner = ScrollHandle::new();
+        let (view_outer, view_inner) = (outer.clone(), inner.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| AxisLockedRegion {
+                outer: view_outer,
+                inner: view_inner,
+            })
+            .into_any_element()
+        });
+
+        for delta in deltas {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(10.), px(10.)),
+                delta: *delta,
+                modifiers: Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+                touch_phase: crate::TouchPhase::Moved,
+                ..Default::default()
+            });
+        }
+
+        (inner.offset().x, outer.offset().y)
+    }
+
+    /// A sideways swipe that is still drifting downward scrolls the strip and leaves the
+    /// document alone — the eager tuning claims it, and the lock keeps the document still.
+    #[gpui::test]
+    fn test_axis_lock_claims_a_drifting_sideways_swipe(cx: &mut TestAppContext) {
+        let (strip, document) = scroll_axis_locked_region(cx, false, &[ScrollDelta::Pixels(point(px(-20.), px(-12.)))]);
+
+        assert_eq!(strip, px(-20.));
+        assert_eq!(document, Pixels::ZERO, "the document must not move");
+    }
+
+    /// A clearly vertical gesture is left to the document, even though the pointer is over the
+    /// strip: the strip does not scroll horizontally and does not consume the event.
+    #[gpui::test]
+    fn test_axis_lock_leaves_vertical_gestures_to_the_document(cx: &mut TestAppContext) {
+        let (strip, document) = scroll_axis_locked_region(cx, false, &[ScrollDelta::Pixels(point(px(-2.), px(-30.)))]);
+
+        assert_eq!(strip, Pixels::ZERO);
+        assert_eq!(document, px(-30.));
+    }
+
+    /// A horizontal gesture keeps the strip even after it runs out of content. Handing it over
+    /// at the bound would make a sideways flick at the end of a long line jump the document.
+    #[gpui::test]
+    fn test_axis_lock_keeps_the_gesture_past_the_horizontal_bound(cx: &mut TestAppContext) {
+        let swipe = ScrollDelta::Pixels(point(px(-150.), px(-12.)));
+        let (strip, document) = scroll_axis_locked_region(cx, false, &[swipe, swipe, swipe]);
+
+        assert_eq!(strip, px(-300.), "the strip is at its own max offset");
+        assert_eq!(
+            document,
+            Pixels::ZERO,
+            "the document must not pick up the tail of a sideways swipe"
+        );
+    }
+
+    /// Restricting to the gesture's axis also opts out of the cross-axis wheel fallback, which a
+    /// horizontal strip needs as much as a trackpad does: a plain vertical notch over a one-line
+    /// input that pans to follow its caret would otherwise drag the text out from under the
+    /// pointer instead of scrolling the page.
+    #[gpui::test]
+    fn test_axis_lock_leaves_a_vertical_wheel_to_the_document(cx: &mut TestAppContext) {
+        let (strip, document) =
+            scroll_axis_locked_region(cx, false, &[ScrollDelta::Lines(point(0., -2.))]);
+
+        assert_eq!(strip, Pixels::ZERO, "the strip must not pan sideways");
+        assert!(
+            document < Pixels::ZERO,
+            "the wheel belongs to the document, got {document:?}"
+        );
+    }
+
+    /// Shift names the axis outright. Platforms only remap the axes for line-based wheels, so a
+    /// Shift-modified *precise* gesture arrives with its magnitude on the vertical axis and has
+    /// to be redirected here.
+    #[gpui::test]
+    fn test_shift_forces_a_precise_gesture_horizontal(cx: &mut TestAppContext) {
+        let (strip, document) = scroll_axis_locked_region(cx, true, &[ScrollDelta::Pixels(point(px(0.), px(-30.)))]);
+
+        assert_eq!(strip, px(-30.), "the vertical magnitude drives the strip");
+        assert_eq!(document, Pixels::ZERO);
+    }
+
+    /// Two single-axis scrollers stacked vertically, neither restricted to the gesture's axis:
+    /// the shape almost every list, panel and one-line input takes. `vertical_only` occupies the
+    /// top half of the window, `horizontal_only` the bottom half.
+    struct UnrestrictedSingleAxisScrollers {
+        vertical_only: ScrollHandle,
+        horizontal_only: ScrollHandle,
+    }
+
+    impl Render for UnrestrictedSingleAxisScrollers {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size(px(100.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("vertical-only")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.vertical_only)
+                        .child(div().w(px(100.)).h(px(400.))),
+                )
+                .child(
+                    div()
+                        .id("horizontal-only")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.horizontal_only)
+                        .child(div().w(px(400.)).h(px(50.))),
+                )
+        }
+    }
+
+    /// Wheels one event at `position`. Returns (vertical-only offset.y, horizontal-only
+    /// offset.x) — each scroller's own axis, so a non-zero result means the delta reached it.
+    fn scroll_unrestricted_single_axis(
+        cx: &mut TestAppContext,
+        position: Point<Pixels>,
+        delta: ScrollDelta,
+    ) -> (Pixels, Pixels) {
+        let cx = cx.add_empty_window();
+        let vertical_only = ScrollHandle::new();
+        let horizontal_only = ScrollHandle::new();
+        let (view_vertical, view_horizontal) = (vertical_only.clone(), horizontal_only.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| UnrestrictedSingleAxisScrollers {
+                vertical_only: view_vertical,
+                horizontal_only: view_horizontal,
+            })
+            .into_any_element()
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta,
+            ..Default::default()
+        });
+
+        (vertical_only.offset().y, horizontal_only.offset().x)
+    }
+
+    /// A wheel with only one notch still drives a scroller that runs the other way. This is the
+    /// only way to scroll a horizontal strip with such a wheel, so the fallback has to stay.
+    #[gpui::test]
+    fn test_line_wheel_still_crosses_axes_on_a_single_axis_scroller(cx: &mut TestAppContext) {
+        let (vertical_only, _) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(10.)),
+            ScrollDelta::Lines(point(-2., 0.)),
+        );
+        assert!(
+            vertical_only < Pixels::ZERO,
+            "a sideways wheel notch must still scroll a vertical-only list, got {vertical_only:?}"
+        );
+
+        let (_, horizontal_only) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(60.)),
+            ScrollDelta::Lines(point(0., -2.)),
+        );
+        assert!(
+            horizontal_only < Pixels::ZERO,
+            "a vertical wheel notch must still pan a horizontal-only strip, got \
+             {horizontal_only:?}"
+        );
+    }
+
+    /// A trackpad already reports both axes, so the same fallback would turn a sideways swipe
+    /// into vertical travel — and a vertical swipe over a one-line input into sideways panning —
+    /// on every frame the platform reports an exact zero on the minor axis.
+    #[gpui::test]
+    fn test_precise_gesture_never_crosses_axes_on_a_single_axis_scroller(cx: &mut TestAppContext) {
+        let (vertical_only, _) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(10.)),
+            ScrollDelta::Pixels(point(px(-30.), Pixels::ZERO)),
+        );
+        assert_eq!(
+            vertical_only,
+            Pixels::ZERO,
+            "a sideways swipe must not scroll a vertical-only list"
+        );
+
+        let (_, horizontal_only) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(60.)),
+            ScrollDelta::Pixels(point(Pixels::ZERO, px(-30.))),
+        );
+        assert_eq!(
+            horizontal_only,
+            Pixels::ZERO,
+            "a vertical swipe must not pan a horizontal-only strip"
+        );
+    }
+
+    struct VerticalListInDocument {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+    }
+
+    impl Render for VerticalListInDocument {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("document")
+                .size(px(100.))
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    div()
+                        .id("nested-list")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.inner)
+                        .restrict_scroll_to_axis()
+                        .propagate_scroll_at_bounds_only()
+                        .child(div().w(px(100.)).h(px(100.))),
+                )
+                .child(div().w(px(100.)).h(px(400.)))
+        }
+    }
+
+    /// The other half of the asymmetry: vertical is the ambient axis, so a vertical gesture that
+    /// exhausts a nested vertical scroller must carry on in the document behind it. Only the
+    /// horizontal axis holds a gesture past its bound.
+    #[gpui::test]
+    fn test_vertical_gesture_chains_once_the_nested_list_is_exhausted(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let outer = ScrollHandle::new();
+        let inner = ScrollHandle::new();
+        let (view_outer, view_inner) = (outer.clone(), inner.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| VerticalListInDocument {
+                outer: view_outer,
+                inner: view_inner,
+            })
+            .into_any_element()
+        });
+
+        for _ in 0..3 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(10.), px(10.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                touch_phase: crate::TouchPhase::Moved,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(inner.offset().y, px(-50.), "the nested list is exhausted");
+        assert!(
+            outer.offset().y < Pixels::ZERO,
+            "the document must pick the gesture up, got {:?}",
+            outer.offset().y
+        );
     }
 }
