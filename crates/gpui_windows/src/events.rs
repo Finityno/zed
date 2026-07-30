@@ -1253,7 +1253,15 @@ impl WindowsWindowInner {
 
                     callback();
                     self.state.callbacks.appearance_changed.set(Some(callback));
-                    configure_dwm_dark_mode(handle, new_appearance);
+                    // An app-set appearance pin keeps winning over the new
+                    // system appearance (see `set_appearance_override`).
+                    configure_dwm_dark_mode(
+                        handle,
+                        self.state
+                            .appearance_override
+                            .get()
+                            .unwrap_or(new_appearance),
+                    );
                 }
             }
         }
