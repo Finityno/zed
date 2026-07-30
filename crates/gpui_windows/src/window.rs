@@ -49,6 +49,11 @@ pub struct WindowsWindowState {
     pub fullscreen_restore_bounds: Cell<Bounds<Pixels>>,
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
+    /// App-requested appearance pin. While set it wins over the system
+    /// appearance for `appearance()` and for the DWM dark-mode attribute, so
+    /// Mica's material (and its inactive solid fallback) follows the app's
+    /// theme rather than the OS setting.
+    pub appearance_override: Cell<Option<WindowAppearance>>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
@@ -161,6 +166,7 @@ impl WindowsWindowState {
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
             border_offset,
             appearance: Cell::new(appearance),
+            appearance_override: Cell::new(None),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
@@ -659,7 +665,19 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn appearance(&self) -> WindowAppearance {
-        self.state.appearance.get()
+        self.state
+            .appearance_override
+            .get()
+            .unwrap_or_else(|| self.state.appearance.get())
+    }
+
+    fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        if self.state.appearance_override.get() == appearance {
+            return;
+        }
+        self.state.appearance_override.set(appearance);
+        let effective = appearance.unwrap_or_else(|| self.state.appearance.get());
+        configure_dwm_dark_mode(self.0.hwnd, effective);
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
@@ -993,15 +1011,29 @@ impl PlatformWindow for WindowsWindow {
         // matching macOS and avoiding the GPU cost of the effect on inactive
         // windows. The user-requested appearance is kept; only the effective
         // rendering follows the active state.
-        let appearance = if self.is_active() {
+        let background_appearance = if self.is_active() {
             self.state.background_appearance.get()
         } else {
             WindowBackgroundAppearance::Opaque
         };
+        // The opaque base has to follow the window's effective appearance: a
+        // dark-themed window whose translucent fills composite over a white
+        // base flips light when it loses focus.
+        let clear_color = match background_appearance {
+            WindowBackgroundAppearance::Opaque => match self.appearance() {
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => {
+                    // AppKit's dark `textBackgroundColor`, the base macOS
+                    // inactive windows fall back to.
+                    [0x1E as f32 / 255.0, 0x1E as f32 / 255.0, 0x1E as f32 / 255.0, 1.0]
+                }
+                WindowAppearance::Light | WindowAppearance::VibrantLight => [1.0; 4],
+            },
+            _ => [0.0; 4],
+        };
         self.state
             .renderer
             .borrow_mut()
-            .draw(scene, appearance)
+            .draw(scene, clear_color)
             .log_err();
     }
 

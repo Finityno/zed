@@ -330,34 +330,23 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        scene: &Scene,
-        background_appearance: WindowBackgroundAppearance,
-    ) -> Result<()> {
+    pub(crate) fn draw(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
+        self.render(scene, clear_color)?;
         self.present()
     }
 
-    /// Clear the render target for `background_appearance` and encode every
-    /// primitive batch of `scene` into it, without presenting. Shared by
+    /// Clear the render target to `clear_color` and encode every primitive
+    /// batch of `scene` into it, without presenting. Shared by
     /// [`draw`](Self::draw) (which then presents) and
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
     /// instead), so the two cannot drift.
-    fn render(
-        &mut self,
-        scene: &Scene,
-        background_appearance: WindowBackgroundAppearance,
-    ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
+    fn render(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
+        self.pre_draw(&clear_color)?;
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -428,7 +417,13 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
-        self.render(scene, background_appearance)?;
+        self.render(
+            scene,
+            match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+        )?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let device = &devices.device;
