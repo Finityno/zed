@@ -8,8 +8,8 @@ use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    PointRefinement, Rgba, ScrollAxisLock, SharedString, Size, SizeRefinement, Styled, TextRun,
+    Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -218,6 +218,24 @@ pub struct Style {
     /// Ideally we would match the web's behavior and not have a need for this, but right now we're adding this opt-in
     /// style property to limit the potential blast radius.
     pub restrict_scroll_to_axis: bool,
+
+    /// How eagerly [`Style::restrict_scroll_to_axis`] commits a gesture to one axis, and how
+    /// hard the user has to push to break that lock. Ignored unless that flag is set.
+    pub scroll_axis_lock: ScrollAxisLock,
+
+    /// Whether a wheel event this element actually scrolled should stop propagating.
+    ///
+    /// GPUI's default is to let every scroll event keep bubbling, so an ancestor scroller moves
+    /// at the same time as the element under the pointer. Setting this makes the element consume
+    /// events it consumed and pass on the ones it could not act on — a nested scroller scrolls
+    /// alone until it reaches the end of its content, and only then does the gesture chain to
+    /// the parent. This is the behavior browsers give you for free (`overscroll-behavior: auto`).
+    ///
+    /// Only events that moved this element's scroll offset are consumed. Events on an axis this
+    /// element does not scroll, and events that arrive when it is already at that bound, still
+    /// propagate. The element's own `on_scroll_wheel` handlers are unaffected: they are dispatched
+    /// before this listener consumes anything.
+    pub propagate_scroll_at_bounds_only: bool,
 
     // Position properties
     /// What should the `position` value of this struct use as a base offset?
@@ -791,6 +809,8 @@ impl Default for Style {
             },
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
+            scroll_axis_lock: ScrollAxisLock::BALANCED,
+            propagate_scroll_at_bounds_only: false,
             scrollbar_width: AbsoluteLength::default(),
             position: Position::Relative,
             inset: Edges::auto(),
