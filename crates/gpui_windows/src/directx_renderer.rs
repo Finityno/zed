@@ -330,20 +330,13 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        scene: &Scene,
-        background_appearance: WindowBackgroundAppearance,
-    ) -> Result<()> {
+    pub(crate) fn draw(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
+        self.pre_draw(&clear_color)?;
 
         self.upload_scene_buffers(scene)?;
 
