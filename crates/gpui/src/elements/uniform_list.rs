@@ -7,8 +7,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, px, size,
+    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollAxisLock, ScrollHandle,
+    Size, StyleRefinement, Styled, Window, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc};
@@ -683,6 +683,30 @@ impl UniformList {
     pub fn track_scroll(mut self, handle: &UniformListScrollHandle) -> Self {
         self.interactivity.tracked_scroll_handle = Some(handle.0.borrow().base_handle.clone());
         self.scroll_handle = Some(handle.clone());
+        self
+    }
+
+    /// Restrict scrolling to the input gesture's axis, with an explicit tuning.
+    ///
+    /// A vertical list nested inside a horizontal scroller needs this: without it, the sideways
+    /// swipe meant for the horizontal parent still carries a small vertical component, and this
+    /// list — which sees the event first, being the innermost — creeps downward through it.
+    ///
+    /// See [`Style::restrict_scroll_to_axis`](crate::Style::restrict_scroll_to_axis).
+    pub fn scroll_axis_lock(mut self, tuning: ScrollAxisLock) -> Self {
+        self.interactivity.base_style.restrict_scroll_to_axis = Some(true);
+        self.interactivity.scroll_axis_lock = Some(tuning);
+        self
+    }
+
+    /// Consume wheel events this list actually scrolled, so a gesture only chains to an ancestor
+    /// scroller once the list reaches the end of its content.
+    ///
+    /// See [`Style::propagate_scroll_at_bounds_only`](crate::Style::propagate_scroll_at_bounds_only).
+    pub fn propagate_scroll_at_bounds_only(mut self) -> Self {
+        self.interactivity
+            .base_style
+            .propagate_scroll_at_bounds_only = Some(true);
         self
     }
 
