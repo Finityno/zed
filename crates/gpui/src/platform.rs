@@ -82,7 +82,7 @@ pub use keystroke::*;
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream, TestWindow};
 
 #[cfg(any(test, feature = "bench"))]
 pub use bench_dispatcher::BenchDispatcher;

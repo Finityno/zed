@@ -2290,20 +2290,17 @@ mod rendered_pixel_tests {
     /// instance buffer, batching, atlas binding, shader — shows up here as missing ink.
     ///
     /// Swept over sub-pixel origins, the axis the reported dropouts were sensitive to.
-    #[test]
-    fn shaped_text_reaches_the_framebuffer() {
-        let Some(devices) = DirectXDevices::new().log_err() else {
-            eprintln!("SKIPPED: no D3D11 adapter");
-            return;
-        };
-        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
-            eprintln!("SKIPPED: no DirectWrite text system");
-            return;
-        };
-        if DirectXHeadlessRenderer::new().is_none() {
-            eprintln!("SKIPPED: no headless renderer");
-            return;
-        }
+    ///
+    /// `subpixel` picks which glyph pipeline to exercise. It matters more than it looks: the two
+    /// share only the shaper. Subpixel glyphs go to a separate RGBA8 atlas, become
+    /// `SubpixelSprite`s, and are drawn by a different shader under a dual-source blend state.
+    /// Windows always takes that path in production and macOS can never take it.
+    fn sweep_origins(subpixel: bool) -> Option<Vec<String>> {
+        let devices = DirectXDevices::new().log_err()?;
+        let text_system = DirectWriteTextSystem::new(&devices).log_err()?;
+        DirectXHeadlessRenderer::new()?;
+
+        gpui::TestWindow::set_subpixel_rendering_supported(subpixel);
 
         let mut cx = TestAppContext::build_with_platform(
             TestDispatcher::new(0),
@@ -2316,7 +2313,7 @@ mod rendered_pixel_tests {
         );
 
         let mut failures = Vec::new();
-        let mut reference_runs: Option<usize> = None;
+        let mut reference_ink: Option<u64> = None;
 
         for origin_x in [0.0f32, 0.25, 0.5, 0.75, 1.3] {
             for origin_y in [4.0f32, 4.5, 11.25] {
@@ -2328,9 +2325,12 @@ mod rendered_pixel_tests {
                 })
                 .unwrap();
 
-                let (sprites, image) = cx
+                let ((monochrome, subpixel_sprites), image) = cx
                     .update_window(window.into(), |_, window, _| {
-                        (window.rendered_glyph_sprite_count(), window.render_to_image())
+                        (
+                            window.rendered_glyph_sprite_counts(),
+                            window.render_to_image(),
+                        )
                     })
                     .unwrap();
                 let image = image.expect("rendering the scene should succeed");
@@ -2338,17 +2338,27 @@ mod rendered_pixel_tests {
                 // Eyeballing the actual output is often faster than reading numbers, so allow
                 // dumping it: GPUI_DUMP_RENDERED_TEXT=<dir> writes one PNG per origin.
                 if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
+                    let kind = if subpixel { "subpixel" } else { "grayscale" };
                     let path = std::path::Path::new(&directory)
-                        .join(format!("text-{origin_x}-{origin_y}.png"));
+                        .join(format!("text-{kind}-{origin_x}-{origin_y}.png"));
                     image.save(&path).log_err();
                 }
 
-                if sprites == 0 {
+                // Guard against the test silently covering the wrong pipeline.
+                let (expected, wrong) = if subpixel {
+                    (subpixel_sprites, monochrome)
+                } else {
+                    (monochrome, subpixel_sprites)
+                };
+                if expected == 0 || wrong != 0 {
                     failures.push(format!(
-                        "  origin ({origin_x}, {origin_y}): no glyph sprites in the scene"
+                        "  origin ({origin_x}, {origin_y}): wanted the {} pipeline but got \
+                         {monochrome} monochrome and {subpixel_sprites} subpixel sprites",
+                        if subpixel { "subpixel" } else { "grayscale" },
                     ));
                     continue;
                 }
+                let sprites = expected;
                 if runs == 0 {
                     failures.push(format!(
                         "  origin ({origin_x}, {origin_y}): {sprites} sprites in the scene but \
@@ -2356,22 +2366,60 @@ mod rendered_pixel_tests {
                     ));
                     continue;
                 }
-                // The same string at a different sub-pixel offset must not lose whole glyph
-                // groups. One run of slack absorbs glyphs merging or splitting as anti-aliasing
-                // shifts.
-                match reference_runs {
-                    None => reference_runs = Some(runs),
-                    Some(reference) if runs + 1 < reference => failures.push(format!(
-                        "  origin ({origin_x}, {origin_y}): {runs} lit runs on screen but \
-                         {reference} at the reference origin, with {sprites} sprites in the \
-                         scene — ink went missing in the draw path"
+                // Total ink is the load-bearing measurement, not the run count. Run count moves
+                // for a benign reason: at some sub-pixel offsets neighbouring glyphs touch and
+                // merge into one run, which is why this string reports 19 runs at x=0.0 and 17
+                // at x=0.25 on both pipelines while rendering identically. Ink mass does not
+                // care about merging — a glyph that actually failed to draw removes its
+                // coverage, and one missing character out of twenty is a multi-percent drop,
+                // far outside the sub-0.01% wobble that anti-aliasing produces.
+                let ink: u64 = image
+                    .pixels()
+                    .map(|p| (p[0] as u64 + p[1] as u64 + p[2] as u64) / 3)
+                    .sum();
+                match reference_ink {
+                    None => reference_ink = Some(ink),
+                    Some(reference) if ink * 100 < reference * 98 => failures.push(format!(
+                        "  origin ({origin_x}, {origin_y}): {ink} ink on screen but {reference} \
+                         at the reference origin, with {sprites} sprites in the scene — ink went \
+                         missing in the draw path"
                     )),
                     Some(_) => {}
                 }
-                eprintln!("  origin ({origin_x}, {origin_y}): {sprites} sprites, {runs} lit runs");
+                eprintln!(
+                    "  origin ({origin_x}, {origin_y}): {sprites} sprites, {runs} lit runs, \
+                     ink {ink}"
+                );
             }
         }
 
+        Some(failures)
+    }
+
+    #[test]
+    fn shaped_text_reaches_the_framebuffer_grayscale() {
+        let Some(failures) = sweep_origins(false) else {
+            eprintln!("SKIPPED: no D3D11 adapter, DirectWrite or headless renderer");
+            return;
+        };
+        assert!(
+            failures.is_empty(),
+            "{} origin(s) lost text between the scene and the framebuffer:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The pipeline fincode actually runs on Windows. Every earlier harness in this
+    /// investigation went through `TestAppContext`, whose window reported subpixel rendering as
+    /// unsupported, so they all covered the grayscale path — on Windows hardware, but never the
+    /// Windows code.
+    #[test]
+    fn shaped_text_reaches_the_framebuffer_subpixel() {
+        let Some(failures) = sweep_origins(true) else {
+            eprintln!("SKIPPED: no D3D11 adapter, DirectWrite or headless renderer");
+            return;
+        };
         assert!(
             failures.is_empty(),
             "{} origin(s) lost text between the scene and the framebuffer:\n{}",
