@@ -346,8 +346,16 @@ impl TextSystem {
             //
             // Legitimately blank glyphs (space and friends) still get cached, so the common
             // path keeps its single platform call per glyph.
+            // Bounded by size on purpose. Below a few device pixels an inked glyph can round
+            // away to nothing legitimately, and refusing to cache that would re-query the
+            // platform for every such glyph on every frame. Only sizes where an empty raster
+            // is unambiguously wrong are retried.
+            const MIN_RETRY_DEVICE_PIXELS: f32 = 4.0;
             let rasterized_empty = bounds.size.width.0 == 0 || bounds.size.height.0 == 0;
-            if rasterized_empty && self.glyph_has_ink(params) {
+            if rasterized_empty
+                && params.font_size.0 * params.scale_factor >= MIN_RETRY_DEVICE_PIXELS
+                && self.glyph_has_ink(params)
+            {
                 self.report_empty_raster_bounds(params);
                 return Ok(bounds);
             }

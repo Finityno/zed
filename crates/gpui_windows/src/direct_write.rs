@@ -221,6 +221,45 @@ impl DirectWriteTextSystem {
     pub(crate) fn handle_gpu_lost(&self, directx_devices: &DirectXDevices) -> Result<()> {
         self.state.write().handle_gpu_lost(directx_devices)
     }
+
+    /// Whether DirectWrite recommends bi-level rendering for this configuration, asked exactly
+    /// the way `create_glyph_run_analysis` asks it. Used to check whether the ALIASED remap
+    /// there guards a real case on this machine or is dead code.
+    #[cfg(test)]
+    pub(crate) fn recommends_aliased_rendering(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        scale_factor: f32,
+    ) -> bool {
+        let lock = self.state.read();
+        let font = &lock.fonts[font_id.0];
+        let transform = DWRITE_MATRIX {
+            m11: scale_factor,
+            m12: 0.0,
+            m21: 0.0,
+            m22: scale_factor,
+            dx: 0.0,
+            dy: 0.0,
+        };
+        let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
+        let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();
+        let queried = unsafe {
+            font.font_face.GetRecommendedRenderingMode(
+                font_size.as_f32(),
+                96.0,
+                96.0,
+                Some(&transform),
+                false,
+                DWRITE_OUTLINE_THRESHOLD_ANTIALIASED,
+                DWRITE_MEASURING_MODE_NATURAL,
+                None,
+                &mut rendering_mode,
+                &mut grid_fit_mode,
+            )
+        };
+        queried.is_ok() && rendering_mode == DWRITE_RENDERING_MODE1_ALIASED
+    }
 }
 
 impl PlatformTextSystem for DirectWriteTextSystem {
@@ -2372,6 +2411,36 @@ mod glyph_pipeline_tests {
         report(
             &failures,
             "paint outside the pre-cull box, so they can be dropped while visible",
+        );
+    }
+
+    /// Diagnostic: does DirectWrite ever recommend ALIASED on this machine?
+    ///
+    /// `create_glyph_run_analysis` remaps ALIASED to NATURAL_SYMMETRIC when the caller is about
+    /// to request a ClearType 3x1 texture, because `GetAlphaTextureBounds` returns EMPTY for
+    /// that combination and the glyph is then silently skipped. That remap is only worth
+    /// carrying if ALIASED actually occurs. This reports what the platform returns rather than
+    /// asserting, so it documents the answer without failing when the answer is "never".
+    #[test]
+    fn report_recommended_rendering_modes() {
+        let Some(Sweep { system, fonts, .. }) = sweep() else {
+            return;
+        };
+        let mut aliased = 0;
+        let mut total = 0;
+        for (family, font_id) in &fonts {
+            for &font_size in FONT_SIZES {
+                for &scale_factor in SCALE_FACTORS {
+                    total += 1;
+                    if system.recommends_aliased_rendering(*font_id, px(font_size), scale_factor) {
+                        aliased += 1;
+                        eprintln!("  ALIASED: {family} {font_size}px @{scale_factor}x");
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "DirectWrite recommended ALIASED for {aliased}/{total} (font, size, scale)              combinations"
         );
     }
 

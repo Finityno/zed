@@ -111,11 +111,12 @@ impl Scene {
             // word. `paint_line` pre-culls with the font's MAX bounding box at the pen
             // position, whereas this culls the glyph's actual quad, so a glyph can pass the
             // coarse check and still be dropped here — scattered singles, neighbours intact.
-            if glyph_drop_logging_enabled()
-                && matches!(
-                    primitive,
-                    Primitive::MonochromeSprite(_) | Primitive::SubpixelSprite(_)
-                )
+            // Kind first: this branch runs for every offscreen glyph while scrolling, and the
+            // discriminant check is cheaper than the flag's atomic load.
+            if matches!(
+                primitive,
+                Primitive::MonochromeSprite(_) | Primitive::SubpixelSprite(_)
+            ) && glyph_drop_logging_enabled()
             {
                 log::warn!(
                     "culled a glyph sprite: bounds {:?} do not intersect content mask {:?}",
