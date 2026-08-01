@@ -49,6 +49,10 @@ pub(crate) struct DirectXRenderer {
     width: u32,
     height: u32,
 
+    /// Render into an owned offscreen texture rather than the swap chain, so frames can be
+    /// read back. Preserved across device-lost recovery.
+    headless: bool,
+
     /// Whether we want to skip drwaing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -81,6 +85,11 @@ struct DirectXResources {
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+
+    /// Render into an owned offscreen texture instead of the swap chain back buffer. A
+    /// flip-model back buffer is not a dependable `CopyResource` source, so headless
+    /// rendering needs a target it can actually read back.
+    headless: bool,
 }
 
 struct DirectXRenderPipelines {
@@ -167,7 +176,7 @@ impl DirectXRenderer {
             .context("Creating DirectX devices")?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
-        let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
+        let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition, false)
             .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectX global elements")?;
@@ -196,8 +205,106 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
+            headless: false,
             skip_draws: false,
         })
+    }
+
+    /// A renderer with no window behind it, for rendering scenes to images in tests.
+    ///
+    /// Uses a composition swap chain, which unlike the HWND variant needs no window to exist,
+    /// and skips DirectComposition entirely (that does need an HWND). Everything downstream —
+    /// pipelines, shaders, blend states, the atlas — is the same as the windowed path, which is
+    /// the point: an image produced here went through the real renderer.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn new_headless(directx_devices: &DirectXDevices) -> Result<Self> {
+        let devices = DirectXRendererDevices::new(directx_devices, false)
+            .context("Creating DirectX devices")?;
+        let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
+        let resources = DirectXResources::new(&devices, 1, 1, HWND::default(), false, true)
+            .context("Creating DirectX resources")?;
+        let globals = DirectXGlobalElements::new(&devices.device)
+            .context("Creating DirectX global elements")?;
+        let pipelines = DirectXRenderPipelines::new(&devices.device)
+            .context("Creating DirectX render pipelines")?;
+
+        Ok(DirectXRenderer {
+            hwnd: HWND::default(),
+            atlas,
+            devices: Some(devices),
+            resources: Some(resources),
+            globals,
+            pipelines,
+            direct_composition: None,
+            font_info: Self::get_font_info(),
+            width: 1,
+            height: 1,
+            headless: true,
+            skip_draws: false,
+        })
+    }
+
+    /// Copies the render target back to the CPU as RGBA.
+    ///
+    /// Must be called after `draw` and before any present. The render target is
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM`, so the channels are swapped on the way out.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn read_back_render_target(&self) -> Result<image::RgbaImage> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING,
+        };
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("render target missing")?;
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut desc) };
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+            ..desc
+        };
+
+        let mut staging: Option<ID3D11Texture2D> = None;
+        unsafe {
+            devices
+                .device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+        }
+        .context("Creating staging texture for readback")?;
+        let staging = staging.context("staging texture missing")?;
+
+        let mut pixels = vec![0u8; (desc.Width * desc.Height * 4) as usize];
+        unsafe {
+            devices.device_context.CopyResource(&staging, render_target);
+            let mut mapped = std::mem::zeroed();
+            devices
+                .device_context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Mapping staging texture")?;
+            for row in 0..desc.Height as usize {
+                let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+                let destination = row * desc.Width as usize * 4;
+                for column in 0..desc.Width as usize {
+                    let bgra = source.add(column * 4);
+                    let rgba = &mut pixels[destination + column * 4..][..4];
+                    rgba[0] = *bgra.add(2);
+                    rgba[1] = *bgra.add(1);
+                    rgba[2] = *bgra;
+                    rgba[3] = *bgra.add(3);
+                }
+            }
+            devices.device_context.Unmap(&staging, 0);
+        }
+
+        image::RgbaImage::from_raw(desc.Width, desc.Height, pixels)
+            .context("Rendered pixels did not fit the image dimensions")
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -297,6 +404,7 @@ impl DirectXRenderer {
             self.height,
             self.hwnd,
             disable_direct_composition,
+            self.headless,
         )
         .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
@@ -894,6 +1002,7 @@ impl DirectXResources {
         height: u32,
         hwnd: HWND,
         disable_direct_composition: bool,
+        headless: bool,
     ) -> Result<Self> {
         let swap_chain = if disable_direct_composition {
             create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
@@ -914,11 +1023,12 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        ) = create_resources(devices, &swap_chain, width, height, headless)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             swap_chain,
+            headless,
             render_target: Some(render_target),
             render_target_view,
             path_intermediate_texture,
@@ -944,7 +1054,7 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        ) = create_resources(devices, &self.swap_chain, width, height, self.headless)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.path_intermediate_texture = path_intermediate_texture;
@@ -1379,6 +1489,7 @@ fn create_resources(
     swap_chain: &IDXGISwapChain1,
     width: u32,
     height: u32,
+    headless: bool,
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
@@ -1389,7 +1500,7 @@ fn create_resources(
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
-        create_render_target_and_its_view(swap_chain, &devices.device)?;
+        create_render_target_and_its_view(swap_chain, &devices.device, width, height, headless)?;
     let (path_intermediate_texture, path_intermediate_srv) =
         create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
@@ -1417,8 +1528,32 @@ fn create_resources(
 fn create_render_target_and_its_view(
     swap_chain: &IDXGISwapChain1,
     device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    headless: bool,
 ) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
-    let render_target: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }?;
+    let render_target: ID3D11Texture2D = if headless {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+        texture.context("Creating headless render target")?
+    } else {
+        unsafe { swap_chain.GetBuffer(0) }?
+    };
     let mut render_target_view = None;
     unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
     Ok((render_target, render_target_view))
@@ -2109,5 +2244,269 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+/// Renders scenes to images with no window, so tests can assert on the pixels the real
+/// DirectX pipeline actually produces rather than on the scene that was handed to it.
+#[cfg(feature = "test-support")]
+pub struct DirectXHeadlessRenderer {
+    renderer: DirectXRenderer,
+}
+
+#[cfg(feature = "test-support")]
+impl DirectXHeadlessRenderer {
+    /// Returns `None` when no usable D3D11 adapter is available, so callers can skip rather
+    /// than fail for a reason unrelated to what they are testing.
+    pub fn new() -> Option<Self> {
+        let devices = DirectXDevices::new().log_err()?;
+        let renderer = DirectXRenderer::new_headless(&devices).log_err()?;
+        Some(Self { renderer })
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl gpui::PlatformHeadlessRenderer for DirectXHeadlessRenderer {
+    fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<image::RgbaImage> {
+        self.renderer.resize(size)?;
+        // Opaque black, so anti-aliased text has a stable background to be measured against.
+        self.renderer.draw(scene, [0.0, 0.0, 0.0, 1.0])?;
+        self.renderer.read_back_render_target()
+    }
+
+    fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
+        self.renderer.resize(size)?;
+        self.renderer.draw(scene, [0.0, 0.0, 0.0, 1.0])
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        self.renderer.sprite_atlas()
+    }
+}
+
+
+/// Pixel-level verification through the real DirectX pipeline.
+///
+/// Every other harness in this crate stops at the scene: they prove the right sprites, with the
+/// right tiles, were handed to the renderer. This one renders that scene on the GPU with the
+/// real shaders, blend states and atlas bindings, reads the framebuffer back, and asserts the
+/// glyphs actually put ink on screen.
+///
+/// That closes the last gap in the "characters go missing" investigation — a glyph can be
+/// present and correct in the scene and still never appear, if the draw path loses it.
+#[cfg(all(test, feature = "test-support"))]
+mod rendered_pixel_tests {
+    use crate::{DirectWriteTextSystem, DirectXDevices, DirectXHeadlessRenderer};
+    use gpui::{
+        AppContext as _, ContentMask, Context, IntoElement, ParentElement as _, Pixels, Point,
+        Render, Styled as _, TestAppContext, TestDispatcher, TextAlign, TextRun, Window, canvas,
+        div, font, hsla, point, px, size,
+    };
+    use gpui_util::ResultExt as _;
+    use std::sync::Arc;
+
+    const TEXT: &str = "Changes in this project";
+    const FONT_SIZE: Pixels = px(16.);
+    const LINE_HEIGHT: Pixels = px(24.);
+
+    struct TextView {
+        origin: Point<Pixels>,
+    }
+
+    impl Render for TextView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let origin = self.origin;
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let runs = [TextRun {
+                            len: TEXT.len(),
+                            font: font(".SystemUIFont"),
+                            // White on the renderer's black clear colour, so ink is unambiguous.
+                            color: hsla(0., 0., 1., 1.),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }];
+                        let line = window
+                            .text_system()
+                            .shape_line(TEXT.into(), FONT_SIZE, &runs, None);
+                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            line.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
+                                .unwrap();
+                        });
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// Counts runs of columns containing ink. Adjacent glyphs can touch, so this is a lower
+    /// bound on the number of characters drawn — but a glyph dropping out removes or splits a
+    /// run, which is what a character missing from a word looks like.
+    fn lit_column_runs(image: &image::RgbaImage) -> usize {
+        let mut runs = 0;
+        let mut in_run = false;
+        for x in 0..image.width() {
+            let lit = (0..image.height()).any(|y| {
+                let pixel = image.get_pixel(x, y);
+                // Anti-aliased edges are dim; anything clearly above the black clear colour
+                // counts as ink.
+                pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > 90
+            });
+            if lit && !in_run {
+                runs += 1;
+            }
+            in_run = lit;
+        }
+        runs
+    }
+
+    /// Text that reached the scene has to reach the framebuffer. Anything lost between the two —
+    /// instance buffer, batching, atlas binding, shader — shows up here as missing ink.
+    ///
+    /// Swept over sub-pixel origins, the axis the reported dropouts were sensitive to.
+    ///
+    /// `subpixel` picks which glyph pipeline to exercise. It matters more than it looks: the two
+    /// share only the shaper. Subpixel glyphs go to a separate RGBA8 atlas, become
+    /// `SubpixelSprite`s, and are drawn by a different shader under a dual-source blend state.
+    /// Windows always takes that path in production and macOS can never take it.
+    fn sweep_origins(subpixel: bool) -> Option<Vec<String>> {
+        let devices = DirectXDevices::new().log_err()?;
+        let text_system = DirectWriteTextSystem::new(&devices).log_err()?;
+        DirectXHeadlessRenderer::new()?;
+
+        gpui::TestWindow::set_subpixel_rendering_supported(subpixel);
+
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(text_system),
+            Some(Box::new(|| {
+                DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+            })),
+        );
+
+        let mut failures = Vec::new();
+        let mut reference_ink: Option<u64> = None;
+
+        for origin_x in [0.0f32, 0.25, 0.5, 0.75, 1.3] {
+            for origin_y in [4.0f32, 4.5, 11.25] {
+                let origin = point(px(origin_x), px(origin_y));
+                let window = cx.add_window(move |_, _| TextView { origin });
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.resize(size(px(600.), px(80.)));
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+
+                let ((monochrome, subpixel_sprites), image) = cx
+                    .update_window(window.into(), |_, window, _| {
+                        (
+                            window.rendered_glyph_sprite_counts(),
+                            window.render_to_image(),
+                        )
+                    })
+                    .unwrap();
+                let image = image.expect("rendering the scene should succeed");
+                let runs = lit_column_runs(&image);
+                // Eyeballing the actual output is often faster than reading numbers, so allow
+                // dumping it: GPUI_DUMP_RENDERED_TEXT=<dir> writes one PNG per origin.
+                if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
+                    let kind = if subpixel { "subpixel" } else { "grayscale" };
+                    let path = std::path::Path::new(&directory)
+                        .join(format!("text-{kind}-{origin_x}-{origin_y}.png"));
+                    image.save(&path).log_err();
+                }
+
+                // Guard against the test silently covering the wrong pipeline.
+                let (expected, wrong) = if subpixel {
+                    (subpixel_sprites, monochrome)
+                } else {
+                    (monochrome, subpixel_sprites)
+                };
+                if expected == 0 || wrong != 0 {
+                    failures.push(format!(
+                        "  origin ({origin_x}, {origin_y}): wanted the {} pipeline but got \
+                         {monochrome} monochrome and {subpixel_sprites} subpixel sprites",
+                        if subpixel { "subpixel" } else { "grayscale" },
+                    ));
+                    continue;
+                }
+                let sprites = expected;
+                if runs == 0 {
+                    failures.push(format!(
+                        "  origin ({origin_x}, {origin_y}): {sprites} sprites in the scene but \
+                         the framebuffer is blank"
+                    ));
+                    continue;
+                }
+                // Total ink is the load-bearing measurement, not the run count. Run count moves
+                // for a benign reason: at some sub-pixel offsets neighbouring glyphs touch and
+                // merge into one run, which is why this string reports 19 runs at x=0.0 and 17
+                // at x=0.25 on both pipelines while rendering identically. Ink mass does not
+                // care about merging — a glyph that actually failed to draw removes its
+                // coverage, and one missing character out of twenty is a multi-percent drop,
+                // far outside the sub-0.01% wobble that anti-aliasing produces.
+                let ink: u64 = image
+                    .pixels()
+                    .map(|p| (p[0] as u64 + p[1] as u64 + p[2] as u64) / 3)
+                    .sum();
+                match reference_ink {
+                    None => reference_ink = Some(ink),
+                    Some(reference) if ink * 100 < reference * 98 => failures.push(format!(
+                        "  origin ({origin_x}, {origin_y}): {ink} ink on screen but {reference} \
+                         at the reference origin, with {sprites} sprites in the scene — ink went \
+                         missing in the draw path"
+                    )),
+                    Some(_) => {}
+                }
+                eprintln!(
+                    "  origin ({origin_x}, {origin_y}): {sprites} sprites, {runs} lit runs, \
+                     ink {ink}"
+                );
+            }
+        }
+
+        Some(failures)
+    }
+
+    #[test]
+    fn shaped_text_reaches_the_framebuffer_grayscale() {
+        let Some(failures) = sweep_origins(false) else {
+            eprintln!("SKIPPED: no D3D11 adapter, DirectWrite or headless renderer");
+            return;
+        };
+        assert!(
+            failures.is_empty(),
+            "{} origin(s) lost text between the scene and the framebuffer:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The pipeline fincode actually runs on Windows. Every earlier harness in this
+    /// investigation went through `TestAppContext`, whose window reported subpixel rendering as
+    /// unsupported, so they all covered the grayscale path — on Windows hardware, but never the
+    /// Windows code.
+    #[test]
+    fn shaped_text_reaches_the_framebuffer_subpixel() {
+        let Some(failures) = sweep_origins(true) else {
+            eprintln!("SKIPPED: no D3D11 adapter, DirectWrite or headless renderer");
+            return;
+        };
+        assert!(
+            failures.is_empty(),
+            "{} origin(s) lost text between the scene and the framebuffer:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }

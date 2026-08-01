@@ -161,13 +161,29 @@ impl TestAppContext {
         fn_name: Option<&'static str>,
         platform_text_system: Arc<dyn PlatformTextSystem>,
     ) -> Self {
+        Self::build_with_platform(dispatcher, fn_name, platform_text_system, None)
+    }
+
+    /// As [`Self::build_with_text_system`], but also supplying a headless renderer so
+    /// [`Window::render_to_image`] produces real pixels instead of failing.
+    ///
+    /// Needed to assert on what the GPU actually drew rather than on the scene it was given.
+    pub fn build_with_platform(
+        dispatcher: TestDispatcher,
+        fn_name: Option<&'static str>,
+        platform_text_system: Arc<dyn PlatformTextSystem>,
+        headless_renderer_factory: Option<
+            Box<dyn Fn() -> Option<Box<dyn crate::PlatformHeadlessRenderer>>>,
+        >,
+    ) -> Self {
         let arc_dispatcher = Arc::new(dispatcher.clone());
         let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
-        let platform = TestPlatform::with_text_system(
+        let platform = TestPlatform::with_platform(
             background_executor.clone(),
             foreground_executor.clone(),
             platform_text_system,
+            headless_renderer_factory,
         );
         let asset_source = Arc::new(());
         let http_client = http_client::FakeHttpClient::with_404_response();

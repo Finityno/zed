@@ -2521,6 +2521,30 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// How many glyph sprites the last rendered frame put in the scene.
+    ///
+    /// Lets a test tell "the scene never had the glyph" apart from "the draw path lost it",
+    /// which are very different bugs with the same symptom.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_glyph_sprite_count(&self) -> usize {
+        self.rendered_frame.scene.monochrome_sprites.len()
+            + self.rendered_frame.scene.subpixel_sprites.len()
+    }
+
+    /// Glyph sprites in the last rendered frame, split as `(monochrome, subpixel)`.
+    ///
+    /// Which of the two a glyph lands in is decided by `should_use_subpixel_rendering`, and the
+    /// two take entirely different atlases, shaders and blend states. A test that means to cover
+    /// the Windows pipeline has to assert it actually got subpixel sprites, because the flag
+    /// defaults off and the grayscale path would otherwise pass while covering nothing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_glyph_sprite_counts(&self) -> (usize, usize) {
+        (
+            self.rendered_frame.scene.monochrome_sprites.len(),
+            self.rendered_frame.scene.subpixel_sprites.len(),
+        )
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);

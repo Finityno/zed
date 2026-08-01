@@ -19,7 +19,21 @@ use std::{
     sync::{self, Arc},
 };
 
+thread_local! {
+    /// Whether `TestWindow`s created on this thread report subpixel (ClearType-style) text
+    /// rendering as supported.
+    ///
+    /// Defaults to `false`, which is what macOS reports. Windows reports `true`, and that single
+    /// flag selects an entirely separate glyph pipeline: a third atlas kind backed by an RGBA8
+    /// texture, `SubpixelSprite` primitives instead of `MonochromeSprite`, a different shader, and
+    /// a dual-source blend state. A test running against the default therefore exercises the
+    /// macOS-shaped path even when it is running on Windows hardware, leaving the Windows-only
+    /// path untested. Opt in with [`TestWindow::set_subpixel_rendering_supported`].
+    static SUBPIXEL_RENDERING_SUPPORTED: Cell<bool> = const { Cell::new(false) };
+}
+
 pub(crate) struct TestWindowState {
+    subpixel_rendering_supported: bool,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
@@ -73,6 +87,13 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
+    /// Makes `TestWindow`s created afterwards on this thread report subpixel text rendering as
+    /// supported, the way a Windows window does, so a test can drive the `SubpixelSprite` glyph
+    /// pipeline rather than the grayscale one. Applies to windows created after the call.
+    pub fn set_subpixel_rendering_supported(supported: bool) {
+        SUBPIXEL_RENDERING_SUPPORTED.set(supported);
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
@@ -85,6 +106,7 @@ impl TestWindow {
             None => Arc::new(TestAtlas::new()),
         };
         Self(Rc::new(Mutex::new(TestWindowState {
+            subpixel_rendering_supported: SUBPIXEL_RENDERING_SUPPORTED.get(),
             bounds: params.bounds,
             display,
             platform,
@@ -319,7 +341,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        false
+        self.0.lock().subpixel_rendering_supported
     }
 
     fn set_title(&mut self, title: &str) {
