@@ -29,7 +29,10 @@ use std::{
     fmt::{Debug, Display, Formatter},
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut, Range},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 /// An opaque identifier for a specific font.
@@ -56,6 +59,8 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    /// Counts glyphs that had design ink but rasterized to nothing, to cap the log volume.
+    empty_raster_reports: AtomicUsize,
 }
 
 impl TextSystem {
@@ -68,6 +73,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            empty_raster_reports: AtomicUsize::new(0),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -344,8 +350,69 @@ impl TextSystem {
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
             let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
+
+            // `Window::paint_glyph` skips a glyph entirely when its raster bounds are empty,
+            // with no error and nothing drawn, while shaping keeps the advance — the glyph
+            // just vanishes from the middle of a word. This cache is never evicted and is
+            // keyed partly on the subpixel variant, so caching an empty result for a glyph
+            // that genuinely has ink would drop that character at that fractional position
+            // for the lifetime of the process, and leave it rendering correctly everywhere
+            // else. Refuse to make that permanent: an empty result for an inked glyph is
+            // returned but not remembered, so the next frame asks the platform again.
+            //
+            // Legitimately blank glyphs (space and friends) still get cached, so the common
+            // path keeps its single platform call per glyph.
+            // Bounded by size on purpose. Below a few device pixels an inked glyph can round
+            // away to nothing legitimately, and refusing to cache that would re-query the
+            // platform for every such glyph on every frame. Only sizes where an empty raster
+            // is unambiguously wrong are retried.
+            const MIN_RETRY_DEVICE_PIXELS: f32 = 4.0;
+            let rasterized_empty = bounds.size.width.0 == 0 || bounds.size.height.0 == 0;
+            if rasterized_empty
+                && params.font_size.0 * params.scale_factor >= MIN_RETRY_DEVICE_PIXELS
+                && self.glyph_has_ink(params)
+            {
+                self.report_empty_raster_bounds(params);
+                return Ok(bounds);
+            }
+
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
+        }
+    }
+
+    /// Whether the font's design metrics say this glyph paints something. Only consulted when
+    /// rasterization already came back empty, so it costs nothing on the common path.
+    fn glyph_has_ink(&self, params: &RenderGlyphParams) -> bool {
+        self.platform_text_system
+            .typographic_bounds(params.font_id, params.glyph_id)
+            .is_ok_and(|bounds| bounds.size.width > 0.0 && bounds.size.height > 0.0)
+    }
+
+    /// Reports a glyph that has design ink but rasterized to nothing. Because the result is
+    /// deliberately not cached, this would otherwise fire every frame for the same glyph, so
+    /// the volume is capped while still naming the glyph precisely enough to reproduce it.
+    fn report_empty_raster_bounds(&self, params: &RenderGlyphParams) {
+        const REPORT_LIMIT: usize = 20;
+        let reported = self.empty_raster_reports.fetch_add(1, Ordering::Relaxed);
+        if reported < REPORT_LIMIT {
+            log::warn!(
+                "glyph {:?} of font {:?} rasterized to empty bounds at {}px, scale {}, \
+                 subpixel variant ({}, {}), subpixel rendering {}; it has design ink, so it \
+                 will be missing from the painted text. Not caching, so it retries next frame.",
+                params.glyph_id.0,
+                params.font_id.0,
+                params.font_size.0,
+                params.scale_factor,
+                params.subpixel_variant.x,
+                params.subpixel_variant.y,
+                params.subpixel_rendering,
+            );
+        } else if reported == REPORT_LIMIT {
+            log::warn!(
+                "further empty-raster-bounds reports suppressed after {REPORT_LIMIT} \
+                 occurrences"
+            );
         }
     }
 
@@ -1218,5 +1285,155 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod raster_bounds_cache_tests {
+    use super::{RenderGlyphParams, TextSystem};
+    use crate::{
+        Bounds, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId, Hsla, LineLayout,
+        NoopTextSystem, Pixels, PlatformTextSystem, Point, Size, TextRenderingMode, px, size,
+    };
+    use anyhow::Result;
+    use std::{
+        borrow::Cow,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    /// The glyph this fake claims has design ink; every other glyph is treated as blank.
+    const INKED_GLYPH: GlyphId = GlyphId(1);
+    const BLANK_GLYPH: GlyphId = GlyphId(2);
+
+    /// Always rasterizes to empty bounds, which is the failure being guarded against, and
+    /// counts how many times it was asked so the test can tell caching from re-querying.
+    struct AlwaysEmptyRasterizer {
+        inner: NoopTextSystem,
+        raster_bounds_calls: AtomicUsize,
+    }
+
+    impl AlwaysEmptyRasterizer {
+        fn new() -> Self {
+            Self {
+                inner: NoopTextSystem,
+                raster_bounds_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.raster_bounds_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl PlatformTextSystem for AlwaysEmptyRasterizer {
+        fn glyph_raster_bounds(&self, _params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            self.raster_bounds_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Bounds::default())
+        }
+
+        fn typographic_bounds(&self, _font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            Ok(Bounds {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: if glyph_id == INKED_GLYPH {
+                    size(392.0, 528.0)
+                } else {
+                    size(0.0, 0.0)
+                },
+            })
+        }
+
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.inner.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            self.inner.all_font_names()
+        }
+        fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+            self.inner.font_id(descriptor)
+        }
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.inner.font_metrics(font_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.inner.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.inner.glyph_for_char(font_id, ch)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            self.inner.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.inner.layout_line(text, font_size, runs)
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            self.inner.recommended_rendering_mode(font_id, font_size)
+        }
+        fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+            self.inner.glyph_dilation_for_color(color)
+        }
+    }
+
+    fn params(glyph_id: GlyphId) -> RenderGlyphParams {
+        RenderGlyphParams {
+            font_id: FontId(0),
+            glyph_id,
+            font_size: px(14.0),
+            subpixel_variant: Point { x: 0, y: 0 },
+            scale_factor: 1.0,
+            is_emoji: false,
+            subpixel_rendering: true,
+            dilation: 0,
+        }
+    }
+
+    /// An empty raster for a glyph that has ink makes `paint_glyph` skip that character while
+    /// its advance stays in the layout. Caching that would make the character missing for the
+    /// lifetime of the process at that subpixel position, so it has to be retried instead.
+    #[test]
+    fn empty_raster_bounds_are_retried_for_glyphs_that_have_ink() {
+        let platform = Arc::new(AlwaysEmptyRasterizer::new());
+        let text_system = TextSystem::new(platform.clone());
+
+        let inked = params(INKED_GLYPH);
+        text_system.raster_bounds(&inked).unwrap();
+        text_system.raster_bounds(&inked).unwrap();
+        text_system.raster_bounds(&inked).unwrap();
+
+        assert_eq!(
+            platform.calls(),
+            3,
+            "an inked glyph that rasterized empty must be re-queried every time, not cached"
+        );
+    }
+
+    /// Glyphs that legitimately paint nothing (space and friends) must still be cached, or the
+    /// common path pays a platform call per space per frame.
+    #[test]
+    fn empty_raster_bounds_are_cached_for_glyphs_without_ink() {
+        let platform = Arc::new(AlwaysEmptyRasterizer::new());
+        let text_system = TextSystem::new(platform.clone());
+
+        let blank = params(BLANK_GLYPH);
+        text_system.raster_bounds(&blank).unwrap();
+        text_system.raster_bounds(&blank).unwrap();
+        text_system.raster_bounds(&blank).unwrap();
+
+        assert_eq!(
+            platform.calls(),
+            1,
+            "a glyph with no design ink rasterizes empty legitimately and must stay cached"
+        );
     }
 }

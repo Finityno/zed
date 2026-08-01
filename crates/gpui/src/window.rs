@@ -4409,17 +4409,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
-        let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
-        );
-        let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
-        );
-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let (integer_origin, subpixel_variant) = quantize_glyph_origin(glyph_origin);
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
@@ -7320,6 +7310,94 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+/// Splits a device-space glyph origin into the integer pixel the sprite is placed at and the
+/// subpixel variant the glyph should be rasterized for.
+///
+/// Both halves have to agree: the variant selects the fractional offset DirectWrite/CoreText
+/// rasterizes at, and the integer origin is where that bitmap is painted. If they disagree the
+/// glyph lands on the wrong pixel with the wrong shape.
+///
+/// `f32::fract` keeps the sign of its input, so taking the fractional part relative to
+/// `floor` matters at negative device coordinates (content scrolled past the left edge, or a
+/// window straddling x = 0): a negative fraction cast to `u8` saturates to variant 0, and
+/// `trunc` rounds toward zero rather than down. For non-negative coordinates — every ordinary
+/// layout — this is exactly what the straightforward `fract`/`trunc` version computes.
+fn quantize_glyph_origin(glyph_origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, Point<u8>) {
+    let quantized_origin = Point::new(
+        round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+            / SUBPIXEL_VARIANTS_X as f32,
+        round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+            / SUBPIXEL_VARIANTS_Y as f32,
+    );
+    let subpixel_variant = Point::new(
+        ((quantized_origin.x - quantized_origin.x.floor()) * SUBPIXEL_VARIANTS_X as f32) as u8,
+        ((quantized_origin.y - quantized_origin.y.floor()) * SUBPIXEL_VARIANTS_Y as f32) as u8,
+    );
+    (
+        quantized_origin.map(|coordinate| ScaledPixels(coordinate.floor())),
+        subpixel_variant,
+    )
+}
+
+#[cfg(test)]
+mod glyph_quantization_tests {
+    use super::quantize_glyph_origin;
+    use crate::{Point, SUBPIXEL_VARIANTS_X, ScaledPixels};
+
+    fn quantize(x: f32) -> (f32, u8) {
+        let (origin, variant) = quantize_glyph_origin(Point::new(ScaledPixels(x), ScaledPixels(0.)));
+        (origin.x.0, variant.x)
+    }
+
+    #[test]
+    fn quantizes_positive_origins_to_the_pixel_below_and_its_fraction() {
+        assert_eq!(quantize(10.0), (10.0, 0));
+        assert_eq!(quantize(10.25), (10.0, 1));
+        assert_eq!(quantize(10.5), (10.0, 2));
+        assert_eq!(quantize(10.75), (10.0, 3));
+        // Rounds to the nearest quarter before splitting.
+        assert_eq!(quantize(10.24), (10.0, 1));
+        assert_eq!(quantize(10.99), (11.0, 0));
+    }
+
+    /// The regression: a negative fraction used to saturate to variant 0 and `trunc` rounded
+    /// the origin up, so glyphs left of the origin were placed a pixel off and rasterized for
+    /// the wrong subpixel offset.
+    #[test]
+    fn quantizes_negative_origins_downward_rather_than_toward_zero() {
+        assert_eq!(quantize(-10.0), (-10.0, 0));
+        assert_eq!(quantize(-9.75), (-10.0, 1));
+        assert_eq!(quantize(-9.5), (-10.0, 2));
+        assert_eq!(quantize(-9.25), (-10.0, 3));
+    }
+
+    /// The two halves have to agree: painting at `origin` a bitmap rasterized for `variant`
+    /// must land within half a quantization step of the position that was asked for, and the
+    /// variant must be a real index or the rasterizer is asked for an offset that lookup
+    /// tables do not have. Swept across zero, where the sign handling used to be wrong.
+    #[test]
+    fn origin_and_variant_reconstruct_the_requested_position() {
+        let step = 1.0 / SUBPIXEL_VARIANTS_X as f32;
+        let tolerance = step / 2.0 + 1e-4;
+
+        let mut coordinate = -50.0f32;
+        while coordinate < 50.0 {
+            let (origin, variant) = quantize(coordinate);
+            assert!(
+                variant < SUBPIXEL_VARIANTS_X,
+                "variant {variant} out of range at {coordinate}"
+            );
+            let reconstructed = origin + variant as f32 * step;
+            assert!(
+                (reconstructed - coordinate).abs() <= tolerance,
+                "{coordinate} quantized to origin {origin} + variant {variant} = \
+                 {reconstructed}, which is more than {tolerance} away"
+            );
+            coordinate += 0.05;
+        }
     }
 }
 

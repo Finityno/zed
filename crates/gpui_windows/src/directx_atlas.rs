@@ -89,7 +89,19 @@ impl PlatformAtlas for DirectXAtlas {
                 .allocate(size, key.texture_kind())
                 .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
             let texture = lock.texture(tile.texture_id);
-            texture.upload(&lock.device_context, tile.bounds, &bytes);
+            let uploaded = texture.upload(&lock.device_context, tile.bounds, &bytes);
+            if !uploaded {
+                // The tile is on the GPU but blank. Caching it would make this glyph
+                // invisible for the lifetime of the process while its advance stayed in the
+                // layout — a character silently missing from the middle of a word. Give the
+                // space back and report failure so the next frame retries instead.
+                lock.deallocate_tile(tile);
+                anyhow::bail!(
+                    "failed to upload a {}x{} tile to the sprite atlas",
+                    tile.bounds.size.width.0,
+                    tile.bounds.size.height.0,
+                );
+            }
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
         }
@@ -101,12 +113,19 @@ impl PlatformAtlas for DirectXAtlas {
         let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
-        let id = tile.texture_id;
+        lock.deallocate_tile(tile);
+    }
+}
 
+impl DirectXAtlasState {
+    /// Returns a tile's space to its texture, freeing the texture itself once nothing
+    /// references it. The caller is responsible for dropping the `tiles_by_key` entry.
+    fn deallocate_tile(&mut self, tile: AtlasTile) {
+        let id = tile.texture_id;
         let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
         };
 
         let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
@@ -123,9 +142,7 @@ impl PlatformAtlas for DirectXAtlas {
             }
         }
     }
-}
 
-impl DirectXAtlasState {
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -276,12 +293,15 @@ impl DirectXAtlasTexture {
         Some(tile)
     }
 
+    /// Returns whether the tile was actually written. A `false` return means the tile is
+    /// still blank on the GPU and must not be cached — see `get_or_insert_with`.
+    #[must_use]
     fn upload(
         &self,
         device_context: &ID3D11DeviceContext,
         bounds: Bounds<DevicePixels>,
         bytes: &[u8],
-    ) {
+    ) -> bool {
         // `UpdateSubresource` reads `row_pitch * height` bytes from `bytes` based on the
         // `D3D11_BOX` below. If the caller hands us a slice shorter than that, the driver would
         // over-read past the end of the source buffer (potentially by multiple megabytes), so bail
@@ -298,7 +318,7 @@ impl DirectXAtlasTexture {
                 bounds.size.height.0,
                 expected,
             );
-            return;
+            return false;
         }
         unsafe {
             device_context.UpdateSubresource(
@@ -317,6 +337,7 @@ impl DirectXAtlasTexture {
                 0,
             );
         }
+        true
     }
 
     fn decrement_ref_count(&mut self) {
@@ -325,6 +346,101 @@ impl DirectXAtlasTexture {
 
     fn is_unreferenced(&mut self) -> bool {
         self.live_atlas_keys == 0
+    }
+}
+
+/// A CPU-side copy of an atlas texture, rows tightly packed.
+#[cfg(test)]
+pub(crate) struct TextureReadback {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) bytes_per_pixel: u32,
+}
+
+#[cfg(test)]
+impl TextureReadback {
+    /// The bytes actually resident on the GPU for `bounds`, tightly packed, so a test can
+    /// compare them against what was handed to `upload`.
+    pub(crate) fn region(&self, bounds: Bounds<DevicePixels>) -> Vec<u8> {
+        let bytes_per_pixel = self.bytes_per_pixel as usize;
+        let row_bytes = self.width as usize * bytes_per_pixel;
+        let tile_row_bytes = bounds.size.width.0 as usize * bytes_per_pixel;
+        let left = bounds.origin.x.0 as usize * bytes_per_pixel;
+        (0..bounds.size.height.0 as usize)
+            .flat_map(|row| {
+                let start = (bounds.origin.y.0 as usize + row) * row_bytes + left;
+                self.bytes[start..start + tile_row_bytes].iter().copied()
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl DirectXAtlas {
+    /// Whether a key currently resolves to a tile. `PlatformAtlas::contains` is gated behind
+    /// gpui's `test-support` feature, which is not on for a plain `cargo test -p gpui_windows`,
+    /// so this is an inherent method instead.
+    pub(crate) fn contains_key(&self, key: &AtlasKey) -> bool {
+        self.0.lock().tiles_by_key.contains_key(key)
+    }
+
+    /// Copies an atlas texture back to the CPU so tests can assert that what the GPU holds
+    /// matches what was uploaded — the only way to catch a tile that was allocated and
+    /// cached but never actually filled, or one that a later upload overwrote.
+    pub(crate) fn read_back(&self, id: AtlasTextureId) -> Option<TextureReadback> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING,
+        };
+
+        let lock = self.0.lock();
+        let texture = match id.kind {
+            AtlasTextureKind::Monochrome => lock.monochrome_textures[id.index as usize].as_ref(),
+            AtlasTextureKind::Polychrome => lock.polychrome_textures[id.index as usize].as_ref(),
+            AtlasTextureKind::Subpixel => lock.subpixel_textures[id.index as usize].as_ref(),
+        }?;
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.texture.GetDesc(&mut desc) };
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+            ..desc
+        };
+
+        let mut staging: Option<ID3D11Texture2D> = None;
+        unsafe {
+            lock.device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+        }
+        .ok()?;
+        let staging = staging?;
+
+        let bytes_per_pixel = texture.bytes_per_pixel;
+        let row_bytes = desc.Width as usize * bytes_per_pixel as usize;
+        let mut bytes = vec![0u8; row_bytes * desc.Height as usize];
+        unsafe {
+            lock.device_context.CopyResource(&staging, &texture.texture);
+            let mut mapped = std::mem::zeroed();
+            lock.device_context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .ok()?;
+            for row in 0..desc.Height as usize {
+                std::ptr::copy_nonoverlapping(
+                    (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
+                    bytes.as_mut_ptr().add(row * row_bytes),
+                    row_bytes,
+                );
+            }
+            lock.device_context.Unmap(&staging, 0);
+        }
+
+        Some(TextureReadback {
+            bytes,
+            width: desc.Width,
+            bytes_per_pixel,
+        })
     }
 }
 
@@ -387,6 +503,57 @@ mod tests {
             })
             .expect("allocation should succeed")
             .expect("callback returns Some")
+    }
+
+    /// A tile whose upload was rejected must not be cached. Caching it would leave the glyph
+    /// sampling a blank region of the atlas for the lifetime of the process — painting as a
+    /// character silently missing from the middle of a word while its advance is preserved,
+    /// which is the reported failure this guards against.
+    #[test]
+    fn test_rejected_upload_is_not_cached_and_frees_its_tile() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let size = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+        let key = make_image_key(1);
+        // Polychrome tiles are 4 bytes per pixel; one byte short has to be refused rather
+        // than letting `UpdateSubresource` over-read the source buffer.
+        let short_byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4 - 1;
+        let mut short_upload = || Ok(Some((size, Cow::Owned(vec![0u8; short_byte_count]))));
+
+        let result = atlas.get_or_insert_with(&key, &mut short_upload);
+        assert!(
+            result.is_err(),
+            "an upload that was skipped must be reported as a failure, not silent success"
+        );
+        assert!(
+            !atlas.contains_key(&key),
+            "a tile that was never written must not be cached, or the glyph is blank forever"
+        );
+
+        // The very same key must still be insertable once the bytes are right.
+        let tile = insert_tile(&atlas, &key, size);
+        assert_eq!(tile.bounds.size, size);
+        assert!(atlas.contains_key(&key));
+
+        // Repeated rejections must hand their space back rather than leaking it.
+        for id in 0..200 {
+            let leak_key = make_image_key(100 + id);
+            assert!(atlas.get_or_insert_with(&leak_key, &mut short_upload).is_err());
+        }
+        let big = Size {
+            width: DevicePixels(700),
+            height: DevicePixels(700),
+        };
+        let big_tile = insert_tile(&atlas, &make_image_key(2), big);
+        assert_eq!(
+            big_tile.texture_id, tile.texture_id,
+            "rejected uploads leaked atlas space, forcing a new texture"
+        );
     }
 
     #[test]
