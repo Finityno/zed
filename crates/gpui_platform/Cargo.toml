@@ -14,7 +14,15 @@ path = "src/gpui_platform.rs"
 [features]
 default = []
 font-kit = ["gpui_macos/font-kit"]
-test-support = ["gpui/test-support", "gpui_macos/test-support"]
+# `current_headless_renderer` is itself gated on this feature and names
+# `gpui_windows::DirectXHeadlessRenderer`, which gpui_windows only exports under ITS
+# test-support. Without forwarding, enabling test-support here fails to compile on Windows,
+# and only there -- which a macOS-only check would never surface.
+test-support = [
+    "gpui/test-support",
+    "gpui_macos/test-support",
+    "gpui_windows/test-support",
+]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
