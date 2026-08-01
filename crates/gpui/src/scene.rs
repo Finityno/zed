@@ -13,7 +13,21 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::OnceLock,
 };
+
+/// Whether to report glyph sprites dropped by the content-mask cull in `insert_primitive`.
+///
+/// Off by default: the cull is a hot path and legitimately discards offscreen glyphs by the
+/// thousand while scrolling. Set `GPUI_DEBUG_GLYPH_DROPS=1` to diagnose characters going
+/// missing from the middle of a word, which is what this cull looks like when it fires on a
+/// glyph that should have been visible.
+fn glyph_drop_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GPUI_DEBUG_GLYPH_DROPS").is_ok_and(|value| value == "1" || value == "true")
+    })
+}
 
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
@@ -91,6 +105,24 @@ impl Scene {
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
+            // The second place a single glyph can vanish with nothing logged (the first is the
+            // empty-raster-bounds path in `Window::paint_glyph`). Shaping has already run, so
+            // the advance survives and the character is simply missing from the middle of a
+            // word. `paint_line` pre-culls with the font's MAX bounding box at the pen
+            // position, whereas this culls the glyph's actual quad, so a glyph can pass the
+            // coarse check and still be dropped here — scattered singles, neighbours intact.
+            if glyph_drop_logging_enabled()
+                && matches!(
+                    primitive,
+                    Primitive::MonochromeSprite(_) | Primitive::SubpixelSprite(_)
+                )
+            {
+                log::warn!(
+                    "culled a glyph sprite: bounds {:?} do not intersect content mask {:?}",
+                    primitive.bounds(),
+                    primitive.content_mask().bounds,
+                );
+            }
             return;
         }
 

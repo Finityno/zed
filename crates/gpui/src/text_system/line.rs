@@ -516,9 +516,25 @@ fn paint_line(
                     );
                 }
 
+                // Conservative pre-cull: this exists only to skip rasterizing glyphs that are
+                // obviously offscreen, and the exact cull happens later in
+                // `Scene::insert_primitive` against the glyph's real quad. So it must never
+                // discard a glyph that would have been visible.
+                //
+                // It previously used the font's max box anchored at `glyph_origin`, which is
+                // the pen position at the TOP of the line — but the glyph is painted down at
+                // the baseline (`+ baseline_offset`), so with generous line heights the box
+                // sat above the ink it was meant to stand for. Near a clip edge that culls
+                // glyphs that are still visible, one at a time, leaving their advances behind:
+                // characters missing from the middle of a word. Cover the whole line row
+                // vertically, and allow a glyph box of horizontal overhang on each side for
+                // negative side bearings.
                 let max_glyph_bounds = Bounds {
-                    origin: glyph_origin,
-                    size: max_glyph_size,
+                    origin: point(glyph_origin.x - max_glyph_size.width, glyph_origin.y),
+                    size: size(
+                        max_glyph_size.width * 3.,
+                        line_height.max(max_glyph_size.height),
+                    ),
                 };
 
                 let content_mask = window.content_mask();
@@ -1011,5 +1027,204 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+}
+
+/// End-to-end reproduction for glyphs vanishing from the middle of a word while their advance
+/// survives (fincode `docs/text-flicker-root-cause-and-plan.md`, root cause 7).
+///
+/// `paint_line` pre-culls each glyph with a cheap box before rasterizing it, and the exact cull
+/// happens later in `Scene::insert_primitive` against the glyph's real quad. The cheap box used
+/// to be the font's max bounding box anchored at `glyph_origin` — the pen position at the TOP of
+/// the line — while the glyph is painted down at the baseline. At generous line heights the box
+/// and the ink are disjoint, so near a clip edge the cheap cull throws away glyphs that are
+/// plainly visible, leaving their advances behind.
+///
+/// This drives the real paint path (shape -> `paint_line` -> pre-cull -> `paint_glyph` ->
+/// `insert_primitive` -> scene) and counts the glyph sprites that actually reached the scene.
+#[cfg(test)]
+mod pre_cull_regression_tests {
+    use crate::{
+        AppContext as _, Bounds, ContentMask, Context, DevicePixels, Font, FontId,
+        FontMetrics, FontRun,
+        GlyphId, Hsla, IntoElement, LineLayout, NoopTextSystem, Pixels, PlatformTextSystem, Point,
+        ParentElement as _, Render, RenderGlyphParams, Size, TestAppContext, TestDispatcher,
+        TextAlign,
+        TextRenderingMode, TextRun, Window, black, canvas, div, font, point, px, size,
+    };
+    use anyhow::Result;
+    use std::{borrow::Cow, cell::Cell, rc::Rc, sync::Arc};
+
+    const TEXT: &str = "Changes in this project";
+    const FONT_SIZE: Pixels = Pixels(16.);
+    /// Roomy leading, as the transcript and review panel use. This is what pushes the baseline
+    /// far below the pen position and separates the ink from the old cull box.
+    const LINE_HEIGHT: Pixels = Pixels(64.);
+
+    /// Reports glyphs whose ink sits at the baseline, like a real font: `origin.y` is negative
+    /// (up from the baseline) and the ink is roughly cap height. `NoopTextSystem` reports empty
+    /// raster bounds for everything, which would make `paint_glyph` skip every glyph and hide
+    /// the very behaviour under test.
+    struct InkedTextSystem(NoopTextSystem);
+
+    /// Ink height in device pixels, varied per glyph so the line is not one uniform box.
+    fn ink_height(glyph_id: GlyphId, font_size: Pixels) -> i32 {
+        (font_size.0 * 0.62).round() as i32 + (glyph_id.0 % 3) as i32
+    }
+
+    impl PlatformTextSystem for InkedTextSystem {
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            let height = ink_height(params.glyph_id, params.font_size);
+            let width = (params.font_size.0 * 0.5).round() as i32;
+            Ok(Bounds {
+                origin: point(DevicePixels(0), DevicePixels(-height)),
+                size: size(DevicePixels(width), DevicePixels(height)),
+            })
+        }
+
+        fn rasterize_glyph(
+            &self,
+            _params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            let byte_count =
+                (raster_bounds.size.width.0 * raster_bounds.size.height.0).max(0) as usize;
+            Ok((raster_bounds.size, vec![255; byte_count]))
+        }
+
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.0.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            self.0.all_font_names()
+        }
+        fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+            self.0.font_id(descriptor)
+        }
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.0.font_metrics(font_id)
+        }
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            self.0.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.0.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.0.glyph_for_char(font_id, ch)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.0.layout_line(text, font_size, runs)
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            self.0.recommended_rendering_mode(font_id, font_size)
+        }
+        fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+            self.0.glyph_dilation_for_color(color)
+        }
+    }
+
+    struct TextUnderMask {
+        mask: Bounds<Pixels>,
+        origin: Point<Pixels>,
+        shaped_glyphs: Rc<Cell<usize>>,
+    }
+
+    impl Render for TextUnderMask {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mask = self.mask;
+            let origin = self.origin;
+            let shaped_glyphs = self.shaped_glyphs.clone();
+            div().child(canvas(
+                |_, _, _| (),
+                move |_bounds, _, window, cx| {
+                    let runs = [TextRun {
+                        len: TEXT.len(),
+                        font: font("test"),
+                        color: black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }];
+                    let line = window
+                        .text_system()
+                        .shape_line(TEXT.into(), FONT_SIZE, &runs, None);
+                    shaped_glyphs.set(line.runs.iter().map(|run| run.glyphs.len()).sum::<usize>());
+                    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+                        line.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
+                            .unwrap();
+                    });
+                },
+            ))
+        }
+    }
+
+    /// Every glyph whose ink lands inside the content mask has to reach the scene. The mask here
+    /// is a band that contains the painted ink but sits entirely BELOW the old pre-cull box, so
+    /// the old box and the mask do not intersect at all: the old code discarded the whole line
+    /// while every glyph in it was visible.
+    #[test]
+    fn glyphs_inside_the_content_mask_are_not_dropped_by_the_pre_cull() {
+        let platform_text_system = Arc::new(InkedTextSystem(NoopTextSystem));
+        let metrics = platform_text_system.font_metrics(FontId(0));
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            platform_text_system,
+        );
+
+        let origin = point(px(0.), px(0.));
+        // Mirrors `paint_line`: the baseline sits `padding_top + ascent` below the pen position.
+        let ascent = FONT_SIZE * (metrics.ascent / metrics.units_per_em as f32);
+        let descent = FONT_SIZE * (metrics.descent / metrics.units_per_em as f32);
+        let baseline = (LINE_HEIGHT - ascent - descent) / 2. + ascent;
+        let old_cull_bottom = metrics.bounding_box(FONT_SIZE).size.height;
+
+        // A band that covers the ink (which spans about `baseline - ink_height ..= baseline`)
+        // while starting below the old cull box, which was `origin.y .. origin.y + font_box`.
+        let mask_top = baseline - px(14.);
+        let mask = Bounds {
+            origin: point(px(-10.), mask_top),
+            size: size(px(1000.), px(60.)),
+        };
+        assert!(
+            mask_top > old_cull_bottom,
+            "the mask has to start below the old cull box for this to exercise the defect \
+             (mask top {mask_top:?}, old box bottom {old_cull_bottom:?})"
+        );
+
+        let shaped_glyphs = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let shaped_glyphs = shaped_glyphs.clone();
+            move |_, _| TextUnderMask {
+                mask,
+                origin,
+                shaped_glyphs,
+            }
+        });
+
+        let painted = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.rendered_frame.scene.monochrome_sprites.len()
+                    + window.rendered_frame.scene.subpixel_sprites.len()
+            })
+            .unwrap();
+
+        let expected = shaped_glyphs.get();
+        assert!(
+            expected > 0,
+            "the line shaped no glyphs, so this proved nothing"
+        );
+        assert_eq!(
+            painted, expected,
+            "{} of {expected} glyphs never reached the scene even though their ink is inside \
+             the content mask, so they were visible: the pre-cull box discarded them",
+            expected - painted
+        );
     }
 }
