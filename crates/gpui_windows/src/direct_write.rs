@@ -221,6 +221,45 @@ impl DirectWriteTextSystem {
     pub(crate) fn handle_gpu_lost(&self, directx_devices: &DirectXDevices) -> Result<()> {
         self.state.write().handle_gpu_lost(directx_devices)
     }
+
+    /// Whether DirectWrite recommends bi-level rendering for this configuration, asked exactly
+    /// the way `create_glyph_run_analysis` asks it. Used to check whether the ALIASED remap
+    /// there guards a real case on this machine or is dead code.
+    #[cfg(test)]
+    pub(crate) fn recommends_aliased_rendering(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        scale_factor: f32,
+    ) -> bool {
+        let lock = self.state.read();
+        let font = &lock.fonts[font_id.0];
+        let transform = DWRITE_MATRIX {
+            m11: scale_factor,
+            m12: 0.0,
+            m21: 0.0,
+            m22: scale_factor,
+            dx: 0.0,
+            dy: 0.0,
+        };
+        let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
+        let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();
+        let queried = unsafe {
+            font.font_face.GetRecommendedRenderingMode(
+                font_size.as_f32(),
+                96.0,
+                96.0,
+                Some(&transform),
+                false,
+                DWRITE_OUTLINE_THRESHOLD_ANTIALIASED,
+                DWRITE_MEASURING_MODE_NATURAL,
+                None,
+                &mut rendering_mode,
+                &mut grid_fit_mode,
+            )
+        };
+        queried.is_ok() && rendering_mode == DWRITE_RENDERING_MODE1_ALIASED
+    }
 }
 
 impl PlatformTextSystem for DirectWriteTextSystem {
@@ -715,6 +754,17 @@ impl DirectWriteState {
         }
         let rendering_mode = match rendering_mode {
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+            // `GetAlphaTextureBounds`/`CreateAlphaTexture` report an EMPTY result when a
+            // ClearType 3x1 texture is asked of an ALIASED analysis, and `raster_bounds` turns
+            // that into zero bounds, which makes `Window::paint_glyph` skip the glyph without
+            // a log while its advance stays in the layout. The two decisions can disagree
+            // because `recommended_rendering_mode` (which sets `subpixel_rendering`) answers
+            // per system ClearType setting, whereas this asks DirectWrite per font and size —
+            // and a font's `gasp` table can say "no antialiasing at this ppem". Keep the mode
+            // compatible with the texture the caller is about to request.
+            DWRITE_RENDERING_MODE1_ALIASED if params.subpixel_rendering => {
+                DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
+            }
             m => m,
         };
 
@@ -2157,5 +2207,614 @@ mod tests {
             "uncovered texel retained the poison from the uninitialized render target"
         );
         Ok(())
+    }
+}
+
+/// Reproduction harness for individual glyphs vanishing mid-word while their advance is
+/// preserved (fincode `docs/text-flicker-root-cause-and-plan.md`, root cause 7).
+///
+/// `Window::paint_glyph` skips a glyph entirely, with no log and no error, when
+/// `glyph_raster_bounds` comes back empty — it is the only place in the pipeline where a
+/// single glyph disappears on its own, and the result is cached for the process lifetime in
+/// `TextSystem::raster_bounds` keyed partly on the subpixel variant. So an empty read here
+/// is not a transient artifact: it removes that character at that fractional position for as
+/// long as the app runs, which is why the same letter renders in one word and not the next.
+///
+/// These tests drive the real DirectWrite path on the running machine (its fonts, its
+/// ClearType setting, its DPI), so they reproduce the defect where it actually happens
+/// rather than against a mock.
+#[cfg(test)]
+mod glyph_pipeline_tests {
+    // Deliberately not `use super::*`: that re-exports `gpui::test`, which shadows the
+    // built-in `#[test]` attribute and blows the macro recursion limit.
+    use crate::{DirectWriteTextSystem, DirectXAtlas, DirectXDevices};
+    use gpui::{
+        AtlasKey, AtlasTextureId, Bounds, DevicePixels, FontId, GlyphId, PlatformAtlas,
+        PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X, font, px,
+    };
+    use gpui_util::ResultExt as _;
+    use std::borrow::Cow;
+
+    /// Sizes fincode paints UI text at, including the fractional values rem scaling produces.
+    const FONT_SIZES: &[f32] = &[
+        10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0, 32.0,
+    ];
+
+    /// Scale factors Windows reports for 100/125/150/175/200% displays.
+    const SCALE_FACTORS: &[f32] = &[1.0, 1.25, 1.5, 1.75, 2.0];
+
+    /// The string from the original report. The `g` in "Changes" and the `t` in "this" were
+    /// observed missing while the same glyphs rendered correctly elsewhere in the same line.
+    const REPORTED_TEXT: &str = "Changes in this project will appear here.";
+
+    /// `theme::UI_FONT_FAMILY` and `theme::BERKELEY_MONO_VARIABLE_FONT_FAMILY` as fincode
+    /// requests them, plus the concrete Windows UI face `.SystemUIFont` resolves to so the
+    /// sweep still covers something real if a family is absent.
+    const FAMILIES: &[&str] = &[".SystemUIFont", "Segoe UI", "Berkeley Mono Variable"];
+
+    /// Below this device-pixel size a glyph legitimately rounds away to nothing, so the
+    /// "typographic ink implies raster ink" invariant is only meaningful at or above it.
+    /// Leading ratios to probe. fincode renders at 1.5 (theme.rs `line_height`), so that row
+    /// is the one that says whether this defect could fire in the real app.
+    const LINE_HEIGHT_SCALES: &[f32] = &[1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2.0, 2.5, 3.0];
+
+    const MIN_INK_DEVICE_PIXELS: f32 = 8.0;
+
+    /// Failures are collected rather than asserted eagerly: the distribution across variants,
+    /// sizes and fonts is what identifies the mechanism, and stopping at the first one hides it.
+    const MAX_REPORTED_FAILURES: usize = 40;
+
+    /// How many tiles the round-trip test pushes into the atlas. A 1024x1024 atlas texture
+    /// holds roughly 1M px²; this many UI-sized glyphs overflows it, so the sweep exercises
+    /// packing, a second atlas texture, and the batching split between them.
+    const TILE_POPULATION: usize = 6000;
+
+    struct Sweep {
+        devices: DirectXDevices,
+        system: DirectWriteTextSystem,
+        fonts: Vec<(&'static str, FontId)>,
+    }
+
+    /// Returns `None` when no D3D11 adapter is available, so a headless machine skips the
+    /// sweep instead of failing for a reason unrelated to glyph rendering.
+    fn sweep() -> Option<Sweep> {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter available");
+            return None;
+        };
+        let Some(system) = DirectWriteTextSystem::new(&devices).log_err() else {
+            eprintln!("SKIPPED: could not create the DirectWrite text system");
+            return None;
+        };
+        let mut fonts: Vec<(&'static str, FontId)> = Vec::new();
+        for family in FAMILIES {
+            let Some(font_id) = system.font_id(&font(*family)).log_err() else {
+                continue;
+            };
+            // DirectWrite falls back rather than failing, so distinct family names routinely
+            // resolve to the same face; sweeping it twice only costs time.
+            if fonts.iter().any(|(_, resolved)| *resolved == font_id) {
+                continue;
+            }
+            fonts.push((family, font_id));
+        }
+        if fonts.is_empty() {
+            eprintln!("SKIPPED: none of {FAMILIES:?} resolved to a font");
+            return None;
+        }
+        eprintln!(
+            "sweeping {} distinct font face(s): {:?}",
+            fonts.len(),
+            fonts.iter().map(|(family, _)| *family).collect::<Vec<_>>()
+        );
+        Some(Sweep {
+            devices,
+            system,
+            fonts,
+        })
+    }
+
+    fn glyph_params(
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: f32,
+        scale_factor: f32,
+        subpixel_variant_x: u8,
+        subpixel_rendering: bool,
+    ) -> RenderGlyphParams {
+        RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: px(font_size),
+            // SUBPIXEL_VARIANTS_Y is 1, so the vertical variant is always 0.
+            subpixel_variant: Point {
+                x: subpixel_variant_x,
+                y: 0,
+            },
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering,
+            dilation: 0,
+        }
+    }
+
+    fn has_ink(bounds: Bounds<DevicePixels>) -> bool {
+        bounds.size.width.0 > 0 && bounds.size.height.0 > 0
+    }
+
+    /// Every non-whitespace character the UI can paint, with the reported string first so a
+    /// regression in exactly those glyphs is reported before the rest of ASCII.
+    fn probe_chars() -> Vec<char> {
+        let mut chars: Vec<char> = REPORTED_TEXT
+            .chars()
+            .chain((0x21u8..=0x7e).map(char::from))
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let mut seen = Vec::new();
+        chars.retain(|ch| {
+            if seen.contains(ch) {
+                false
+            } else {
+                seen.push(*ch);
+                true
+            }
+        });
+        chars
+    }
+
+    fn report(failures: &[String], what: &str) {
+        assert!(
+            failures.is_empty(),
+            "{} glyph configuration(s) {what}.\n\
+             Each entry is a character that is silently dropped by Window::paint_glyph and \
+             cached as dropped for the process lifetime.\n{}{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(MAX_REPORTED_FAILURES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            if failures.len() > MAX_REPORTED_FAILURES {
+                format!(
+                    "\n… and {} more",
+                    failures.len() - MAX_REPORTED_FAILURES
+                )
+            } else {
+                String::new()
+            },
+        );
+    }
+
+    /// The tight regression guard: the exact string that was reported, at the sizes and scale
+    /// factors it was seen at. Fast enough to keep in the default test run.
+    #[test]
+    fn reported_regression_string_rasterizes_every_glyph() {
+        let Some(Sweep { system, fonts, .. }) = sweep() else {
+            return;
+        };
+
+        let mut failures = Vec::new();
+        for (family, font_id) in &fonts {
+            for ch in REPORTED_TEXT.chars().filter(|ch| !ch.is_whitespace()) {
+                let Some(glyph_id) = system.glyph_for_char(*font_id, ch) else {
+                    continue;
+                };
+                for &font_size in FONT_SIZES {
+                    for &scale_factor in SCALE_FACTORS {
+                        for subpixel_rendering in [true, false] {
+                            for variant in 0..SUBPIXEL_VARIANTS_X {
+                                let params = glyph_params(
+                                    *font_id,
+                                    glyph_id,
+                                    font_size,
+                                    scale_factor,
+                                    variant,
+                                    subpixel_rendering,
+                                );
+                                match system.glyph_raster_bounds(&params) {
+                                    Ok(bounds) if has_ink(bounds) => {}
+                                    Ok(_) => failures.push(format!(
+                                        "  {ch:?} {family} {font_size}px @{scale_factor}x \
+                                         variant {variant} subpixel={subpixel_rendering}: \
+                                         empty raster bounds"
+                                    )),
+                                    Err(error) => failures.push(format!(
+                                        "  {ch:?} {family} {font_size}px @{scale_factor}x \
+                                         variant {variant} subpixel={subpixel_rendering}: \
+                                         {error}"
+                                    )),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        report(&failures, "from the reported string produced no ink");
+    }
+
+    /// The diagnostic sweep. Checks two independent invariants across all of printable ASCII:
+    ///
+    /// 1. Ink must not depend on the subpixel variant. If a glyph rasterizes at one fractional
+    ///    position it must rasterize at all four — this is the exact shape of the reported bug
+    ///    (`t` present in "project", missing in "this") and needs no font-metric oracle.
+    /// 2. A glyph whose design metrics carry ink must produce a non-empty raster. This catches
+    ///    whole-(font, size) dropouts, which variant comparison alone cannot see because every
+    ///    variant fails together.
+    #[test]
+    fn glyph_rasterization_never_silently_drops_ink() {
+        let Some(Sweep { system, fonts, .. }) = sweep() else {
+            return;
+        };
+
+        let chars = probe_chars();
+        let mut variant_failures = Vec::new();
+        let mut ink_failures = Vec::new();
+        let mut checked = 0usize;
+        let mut inked = 0usize;
+
+        for (family, font_id) in &fonts {
+            for ch in &chars {
+                let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
+                    continue;
+                };
+                // Design-unit ink box; zero for glyphs that legitimately paint nothing.
+                let typographic_ink = system
+                    .typographic_bounds(*font_id, glyph_id)
+                    .map(|bounds| bounds.size.width > 0.0 && bounds.size.height > 0.0)
+                    .unwrap_or(false);
+
+                for &font_size in FONT_SIZES {
+                    for &scale_factor in SCALE_FACTORS {
+                        for subpixel_rendering in [true, false] {
+                            let inked_variants: Vec<bool> = (0..SUBPIXEL_VARIANTS_X)
+                                .map(|variant| {
+                                    let params = glyph_params(
+                                        *font_id,
+                                        glyph_id,
+                                        font_size,
+                                        scale_factor,
+                                        variant,
+                                        subpixel_rendering,
+                                    );
+                                    system
+                                        .glyph_raster_bounds(&params)
+                                        .map(has_ink)
+                                        .unwrap_or(false)
+                                })
+                                .collect();
+
+                            checked += SUBPIXEL_VARIANTS_X as usize;
+                            inked += inked_variants.iter().filter(|inked| **inked).count();
+
+                            let context = format!(
+                                "{ch:?} {family} {font_size}px @{scale_factor}x \
+                                 subpixel={subpixel_rendering}"
+                            );
+
+                            if inked_variants.iter().any(|inked| *inked)
+                                && !inked_variants.iter().all(|inked| *inked)
+                            {
+                                let missing: Vec<String> = inked_variants
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, inked)| !**inked)
+                                    .map(|(variant, _)| variant.to_string())
+                                    .collect();
+                                variant_failures.push(format!(
+                                    "  {context}: ink at some variants but not {}",
+                                    missing.join(", ")
+                                ));
+                            }
+
+                            if typographic_ink
+                                && font_size * scale_factor >= MIN_INK_DEVICE_PIXELS
+                                && inked_variants.iter().all(|inked| !*inked)
+                            {
+                                ink_failures.push(format!(
+                                    "  {context}: glyph has design ink but no variant rasterized"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "sweep: {checked} glyph configurations checked, {inked} produced ink"
+        );
+        assert!(
+            inked * 2 > checked,
+            "only {inked}/{checked} configurations produced ink; the sweep is not exercising              real glyphs and its invariants would hold vacuously"
+        );
+        report(&variant_failures, "lost ink on some subpixel variants only");
+        report(&ink_failures, "have design ink but rasterize to nothing");
+    }
+
+    /// `paint_line` pre-culls each glyph with a cheap box before rasterizing it, and the exact
+    /// cull against the glyph's real quad happens later in `Scene::insert_primitive`. The cheap
+    /// box therefore has to be a superset of the real one: if it is ever tighter, a glyph that
+    /// would have been visible is discarded near a clip edge and the character goes missing
+    /// from the middle of a word with its advance left behind.
+    ///
+    /// The box used to be the font's max bounding box anchored at `glyph_origin`, the pen
+    /// position at the TOP of the line, while the glyph is painted down at the baseline. This
+    /// reproduces that with real metrics: at generous line heights the ink sat below the box.
+    #[test]
+    fn line_pre_cull_box_contains_the_painted_glyph() {
+        let Some(Sweep { system, fonts, .. }) = sweep() else {
+            return;
+        };
+        let chars = probe_chars();
+        let mut failures = Vec::new();
+        // How far the ink escapes the OLD box, per leading ratio. fincode renders at
+        // `theme.line_height = 1.5`, so this is what says whether the defect could ever have
+        // fired in the app rather than only in a synthetic case.
+        let mut old_box_overflow: Vec<(f32, usize, f32)> = LINE_HEIGHT_SCALES
+            .iter()
+            .map(|scale| (*scale, 0, 0.0))
+            .collect();
+
+        for (family, font_id) in &fonts {
+            let metrics = system.font_metrics(*font_id);
+            for &font_size in FONT_SIZES {
+                let size = px(font_size);
+                let ascent = metrics.ascent(size);
+                let descent = metrics.descent(size);
+                let font_box = metrics.bounding_box(size);
+
+                for line_height_scale in LINE_HEIGHT_SCALES.iter().copied() {
+                    let line_height = size * line_height_scale;
+                    // Mirrors `paint_line`: the glyph is painted at the baseline, which sits
+                    // `padding_top + ascent` below the pen position the cull box starts at.
+                    let padding_top = (line_height - ascent - descent) / 2.;
+                    let baseline_offset = padding_top + ascent;
+
+                    // The conservative box `paint_line` now uses, relative to `glyph_origin`:
+                    // the font's bounding box flipped onto the baseline (it is y-up in font
+                    // space), unioned with the line row.
+                    let ink_span_top =
+                        baseline_offset - (font_box.origin.y + font_box.size.height);
+                    let ink_span_bottom = baseline_offset - font_box.origin.y;
+                    let cull_top = ink_span_top.min(px(0.));
+                    let cull_bottom = ink_span_bottom.max(line_height);
+
+                    for ch in &chars {
+                        let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
+                            continue;
+                        };
+                        let params =
+                            glyph_params(*font_id, glyph_id, font_size, 1.0, 0, true);
+                        let Some(raster) = system.glyph_raster_bounds(&params).log_err() else {
+                            continue;
+                        };
+                        if !has_ink(raster) {
+                            continue;
+                        }
+
+                        // Where the sprite actually lands, in the same space as the cull box.
+                        let ink_top = baseline_offset + px(raster.origin.y.0 as f32);
+                        let ink_bottom = ink_top + px(raster.size.height.0 as f32);
+
+                        if ink_top < cull_top || ink_bottom > cull_bottom {
+                            failures.push(format!(
+                                "  {ch:?} {family} {font_size}px line-height {line_height_scale}x: \
+                                 ink spans {ink_top:?}..{ink_bottom:?} but the cull box is \
+                                 {cull_top:?}..{cull_bottom:?}"
+                            ));
+                        }
+
+                        // The box before the fix: the font's max box at the pen position.
+                        let old_bottom = font_box.size.height;
+                        if ink_bottom > old_bottom
+                            && let Some(entry) = old_box_overflow
+                                .iter_mut()
+                                .find(|(scale, _, _)| *scale == line_height_scale)
+                        {
+                            entry.1 += 1;
+                            entry.2 = entry.2.max((ink_bottom - old_bottom).to_f64() as f32);
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("how far ink escaped the OLD pre-cull box, by leading ratio:");
+        for (scale, count, worst) in &old_box_overflow {
+            eprintln!("  {scale}x leading: {count} glyph configs, worst overflow {worst:.2}px");
+        }
+
+        report(
+            &failures,
+            "paint outside the pre-cull box, so they can be dropped while visible",
+        );
+    }
+
+    /// Diagnostic: does DirectWrite ever recommend ALIASED on this machine?
+    ///
+    /// `create_glyph_run_analysis` remaps ALIASED to NATURAL_SYMMETRIC when the caller is about
+    /// to request a ClearType 3x1 texture, because `GetAlphaTextureBounds` returns EMPTY for
+    /// that combination and the glyph is then silently skipped. That remap is only worth
+    /// carrying if ALIASED actually occurs. This reports what the platform returns rather than
+    /// asserting, so it documents the answer without failing when the answer is "never".
+    #[test]
+    fn report_recommended_rendering_modes() {
+        let Some(Sweep { system, fonts, .. }) = sweep() else {
+            return;
+        };
+        let mut aliased = 0;
+        let mut total = 0;
+        for (family, font_id) in &fonts {
+            for &font_size in FONT_SIZES {
+                for &scale_factor in SCALE_FACTORS {
+                    total += 1;
+                    if system.recommends_aliased_rendering(*font_id, px(font_size), scale_factor) {
+                        aliased += 1;
+                        eprintln!("  ALIASED: {family} {font_size}px @{scale_factor}x");
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "DirectWrite recommended ALIASED for {aliased}/{total} (font, size, scale)              combinations"
+        );
+    }
+
+    /// The end-to-end check: rasterize a large population of glyphs, push them through a real
+    /// `DirectXAtlas` on the GPU, then read every atlas texture back and assert each tile still
+    /// holds exactly the bytes that were uploaded for it.
+    ///
+    /// This is the only test that can see the failure modes *downstream* of rasterization, all
+    /// of which paint as a glyph missing with its advance intact: a tile allocated and cached
+    /// but never uploaded (`DirectXAtlasTexture::upload` bails on a short slice and the tile
+    /// stays in `tiles_by_key` regardless), a tile a later allocation overlapped and
+    /// overwrote, or a row-pitch/origin mistake that lands the ink somewhere else.
+    #[test]
+    fn glyph_tiles_survive_the_round_trip_through_the_atlas() {
+        let Some(Sweep {
+            devices,
+            system,
+            fonts,
+        }) = sweep()
+        else {
+            return;
+        };
+        let atlas = DirectXAtlas::new(&devices.device, &devices.device_context);
+        let chars = probe_chars();
+
+        struct Inserted {
+            texture_id: AtlasTextureId,
+            bounds: Bounds<DevicePixels>,
+            expected: Vec<u8>,
+            label: String,
+        }
+        let mut inserted: Vec<Inserted> = Vec::new();
+
+        'population: for (family, font_id) in &fonts {
+            for ch in &chars {
+                let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
+                    continue;
+                };
+                for &font_size in FONT_SIZES {
+                    for &scale_factor in SCALE_FACTORS {
+                        for subpixel_rendering in [true, false] {
+                            for variant in 0..SUBPIXEL_VARIANTS_X {
+                                let params = glyph_params(
+                                    *font_id,
+                                    glyph_id,
+                                    font_size,
+                                    scale_factor,
+                                    variant,
+                                    subpixel_rendering,
+                                );
+                                let Some(bounds) = system.glyph_raster_bounds(&params).log_err()
+                                else {
+                                    continue;
+                                };
+                                if !has_ink(bounds) {
+                                    continue;
+                                }
+                                let Some((size, bytes)) =
+                                    system.rasterize_glyph(&params, bounds).log_err()
+                                else {
+                                    continue;
+                                };
+
+                                let tile = atlas
+                                    .get_or_insert_with(&AtlasKey::Glyph(params.clone()), &mut || {
+                                        Ok(Some((size, Cow::Owned(bytes.clone()))))
+                                    })
+                                    .expect("atlas allocation should succeed")
+                                    .expect("an inked glyph should always produce a tile");
+
+                                inserted.push(Inserted {
+                                    texture_id: tile.texture_id,
+                                    bounds: tile.bounds,
+                                    expected: bytes,
+                                    label: format!(
+                                        "{ch:?} {family} {font_size}px @{scale_factor}x \
+                                         variant {variant} subpixel={subpixel_rendering}"
+                                    ),
+                                });
+                                if inserted.len() >= TILE_POPULATION {
+                                    break 'population;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            inserted.len(),
+            TILE_POPULATION,
+            "the sweep ran out of glyph configurations before filling the atlas, so it did not \
+             exercise packing or a second atlas texture"
+        );
+        // A tile whose uploaded bytes are entirely zero would compare equal to a blank GPU
+        // region, so the comparison below would pass without proving anything.
+        let vacuous = inserted
+            .iter()
+            .filter(|entry| entry.expected.iter().all(|byte| *byte == 0))
+            .count();
+        assert!(
+            vacuous * 20 < inserted.len(),
+            "{vacuous}/{} uploaded tiles were entirely zero bytes; the round trip would pass \
+             even against a blank atlas",
+            inserted.len()
+        );
+
+        // Read each atlas texture back once and compare every tile that lives in it. Reading
+        // after ALL inserts is what makes overwrites visible: a tile can be correct when it is
+        // written and clobbered by a later allocation.
+        let mut readbacks: Vec<(AtlasTextureId, crate::directx_atlas::TextureReadback)> =
+            Vec::new();
+        let mut blank = Vec::new();
+        let mut corrupted = Vec::new();
+
+        for entry in &inserted {
+            if !readbacks.iter().any(|(id, _)| *id == entry.texture_id) {
+                let readback = atlas
+                    .read_back(entry.texture_id)
+                    .expect("atlas texture should be readable");
+                readbacks.push((entry.texture_id, readback));
+            }
+            let readback = &readbacks
+                .iter()
+                .find(|(id, _)| *id == entry.texture_id)
+                .expect("just inserted")
+                .1;
+
+            let actual = readback.region(entry.bounds);
+            if actual == entry.expected {
+                continue;
+            }
+            if actual.iter().all(|byte| *byte == 0) {
+                blank.push(format!("  {}: tile is blank on the GPU", entry.label));
+            } else {
+                let differing = actual
+                    .iter()
+                    .zip(&entry.expected)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                corrupted.push(format!(
+                    "  {}: {differing}/{} bytes differ from what was uploaded",
+                    entry.label,
+                    entry.expected.len()
+                ));
+            }
+        }
+
+        eprintln!(
+            "round trip: verified {} tiles across {} atlas texture(s)",
+            inserted.len(),
+            readbacks.len()
+        );
+        report(&blank, "were uploaded but read back empty");
+        report(&corrupted, "read back different bytes than were uploaded");
     }
 }
