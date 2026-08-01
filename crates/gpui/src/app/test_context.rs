@@ -3,6 +3,7 @@ use crate::{
     BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
     Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    NoopTextSystem,
     Pixels, Platform, PlatformTextSystem, Point, Render, Result, SharedString, Size,
     SystemNotification, SystemNotificationResponse, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
@@ -125,66 +126,7 @@ impl AppContext for TestAppContext {
 impl TestAppContext {
     /// Creates a new `TestAppContext`. Usually you can rely on `#[gpui::test]` to do this for you.
     pub fn build(dispatcher: TestDispatcher, fn_name: Option<&'static str>) -> Self {
-        let arc_dispatcher = Arc::new(dispatcher.clone());
-        let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
-        let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
-        let platform = TestPlatform::new(background_executor.clone(), foreground_executor.clone());
-        Self::build_with_platform(
-            dispatcher,
-            fn_name,
-            background_executor,
-            foreground_executor,
-            platform,
-        )
-    }
-
-    /// Creates a test context backed by the provided platform text system.
-    pub fn build_with_text_system(
-        dispatcher: TestDispatcher,
-        fn_name: Option<&'static str>,
-        platform_text_system: Arc<dyn PlatformTextSystem>,
-    ) -> Self {
-        let arc_dispatcher = Arc::new(dispatcher.clone());
-        let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
-        let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
-        let platform = TestPlatform::with_text_system(
-            background_executor.clone(),
-            foreground_executor.clone(),
-            platform_text_system,
-        );
-        Self::build_with_platform(
-            dispatcher,
-            fn_name,
-            background_executor,
-            foreground_executor,
-            platform,
-        )
-    }
-
-    fn build_with_platform(
-        dispatcher: TestDispatcher,
-        fn_name: Option<&'static str>,
-        background_executor: BackgroundExecutor,
-        foreground_executor: ForegroundExecutor,
-        platform: Rc<TestPlatform>,
-    ) -> Self {
-        let asset_source = Arc::new(());
-        let http_client = http_client::FakeHttpClient::with_404_response();
-        let text_system = Arc::new(TextSystem::new(platform.text_system()));
-
-        let app = App::new_app(platform.clone(), asset_source, http_client);
-        app.borrow_mut().mode = GpuiMode::test();
-
-        Self {
-            app,
-            background_executor,
-            foreground_executor,
-            dispatcher,
-            test_platform: platform,
-            text_system,
-            fn_name,
-            on_quit: Rc::new(RefCell::new(Vec::default())),
-        }
+        Self::build_with_platform(dispatcher, fn_name, Arc::new(NoopTextSystem), None)
     }
 
     /// Creates a `TestAppContext` backed by a specific text system rather than
@@ -199,13 +141,29 @@ impl TestAppContext {
         fn_name: Option<&'static str>,
         platform_text_system: Arc<dyn PlatformTextSystem>,
     ) -> Self {
+        Self::build_with_platform(dispatcher, fn_name, platform_text_system, None)
+    }
+
+    /// As [`Self::build_with_text_system`], but also supplying a headless renderer so
+    /// [`Window::render_to_image`] produces real pixels instead of failing.
+    ///
+    /// Needed to assert on what the GPU actually drew rather than on the scene it was given.
+    pub fn build_with_platform(
+        dispatcher: TestDispatcher,
+        fn_name: Option<&'static str>,
+        platform_text_system: Arc<dyn PlatformTextSystem>,
+        headless_renderer_factory: Option<
+            Box<dyn Fn() -> Option<Box<dyn crate::PlatformHeadlessRenderer>>>,
+        >,
+    ) -> Self {
         let arc_dispatcher = Arc::new(dispatcher.clone());
         let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
-        let platform = TestPlatform::with_text_system(
+        let platform = TestPlatform::with_platform(
             background_executor.clone(),
             foreground_executor.clone(),
             platform_text_system,
+            headless_renderer_factory,
         );
         let asset_source = Arc::new(());
         let http_client = http_client::FakeHttpClient::with_404_response();

@@ -39,4 +39,7 @@ pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
 
+#[cfg(feature = "test-support")]
+pub use directx_renderer::DirectXHeadlessRenderer;
+
 pub(crate) use windows::Win32::Foundation::HWND;
