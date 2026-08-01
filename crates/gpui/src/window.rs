@@ -2476,6 +2476,16 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// How many glyph sprites the last rendered frame put in the scene.
+    ///
+    /// Lets a test tell "the scene never had the glyph" apart from "the draw path lost it",
+    /// which are very different bugs with the same symptom.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_glyph_sprite_count(&self) -> usize {
+        self.rendered_frame.scene.monochrome_sprites.len()
+            + self.rendered_frame.scene.subpixel_sprites.len()
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
