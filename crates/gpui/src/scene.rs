@@ -13,7 +13,63 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::OnceLock,
 };
+
+/// How glyph-drop reporting is configured by `GPUI_DEBUG_GLYPH_DROPS`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlyphDropReporting {
+    Off,
+    /// Only glyphs that missed their content mask by a hair.
+    NearMisses,
+    /// Every dropped glyph, including ones legitimately scrolled offscreen.
+    All,
+}
+
+/// Whether to report glyph sprites dropped by the content-mask cull in `insert_primitive`.
+///
+/// Off by default: the cull is a hot path and legitimately discards offscreen glyphs by the
+/// thousand while scrolling. `GPUI_DEBUG_GLYPH_DROPS=1` reports only near misses, which is
+/// what you want when diagnosing characters going missing from the middle of a word;
+/// `GPUI_DEBUG_GLYPH_DROPS=all` reports every drop and will be extremely noisy.
+fn glyph_drop_reporting() -> GlyphDropReporting {
+    static MODE: OnceLock<GlyphDropReporting> = OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("GPUI_DEBUG_GLYPH_DROPS").as_deref() {
+            Ok("1" | "true") => GlyphDropReporting::NearMisses,
+            Ok("all") => GlyphDropReporting::All,
+            _ => GlyphDropReporting::Off,
+        },
+    )
+}
+
+/// A glyph that missed its mask by less than this many scaled pixels is very unlikely to have
+/// been scrolled away and very likely to have been rounded away.
+const GLYPH_NEAR_MISS_PIXELS: f32 = 2.0;
+
+/// Scaled pixels by which `bounds` misses `mask` on each axis; zero where they touch or
+/// overlap.
+///
+/// The magnitude separates the two reasons a glyph is culled, which a log otherwise cannot
+/// tell apart: content scrolled out of a viewport misses by tens or thousands of pixels, while
+/// a glyph rounded off a clip edge misses by well under one.
+///
+/// The AXIS then separates the two reasons a glyph can miss by a hair, which matters just as
+/// much. A vertical near miss is the ordinary case — the line above a scroll viewport sits a
+/// few pixels above its mask and is supposed to be invisible, and a transcript produces
+/// hundreds of those per second. A horizontal near miss is not ordinary: text is not scrolled
+/// sideways, so a glyph a fraction of a pixel past the left or right edge means a clip edge
+/// landed inside a label, which is the reported "character missing from the middle of a word".
+/// Reporting only the larger of the two buries the interesting case under the boring one.
+fn mask_miss_distances(bounds: &Bounds<ScaledPixels>, mask: &Bounds<ScaledPixels>) -> (f32, f32) {
+    let horizontal = (mask.origin.x.0 - (bounds.origin.x.0 + bounds.size.width.0))
+        .max(bounds.origin.x.0 - (mask.origin.x.0 + mask.size.width.0))
+        .max(0.0);
+    let vertical = (mask.origin.y.0 - (bounds.origin.y.0 + bounds.size.height.0))
+        .max(bounds.origin.y.0 - (mask.origin.y.0 + mask.size.height.0))
+        .max(0.0);
+    (horizontal, vertical)
+}
 
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
@@ -91,6 +147,38 @@ impl Scene {
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
+            // The second place a single glyph can vanish with nothing logged (the first is the
+            // empty-raster-bounds path in `Window::paint_glyph`). Shaping has already run, so
+            // the advance survives and the character is simply missing from the middle of a
+            // word. `paint_line` pre-culls with the font's MAX bounding box at the pen
+            // position, whereas this culls the glyph's actual quad, so a glyph can pass the
+            // coarse check and still be dropped here — scattered singles, neighbours intact.
+            // Kind first: this branch runs for every offscreen glyph while scrolling, and the
+            // discriminant check is cheaper than the flag's atomic load.
+            if matches!(
+                primitive,
+                Primitive::MonochromeSprite(_) | Primitive::SubpixelSprite(_)
+            ) {
+                let mode = glyph_drop_reporting();
+                if mode != GlyphDropReporting::Off {
+                    let bounds = primitive.bounds();
+                    let mask = &primitive.content_mask().bounds;
+                    let (horizontal, vertical) = mask_miss_distances(bounds, mask);
+                    // A horizontal miss means a clip edge cut into a line of text, which is
+                    // the suspicious case at any distance under a pixel. A purely vertical
+                    // miss is the line above a scroll viewport and is expected.
+                    let suspicious =
+                        horizontal > 0.0 && horizontal < GLYPH_NEAR_MISS_PIXELS && vertical == 0.0;
+                    if mode == GlyphDropReporting::All || suspicious {
+                        let axis = if suspicious { "HORIZONTAL" } else { "vertical" };
+                        log::warn!(
+                            "dropped a glyph sprite ({axis}) {horizontal:.3}px x / \
+                             {vertical:.3}px y outside its content mask: \
+                             bounds {bounds:?} vs mask {mask:?}",
+                        );
+                    }
+                }
+            }
             return;
         }
 
@@ -1002,5 +1090,62 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod glyph_drop_diagnostic_tests {
+    use super::{GLYPH_NEAR_MISS_PIXELS, mask_miss_distances};
+    use crate::{Bounds, ScaledPixels, point, size};
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    /// The diagnostic is only useful if it separates a clip edge cutting into a line of text
+    /// from the line above a scroll viewport. Both are "culled by the content mask", both can
+    /// miss by well under a pixel, and only the first is a bug -- so distance alone is not
+    /// enough, the axis carries the signal.
+    #[test]
+    fn horizontal_near_misses_are_distinguished_from_scroll_edges() {
+        let mask = bounds(100., 100., 400., 200.);
+
+        // A clip edge landing inside a line of text: overlaps vertically, misses horizontally
+        // by a hair. This is the case worth waking someone up for.
+        for glyph in [bounds(99.4, 150., 0.5, 10.), bounds(500.1, 150., 8., 10.)] {
+            let (horizontal, vertical) = mask_miss_distances(&glyph, &mask);
+            assert!(
+                horizontal > 0.0 && horizontal < GLYPH_NEAR_MISS_PIXELS && vertical == 0.0,
+                "{glyph:?} should read as a horizontal near miss, got {horizontal}x / {vertical}y"
+            );
+        }
+
+        // The line just above or below a scroll viewport. Misses by a hair too, but vertically,
+        // and is supposed to be invisible. A transcript emits hundreds of these per second, so
+        // reporting them would bury the case above.
+        for glyph in [bounds(150., 90., 8., 9.), bounds(150., 300.5, 8., 10.)] {
+            let (horizontal, vertical) = mask_miss_distances(&glyph, &mask);
+            assert_eq!(horizontal, 0.0, "{glyph:?} does not miss horizontally at all");
+            assert!(vertical > 0.0, "{glyph:?} is a scroll-edge cull");
+        }
+
+        // The commonest shape in a real transcript: the line above the viewport ends exactly
+        // on the mask's top edge, so the intersection is empty and it is dropped while missing
+        // by zero on both axes. It must NOT read as horizontal, or every scrolling frame
+        // reports hundreds of false positives.
+        let (horizontal, vertical) = mask_miss_distances(&bounds(150., 91., 8., 9.), &mask);
+        assert_eq!((horizontal, vertical), (0.0, 0.0));
+
+        // Scrolled well out of the viewport: correctly culled, far away on both counts.
+        let (_, vertical) = mask_miss_distances(&bounds(150., -400., 8., 10.), &mask);
+        assert!(vertical >= GLYPH_NEAR_MISS_PIXELS);
+
+        // Exactly touching an edge yields an empty intersection and so is dropped, with a zero
+        // miss. That is the most suspicious geometry of all and must not read as "far away".
+        assert_eq!(mask_miss_distances(&bounds(92., 150., 8., 10.), &mask).0, 0.0);
+        assert_eq!(mask_miss_distances(&bounds(150., 150., 8., 10.), &mask), (0.0, 0.0));
     }
 }
