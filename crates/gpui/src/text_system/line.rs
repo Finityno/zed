@@ -382,13 +382,12 @@ fn paint_line(
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
-        // The font's bounding box, which contains every glyph's ink by construction. It is
-        // expressed relative to the BASELINE with y pointing up, so it has to be flipped and
-        // positioned on the baseline to say where ink can actually land on screen.
-        let mut max_glyph_box = Bounds::default();
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_box = text_system.bounding_box(run.font_id, layout.font_size);
+            // The font's bounding box, which contains every glyph's ink by construction. It is
+            // expressed relative to the BASELINE with y pointing up, so it has to be flipped
+            // and positioned on the baseline to say where ink can actually land on screen.
+            let max_glyph_box = text_system.bounding_box(run.font_id, layout.font_size);
             max_glyph_size = max_glyph_box.size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
