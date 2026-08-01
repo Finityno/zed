@@ -420,6 +420,33 @@ struct WindowCreateContext {
 }
 
 impl WindowsWindow {
+    fn effective_clear_color(&self) -> [f32; 4] {
+        // Render inactive windows opaque so a translucent (Mica / blurred)
+        // background doesn't show through when the window isn't active,
+        // matching macOS and avoiding the GPU cost of the effect on inactive
+        // windows. The user-requested appearance is kept; only the effective
+        // rendering follows the active state.
+        let background_appearance = if self.is_active() {
+            self.state.background_appearance.get()
+        } else {
+            WindowBackgroundAppearance::Opaque
+        };
+        // The opaque base has to follow the window's effective appearance: a
+        // dark-themed window whose translucent fills composite over a white
+        // base flips light when it loses focus.
+        match background_appearance {
+            WindowBackgroundAppearance::Opaque => match self.appearance() {
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => {
+                    // AppKit's dark `textBackgroundColor`, the base macOS
+                    // inactive windows fall back to.
+                    [0x1E as f32 / 255.0, 0x1E as f32 / 255.0, 0x1E as f32 / 255.0, 1.0]
+                }
+                WindowAppearance::Light | WindowAppearance::VibrantLight => [1.0; 4],
+            },
+            _ => [0.0; 4],
+        }
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
@@ -1006,30 +1033,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        // Render inactive windows opaque so a translucent (Mica / blurred)
-        // background doesn't show through when the window isn't active,
-        // matching macOS and avoiding the GPU cost of the effect on inactive
-        // windows. The user-requested appearance is kept; only the effective
-        // rendering follows the active state.
-        let background_appearance = if self.is_active() {
-            self.state.background_appearance.get()
-        } else {
-            WindowBackgroundAppearance::Opaque
-        };
-        // The opaque base has to follow the window's effective appearance: a
-        // dark-themed window whose translucent fills composite over a white
-        // base flips light when it loses focus.
-        let clear_color = match background_appearance {
-            WindowBackgroundAppearance::Opaque => match self.appearance() {
-                WindowAppearance::Dark | WindowAppearance::VibrantDark => {
-                    // AppKit's dark `textBackgroundColor`, the base macOS
-                    // inactive windows fall back to.
-                    [0x1E as f32 / 255.0, 0x1E as f32 / 255.0, 0x1E as f32 / 255.0, 1.0]
-                }
-                WindowAppearance::Light | WindowAppearance::VibrantLight => [1.0; 4],
-            },
-            _ => [0.0; 4],
-        };
+        let clear_color = self.effective_clear_color();
         self.state
             .renderer
             .borrow_mut()
@@ -1043,6 +1047,23 @@ impl PlatformWindow for WindowsWindow {
             .renderer
             .borrow_mut()
             .render_to_image(scene, self.state.background_appearance.get())
+    }
+
+    fn draw_layered(&self, scene: &Scene, overlay_start: usize) {
+        let clear_color = self.effective_clear_color();
+        self.state
+            .renderer
+            .borrow_mut()
+            .draw_layered(scene, overlay_start, clear_color)
+            .log_err();
+    }
+
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.state.renderer.borrow_mut().enable_scene_overlay()
+    }
+
+    fn create_native_surface(&self) -> anyhow::Result<Rc<dyn PlatformNativeSurface>> {
+        self.state.renderer.borrow_mut().create_native_surface()
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

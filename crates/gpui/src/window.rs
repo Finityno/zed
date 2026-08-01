@@ -974,6 +974,8 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    /// First paint operation that belongs on the GPUI overlay surface.
+    pub(crate) overlay_scene_start: usize,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -1020,6 +1022,7 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
+            overlay_scene_start: 0,
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1045,6 +1048,7 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.overlay_scene_start = 0;
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -2075,6 +2079,21 @@ impl Window {
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle
+    }
+
+    /// Enables an experimental transparent GPUI scene plane above native child
+    /// views hosted by this window.
+    ///
+    /// The root scene remains on the primary surface. Deferred elements and
+    /// window-level overlays are rendered on the transparent plane.
+    pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.platform_window.enable_scene_overlay()
+    }
+
+    /// Creates a native surface slot between the root scene and GPUI's
+    /// deferred/window-level overlay scene.
+    pub fn create_native_surface(&self) -> anyhow::Result<Rc<dyn crate::PlatformNativeSurface>> {
+        self.platform_window.create_native_surface()
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
@@ -3152,7 +3171,10 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window.draw_layered(
+            &self.rendered_frame.scene,
+            self.rendered_frame.overlay_scene_start,
+        );
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3291,6 +3313,12 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
+
+        // Native surfaces are composited after the root scene and before all
+        // deferred/window-level overlays. Platform backends with layered scene
+        // support use this boundary to render the remainder on a transparent
+        // surface above native children such as WebViews.
+        self.next_frame.overlay_scene_start = self.next_frame.scene.len();
 
         self.paint_deferred_draws(cx);
 
@@ -4573,7 +4601,7 @@ impl Window {
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
-                grayscale: false,
+                grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
