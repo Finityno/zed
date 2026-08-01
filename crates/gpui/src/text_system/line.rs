@@ -372,9 +372,14 @@ fn paint_line(
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
+        // The font's bounding box, which contains every glyph's ink by construction. It is
+        // expressed relative to the BASELINE with y pointing up, so it has to be flipped and
+        // positioned on the baseline to say where ink can actually land on screen.
+        let mut max_glyph_box = Bounds::default();
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_box = text_system.bounding_box(run.font_id, layout.font_size);
+            max_glyph_size = max_glyph_box.size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -521,25 +526,30 @@ fn paint_line(
                 // `Scene::insert_primitive` against the glyph's real quad. So it must never
                 // discard a glyph that would have been visible.
                 //
-                // It previously used the font's max box anchored at `glyph_origin`, which is
-                // the pen position at the TOP of the line — but the glyph is painted down at
-                // the baseline (`+ baseline_offset`), so with generous line heights the box
-                // sat above the ink it was meant to stand for. Near a clip edge that culls
-                // glyphs that are still visible, one at a time, leaving their advances behind:
-                // characters missing from the middle of a word. Cover the whole line row
-                // vertically, and allow a glyph box of horizontal overhang on each side for
-                // negative side bearings.
+                // It previously used the font's max box anchored at `glyph_origin` — the pen
+                // position at the TOP of the line — while the glyph is painted down at the
+                // baseline. The box therefore described a region the glyph is not in, and near
+                // a clip edge that culls glyphs that are still visible, one at a time, leaving
+                // their advances behind: characters missing from the middle of a word.
+                //
+                // Anchor it to the baseline instead. `max_glyph_box` is in font space (y up,
+                // relative to the baseline), so flipping it onto the baseline the glyph is
+                // actually painted on gives a span that provably contains the ink, descenders
+                // included. Union with the line row so the box is never smaller than the row,
+                // and allow a glyph box of horizontal overhang for negative side bearings.
+                let vertical_offset = point(px(0.0), glyph.position.y);
+                let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
+                let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
+                let ink_bottom = baseline_y - max_glyph_box.origin.y;
+                let cull_top = ink_top.min(glyph_origin.y);
+                let cull_bottom = ink_bottom.max(glyph_origin.y + line_height);
                 let max_glyph_bounds = Bounds {
-                    origin: point(glyph_origin.x - max_glyph_size.width, glyph_origin.y),
-                    size: size(
-                        max_glyph_size.width * 3.,
-                        line_height.max(max_glyph_size.height),
-                    ),
+                    origin: point(glyph_origin.x - max_glyph_size.width, cull_top),
+                    size: size(max_glyph_size.width * 3., cull_bottom - cull_top),
                 };
 
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
-                    let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,

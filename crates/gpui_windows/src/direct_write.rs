@@ -2065,6 +2065,10 @@ mod glyph_pipeline_tests {
 
     /// Below this device-pixel size a glyph legitimately rounds away to nothing, so the
     /// "typographic ink implies raster ink" invariant is only meaningful at or above it.
+    /// Leading ratios to probe. fincode renders at 1.5 (theme.rs `line_height`), so that row
+    /// is the one that says whether this defect could fire in the real app.
+    const LINE_HEIGHT_SCALES: &[f32] = &[1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2.0, 2.5, 3.0];
+
     const MIN_INK_DEVICE_PIXELS: f32 = 8.0;
 
     /// Failures are collected rather than asserted eagerly: the distribution across variants,
@@ -2357,6 +2361,13 @@ mod glyph_pipeline_tests {
         };
         let chars = probe_chars();
         let mut failures = Vec::new();
+        // How far the ink escapes the OLD box, per leading ratio. fincode renders at
+        // `theme.line_height = 1.5`, so this is what says whether the defect could ever have
+        // fired in the app rather than only in a synthetic case.
+        let mut old_box_overflow: Vec<(f32, usize, f32)> = LINE_HEIGHT_SCALES
+            .iter()
+            .map(|scale| (*scale, 0, 0.0))
+            .collect();
 
         for (family, font_id) in &fonts {
             let metrics = system.font_metrics(*font_id);
@@ -2366,18 +2377,21 @@ mod glyph_pipeline_tests {
                 let descent = metrics.descent(size);
                 let font_box = metrics.bounding_box(size);
 
-                // Tight, typical, and deliberately generous leading. The last is where the old
-                // box failed, and fincode's transcript uses roomy line heights.
-                for line_height_scale in [1.0, 1.3, 1.5, 2.0, 3.0] {
+                for line_height_scale in LINE_HEIGHT_SCALES.iter().copied() {
                     let line_height = size * line_height_scale;
                     // Mirrors `paint_line`: the glyph is painted at the baseline, which sits
                     // `padding_top + ascent` below the pen position the cull box starts at.
                     let padding_top = (line_height - ascent - descent) / 2.;
                     let baseline_offset = padding_top + ascent;
 
-                    // The conservative box `paint_line` now uses, relative to `glyph_origin`.
-                    let cull_top = px(0.);
-                    let cull_bottom = line_height.max(font_box.size.height);
+                    // The conservative box `paint_line` now uses, relative to `glyph_origin`:
+                    // the font's bounding box flipped onto the baseline (it is y-up in font
+                    // space), unioned with the line row.
+                    let ink_span_top =
+                        baseline_offset - (font_box.origin.y + font_box.size.height);
+                    let ink_span_bottom = baseline_offset - font_box.origin.y;
+                    let cull_top = ink_span_top.min(px(0.));
+                    let cull_bottom = ink_span_bottom.max(line_height);
 
                     for ch in &chars {
                         let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
@@ -2403,9 +2417,25 @@ mod glyph_pipeline_tests {
                                  {cull_top:?}..{cull_bottom:?}"
                             ));
                         }
+
+                        // The box before the fix: the font's max box at the pen position.
+                        let old_bottom = font_box.size.height;
+                        if ink_bottom > old_bottom
+                            && let Some(entry) = old_box_overflow
+                                .iter_mut()
+                                .find(|(scale, _, _)| *scale == line_height_scale)
+                        {
+                            entry.1 += 1;
+                            entry.2 = entry.2.max((ink_bottom - old_bottom).to_f64() as f32);
+                        }
                     }
                 }
             }
+        }
+
+        eprintln!("how far ink escaped the OLD pre-cull box, by leading ratio:");
+        for (scale, count, worst) in &old_box_overflow {
+            eprintln!("  {scale}x leading: {count} glyph configs, worst overflow {worst:.2}px");
         }
 
         report(
