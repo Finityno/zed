@@ -550,8 +550,18 @@ fn paint_line(
                 let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
                 let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
                 let ink_bottom = baseline_y - max_glyph_box.origin.y;
-                let cull_top = ink_top.min(glyph_origin.y);
-                let cull_bottom = ink_bottom.max(glyph_origin.y + line_height);
+                // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
+                // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
+                // texture bounds include the antialiasing skirt, and some fonts report a box
+                // their own glyphs then exceed. Berkeley Mono Variable -- fincode's code font --
+                // rasterizes its descenders 0.55px below the box it reports, at every weight and
+                // at every leading from 1.0x to 1.6x, so without this pad the cheap box is not a
+                // superset of the exact one and a descender at a clip edge is dropped while
+                // visible. The pre-cull only exists to avoid rasterizing obviously offscreen
+                // glyphs, so erring large costs a few edge rasterizations and nothing else.
+                const RASTER_SKIRT: Pixels = px(2.0);
+                let cull_top = ink_top.min(glyph_origin.y) - RASTER_SKIRT;
+                let cull_bottom = ink_bottom.max(glyph_origin.y + line_height) + RASTER_SKIRT;
                 let max_glyph_bounds = Bounds {
                     origin: point(glyph_origin.x - max_glyph_size.width, cull_top),
                     size: size(max_glyph_size.width * 3., cull_bottom - cull_top),
