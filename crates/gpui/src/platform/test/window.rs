@@ -65,6 +65,7 @@ pub(crate) struct TestWindowState {
     start_external_drag_result: bool,
 }
 
+/// A window backed by no platform window at all, used by `TestAppContext`.
 #[derive(Clone)]
 pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
@@ -169,6 +170,7 @@ impl TestWindow {
         self.0.lock().text_input_state_changes.clone()
     }
 
+    /// Resizes the window and fires its resize callback, as the platform would.
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
         let scale_factor = self.scale_factor();
         let mut lock = self.0.lock();
@@ -192,6 +194,7 @@ impl TestWindow {
         self.0.lock().active_status_change_callback = Some(callback);
     }
 
+    /// Switches the window's appearance (light/dark) and fires its change callback.
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
         let mut lock = self.0.lock();
         lock.appearance = appearance;
@@ -220,6 +223,7 @@ impl TestWindow {
         self.0.lock().request_frame_callback = Some(callback);
     }
 
+    /// Delivers an input event to the window, returning whether it was handled.
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.input_callback.take() else {
@@ -231,10 +235,12 @@ impl TestWindow {
         !result.propagate
     }
 
+    /// Files currently being dragged out of this window, with whether each is a directory.
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
         self.0.lock().external_drag_files.clone()
     }
 
+    /// Sets what `start_external_drag` reports back to the caller.
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
     }

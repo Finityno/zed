@@ -2229,7 +2229,7 @@ mod glyph_pipeline_tests {
     // built-in `#[test]` attribute and blows the macro recursion limit.
     use crate::{DirectWriteTextSystem, DirectXAtlas, DirectXDevices};
     use gpui::{
-        AtlasKey, AtlasTextureId, Bounds, DevicePixels, FontId, GlyphId, PlatformAtlas,
+        AtlasKey, AtlasTextureId, Bounds, DevicePixels, FontId, FontWeight, GlyphId, PlatformAtlas,
         PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X, font, px,
     };
     use gpui_util::ResultExt as _;
@@ -2269,10 +2269,60 @@ mod glyph_pipeline_tests {
     /// packing, a second atlas texture, and the batching split between them.
     const TILE_POPULATION: usize = 6000;
 
+    /// Variable-font instance weights an app can ask for beyond the usual 400/700. fincode uses
+    /// 250, 325, 350, 375 and 550 for UI and code text. A named instance is one thing to
+    /// rasterize; an interpolated one at 375 is another, and only the latter is what ships.
+    const WEIGHTS: &[f32] = &[250.0, 325.0, 375.0, 400.0, 550.0, 700.0];
+
     struct Sweep {
         devices: DirectXDevices,
         system: DirectWriteTextSystem,
-        fonts: Vec<(&'static str, FontId)>,
+        fonts: Vec<(String, FontId)>,
+    }
+
+    /// Registers every font file in `GPUI_SWEEP_FONT_DIR` and returns the family names they
+    /// added.
+    ///
+    /// `FAMILIES` can only name faces installed system-wide. An app that ships its own fonts
+    /// registers them from memory through `add_fonts`, which builds a DirectWrite *custom*
+    /// font collection — a different lookup path from the system collection, holding faces that
+    /// nearly all of the app's text is then drawn in. Sweeping only installed fonts therefore
+    /// covers the faces the app does not use and misses the ones it does. fincode ships Inter
+    /// Variable, Berkeley Mono Variable and Lilex this way, so pointing this at its
+    /// `assets/fonts` covers what the app actually renders.
+    fn register_extra_fonts(system: &DirectWriteTextSystem) -> Vec<String> {
+        let Ok(directory) = std::env::var("GPUI_SWEEP_FONT_DIR") else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            eprintln!("GPUI_SWEEP_FONT_DIR={directory} could not be read");
+            return Vec::new();
+        };
+        let before = system.all_font_names();
+        let mut loaded = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // woff2 is a web wrapper DirectWrite will not take; only sniff real font files.
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("ttf" | "otf" | "ttc")
+            ) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if system.add_fonts(vec![Cow::Owned(bytes)]).log_err().is_some() {
+                loaded += 1;
+            }
+        }
+        let added: Vec<String> = system
+            .all_font_names()
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .collect();
+        eprintln!("registered {loaded} font file(s) from {directory}, adding families: {added:?}");
+        added
     }
 
     /// Returns `None` when no D3D11 adapter is available, so a headless machine skips the
@@ -2286,26 +2336,34 @@ mod glyph_pipeline_tests {
             eprintln!("SKIPPED: could not create the DirectWrite text system");
             return None;
         };
-        let mut fonts: Vec<(&'static str, FontId)> = Vec::new();
-        for family in FAMILIES {
-            let Some(font_id) = system.font_id(&font(*family)).log_err() else {
-                continue;
-            };
-            // DirectWrite falls back rather than failing, so distinct family names routinely
-            // resolve to the same face; sweeping it twice only costs time.
-            if fonts.iter().any(|(_, resolved)| *resolved == font_id) {
-                continue;
+        let mut families: Vec<String> = FAMILIES.iter().map(|f| (*f).to_owned()).collect();
+        families.extend(register_extra_fonts(&system));
+
+        let mut fonts: Vec<(String, FontId)> = Vec::new();
+        for family in &families {
+            for weight in WEIGHTS {
+                let mut requested = font(family.as_str());
+                requested.weight = FontWeight(*weight);
+                let Some(font_id) = system.font_id(&requested).log_err() else {
+                    continue;
+                };
+                // DirectWrite falls back rather than failing, so distinct family names -- and
+                // weights a family has no instance for -- routinely resolve to the same face;
+                // sweeping it twice only costs time.
+                if fonts.iter().any(|(_, resolved)| *resolved == font_id) {
+                    continue;
+                }
+                fonts.push((format!("{family}@{weight}"), font_id));
             }
-            fonts.push((family, font_id));
         }
         if fonts.is_empty() {
-            eprintln!("SKIPPED: none of {FAMILIES:?} resolved to a font");
+            eprintln!("SKIPPED: none of {families:?} resolved to a font");
             return None;
         }
         eprintln!(
             "sweeping {} distinct font face(s): {:?}",
             fonts.len(),
-            fonts.iter().map(|(family, _)| *family).collect::<Vec<_>>()
+            fonts.iter().map(|(family, _)| family.as_str()).collect::<Vec<_>>()
         );
         Some(Sweep {
             devices,
@@ -2553,6 +2611,10 @@ mod glyph_pipeline_tests {
         // How far the ink escapes the OLD box, per leading ratio. fincode renders at
         // `theme.line_height = 1.5`, so this is what says whether the defect could ever have
         // fired in the app rather than only in a synthetic case.
+        // Which faces escape the CURRENT box, and by how much. Reported per (face, leading) so
+        // a defect that only fires for one shipped font at one leading is visible rather than
+        // buried in a flat failure list.
+        let mut overflow_by_face: Vec<(String, f32, usize, f32)> = Vec::new();
         let mut old_box_overflow: Vec<(f32, usize, f32)> = LINE_HEIGHT_SCALES
             .iter()
             .map(|scale| (*scale, 0, 0.0))
@@ -2579,8 +2641,11 @@ mod glyph_pipeline_tests {
                     let ink_span_top =
                         baseline_offset - (font_box.origin.y + font_box.size.height);
                     let ink_span_bottom = baseline_offset - font_box.origin.y;
-                    let cull_top = ink_span_top.min(px(0.));
-                    let cull_bottom = ink_span_bottom.max(line_height);
+                    // Mirrors `paint_line`'s RASTER_SKIRT: the geometric box a font reports is
+                    // not an upper bound on what it rasterizes.
+                    let raster_skirt = px(2.0);
+                    let cull_top = ink_span_top.min(px(0.)) - raster_skirt;
+                    let cull_bottom = ink_span_bottom.max(line_height) + raster_skirt;
 
                     for ch in &chars {
                         let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
@@ -2600,6 +2665,22 @@ mod glyph_pipeline_tests {
                         let ink_bottom = ink_top + px(raster.size.height.0 as f32);
 
                         if ink_top < cull_top || ink_bottom > cull_bottom {
+                            let escape = (cull_top - ink_top).max(ink_bottom - cull_bottom);
+                            match overflow_by_face
+                                .iter_mut()
+                                .find(|(name, scale, ..)| name == family && *scale == line_height_scale)
+                            {
+                                Some(entry) => {
+                                    entry.2 += 1;
+                                    entry.3 = entry.3.max(escape.to_f64() as f32);
+                                }
+                                None => overflow_by_face.push((
+                                    family.clone(),
+                                    line_height_scale,
+                                    1,
+                                    escape.to_f64() as f32,
+                                )),
+                            }
                             failures.push(format!(
                                 "  {ch:?} {family} {font_size}px line-height {line_height_scale}x: \
                                  ink spans {ink_top:?}..{ink_bottom:?} but the cull box is \
@@ -2620,6 +2701,12 @@ mod glyph_pipeline_tests {
                     }
                 }
             }
+        }
+
+        overflow_by_face.sort_by(|a, b| b.3.total_cmp(&a.3));
+        eprintln!("ink escaping the CURRENT pre-cull box, by (face, leading):");
+        for (family, scale, count, worst) in &overflow_by_face {
+            eprintln!("  {family} at {scale}x leading: {count} configs, worst {worst:.3}px");
         }
 
         eprintln!("how far ink escaped the OLD pre-cull box, by leading ratio:");
