@@ -370,7 +370,7 @@ impl TextSystem {
             let rasterized_empty = bounds.size.width.0 == 0 || bounds.size.height.0 == 0;
             if rasterized_empty
                 && params.font_size.0 * params.scale_factor >= MIN_RETRY_DEVICE_PIXELS
-                && self.glyph_has_ink(params)
+                && self.glyph_may_have_ink(params)
             {
                 self.report_empty_raster_bounds(params);
                 return Ok(bounds);
@@ -381,12 +381,25 @@ impl TextSystem {
         }
     }
 
-    /// Whether the font's design metrics say this glyph paints something. Only consulted when
-    /// rasterization already came back empty, so it costs nothing on the common path.
-    fn glyph_has_ink(&self, params: &RenderGlyphParams) -> bool {
-        self.platform_text_system
+    /// Whether the font's design metrics leave open that this glyph paints something. Only
+    /// consulted when rasterization already came back empty, so it costs nothing on the common
+    /// path.
+    ///
+    /// Deliberately answers `true` when the metrics cannot be read at all. The two ways of
+    /// being wrong here are not symmetric: guessing "no ink" caches an empty raster forever,
+    /// in a cache that is never evicted and is keyed on the subpixel variant, so the character
+    /// goes permanently invisible at that one fractional position while rendering correctly
+    /// everywhere else on the same line. Guessing "has ink" costs one extra platform call per
+    /// frame for a glyph that is genuinely blank. Only the second is recoverable, and a
+    /// `typographic_bounds` failure is exactly the moment the first would be chosen.
+    fn glyph_may_have_ink(&self, params: &RenderGlyphParams) -> bool {
+        match self
+            .platform_text_system
             .typographic_bounds(params.font_id, params.glyph_id)
-            .is_ok_and(|bounds| bounds.size.width > 0.0 && bounds.size.height > 0.0)
+        {
+            Ok(bounds) => bounds.size.width > 0.0 && bounds.size.height > 0.0,
+            Err(_) => true,
+        }
     }
 
     /// Reports a glyph that has design ink but rasterized to nothing. Because the result is
@@ -1307,6 +1320,8 @@ mod raster_bounds_cache_tests {
     /// The glyph this fake claims has design ink; every other glyph is treated as blank.
     const INKED_GLYPH: GlyphId = GlyphId(1);
     const BLANK_GLYPH: GlyphId = GlyphId(2);
+    /// A glyph whose design metrics cannot be read at all.
+    const UNREADABLE_GLYPH: GlyphId = GlyphId(3);
 
     /// Always rasterizes to empty bounds, which is the failure being guarded against, and
     /// counts how many times it was asked so the test can tell caching from re-querying.
@@ -1335,6 +1350,9 @@ mod raster_bounds_cache_tests {
         }
 
         fn typographic_bounds(&self, _font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            if glyph_id == UNREADABLE_GLYPH {
+                anyhow::bail!("design metrics unavailable for this glyph");
+            }
             Ok(Bounds {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: if glyph_id == INKED_GLYPH {
@@ -1415,6 +1433,30 @@ mod raster_bounds_cache_tests {
             platform.calls(),
             3,
             "an inked glyph that rasterized empty must be re-queried every time, not cached"
+        );
+    }
+
+    /// When the design metrics cannot be read, the empty raster must NOT be cached.
+    ///
+    /// This is the fail-safe direction, and the asymmetry is the whole point. Caching decides
+    /// the character's fate permanently: the raster-bounds cache is never evicted and is keyed
+    /// on the subpixel variant, so one unreadable-metrics answer makes that character invisible
+    /// at that one fractional x for the life of the process while every other instance of it on
+    /// the same line renders correctly. Not caching costs one platform call per frame.
+    #[test]
+    fn empty_raster_bounds_are_retried_when_design_metrics_cannot_be_read() {
+        let platform = Arc::new(AlwaysEmptyRasterizer::new());
+        let text_system = TextSystem::new(platform.clone());
+
+        let unreadable = params(UNREADABLE_GLYPH);
+        text_system.raster_bounds(&unreadable).unwrap();
+        text_system.raster_bounds(&unreadable).unwrap();
+        text_system.raster_bounds(&unreadable).unwrap();
+
+        assert_eq!(
+            platform.calls(),
+            3,
+            "a glyph whose metrics could not be read must be retried, not written off as blank"
         );
     }
 
