@@ -2720,6 +2720,98 @@ mod glyph_pipeline_tests {
         );
     }
 
+    /// Non-empty raster bounds do not mean the glyph actually rasterized.
+    ///
+    /// `rasterize_monochrome` allocates a PRE-ZEROED buffer and hands it to
+    /// `CreateAlphaTexture`. If that call succeeds without writing anything, the result is an
+    /// all-zero bitmap that looks exactly like a legitimate one. `Window::paint_glyph` only
+    /// guards on the BOUNDS being non-empty, so a blank bitmap sails past it, gets a tile
+    /// allocated, and is uploaded to the atlas -- where, because glyph tiles are never evicted,
+    /// it stays for the life of the process.
+    ///
+    /// The symptom is a specific character invisible at a specific subpixel position while the
+    /// same character renders fine elsewhere on the same line, since each instance's fractional
+    /// x picks a different variant. Every other sweep in this file checks bounds, which cannot
+    /// see this.
+    #[test]
+    fn rasterized_glyph_bytes_are_never_blank() {
+        let Some(Sweep { system, fonts, .. }) = sweep() else {
+            return;
+        };
+
+        let chars = probe_chars();
+        let mut blank = Vec::new();
+        let mut short = Vec::new();
+        let mut checked = 0usize;
+
+        for (family, font_id) in &fonts {
+            for ch in &chars {
+                let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
+                    continue;
+                };
+                for &font_size in FONT_SIZES {
+                    for &scale_factor in SCALE_FACTORS {
+                        for subpixel_rendering in [true, false] {
+                            for variant in 0..SUBPIXEL_VARIANTS_X {
+                                let params = glyph_params(
+                                    *font_id,
+                                    glyph_id,
+                                    font_size,
+                                    scale_factor,
+                                    variant,
+                                    subpixel_rendering,
+                                );
+                                let Some(bounds) =
+                                    system.glyph_raster_bounds(&params).log_err()
+                                else {
+                                    continue;
+                                };
+                                // An empty raster is the other sweep's business; here the
+                                // question is only whether a NON-empty one carries ink.
+                                if !has_ink(bounds) {
+                                    continue;
+                                }
+                                let Some((size, bytes)) =
+                                    system.rasterize_glyph(&params, bounds).log_err()
+                                else {
+                                    continue;
+                                };
+                                checked += 1;
+
+                                let bytes_per_pixel = if subpixel_rendering { 4 } else { 1 };
+                                let expected = size.width.0 as usize
+                                    * size.height.0 as usize
+                                    * bytes_per_pixel;
+                                if bytes.len() < expected {
+                                    short.push(format!(
+                                        "  {ch:?} {family} {font_size}px scale {scale_factor}                                          variant {variant} subpixel={subpixel_rendering}:                                          {} bytes for a {}x{} tile needing {expected}",
+                                        bytes.len(),
+                                        size.width.0,
+                                        size.height.0,
+                                    ));
+                                }
+                                if bytes.iter().all(|byte| *byte == 0) {
+                                    blank.push(format!(
+                                        "  {ch:?} {family} {font_size}px scale {scale_factor}                                          variant {variant} subpixel={subpixel_rendering}:                                          {}x{} raster is entirely zero",
+                                        size.width.0, size.height.0,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("checked {checked} rasterized glyph bitmaps");
+        assert!(
+            checked > 1000,
+            "only {checked} bitmaps rasterized; the sweep is not exercising real glyphs"
+        );
+        report(&short, "rasterized fewer bytes than their tile needs");
+        report(&blank, "have non-empty bounds but rasterize to an all-zero bitmap");
+    }
+
     /// Diagnostic: does DirectWrite ever recommend ALIASED on this machine?
     ///
     /// `create_glyph_run_analysis` remaps ALIASED to NATURAL_SYMMETRIC when the caller is about
