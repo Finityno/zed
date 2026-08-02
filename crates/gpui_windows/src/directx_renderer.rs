@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    ops::Range,
     rc::Rc,
     slice,
     sync::{Arc, OnceLock},
@@ -273,6 +274,7 @@ impl DirectXRenderer {
             // never needs one.
             overlay_resources: None,
             font_info: Self::get_font_info(),
+            frame_scratch: FrameScratch::default(),
             width: 1,
             height: 1,
             headless: true,
