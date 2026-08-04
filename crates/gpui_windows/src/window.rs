@@ -229,7 +229,13 @@ impl WindowsWindowState {
                 &self.border_offset,
                 self.scale_factor.get(),
             ),
-            placement.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+            // A minimized window keeps no SW_SHOWMAXIMIZED showCmd, so a
+            // maximized window that is currently minimized would otherwise
+            // save as windowed and reopen un-maximized; the restore-to state
+            // lives in the placement flags.
+            placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
+                || (placement.showCmd == SW_SHOWMINIMIZED.0 as u32
+                    && placement.flags.contains(WPF_RESTORETOMAXIMIZED)),
         )
     }
 
@@ -347,6 +353,17 @@ impl WindowsWindowInner {
                     )
                 }
                 .log_err();
+                // A window opened directly into fullscreen is still hidden at
+                // this point (set_window_placement applies its placement with
+                // SW_HIDE); show it only now that it has the fullscreen style
+                // and bounds. Activation happened while the window was hidden
+                // and silently failed, so bring it to the foreground here.
+                if !unsafe { IsWindowVisible(this.hwnd) }.as_bool() {
+                    unsafe {
+                        ShowWindowAsync(this.hwnd, SW_SHOW).ok().log_err();
+                        SetForegroundWindow(this.hwnd).as_bool();
+                    }
+                }
             })
             .detach();
     }
@@ -357,13 +374,24 @@ impl WindowsWindowInner {
         };
         match open_status.state {
             WindowOpenState::Maximized => unsafe {
-                SetWindowPlacement(self.hwnd, &open_status.placement)
+                // Show maximized in the same call that sets the restore rect.
+                // SetWindowPlacement with the creation-time showCmd makes the
+                // windowed frame visible first, and the async SW_MAXIMIZE only
+                // lands a message-pump turn later, flashing the restored
+                // window before it maximizes.
+                let mut placement = open_status.placement;
+                placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+                SetWindowPlacement(self.hwnd, &placement)
                     .context("failed to set window placement")?;
-                ShowWindowAsync(self.hwnd, SW_MAXIMIZE).ok()?;
             },
             WindowOpenState::Fullscreen => {
+                // Keep the window hidden while the restore rect is applied;
+                // toggle_fullscreen shows it once the fullscreen style and
+                // bounds are in place so the windowed frame never flashes.
+                let mut placement = open_status.placement;
+                placement.showCmd = SW_HIDE.0 as u32;
                 unsafe {
-                    SetWindowPlacement(self.hwnd, &open_status.placement)
+                    SetWindowPlacement(self.hwnd, &placement)
                         .context("failed to set window placement")?
                 };
                 self.toggle_fullscreen();
