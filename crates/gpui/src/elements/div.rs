@@ -3277,10 +3277,18 @@ impl Interactivity {
                         ongoing_scroll.set(gesture);
                     }
 
+                    // A container that scrolls one way takes the *other* axis's delta as a
+                    // fallback, which is the only way a wheel with no horizontal notch can
+                    // drive a horizontal strip. It is wrong for a trackpad: both axes are
+                    // already there, so remapping turns a sideways swipe into vertical travel
+                    // on every frame the platform happens to report an exact zero on the minor
+                    // axis. Restricting to the gesture's axis opts out of it entirely.
+                    let cross_axis_wheel_fallback =
+                        !restrict_scroll_to_axis && !event.delta.precise();
                     let mut delta_x = match overflow.x {
                         Overflow::Scroll if !delta.x.is_zero() => delta.x,
                         Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
+                            if cross_axis_wheel_fallback && overflow.y != Overflow::Scroll =>
                         {
                             delta.y
                         }
@@ -3289,7 +3297,7 @@ impl Interactivity {
                     let mut delta_y = match overflow.y {
                         Overflow::Scroll if !delta.y.is_zero() => delta.y,
                         Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
+                            if cross_axis_wheel_fallback && overflow.x != Overflow::Scroll =>
                         {
                             delta.x
                         }
@@ -5477,7 +5485,7 @@ mod tests {
     fn scroll_axis_locked_region(
         cx: &mut TestAppContext,
         shift: bool,
-        deltas: &[Point<Pixels>],
+        deltas: &[ScrollDelta],
     ) -> (Pixels, Pixels) {
         let cx = cx.add_empty_window();
         let outer = ScrollHandle::new();
@@ -5494,7 +5502,7 @@ mod tests {
         for delta in deltas {
             cx.simulate_event(ScrollWheelEvent {
                 position: point(px(10.), px(10.)),
-                delta: ScrollDelta::Pixels(*delta),
+                delta: *delta,
                 modifiers: Modifiers {
                     shift,
                     ..Default::default()
@@ -5510,7 +5518,7 @@ mod tests {
     /// document alone — the eager tuning claims it, and the lock keeps the document still.
     #[gpui::test]
     fn test_axis_lock_claims_a_drifting_sideways_swipe(cx: &mut TestAppContext) {
-        let (strip, document) = scroll_axis_locked_region(cx, false, &[point(px(-20.), px(-12.))]);
+        let (strip, document) = scroll_axis_locked_region(cx, false, &[ScrollDelta::Pixels(point(px(-20.), px(-12.)))]);
 
         assert_eq!(strip, px(-20.));
         assert_eq!(document, Pixels::ZERO, "the document must not move");
@@ -5520,7 +5528,7 @@ mod tests {
     /// strip: the strip does not scroll horizontally and does not consume the event.
     #[gpui::test]
     fn test_axis_lock_leaves_vertical_gestures_to_the_document(cx: &mut TestAppContext) {
-        let (strip, document) = scroll_axis_locked_region(cx, false, &[point(px(-2.), px(-30.))]);
+        let (strip, document) = scroll_axis_locked_region(cx, false, &[ScrollDelta::Pixels(point(px(-2.), px(-30.)))]);
 
         assert_eq!(strip, Pixels::ZERO);
         assert_eq!(document, px(-30.));
@@ -5530,7 +5538,7 @@ mod tests {
     /// at the bound would make a sideways flick at the end of a long line jump the document.
     #[gpui::test]
     fn test_axis_lock_keeps_the_gesture_past_the_horizontal_bound(cx: &mut TestAppContext) {
-        let swipe = point(px(-150.), px(-12.));
+        let swipe = ScrollDelta::Pixels(point(px(-150.), px(-12.)));
         let (strip, document) = scroll_axis_locked_region(cx, false, &[swipe, swipe, swipe]);
 
         assert_eq!(strip, px(-300.), "the strip is at its own max offset");
@@ -5541,15 +5549,148 @@ mod tests {
         );
     }
 
+    /// Restricting to the gesture's axis also opts out of the cross-axis wheel fallback, which a
+    /// horizontal strip needs as much as a trackpad does: a plain vertical notch over a one-line
+    /// input that pans to follow its caret would otherwise drag the text out from under the
+    /// pointer instead of scrolling the page.
+    #[gpui::test]
+    fn test_axis_lock_leaves_a_vertical_wheel_to_the_document(cx: &mut TestAppContext) {
+        let (strip, document) =
+            scroll_axis_locked_region(cx, false, &[ScrollDelta::Lines(point(0., -2.))]);
+
+        assert_eq!(strip, Pixels::ZERO, "the strip must not pan sideways");
+        assert!(
+            document < Pixels::ZERO,
+            "the wheel belongs to the document, got {document:?}"
+        );
+    }
+
     /// Shift names the axis outright. Platforms only remap the axes for line-based wheels, so a
     /// Shift-modified *precise* gesture arrives with its magnitude on the vertical axis and has
     /// to be redirected here.
     #[gpui::test]
     fn test_shift_forces_a_precise_gesture_horizontal(cx: &mut TestAppContext) {
-        let (strip, document) = scroll_axis_locked_region(cx, true, &[point(px(0.), px(-30.))]);
+        let (strip, document) = scroll_axis_locked_region(cx, true, &[ScrollDelta::Pixels(point(px(0.), px(-30.)))]);
 
         assert_eq!(strip, px(-30.), "the vertical magnitude drives the strip");
         assert_eq!(document, Pixels::ZERO);
+    }
+
+    /// Two single-axis scrollers stacked vertically, neither restricted to the gesture's axis:
+    /// the shape almost every list, panel and one-line input takes. `vertical_only` occupies the
+    /// top half of the window, `horizontal_only` the bottom half.
+    struct UnrestrictedSingleAxisScrollers {
+        vertical_only: ScrollHandle,
+        horizontal_only: ScrollHandle,
+    }
+
+    impl Render for UnrestrictedSingleAxisScrollers {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size(px(100.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("vertical-only")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.vertical_only)
+                        .child(div().w(px(100.)).h(px(400.))),
+                )
+                .child(
+                    div()
+                        .id("horizontal-only")
+                        .w(px(100.))
+                        .h(px(50.))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.horizontal_only)
+                        .child(div().w(px(400.)).h(px(50.))),
+                )
+        }
+    }
+
+    /// Wheels one event at `position`. Returns (vertical-only offset.y, horizontal-only
+    /// offset.x) — each scroller's own axis, so a non-zero result means the delta reached it.
+    fn scroll_unrestricted_single_axis(
+        cx: &mut TestAppContext,
+        position: Point<Pixels>,
+        delta: ScrollDelta,
+    ) -> (Pixels, Pixels) {
+        let cx = cx.add_empty_window();
+        let vertical_only = ScrollHandle::new();
+        let horizontal_only = ScrollHandle::new();
+        let (view_vertical, view_horizontal) = (vertical_only.clone(), horizontal_only.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| UnrestrictedSingleAxisScrollers {
+                vertical_only: view_vertical,
+                horizontal_only: view_horizontal,
+            })
+            .into_any_element()
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta,
+            ..Default::default()
+        });
+
+        (vertical_only.offset().y, horizontal_only.offset().x)
+    }
+
+    /// A wheel with only one notch still drives a scroller that runs the other way. This is the
+    /// only way to scroll a horizontal strip with such a wheel, so the fallback has to stay.
+    #[gpui::test]
+    fn test_line_wheel_still_crosses_axes_on_a_single_axis_scroller(cx: &mut TestAppContext) {
+        let (vertical_only, _) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(10.)),
+            ScrollDelta::Lines(point(-2., 0.)),
+        );
+        assert!(
+            vertical_only < Pixels::ZERO,
+            "a sideways wheel notch must still scroll a vertical-only list, got {vertical_only:?}"
+        );
+
+        let (_, horizontal_only) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(60.)),
+            ScrollDelta::Lines(point(0., -2.)),
+        );
+        assert!(
+            horizontal_only < Pixels::ZERO,
+            "a vertical wheel notch must still pan a horizontal-only strip, got \
+             {horizontal_only:?}"
+        );
+    }
+
+    /// A trackpad already reports both axes, so the same fallback would turn a sideways swipe
+    /// into vertical travel — and a vertical swipe over a one-line input into sideways panning —
+    /// on every frame the platform reports an exact zero on the minor axis.
+    #[gpui::test]
+    fn test_precise_gesture_never_crosses_axes_on_a_single_axis_scroller(cx: &mut TestAppContext) {
+        let (vertical_only, _) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(10.)),
+            ScrollDelta::Pixels(point(px(-30.), Pixels::ZERO)),
+        );
+        assert_eq!(
+            vertical_only,
+            Pixels::ZERO,
+            "a sideways swipe must not scroll a vertical-only list"
+        );
+
+        let (_, horizontal_only) = scroll_unrestricted_single_axis(
+            cx,
+            point(px(10.), px(60.)),
+            ScrollDelta::Pixels(point(Pixels::ZERO, px(-30.))),
+        );
+        assert_eq!(
+            horizontal_only,
+            Pixels::ZERO,
+            "a vertical swipe must not pan a horizontal-only strip"
+        );
     }
 
     struct VerticalListInDocument {
