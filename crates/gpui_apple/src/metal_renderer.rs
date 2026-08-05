@@ -146,6 +146,9 @@ pub struct MetalRenderer {
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     depth_texture: Option<metal::Texture>,
+    /// How many times `render_frame` found the intermediate textures sized
+    /// for a stale drawable and recreated them; used to rate-limit the log.
+    stale_texture_heals: u32,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -417,6 +420,7 @@ impl MetalRenderer {
             sprite_atlas,
             core_video_texture_cache,
             depth_texture: None,
+            stale_texture_heals: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -573,6 +577,45 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        // A window that lives through display, backing-scale, or backing-view
+        // changes can be left with renderer textures sized for a stale
+        // drawable. A depth attachment whose size disagrees with the color
+        // attachment is undefined behavior — with the depth prepass it shows
+        // up as blended fills failing arbitrary depth tests (translucent
+        // overlays losing their fill) persistently for that window, while
+        // fresh windows render correctly. Heal by recreating the textures
+        // whenever they disagree with the drawable, and log the stale size so
+        // the event that bypassed `update_drawable_size` can be identified.
+        let depth_texture_matches_viewport = self.depth_texture.as_ref().is_some_and(|texture| {
+            texture.width() == viewport_size.width.0 as u64
+                && texture.height() == viewport_size.height.0 as u64
+        });
+        if !depth_texture_matches_viewport
+            && viewport_size.width.0 > 0
+            && viewport_size.height.0 > 0
+        {
+            self.stale_texture_heals = self.stale_texture_heals.saturating_add(1);
+            // In steady state this never fires: draw() reads the drawable
+            // size that update_drawable_size set alongside the textures. A
+            // recreated layer whose auto-derived drawable size tracks live
+            // resizing can heal once per frame during a drag, so cap the log
+            // rather than emit sixty lines a second.
+            if self.stale_texture_heals == 1 || self.stale_texture_heals.is_multiple_of(100) {
+                log::warn!(
+                    "renderer textures were stale for a {}x{} drawable (depth texture {:?}, \
+                     heal #{}) — recreating; a display or backing change likely bypassed \
+                     update_drawable_size",
+                    viewport_size.width.0,
+                    viewport_size.height.0,
+                    self.depth_texture
+                        .as_ref()
+                        .map(|texture| (texture.width(), texture.height())),
+                    self.stale_texture_heals,
+                );
+            }
+            self.update_intermediate_textures(viewport_size);
+        }
+
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
@@ -1890,5 +1933,101 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+/// A window that lives through a display or backing change can keep
+/// intermediate textures (depth above all) sized for a stale drawable, and a
+/// mismatched depth attachment makes every depth test undefined — observed
+/// live as translucent overlays losing their fill in aged windows while fresh
+/// windows rendered correctly. `render_frame` must heal the mismatch instead
+/// of rendering through it.
+#[cfg(test)]
+mod stale_texture_healing_tests {
+    use super::{InstanceBufferPool, MetalRenderer, read_texture_to_image};
+    use gpui::{
+        Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Point, Quad,
+        ScaledPixels, Scene,
+    };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn solid_quad_scene(extent: f32) -> Scene {
+        let mut scene = Scene::default();
+        let bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.),
+                y: ScaledPixels(0.),
+            },
+            size: gpui::size(ScaledPixels(extent), ScaledPixels(extent)),
+        };
+        scene.quads.push(Quad {
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(Hsla::red()),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn render_frame_heals_stale_intermediate_textures() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+
+        // Size the intermediate textures for a small drawable.
+        let small = gpui::size(DevicePixels(64), DevicePixels(64));
+        let scene = solid_quad_scene(256.);
+        renderer
+            .render_scene_to_image(&scene, small)
+            .expect("small render succeeds");
+
+        // Now render a bigger drawable through `render_frame` directly, the
+        // way a window draw does — without anything resizing the textures
+        // first. Before the healing check this pairs a 128x128 color target
+        // with a 64x64 depth texture.
+        let large = gpui::size(DevicePixels(128), DevicePixels(128));
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(large.width.0 as u64);
+        descriptor.set_height(large.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+        let target = renderer.device.new_texture(&descriptor);
+
+        let command_buffer = renderer
+            .render_frame(&scene, &target, large)
+            .expect("stale-texture render heals and succeeds");
+        if !renderer.is_unified_memory {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.synchronize_resource(&target);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let depth_texture = renderer
+            .depth_texture
+            .as_ref()
+            .expect("depth texture recreated");
+        assert_eq!(
+            (depth_texture.width(), depth_texture.height()),
+            (large.width.0 as u64, large.height.0 as u64),
+            "healing must resize the depth texture to the drawable"
+        );
+
+        let image = read_texture_to_image(&target).expect("read back");
+        let center = image.get_pixel(64, 64);
+        assert!(
+            center[0] > 200 && center[1] < 60 && center[2] < 60,
+            "the opaque red quad must survive the healed render, got {center:?}"
+        );
     }
 }
