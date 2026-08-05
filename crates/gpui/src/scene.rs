@@ -274,8 +274,9 @@ impl Scene {
     fn partition_quads(&mut self) {
         self.blended_quad_indices.clear();
         self.opaque_quad_indices.clear();
+        let opaque_pass = opaque_quad_pass_enabled();
         for (quad_id, quad) in self.quads.iter().enumerate() {
-            let has_opaque_core = quad.has_opaque_core();
+            let has_opaque_core = opaque_pass && quad.has_opaque_core();
             if has_opaque_core {
                 self.opaque_quad_indices.push(quad_id as u32);
             }
@@ -317,6 +318,23 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
         }
     }
+}
+
+/// Whether opaque quads are lifted into the depth-writing front-to-back
+/// prepass, set with `GPUI_ENABLE_OPAQUE_QUAD_PASS=1`.
+///
+/// Off by default: with the bucket empty, every quad stays in the blended
+/// back-to-front pass and the depth test degenerates to always-pass against
+/// the cleared buffer — byte-for-byte the pre-depth-buffer painter's-order
+/// output. The prepass is an overdraw optimization only, and it is suspected
+/// of changing how translucent overlays (popup menus) composite over content,
+/// so it stays opt-in until that is ruled out.
+pub fn opaque_quad_pass_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GPUI_ENABLE_OPAQUE_QUAD_PASS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 /// Maps a quad's index in [`Scene::quads`] to depth, with greater values closer.
