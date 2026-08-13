@@ -30,6 +30,7 @@ pub fn list(
         render_item: Box::new(render_item),
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
+        measured_item_width: None,
     }
 }
 
@@ -39,12 +40,35 @@ pub struct List {
     render_item: Box<RenderItemFn>,
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
+    measured_item_width: Option<Box<dyn Fn(Pixels) -> Pixels>>,
 }
 
 impl List {
     /// Set the sizing behavior for the list.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
+        self
+    }
+
+    /// Declare the width item content is actually laid out at, as a function of
+    /// the list's own width.
+    ///
+    /// Cached item heights are dropped whenever the list's width changes,
+    /// because an item that fills the list re-wraps at the new width. That is
+    /// the wrong key for a list whose items do *not* fill it — a transcript
+    /// that hands each row a definite width clamped to a maximum keeps laying
+    /// its rows out at exactly the same width while the list around them
+    /// resizes, so every height is discarded and re-measured to arrive at the
+    /// identical answer. Re-measuring means re-shaping text, which is the
+    /// expensive part, and a dock animation resizes the list on every frame of
+    /// the slide.
+    ///
+    /// The closure receives the list's width and returns the width items are
+    /// laid out at; heights are then invalidated when *that* changes. Callers
+    /// must return a width that genuinely determines item layout, or items will
+    /// keep stale heights after a resize.
+    pub fn measured_item_width(mut self, width: impl Fn(Pixels) -> Pixels + 'static) -> Self {
+        self.measured_item_width = Some(Box::new(width));
         self
     }
 }
@@ -61,6 +85,9 @@ impl std::fmt::Debug for ListState {
 
 struct StateInner {
     last_layout_bounds: Option<Bounds<Pixels>>,
+    /// Width items were last measured at. Equal to the list's own width unless
+    /// the caller overrode it with [`List::measured_item_width`].
+    last_measured_item_width: Option<Pixels>,
     last_padding: Option<Edges<Pixels>>,
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
@@ -314,6 +341,7 @@ impl ListState {
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let this = Self(Rc::new(RefCell::new(StateInner {
             last_layout_bounds: None,
+            last_measured_item_width: None,
             last_padding: None,
             items: SumTree::default(),
             logical_scroll_top: None,
@@ -1540,14 +1568,26 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // If the width of the list has changed, invalidate all cached item heights
+        // If the width item content is laid out at has changed, invalidate all
+        // cached item heights. That is the list's own width unless the caller
+        // sizes items itself and told us so; see `List::measured_item_width`.
+        let measured_item_width = self
+            .measured_item_width
+            .as_ref()
+            .map_or(bounds.size.width, |width| width(bounds.size.width));
         if state
-            .last_layout_bounds
-            .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
+            .last_measured_item_width
+            .is_none_or(|last_width| last_width != measured_item_width)
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    // Carry the old measurement forward as an estimate. It is
+                    // wrong at the new width, but it is far closer than the
+                    // nothing this used to record: with no hint every summary
+                    // height collapses to zero, so the total content height,
+                    // the scrollbar thumb and any proportional pending scroll
+                    // all lurch until the items are re-measured.
+                    size_hint: item.size_hint(),
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -1556,6 +1596,7 @@ impl Element for List {
             state.items = new_items;
             state.measuring_behavior.reset();
         }
+        state.last_measured_item_width = Some(measured_item_width);
 
         let padding = style
             .padding
@@ -1720,7 +1761,7 @@ impl sum_tree::SeekTarget<'_, ListItemSummary, ListItemSummary> for Height {
 mod test {
 
     use gpui::{ScrollDelta, ScrollWheelEvent};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use crate::{
@@ -2096,6 +2137,63 @@ mod test {
             view.into_any_element()
         });
         assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+    }
+
+    #[gpui::test]
+    fn test_constant_measured_item_width_survives_list_width_change(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.)).measure_all();
+        let rendered = Rc::new(RefCell::new(Vec::<usize>::new()));
+
+        struct TestView {
+            state: ListState,
+            rendered: Rc<RefCell<Vec<usize>>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rendered = self.rendered.clone();
+                list(self.state.clone(), move |ix, _, _| {
+                    rendered.borrow_mut().push(ix);
+                    // Height cannot depend on the list's width: the row gives
+                    // its content a fixed width, which is what a transcript
+                    // clamped to a maximum content width does.
+                    div().h(px(50.)).w(px(40.)).into_any()
+                })
+                .measured_item_width(|_| px(40.))
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state.clone(),
+                rendered: rendered.clone(),
+            })
+        });
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+        assert!(
+            rendered.borrow().contains(&9),
+            "the first draw should have measured every item"
+        );
+
+        rendered.borrow_mut().clear();
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+
+        assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+        assert!(
+            !rendered.borrow().contains(&9),
+            "doubling the list's width must not re-measure an off-screen item whose \
+             own layout width did not change, but item 9 was rendered again"
+        );
     }
 
     #[gpui::test]
