@@ -1249,8 +1249,12 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 
 struct SpriteEffect {
     uint kind;
-    uint3 pad;
-    Bounds bounds;
+    float peak;
+    float falloff;
+    float core_gain;
+    float2 origin;
+    float core_spread;
+    uint pad;
     Hsla highlight_color;
     float band_origin;
     float band_width;
@@ -1290,22 +1294,30 @@ struct MonochromeSpriteFragmentInput {
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
 
-// Highlight profile of the shimmer band: a symmetric ramp peaking at the band
-// center and falling to zero at both edges, matching the CSS
-// `linear-gradient(<angle>, transparent 40%, highlight 50%, transparent 60%)`
-// sheen. The smoothstep easing removes the crease a bare linear ramp leaves at
-// the peak, and the projection onto `effect.direction` is what makes the band
-// diagonal rather than axis-aligned.
+// Highlight profile of the shimmer band. `u` is the position across the band
+// along `effect.direction` — projecting onto that vector is what makes the band
+// diagonal rather than axis-aligned. Each side of `effect.peak` gets its own
+// smoothstep ramp, so moving the peak off center gives the band a sharp leading
+// edge and a long trailing tail; `effect.falloff` shapes those ramps and
+// `effect.core_gain` holds light back from the shoulders so the core reads
+// brighter than the rest of the band.
 //
 // Callers must check `kind` first (via the nointerpolation `effect_kind`
 // varying) so unshimmered text never reaches this function or the structured
 // buffer read it needs.
 float sprite_effect_intensity(SpriteEffect effect, float2 local_position) {
-    float2 offset = local_position - effect.bounds.origin;
-    float half_width = max(effect.band_width, 1.0f) * 0.5f;
-    float center = effect.band_origin + half_width;
-    float ramp = saturate(1.0f - abs(dot(offset, effect.direction) - center) / half_width);
-    return ramp * ramp * (3.0f - 2.0f * ramp);
+    float2 offset = local_position - effect.origin;
+    float width = max(effect.band_width, 1.0f);
+    float u = (dot(offset, effect.direction) - effect.band_origin) / width;
+    if (u <= 0.0f || u >= 1.0f) {
+        return 0.0f;
+    }
+    float side = u < effect.peak ? u / effect.peak : (1.0f - u) / (1.0f - effect.peak);
+    float ramp = side * side * (3.0f - 2.0f * side);
+    ramp = pow(ramp, effect.falloff);
+    float core = saturate(1.0f - abs(u - effect.peak) / effect.core_spread);
+    core = core * core * (3.0f - 2.0f * core);
+    return ramp * (1.0f - effect.core_gain * (1.0f - core));
 }
 
 MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
