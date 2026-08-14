@@ -27,18 +27,106 @@ static SHIMMER_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// the web `linear-gradient(120deg, ...)` shiny-text idiom.
 pub const DEFAULT_SHIMMER_ANGLE: f32 = 120.0;
 
-fn shimmer_delta(duration: Duration) -> f32 {
-    let period = duration.as_secs_f32();
+/// Progress of the band across its travel, in `0..=1`. `hold` reserves a
+/// fraction of the cycle for the band to sit off the end of the text, which
+/// reads as a pause between sweeps.
+fn shimmer_delta(period: Duration, hold: f32) -> f32 {
+    let period = period.as_secs_f32();
     if period <= 0.0 {
         return 0.0;
     }
-    (SHIMMER_EPOCH.elapsed().as_secs_f32() / period) % 1.0
+    let phase = (SHIMMER_EPOCH.elapsed().as_secs_f32() / period) % 1.0;
+    let sweep = 1.0 - hold.clamp(0.0, 0.95);
+    (phase / sweep).min(1.0)
 }
 
 /// Unit sweep vector for a CSS gradient angle, in y-down screen space.
 fn shimmer_direction(angle_degrees: f32) -> [f32; 2] {
     let (sin, cos) = angle_degrees.to_radians().sin_cos();
     [sin, -cos]
+}
+
+/// How wide a [`ShimmerText`] highlight band is, measured along the sweep.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ShimmerSpread {
+    /// A multiple of the laid-out text's own width, so the band keeps the same
+    /// proportion of the label whatever it says. `1.0` lights roughly half the
+    /// label at once.
+    TextWidths(f32),
+    /// A multiple of the average character width, so the band scales with the
+    /// font rather than with how much text there is.
+    CharWidths(f32),
+    /// An absolute width in logical pixels.
+    Pixels(Pixels),
+}
+
+/// Everything about a [`ShimmerText`] sweep except the text and its colors.
+///
+/// The defaults describe a wide, soft band whose peak sits past its middle:
+/// a glyph brightens quickly as the leading edge arrives and dims slowly
+/// behind it, which reads as a sheen travelling over the label rather than a
+/// hard bar crossing it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ShimmerStyle {
+    /// Width of the highlight band.
+    pub spread: ShimmerSpread,
+    /// Where the band reaches full strength, as a fraction of its width
+    /// measured from the trailing edge. `0.5` is symmetric; higher values leave
+    /// a longer tail behind the sweep.
+    pub peak: f32,
+    /// Exponent applied to each side's smoothstep ramp. `1.0` is the plain
+    /// smoothstep; larger values concentrate the light near the peak, smaller
+    /// values flatten the band out towards its edges.
+    pub falloff: f32,
+    /// Fraction of the highlight withheld from the band's shoulders, so only
+    /// its core reaches the full highlight color. `0.0` lights the whole band
+    /// evenly; `0.5` halves everything outside the core.
+    pub core_gain: f32,
+    /// Half-width of that core, as a fraction of the band width.
+    pub core_spread: f32,
+    /// Sweep angle in CSS `linear-gradient` degrees (0 = upward, growing
+    /// clockwise). `90` gives a vertical, unslanted band.
+    pub angle: f32,
+    /// Duration of one full cycle, sweep plus hold.
+    pub period: Duration,
+    /// Fraction of the cycle the band spends parked past the end of the text,
+    /// i.e. the pause between sweeps.
+    pub hold: f32,
+    /// Scales the highlight color's alpha, so the same color can shimmer
+    /// harder or softer without picking a new one.
+    pub intensity: f32,
+}
+
+impl Default for ShimmerStyle {
+    /// Measured off a reference recording of the look this is meant to match:
+    /// a band as wide as the label itself, peaking two thirds of the way along
+    /// so the trailing ramp is twice the leading one, on a one second cycle
+    /// with a tenth of it spent parked past the end.
+    fn default() -> Self {
+        Self {
+            spread: ShimmerSpread::TextWidths(1.0),
+            peak: 0.66,
+            falloff: 1.0,
+            core_gain: 0.0,
+            core_spread: 0.35,
+            angle: DEFAULT_SHIMMER_ANGLE,
+            period: Duration::from_millis(1000),
+            hold: 0.1,
+            intensity: 1.0,
+        }
+    }
+}
+
+impl ShimmerStyle {
+    /// Width of the band in logical pixels, for text of the given width.
+    fn band_width(&self, text_width: Pixels, average_char_width: Pixels) -> Pixels {
+        let width = match self.spread {
+            ShimmerSpread::TextWidths(ratio) => text_width * ratio.max(0.0),
+            ShimmerSpread::CharWidths(chars) => average_char_width * chars.max(0.0),
+            ShimmerSpread::Pixels(width) => width,
+        };
+        width.max(average_char_width.max(px(1.0)))
+    }
 }
 
 /// An [`Element`] that renders text.
@@ -640,9 +728,7 @@ pub struct ShimmerText {
     text: SharedString,
     base_color: Option<crate::Hsla>,
     highlight_color: Option<crate::Hsla>,
-    duration: Duration,
-    spread: f32,
-    angle: f32,
+    style: ShimmerStyle,
     layout: TextLayout,
 }
 
@@ -653,9 +739,7 @@ impl ShimmerText {
             text: text.into(),
             base_color: None,
             highlight_color: None,
-            duration: Duration::from_secs_f32(1.5),
-            spread: 3.0,
-            angle: DEFAULT_SHIMMER_ANGLE,
+            style: ShimmerStyle::default(),
             layout: TextLayout::default(),
         }
     }
@@ -672,22 +756,71 @@ impl ShimmerText {
         self
     }
 
-    /// Set the shimmer cycle duration.
-    pub fn duration(mut self, duration: Duration) -> Self {
-        self.duration = duration;
+    /// Replace the whole sweep description at once.
+    pub fn style(mut self, style: ShimmerStyle) -> Self {
+        self.style = style;
         self
     }
 
-    /// Set the highlight band width in average character widths.
+    /// Set the duration of one full cycle, sweep plus hold.
+    pub fn duration(mut self, duration: Duration) -> Self {
+        self.style.period = duration;
+        self
+    }
+
+    /// Set the highlight band width in average character widths. The band is
+    /// twice `spread` wide, matching the historical meaning of this knob; use
+    /// [`ShimmerText::band`] for the other units.
     pub fn spread(mut self, spread: f32) -> Self {
-        self.spread = spread;
+        self.style.spread = ShimmerSpread::CharWidths(spread.max(1.0) * 2.0);
+        self
+    }
+
+    /// Set the highlight band width.
+    pub fn band(mut self, spread: ShimmerSpread) -> Self {
+        self.style.spread = spread;
+        self
+    }
+
+    /// Set where the band reaches full strength, as a fraction of its width
+    /// measured from the trailing edge.
+    pub fn peak(mut self, peak: f32) -> Self {
+        self.style.peak = peak;
+        self
+    }
+
+    /// Set the exponent applied to each side's smoothstep ramp.
+    pub fn falloff(mut self, falloff: f32) -> Self {
+        self.style.falloff = falloff;
+        self
+    }
+
+    /// Concentrate the highlight into the middle of the band: `gain` is the
+    /// fraction held back from the shoulders, `spread` the core's half-width as
+    /// a fraction of the band.
+    pub fn core(mut self, gain: f32, spread: f32) -> Self {
+        self.style.core_gain = gain;
+        self.style.core_spread = spread;
+        self
+    }
+
+    /// Set the fraction of the cycle the band spends parked past the end of the
+    /// text, i.e. the pause between sweeps.
+    pub fn hold(mut self, hold: f32) -> Self {
+        self.style.hold = hold;
+        self
+    }
+
+    /// Scale the highlight color's alpha.
+    pub fn intensity(mut self, intensity: f32) -> Self {
+        self.style.intensity = intensity;
         self
     }
 
     /// Set the sweep angle in CSS `linear-gradient` degrees. Defaults to
     /// [`DEFAULT_SHIMMER_ANGLE`]; 90° gives a vertical (non-slanted) band.
     pub fn angle(mut self, degrees: f32) -> Self {
-        self.angle = degrees;
+        self.style.angle = degrees;
         self
     }
 }
@@ -748,15 +881,8 @@ impl Element for ShimmerText {
         cx: &mut App,
     ) {
         if let Some(highlight_color) = self.highlight_color {
-            self.layout.paint_shimmer(
-                &self.text,
-                highlight_color,
-                self.duration,
-                self.spread,
-                self.angle,
-                window,
-                cx,
-            );
+            self.layout
+                .paint_shimmer(&self.text, highlight_color, &self.style, window, cx);
         } else {
             self.layout.paint(&self.text, window, cx);
         }
@@ -1019,14 +1145,11 @@ impl TextLayout {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn paint_shimmer(
         &self,
         text: &str,
         highlight_color: crate::Hsla,
-        duration: Duration,
-        spread: f32,
-        angle: f32,
+        style: &ShimmerStyle,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1071,30 +1194,36 @@ impl TextLayout {
 
         let char_count = text.chars().count().max(1) as f32;
         let average_char_width = text_size.width * (1.0 / char_count);
-        let band_width = (average_char_width * (spread.max(1.0) * 2.0)).max(average_char_width);
+        let band_width = style.band_width(text_size.width, average_char_width);
 
         // The band sweeps along `direction`, so it has to enter and exit at the
         // projected extremes of the text box, not the horizontal ones —
         // otherwise a slanted band clips in on one corner and out on another.
-        let direction = shimmer_direction(angle);
+        let direction = shimmer_direction(style.angle);
         let projected_width = direction[0] * text_size.width.0;
         let projected_height = direction[1] * text_size.height.0;
         let axis_min = projected_width.min(0.0) + projected_height.min(0.0);
         let axis_max = projected_width.max(0.0) + projected_height.max(0.0);
         let travel = px(axis_max - axis_min) + band_width * 2.0;
-        let band_origin = px(axis_min) - band_width + travel * shimmer_delta(duration);
-        let shimmer_bounds = Bounds {
-            origin: bounds.origin,
-            size: text_size,
-        };
+        let band_origin =
+            px(axis_min) - band_width + travel * shimmer_delta(style.period, style.hold);
+        let mut highlight_color = highlight_color;
+        highlight_color.a *= style.intensity.clamp(0.0, 1.0);
 
         window.with_text_shimmer(
             crate::window::TextShimmerStyle {
-                bounds: shimmer_bounds,
+                origin: bounds.origin,
                 highlight_color,
                 band_origin,
                 band_width,
                 direction,
+                // `pow(0.0, 0.0)` is undefined in the shading languages, and a
+                // zero-width core would divide by zero, so both are clamped
+                // here rather than in every backend.
+                peak: style.peak.clamp(0.01, 0.99),
+                falloff: style.falloff.max(0.05),
+                core_gain: style.core_gain.clamp(0.0, 1.0),
+                core_spread: style.core_spread.clamp(0.01, 1.0),
             },
             |window| {
                 for line in &element_state.lines {

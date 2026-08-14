@@ -204,10 +204,12 @@ fn load_underline(instance_id: u32) -> Underline {
 fn read_sprite_effect(cursor: ptr<function, InstanceCursor>) -> SpriteEffect {
     return SpriteEffect(
         read_word(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_vec2_f32(cursor),
+        read_f32(cursor),
         read_word(cursor),
-        read_word(cursor),
-        read_word(cursor),
-        read_bounds(cursor),
         read_hsla(cursor),
         read_f32(cursor),
         read_f32(cursor),
