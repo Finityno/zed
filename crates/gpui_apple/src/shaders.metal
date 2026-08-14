@@ -741,23 +741,30 @@ struct MonochromeSpriteFragmentInput {
   float4 clip_distance;
 };
 
-// Highlight profile of the shimmer band: a symmetric ramp peaking at the band
-// center and falling to zero at both edges, matching the CSS
-// `linear-gradient(<angle>, transparent 40%, highlight 50%, transparent 60%)`
-// sheen. The smoothstep easing removes the crease a bare linear ramp leaves at
-// the peak, and the projection onto `effect.direction` is what makes the band
-// diagonal rather than axis-aligned.
+// Highlight profile of the shimmer band. `u` is the position across the band
+// along `effect.direction` — projecting onto that vector is what makes the band
+// diagonal rather than axis-aligned. Each side of `effect.peak` gets its own
+// smoothstep ramp, so moving the peak off center gives the band a sharp leading
+// edge and a long trailing tail; `effect.falloff` shapes those ramps and
+// `effect.core_gain` holds light back from the shoulders so the core reads
+// brighter than the rest of the band.
 //
 // Callers must check `kind` first (via the flat `effect_kind` varying) so
 // unshimmered text never reaches this function or the storage read it needs.
 float sprite_effect_intensity(SpriteEffect effect, float2 local_position) {
   float2 direction = float2(effect.direction[0], effect.direction[1]);
-  float2 offset =
-      local_position - float2(effect.bounds.origin.x, effect.bounds.origin.y);
-  float half_width = max(effect.band_width, 1.0) * 0.5;
-  float center = effect.band_origin + half_width;
-  float ramp = saturate(1.0 - fabs(dot(offset, direction) - center) / half_width);
-  return ramp * ramp * (3.0 - 2.0 * ramp);
+  float2 offset = local_position - float2(effect.origin.x, effect.origin.y);
+  float width = max(effect.band_width, 1.0);
+  float u = (dot(offset, direction) - effect.band_origin) / width;
+  if (u <= 0.0 || u >= 1.0) {
+    return 0.0;
+  }
+  float side = u < effect.peak ? u / effect.peak : (1.0 - u) / (1.0 - effect.peak);
+  float ramp = side * side * (3.0 - 2.0 * side);
+  ramp = pow(ramp, effect.falloff);
+  float core = saturate(1.0 - fabs(u - effect.peak) / effect.core_spread);
+  core = core * core * (3.0 - 2.0 * core);
+  return ramp * (1.0 - effect.core_gain * (1.0 - core));
 }
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(

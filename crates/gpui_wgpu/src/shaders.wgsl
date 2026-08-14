@@ -1323,10 +1323,12 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 // Rust side writes. `sprite_layouts_match_rust` guards the sizes.
 struct SpriteEffect {
     kind: u32,
-    pad_0: u32,
-    pad_1: u32,
-    pad_2: u32,
-    bounds: Bounds,
+    peak: f32,
+    falloff: f32,
+    core_gain: f32,
+    origin: vec2<f32>,
+    core_spread: f32,
+    pad: u32,
     highlight_color: Hsla,
     band_origin: f32,
     band_width: f32,
@@ -1355,21 +1357,32 @@ struct MonoSpriteVarying {
     @location(5) @interpolate(flat) effect_kind: u32,
 }
 
-// Highlight profile of the shimmer band: a symmetric ramp peaking at the band
-// center and falling to zero at both edges, matching the CSS
-// `linear-gradient(<angle>, transparent 40%, highlight 50%, transparent 60%)`
-// sheen. The smoothstep easing removes the crease a bare linear ramp leaves at
-// the peak, and the projection onto `effect.direction` is what makes the band
-// diagonal rather than axis-aligned.
+// Highlight profile of the shimmer band. `u` is the position across the band
+// along `effect.direction` — projecting onto that vector is what makes the band
+// diagonal rather than axis-aligned. Each side of `effect.peak` gets its own
+// smoothstep ramp, so moving the peak off center gives the band a sharp leading
+// edge and a long trailing tail; `effect.falloff` shapes those ramps and
+// `effect.core_gain` holds light back from the shoulders so the core reads
+// brighter than the rest of the band.
 //
 // Callers must check `kind` first (via the flat `effect_kind` varying) so
 // unshimmered text never reaches this function or the storage read it needs.
 fn sprite_effect_intensity(effect: SpriteEffect, local_position: vec2<f32>) -> f32 {
-    let offset = local_position - effect.bounds.origin;
-    let half_width = max(effect.band_width, 1.0) * 0.5;
-    let center = effect.band_origin + half_width;
-    let ramp = saturate(1.0 - abs(dot(offset, effect.direction) - center) / half_width);
-    return ramp * ramp * (3.0 - 2.0 * ramp);
+    let offset = local_position - effect.origin;
+    let width = max(effect.band_width, 1.0);
+    let u = (dot(offset, effect.direction) - effect.band_origin) / width;
+    if (u <= 0.0 || u >= 1.0) {
+        return 0.0;
+    }
+    var side = (1.0 - u) / (1.0 - effect.peak);
+    if (u < effect.peak) {
+        side = u / effect.peak;
+    }
+    var ramp = side * side * (3.0 - 2.0 * side);
+    ramp = pow(ramp, effect.falloff);
+    var core = saturate(1.0 - abs(u - effect.peak) / effect.core_spread);
+    core = core * core * (3.0 - 2.0 * core);
+    return ramp * (1.0 - effect.core_gain * (1.0 - core));
 }
 
 @vertex

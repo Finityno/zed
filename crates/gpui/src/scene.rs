@@ -970,17 +970,38 @@ impl Default for TransformationMatrix {
     }
 }
 
+/// Per-sprite highlight the text fragment shaders apply on top of the glyph
+/// color. The struct is embedded in *every* [`MonochromeSprite`] and
+/// [`SubpixelSprite`], so it is deliberately held to 64 bytes and the shaders
+/// early-out on `kind == 0` before reading it.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
-#[expect(missing_docs)]
 pub struct SpriteEffect {
+    /// `0` for plain text, [`SpriteEffect::SHIMMER_KIND`] for the shimmer band.
     pub kind: u32,
-    pub pad: [u32; 3],
-    pub bounds: Bounds<ScaledPixels>,
+    /// Where the band reaches full strength, as a fraction of `band_width`
+    /// measured from the trailing edge. `0.5` is a symmetric band; values above
+    /// it push the peak towards the leading edge, leaving a longer tail behind
+    /// the sweep.
+    pub peak: f32,
+    /// Exponent applied to each side's smoothstep ramp. `1.0` is the plain
+    /// smoothstep; larger values pull the highlight in towards the peak.
+    pub falloff: f32,
+    /// Fraction of the highlight withheld from the band's shoulders, so only
+    /// the core reaches the full highlight color. `0.0` lights the whole band
+    /// evenly.
+    pub core_gain: f32,
+    /// Point band offsets are measured from, in device pixels.
+    pub origin: Point<ScaledPixels>,
+    /// Half-width of the core, as a fraction of `band_width`.
+    pub core_spread: f32,
+    /// Padding to keep the struct at 64 bytes across all four shader backends.
+    pub pad: u32,
+    /// Color the band blends towards at full intensity.
     pub highlight_color: Hsla,
-    /// Leading edge of the highlight band, measured along `direction` from
-    /// `bounds.origin`. Sweeping this past the projected extent of `bounds`
-    /// animates the shimmer.
+    /// Trailing edge of the highlight band, measured along `direction` from
+    /// `origin`. Sweeping this past the projected extent of the text animates
+    /// the shimmer.
     pub band_origin: f32,
     /// Width of the highlight band along `direction`.
     pub band_width: f32,
@@ -991,32 +1012,23 @@ pub struct SpriteEffect {
 
 impl SpriteEffect {
     pub(crate) const SHIMMER_KIND: u32 = 1;
-
-    pub(crate) fn shimmer(
-        bounds: Bounds<ScaledPixels>,
-        highlight_color: Hsla,
-        band_origin: f32,
-        band_width: f32,
-        direction: [f32; 2],
-    ) -> Self {
-        Self {
-            kind: Self::SHIMMER_KIND,
-            pad: [0; 3],
-            bounds,
-            highlight_color,
-            band_origin,
-            band_width,
-            direction,
-        }
-    }
 }
+
+// Every glyph in the window carries one of these, and the four shader backends
+// mirror the layout by hand, so growing it is a decision rather than an
+// accident. `pad` exists to keep this assertion true.
+const _: () = assert!(std::mem::size_of::<SpriteEffect>() == 64);
 
 impl Default for SpriteEffect {
     fn default() -> Self {
         Self {
             kind: 0,
-            pad: [0; 3],
-            bounds: Bounds::default(),
+            peak: 0.5,
+            falloff: 1.0,
+            core_gain: 0.0,
+            origin: Point::default(),
+            core_spread: 0.5,
+            pad: 0,
             highlight_color: Hsla::default(),
             band_origin: 0.0,
             band_width: 0.0,

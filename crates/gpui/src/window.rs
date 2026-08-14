@@ -1971,24 +1971,35 @@ impl ContentMask<Pixels> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TextShimmerStyle {
-    pub bounds: Bounds<Pixels>,
+    pub origin: Point<Pixels>,
     pub highlight_color: Hsla,
     pub band_origin: Pixels,
     pub band_width: Pixels,
     pub direction: [f32; 2],
+    pub peak: f32,
+    pub falloff: f32,
+    pub core_gain: f32,
+    pub core_spread: f32,
 }
 
 impl TextShimmerStyle {
     fn scale(self, factor: f32) -> SpriteEffect {
-        // `direction` is a unit vector, so it is scale-invariant; only the
-        // band's position and width along it convert to device pixels.
-        SpriteEffect::shimmer(
-            self.bounds.scale(factor),
-            self.highlight_color,
-            self.band_origin.0 * factor,
-            self.band_width.0 * factor,
-            self.direction,
-        )
+        // `direction` is a unit vector and the profile fields are all fractions
+        // of the band, so they are scale-invariant; only the band's position and
+        // width along `direction` convert to device pixels.
+        SpriteEffect {
+            kind: SpriteEffect::SHIMMER_KIND,
+            peak: self.peak,
+            falloff: self.falloff,
+            core_gain: self.core_gain,
+            origin: self.origin.scale(factor),
+            core_spread: self.core_spread,
+            pad: 0,
+            highlight_color: self.highlight_color,
+            band_origin: self.band_origin.0 * factor,
+            band_width: self.band_width.0 * factor,
+            direction: self.direction,
+        }
     }
 }
 
