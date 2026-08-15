@@ -28,6 +28,25 @@ impl MetalAtlas {
     }
 }
 
+impl MetalAtlas {
+    /// Device bytes the atlas's textures hold, as (monochrome, polychrome).
+    /// Read by the renderer's GPU stats logging.
+    pub(crate) fn allocated_bytes(&self) -> (u64, u64) {
+        fn total(list: &AtlasTextureList<MetalAtlasTexture>) -> u64 {
+            list.textures
+                .iter()
+                .flatten()
+                .map(|texture| texture.metal_texture.allocated_size() as u64)
+                .sum()
+        }
+        let lock = self.0.lock();
+        (
+            total(&lock.monochrome_textures),
+            total(&lock.polychrome_textures),
+        )
+    }
+}
+
 struct MetalAtlasState {
     device: AssertSend<Device>,
     is_apple_gpu: bool,
