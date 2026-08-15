@@ -65,13 +65,27 @@ pub fn new_overlay_renderer(context: self::Context, base: &Renderer) -> Renderer
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// Consecutive frames that used no more than half of `buffer_size`.
+    /// Drives the shrink in [`Self::record_frame_usage`].
+    low_use_frames: u32,
 }
+
+/// A pool buffer can never shrink below this; it is also the size every
+/// window starts from.
+const INSTANCE_BUFFER_FLOOR_SIZE: usize = 2 * 1024 * 1024;
+
+/// How many consecutive low-use frames it takes to halve the buffer size.
+/// Two seconds at 60fps: long enough that a burst of complex frames with
+/// brief pauses never thrashes, short enough that one elaborate frame does
+/// not set the allocation for the rest of the session.
+const INSTANCE_BUFFER_SHRINK_AFTER_FRAMES: u32 = 120;
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: INSTANCE_BUFFER_FLOOR_SIZE,
             buffers: Vec::new(),
+            low_use_frames: 0,
         }
     }
 }
@@ -115,6 +129,34 @@ impl InstanceBufferPool {
             self.buffers.push(buffer.metal_buffer)
         }
     }
+
+    /// Notes how many instance bytes a finished frame actually wrote, and
+    /// halves `buffer_size` once enough consecutive frames used less than
+    /// half of it.
+    ///
+    /// Growth is a ratchet without this: one elaborate frame doubles the
+    /// buffer, and every frame after — plus every buffer the in-flight pool
+    /// holds — pays that high-water size for the life of the window. The
+    /// halving converges on the size the current workload needs (release()
+    /// already drops returned buffers of the old size), and stops at the
+    /// floor every window starts from. A frame that needs more space again
+    /// grows exactly as before.
+    pub(crate) fn record_frame_usage(&mut self, used_bytes: usize) {
+        if self.buffer_size <= INSTANCE_BUFFER_FLOOR_SIZE
+            || used_bytes.saturating_mul(2) > self.buffer_size
+        {
+            self.low_use_frames = 0;
+            return;
+        }
+        self.low_use_frames += 1;
+        if self.low_use_frames < INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            return;
+        }
+        self.low_use_frames = 0;
+        let buffer_size = (self.buffer_size / 2).max(INSTANCE_BUFFER_FLOOR_SIZE);
+        log::info!("decreased instance buffer size to {buffer_size}");
+        self.reset(buffer_size);
+    }
 }
 
 pub struct MetalRenderer {
@@ -149,6 +191,8 @@ pub struct MetalRenderer {
     /// How many times `render_frame` found the intermediate textures sized
     /// for a stale drawable and recreated them; used to rate-limit the log.
     stale_texture_heals: u32,
+    /// When GPU memory stats were last logged, while `FINCODE_GPU_STATS=1`.
+    gpu_stats_last_log: Option<std::time::Instant>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -421,6 +465,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             depth_texture: None,
             stale_texture_heals: 0,
+            gpu_stats_last_log: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -569,6 +614,65 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        self.maybe_log_gpu_stats();
+    }
+
+    fn gpu_stats_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED
+            .get_or_init(|| std::env::var("FINCODE_GPU_STATS").is_ok_and(|value| value == "1"))
+    }
+
+    /// Logs where the renderer's device memory sits, at most every ten
+    /// seconds, while `FINCODE_GPU_STATS=1`.
+    ///
+    /// `current_allocated_size` is the device's own accounting of live
+    /// allocations; the per-category numbers say which of atlas growth, the
+    /// instance pool, or the depth/path intermediates is responsible when it
+    /// climbs. Note the OS additionally charges driver-side arenas to the
+    /// process ("owned graphics" in footprint output) that no number here
+    /// includes.
+    fn maybe_log_gpu_stats(&mut self) {
+        if !Self::gpu_stats_enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .gpu_stats_last_log
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(10))
+        {
+            return;
+        }
+        self.gpu_stats_last_log = Some(now);
+        let (monochrome_bytes, polychrome_bytes) = self.sprite_atlas.allocated_bytes();
+        let (pool_buffers, pool_buffer_size) = {
+            let pool = self.instance_buffer_pool.lock();
+            (pool.buffers.len(), pool.buffer_size)
+        };
+        let depth_bytes = self
+            .depth_texture
+            .as_ref()
+            .map_or(0, |texture| texture.allocated_size() as u64);
+        let path_intermediate_bytes = self
+            .path_intermediate_texture
+            .as_ref()
+            .map_or(0, |texture| texture.allocated_size() as u64)
+            + self
+                .path_intermediate_msaa_texture
+                .as_ref()
+                .map_or(0, |texture| texture.allocated_size() as u64);
+        const MB: u64 = 1024 * 1024;
+        log::info!(
+            "[gpu-stats] device_allocated={}MB atlas_monochrome={}MB atlas_polychrome={}MB \
+             instance_pool={}x{}KB depth={}MB path_intermediates={}MB",
+            self.device.current_allocated_size() as u64 / MB,
+            monochrome_bytes / MB,
+            polychrome_bytes / MB,
+            pool_buffers,
+            pool_buffer_size / 1024,
+            depth_bytes / MB,
+            path_intermediate_bytes / MB,
+        );
     }
 
     fn render_frame(
@@ -1816,6 +1920,7 @@ impl InstanceBufferWriter {
     /// Flushes the frame's writes and returns the buffer worth recycling.
     fn finish(self) -> InstanceBuffer {
         let Self {
+            pool,
             unified_memory,
             mut filled,
             current,
@@ -1823,6 +1928,8 @@ impl InstanceBufferWriter {
             ..
         } = self;
         filled.push((current, offset));
+        pool.lock()
+            .record_frame_usage(filled.iter().map(|(_, written)| *written).sum());
 
         if !unified_memory {
             for (buffer, written) in &filled {
