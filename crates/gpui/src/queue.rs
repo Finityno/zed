@@ -9,6 +9,25 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::Priority;
 
+/// Depth of the platform main-thread runnable queue as of the most recent
+/// enqueue or drain-batch exit. Exposed so application crash reporting can
+/// stamp a starved-queue incident with its scale — a runaway producer reads as
+/// six-figure depth in the report itself, without needing the multi-gigabyte
+/// dump that queue becomes.
+///
+/// Only the Windows dispatcher writes it today. `threaded_dispatcher` and the
+/// web dispatcher drain a [`PriorityQueueReceiver`] for main-thread runnables
+/// just the same and could starve identically, so a 0 here means "this
+/// platform does not report yet", not "this platform does not queue"; macOS
+/// and Linux hand runnables straight to an OS run loop and have no depth to
+/// report at all.
+pub static MAIN_THREAD_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`MAIN_THREAD_QUEUE_DEPTH`].
+pub fn main_thread_queue_depth() -> usize {
+    MAIN_THREAD_QUEUE_DEPTH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct PriorityQueues<T> {
     high_priority: VecDeque<T>,
     medium_priority: VecDeque<T>,
@@ -21,6 +40,44 @@ impl<T> PriorityQueues<T> {
             && self.medium_priority.is_empty()
             && self.low_priority.is_empty()
     }
+
+    fn len(&self) -> usize {
+        self.high_priority.len() + self.medium_priority.len() + self.low_priority.len()
+    }
+
+    /// A burst can double a queue's backing buffer into the gigabytes (a
+    /// field dump caught a starved main-thread queue at 4 GiB of capacity),
+    /// and `VecDeque` never returns capacity on its own — after the drain the
+    /// empty queue would pin the burst's memory for the life of the process.
+    ///
+    /// Shrinking toward twice the occupancy once it falls under a quarter of
+    /// capacity reallocates at most once per halving of the queue (amortized
+    /// O(1) per pop) while a drain is in progress, and releases the whole
+    /// buffer down to the floor on the last pops. The 1024-entry gate with a
+    /// 512-entry target is hysteresis: steady-state queues never churn.
+    ///
+    /// Note the cost of releasing progressively: `shrink_to` reallocates and
+    /// moves every live element while holding the queue mutex, which
+    /// `spin_send` and `spin_try_recv` busy-wait on with `try_lock` and no
+    /// yield. The first shrink of a multi-million-entry burst moves a quarter
+    /// of it in one hold and spins every waiting producer core for that long.
+    /// That is the deliberate trade: returning a multi-gigabyte buffer to the
+    /// allocator early, during the drain, beats holding it to the tail when
+    /// the incident being recovered from is an out-of-memory — but only where
+    /// that trade was actually made, which is why the drain paths run this
+    /// behind [`PriorityQueueReceiver::reclaiming_capacity`].
+    fn shrink_oversized(&mut self) {
+        for queue in [
+            &mut self.high_priority,
+            &mut self.medium_priority,
+            &mut self.low_priority,
+        ] {
+            let capacity = queue.capacity();
+            if capacity >= 1024 && queue.len() <= capacity / 4 {
+                queue.shrink_to((queue.len() * 2).max(512));
+            }
+        }
+    }
 }
 
 struct PriorityQueueState<T> {
@@ -31,7 +88,7 @@ struct PriorityQueueState<T> {
 }
 
 impl<T> PriorityQueueState<T> {
-    fn send(&self, priority: Priority, item: T) -> Result<(), SendError<T>> {
+    fn send(&self, priority: Priority, item: T) -> Result<usize, SendError<T>> {
         if self
             .receiver_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -42,8 +99,9 @@ impl<T> PriorityQueueState<T> {
 
         let mut queues = self.queues.lock();
         Self::push(&mut queues, priority, item);
+        let queued = queues.len();
         self.condvar.notify_one();
-        Ok(())
+        Ok(queued)
     }
 
     fn spin_send(&self, priority: Priority, item: T) -> Result<(), SendError<T>> {
@@ -147,6 +205,14 @@ impl<T> PriorityQueueSender<T> {
         Ok(())
     }
 
+    /// Like [`Self::send`], but returns the total number of queued elements
+    /// after the push, measured under the same lock. Lets a dispatcher watch
+    /// for a runaway producer (a queue that only ever grows because its
+    /// consumer is starved) without taking the lock a second time.
+    pub fn send_and_len(&self, priority: Priority, item: T) -> Result<usize, SendError<T>> {
+        self.state.send(priority, item)
+    }
+
     pub fn spin_send(&self, priority: Priority, item: T) -> Result<(), SendError<T>> {
         self.state.spin_send(priority, item)?;
         Ok(())
@@ -166,6 +232,7 @@ pub struct PriorityQueueReceiver<T> {
     state: Arc<PriorityQueueState<T>>,
     rand: SmallRng,
     disconnected: bool,
+    reclaim_capacity: bool,
 }
 
 impl<T> Clone for PriorityQueueReceiver<T> {
@@ -177,6 +244,7 @@ impl<T> Clone for PriorityQueueReceiver<T> {
             state: Arc::clone(&self.state),
             rand: SmallRng::seed_from_u64(0),
             disconnected: self.disconnected,
+            reclaim_capacity: self.reclaim_capacity,
         }
     }
 }
@@ -215,9 +283,29 @@ impl<T> PriorityQueueReceiver<T> {
             state,
             rand: SmallRng::seed_from_u64(0),
             disconnected: false,
+            reclaim_capacity: false,
         };
 
         (sender, receiver)
+    }
+
+    /// Opts this receiver's drain into returning backing-buffer capacity to
+    /// the allocator as the queue empties (see
+    /// [`PriorityQueues::shrink_oversized`]). Clones of the receiver inherit
+    /// it, so call this on the receiver `new` hands back, before it is handed
+    /// around.
+    ///
+    /// Off by default because the shrink reallocates and moves the live
+    /// elements while holding the queue mutex that `send` also blocks on. On a
+    /// many-producer background pool that turns one burst's cleanup into a
+    /// stall for every producer, which is a bad trade for a queue whose bursts
+    /// are bounded by the work that spawned them. It pays for itself on a
+    /// single-consumer queue whose producer can outrun it without bound — the
+    /// platform main-thread queue, where a starved drain has been seen leaving
+    /// gigabytes of capacity pinned for the life of the process.
+    pub fn reclaiming_capacity(mut self) -> Self {
+        self.reclaim_capacity = true;
+        self
     }
 
     /// Returns whether the queue currently contains no elements.
@@ -226,9 +314,13 @@ impl<T> PriorityQueueReceiver<T> {
     }
 
     /// Returns the number of queued elements across all priorities.
-    pub(crate) fn len(&self) -> usize {
-        let queues = self.state.queues.lock();
-        queues.high_priority.len() + queues.medium_priority.len() + queues.low_priority.len()
+    pub fn len(&self) -> usize {
+        self.state.queues.lock().len()
+    }
+
+    #[cfg(test)]
+    fn low_priority_capacity(&self) -> usize {
+        self.state.queues.lock().low_priority.capacity()
     }
 
     /// Tries to pop one element from the priority queue without blocking.
@@ -251,6 +343,9 @@ impl<T> PriorityQueueReceiver<T> {
         let Some(mut queues) = self.state.spin_try_recv()? else {
             return Ok(None);
         };
+        if self.reclaim_capacity {
+            queues.shrink_oversized();
+        }
 
         let high = P::High.weight() * !queues.high_priority.is_empty() as u32;
         let medium = P::Medium.weight() * !queues.medium_priority.is_empty() as u32;
@@ -324,6 +419,9 @@ impl<T> PriorityQueueReceiver<T> {
         } else {
             self.state.recv()?
         };
+        if self.reclaim_capacity {
+            queues.shrink_oversized();
+        }
 
         let high = P::High.weight() * !queues.high_priority.is_empty() as u32;
         let medium = P::Medium.weight() * !queues.medium_priority.is_empty() as u32;
@@ -431,5 +529,29 @@ mod tests {
         tx.send(Priority::High, 3).unwrap();
         assert_eq!(rx.pop().unwrap(), 3);
         assert_eq!(rx.pop().unwrap(), 1);
+    }
+
+    #[test]
+    fn burst_capacity_is_reclaimed_only_when_opted_in() {
+        const BURST: usize = 8192;
+
+        let drain = |receiver: &mut PriorityQueueReceiver<usize>| {
+            while receiver.try_pop().unwrap().is_some() {}
+        };
+
+        let (sender, mut receiver) = PriorityQueueReceiver::new();
+        for item in 0..BURST {
+            sender.send(Priority::Low, item).unwrap();
+        }
+        drain(&mut receiver);
+        assert!(receiver.low_priority_capacity() >= BURST);
+
+        let (sender, receiver) = PriorityQueueReceiver::new();
+        let mut receiver = receiver.reclaiming_capacity();
+        for item in 0..BURST {
+            sender.send(Priority::Low, item).unwrap();
+        }
+        drain(&mut receiver);
+        assert!(receiver.low_priority_capacity() <= 1024);
     }
 }
