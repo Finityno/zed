@@ -36,7 +36,7 @@ impl MetalAtlas {
             list.textures
                 .iter()
                 .flatten()
-                .map(|texture| texture.metal_texture.allocated_size() as u64)
+                .map(|texture| texture.metal_texture.allocated_size())
                 .sum()
         }
         let lock = self.0.lock();
