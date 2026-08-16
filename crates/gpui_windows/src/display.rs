@@ -125,6 +125,14 @@ impl WindowsDisplay {
     pub fn physical_bounds(&self) -> Bounds<DevicePixels> {
         self.physical_bounds
     }
+
+    /// The monitor's effective-DPI scale, for converting logical coordinates
+    /// that belong to THIS display into physical pixels. Conversions with the
+    /// scale of whatever monitor a window currently sits on are only valid
+    /// for rects on that same monitor.
+    pub(crate) fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
 }
 
 impl PlatformDisplay for WindowsDisplay {
