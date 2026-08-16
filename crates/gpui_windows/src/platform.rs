@@ -131,6 +131,10 @@ impl WindowsPlatform {
         };
 
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
+        // The foreground queue is the one that can be grown without bound by a
+        // producer the drain cannot keep up with, so it is the one that has to
+        // hand the burst's capacity back as it empties.
+        let main_receiver = main_receiver.reclaiming_capacity();
         let validation_number = if usize::BITS == 64 {
             rand::random::<u64>() as usize
         } else {
@@ -595,6 +599,7 @@ impl Platform for WindowsPlatform {
     ) -> Result<Box<dyn PlatformWindow>> {
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
         let handle = window.get_raw_handle();
+        window.state.registered_with_platform.set(true);
         self.raw_window_handles.write().push(handle.into());
 
         Ok(Box::new(window))
@@ -1073,6 +1078,10 @@ impl WindowsPlatformInner {
             return false;
         };
         let mut lock = all_windows.write();
+        // Upstream asserts that a close request always names a registered
+        // window; `WindowsWindowState::registered_with_platform` is what keeps
+        // that true here, by not posting the request at all for a window whose
+        // creation failed before `open_window` could register it.
         let index = lock
             .iter()
             .position(|handle| handle.as_raw() == target_window)
@@ -1122,16 +1131,7 @@ impl WindowsPlatformInner {
                         process_message(&msg);
                     }
                     // Allow the main loop to process other gpui events before going back into `run_foreground_task`
-                    unsafe {
-                        if let Err(_) = PostMessageW(
-                            Some(self.dispatcher.platform_window_handle.as_raw()),
-                            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
-                            WPARAM(self.validation_number),
-                            LPARAM(0),
-                        ) {
-                            self.dispatcher.wake_posted.store(false, Ordering::Release);
-                        };
-                    }
+                    self.dispatcher.repost_wake();
                     break 'tasks;
                 }
                 let mut main_receiver = self.main_receiver.clone();
@@ -1153,6 +1153,17 @@ impl WindowsPlatformInner {
                 }
                 _ => break 'tasks,
             }
+        }
+
+        // Re-stamp the depth at drain exit: the enqueue-side stamp goes stale
+        // downward once the queue empties and nothing new is sent, which
+        // would make an idle-time crash report claim a deep queue.
+        let queued = self.main_receiver.len();
+        gpui::queue::MAIN_THREAD_QUEUE_DEPTH.store(queued, Ordering::Relaxed);
+        if queued == 0 {
+            // Draining to empty is the only proof the starvation ended, and so
+            // the only safe point to re-arm the runaway-queue alarm.
+            self.dispatcher.rearm_queue_alarm();
         }
 
         Some(0)

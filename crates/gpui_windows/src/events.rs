@@ -205,28 +205,53 @@ impl WindowsWindowInner {
             lparam.signed_hiword() as f32,
             self.state.scale_factor.get(),
         );
-        self.state.origin.set(origin);
+        let origin_changed = self.state.origin.replace(origin) != origin;
+        // The did-we-leave-the-monitor test runs in PHYSICAL pixels, the one
+        // coordinate space monitors share. Comparing this window's logical
+        // origin (scaled by its own DPI) against another display's logical
+        // bounds (scaled by that display's DPI) is meaningless on mixed-DPI
+        // setups, and the mismatch made every WM_MOVE re-query and rebuild
+        // the display (GetMonitorInfo + GetDpiForMonitor) for the whole drag.
+        let scale_factor = self.state.scale_factor.get();
         let size = self.state.logical_size.get();
-        let center_x = origin.x.as_f32() + size.width.as_f32() / 2.;
-        let center_y = origin.y.as_f32() + size.height.as_f32() / 2.;
-        let monitor_bounds = self.state.display.get().bounds();
-        if center_x < monitor_bounds.left().as_f32()
-            || center_x > monitor_bounds.right().as_f32()
-            || center_y < monitor_bounds.top().as_f32()
-            || center_y > monitor_bounds.bottom().as_f32()
-        {
+        let physical_center = point(
+            DevicePixels(
+                lparam.signed_loword() as i32 + (size.width.as_f32() * scale_factor / 2.) as i32,
+            ),
+            DevicePixels(
+                lparam.signed_hiword() as i32 + (size.height.as_f32() * scale_factor / 2.) as i32,
+            ),
+        );
+        let monitor_bounds = self.state.display.get().physical_bounds();
+        let mut display_changed = false;
+        if !monitor_bounds.contains(&physical_center) {
             // center of the window may have moved to another monitor
             let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
             // minimize the window can trigger this event too, in this case,
             // monitor is invalid, we do nothing.
-            if !monitor.is_invalid() && self.state.display.get().handle != monitor {
+            if !monitor.is_invalid()
+                && self.state.display.get().handle != monitor
                 // we will get the same monitor if we only have one
-                self.state.display.set(WindowsDisplay::new(
-                    WindowsDisplay::display_id_for_monitor(monitor),
-                )?);
+                && let Some(display) =
+                    WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(monitor))
+            {
+                self.state.display.set(display);
+                display_changed = true;
             }
         }
-        if let Some(mut callback) = self.state.callbacks.moved.take() {
+        // Only a real move reaches the app's bounds observers: SetWindowPos
+        // re-entries and DWM frame churn re-deliver WM_MOVE with an unchanged
+        // origin, and each fan-out costs a synchronous pass over every
+        // observer while the wndproc still owns the thread. A display change
+        // fans out too, because the callback is what refreshes GPUI's display
+        // id and a DPI boundary can be crossed at an unchanged *logical*
+        // origin (physical 960 at 100% and 1920 at 200% both read as 960).
+        //
+        // Note this must not sit behind an early return: `origin` was already
+        // advanced above, so a skipped fan-out is never redelivered.
+        if (origin_changed || display_changed)
+            && let Some(mut callback) = self.state.callbacks.moved.take()
+        {
             callback();
             self.state.callbacks.moved.set(Some(callback));
         }
@@ -252,9 +277,17 @@ impl WindowsWindowInner {
         // Don't resize the renderer when the window is minimized, but record that it was minimized so
         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
         if wparam.0 == SIZE_MINIMIZED as usize {
-            self.state
-                .restore_from_minimized
-                .set(self.state.callbacks.request_frame.take());
+            // Windows can deliver SIZE_MINIMIZED again for an already-minimized
+            // window (Win+D, a second `SW_MINIMIZE`); overwriting the stash with
+            // the `None` that second take yields would drop `request_frame` for
+            // good and the window would never paint again once restored.
+            if let Some(request_frame) = self.state.callbacks.request_frame.take() {
+                self.state.restore_from_minimized.set(Some(request_frame));
+            }
+            // Restore usually arrives with the pre-minimize size; resetting
+            // the dedup key keeps the restore's resize callback (and the
+            // refresh it triggers) firing despite the unchanged size.
+            self.state.last_reported_resize.set(None);
             return Some(0);
         }
 
@@ -294,7 +327,18 @@ impl WindowsWindowInner {
                 .invalidate_devices
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        if let Some(mut callback) = self.state.callbacks.resize.take() {
+        // Same dedup as `handle_move_msg`: only a real change fans out to the
+        // bounds observers. Keyed on (size, scale) because a DPI change can
+        // land with the logical size unchanged and must still be reported.
+        // The key is recorded only once the callback has actually been taken:
+        // a WM_SIZE that lands before GPUI installs `on_resize`, or while an
+        // outer re-entered handler holds the callback, would otherwise mark
+        // itself delivered and suppress the redelivery that used to correct it.
+        let reported = Some((new_logical_size, scale_factor));
+        if self.state.last_reported_resize.get() != reported
+            && let Some(mut callback) = self.state.callbacks.resize.take()
+        {
+            self.state.last_reported_resize.set(reported);
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
         }
@@ -361,14 +405,21 @@ impl WindowsWindowInner {
         if let Some(callback) = callback {
             callback();
         }
-        unsafe {
-            PostMessageW(
-                Some(self.platform_window_handle),
-                WM_GPUI_CLOSE_ONE_WINDOW,
-                WPARAM(self.validation_number),
-                LPARAM(handle.0 as isize),
-            )
-            .log_err();
+        // Only ask the platform to forget a handle it was told about. A window
+        // whose creation failed after `CreateWindowExW` is destroyed before
+        // `open_window` can register it, and this message would then be drained
+        // after Windows had already recycled the HWND value onto a live window,
+        // unregistering that one instead.
+        if self.state.registered_with_platform.get() {
+            unsafe {
+                PostMessageW(
+                    Some(self.platform_window_handle),
+                    WM_GPUI_CLOSE_ONE_WINDOW,
+                    WPARAM(self.validation_number),
+                    LPARAM(handle.0 as isize),
+                )
+                .log_err();
+            }
         }
         Some(0)
     }
@@ -891,7 +942,6 @@ impl WindowsWindowInner {
     ) -> Option<isize> {
         let new_dpi = wparam.loword() as f32;
 
-        let is_maximized = self.state.is_maximized();
         let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
         self.state.scale_factor.set(new_scale_factor);
         self.state.border_offset.update(handle).log_err();
@@ -900,9 +950,34 @@ impl WindowsWindowInner {
             .direct_manipulation
             .set_scale_factor(new_scale_factor);
 
+        // The repositioning below re-enters the wndproc synchronously, and
+        // when the target rect crosses yet another DPI boundary the next
+        // WM_DPICHANGED arrives *inside* the SetWindowPos call. Answering it
+        // with another SetWindowPos is an unbounded mutual recursion between
+        // two monitors — a field dump caught it enqueueing 2.5M foreground
+        // runnables per second with the message loop never running again. A
+        // nested change records the new scale above and stops; the outermost
+        // handler owns placement, and its rect (from this very lparam) is
+        // already consistent with whichever monitor Windows settled on.
+        if self.state.handling_dpi_change.replace(true) {
+            return Some(0);
+        }
+        // A scope guard, not a paired `set(false)` at the tail: this handler
+        // returns `Option`, `?`-on-`Option` is the idiom throughout this file,
+        // and one added early return would wedge the flag and silently disable
+        // DPI handling for this window for the rest of the process.
+        let _handling_dpi_change = gpui_util::defer(|| self.state.handling_dpi_change.set(false));
+
+        let is_maximized = self.state.is_maximized();
+        let suggested_rect = unsafe { &*(lparam.0 as *const RECT) };
         if is_maximized {
-            // Get the monitor and its work area at the new DPI
-            let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
+            // Re-maximize onto the monitor that now owns the window. That
+            // monitor must come from the *suggested* rect: WM_DPICHANGED is
+            // delivered before the window has actually moved, so asking
+            // MonitorFromWindow here returns the monitor being left, and
+            // snapping to its work area drags the window back — the other
+            // half of the ping-pong above.
+            let monitor = unsafe { MonitorFromRect(suggested_rect, MONITOR_DEFAULTTONEAREST) };
             let mut monitor_info: MONITORINFO = unsafe { std::mem::zeroed() };
             monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
             if unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
@@ -926,16 +1001,44 @@ impl WindowsWindowInner {
                     .log_err();
                 }
 
-                // SetWindowPos may not send WM_SIZE for maximized windows in some cases,
-                // so we manually update the size to ensure proper rendering
-                let device_size = size(DevicePixels(width), DevicePixels(height));
-                self.handle_size_change(device_size, new_scale_factor, true);
+                // SetWindowPos may not send WM_SIZE for maximized windows in
+                // some cases, so we manually update the size to ensure proper
+                // rendering. Both halves are re-read from the window rather
+                // than carried over from this message: the SetWindowPos above
+                // re-enters the wndproc, and a nested WM_DPICHANGED there
+                // records a *different* monitor's scale, so pairing this
+                // message's work area with either scale leaves `scale_factor`
+                // and `logical_size` describing different monitors. That
+                // mismatch would survive exactly in the case this manual
+                // update exists for — no WM_SIZE arriving to correct it —
+                // leaving `bounds()`, min/max tracking and mouse coordinates
+                // reading off two monitors at once. The client rect is also
+                // what a WM_SIZE would have carried, where the work area is
+                // the window rect.
+                let scale_factor = match unsafe { GetDpiForWindow(handle) } {
+                    0 => self.state.scale_factor.get(),
+                    dpi => dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32,
+                };
+                self.state.scale_factor.set(scale_factor);
+                self.state
+                    .direct_manipulation
+                    .set_scale_factor(scale_factor);
+                self.state.border_offset.update(handle).log_err();
+                let mut client_rect = RECT::default();
+                let device_size = if unsafe { GetClientRect(handle, &mut client_rect) }.is_ok() {
+                    size(
+                        DevicePixels((client_rect.right - client_rect.left).max(1)),
+                        DevicePixels((client_rect.bottom - client_rect.top).max(1)),
+                    )
+                } else {
+                    size(DevicePixels(width.max(1)), DevicePixels(height.max(1)))
+                };
+                self.handle_size_change(device_size, scale_factor, true);
             }
         } else {
             // For non-maximized windows, use the suggested RECT from the system
-            let rect = unsafe { &*(lparam.0 as *const RECT) };
-            let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top;
+            let width = suggested_rect.right - suggested_rect.left;
+            let height = suggested_rect.bottom - suggested_rect.top;
             // this will emit `WM_SIZE` and `WM_MOVE` right here
             // even before this function returns
             // the new size is handled in `WM_SIZE`
@@ -943,8 +1046,8 @@ impl WindowsWindowInner {
                 SetWindowPos(
                     handle,
                     None,
-                    rect.left,
-                    rect.top,
+                    suggested_rect.left,
+                    suggested_rect.top,
                     width,
                     height,
                     SWP_NOZORDER | SWP_NOACTIVATE,

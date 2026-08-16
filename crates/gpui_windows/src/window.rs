@@ -57,6 +57,27 @@ pub struct WindowsWindowState {
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    /// Set while `handle_dpi_changed_msg` repositions the window. Its
+    /// `SetWindowPos` re-enters the wndproc synchronously, and when the new
+    /// rect crosses another DPI boundary Windows delivers the next
+    /// WM_DPICHANGED *inside* that call; handling it with another
+    /// `SetWindowPos` is how two monitors ping-pong a window between them
+    /// forever without the message loop ever running again. A nested change
+    /// only records the new scale — the outermost handler owns placement.
+    pub(crate) handling_dpi_change: Cell<bool>,
+    /// The (logical size, scale factor) last delivered to the resize
+    /// callback, so repeated same-size WM_SIZE deliveries (SetWindowPos
+    /// storms re-enter the wndproc with an unchanged size) don't fan out to
+    /// every bounds observer per message.
+    pub(crate) last_reported_resize: Cell<Option<(Size<Pixels>, f32)>>,
+    /// Whether `open_window` added this window's HWND to the platform's window
+    /// list. Creation can fail after `CreateWindowExW`, and the `DestroyWindow`
+    /// that cleans that up still runs `WM_DESTROY`; asking the platform to
+    /// unregister a handle it never registered is not just a no-op, because
+    /// Windows recycles HWND values — by the time that posted request is
+    /// drained the same value may belong to a live, registered window, which
+    /// would then be dropped from accelerator routing.
+    pub(crate) registered_with_platform: Cell<bool>,
 
     pub callbacks: Callbacks,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
@@ -170,6 +191,9 @@ impl WindowsWindowState {
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
+            handling_dpi_change: Cell::new(false),
+            last_reported_resize: Cell::new(None),
+            registered_with_platform: Cell::new(false),
             min_size,
             callbacks,
             input_handler: Cell::new(input_handler),
@@ -515,6 +539,14 @@ impl WindowsWindow {
         } else {
             None
         };
+        // The disable above is undone only by the dialog's `WM_DESTROY`, so
+        // every failure between here and a live window would leave the parent
+        // permanently un-clickable.
+        let modal_parent = parent_hwnd.map(|parent_hwnd| {
+            gpui_util::defer(move || unsafe {
+                EnableWindow(parent_hwnd, true).as_bool();
+            })
+        });
         let hide_title_bar = params
             .titlebar
             .as_ref()
@@ -611,27 +643,41 @@ impl WindowsWindow {
         // so check the inner result first.
         let this = context.inner.take().transpose()?;
         let hwnd = creation_result?;
-        let this = this.unwrap();
+        let Some(this) = this else {
+            // Unreachable in practice — `WM_NCCREATE` either stores the state
+            // or fails the creation checked above — but destroying beats
+            // unwrapping if that ever stops holding.
+            unsafe { DestroyWindow(hwnd).log_err() };
+            anyhow::bail!("window creation produced no window state");
+        };
 
-        register_drag_drop(&this)?;
-        set_non_rude_hwnd(hwnd, true);
-        configure_dwm_dark_mode(hwnd, appearance);
-        this.state.border_offset.update(hwnd)?;
-        let placement =
-            retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
-        if params.show {
-            let mut placement = placement;
-            if !params.focus {
-                placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+        // The HWND exists but no `WindowsWindow` was constructed yet, so no Drop
+        // will destroy it on the failure paths below. Without that a caller that
+        // keeps retrying a failing open leaks a USER handle per attempt until the
+        // process hits the 10k quota, after which USER32 calls fail process-wide
+        // (often with no last-error set).
+        //
+        // Drag-drop registration is kept out of `configure_created_window` so the
+        // cleanup only revokes a target that was actually registered; revoking one
+        // that was not returns `DRAGDROP_E_NOTREGISTERED` and logs an error next to
+        // (and often after) the real cause.
+        if let Err(error) = register_drag_drop(&this) {
+            unsafe { DestroyWindow(hwnd).log_err() };
+            return Err(error);
+        }
+        if let Err(error) = configure_created_window(&this, hwnd, display, &params, appearance) {
+            unsafe {
+                RevokeDragDrop(hwnd).log_err();
+                DestroyWindow(hwnd).log_err();
             }
-            unsafe { SetWindowPlacement(hwnd, &placement)? };
-        } else {
-            this.state.initial_placement.set(Some(WindowOpenStatus {
-                placement,
-                state: WindowOpenState::Windowed,
-            }));
+            return Err(error);
         }
 
+        // The window owns the parent's modal state from here: its `WM_DESTROY`
+        // re-enables the parent.
+        if let Some(modal_parent) = modal_parent {
+            modal_parent.abort();
+        }
         Ok(Self(this))
     }
 }
@@ -1614,10 +1660,47 @@ fn calculate_client_rect(
     }
 }
 
+/// The fallible configuration that runs after `CreateWindowExW` succeeded but
+/// before the `WindowsWindow` exists. Split out so `WindowsWindow::new` can
+/// destroy the HWND when any step fails — at that point no Drop impl owns the
+/// handle yet.
+fn configure_created_window(
+    this: &Rc<WindowsWindowInner>,
+    hwnd: HWND,
+    display: WindowsDisplay,
+    params: &WindowParams,
+    appearance: WindowAppearance,
+) -> Result<()> {
+    set_non_rude_hwnd(hwnd, true);
+    configure_dwm_dark_mode(hwnd, appearance);
+    this.state.border_offset.update(hwnd)?;
+    let placement = retrieve_window_placement(
+        hwnd,
+        display,
+        params.bounds,
+        this.state.scale_factor.get(),
+        &this.state.border_offset,
+    )?;
+    if params.show {
+        let mut placement = placement;
+        if !params.focus {
+            placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+        }
+        unsafe { SetWindowPlacement(hwnd, &placement)? };
+    } else {
+        this.state.initial_placement.set(Some(WindowOpenStatus {
+            placement,
+            state: WindowOpenState::Windowed,
+        }));
+    }
+    Ok(())
+}
+
 fn retrieve_window_placement(
     hwnd: HWND,
     display: WindowsDisplay,
     initial_bounds: Bounds<Pixels>,
+    scale_factor: f32,
     border_offset: &WindowBorderOffset,
 ) -> Result<WINDOWPLACEMENT> {
     let mut placement = WINDOWPLACEMENT {
@@ -1631,15 +1714,37 @@ fn retrieve_window_placement(
     } else {
         display.default_bounds()
     };
-    // `bounds` is expressed in logical pixels for `display`, so it must be converted
-    // to device pixels using that display's own scale factor. The window's current
-    // scale factor can't be used here: `CreateWindowExW` was called with
-    // `CW_USEDEFAULT`, so at this point the window may still be sitting on whichever
-    // monitor Windows picked by default, which can have a different DPI than `display`
-    // and would otherwise throw off the physical position (e.g. leaving the window
-    // partially off-screen when moved to a monitor with a different scale factor).
-    let bounds = bounds.to_device_pixels(display.scale_factor());
-    placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
+    // The bounds are logical coordinates on `display`, so the physical rect
+    // must use that display's scale. `scale_factor` is the DPI of whatever
+    // monitor `CW_USEDEFAULT` created the still-hidden window on, and
+    // converting with it misplaces the rect whenever the two differ: bounds
+    // saved on a 150% monitor restored through a 100% creation monitor
+    // produced a rect 1.5x too small at 2/3 the position — parked straddling
+    // a monitor boundary, which is the initial condition of the
+    // WM_DPICHANGED ping-pong (see `handle_dpi_changed_msg`). The decision
+    // above (`check_given_bounds`) already tests the center at the display's
+    // own scale; the placement must agree with it. The border offset was
+    // measured on the creation monitor, so it scales by the same ratio.
+    let target_scale_factor = display.scale_factor();
+    let bounds = bounds.to_device_pixels(target_scale_factor);
+    // `scale_factor` is `GetDpiForWindow(hwnd) / 96.0` and that call reports 0
+    // for a handle it cannot resolve, so the ratio has to be guarded: an
+    // infinite one saturates the offsets below to `i32::MAX` and hands
+    // `SetWindowPlacement` a rect two billion pixels wide.
+    let border_ratio = if scale_factor > 0. {
+        target_scale_factor / scale_factor
+    } else {
+        1.
+    };
+    let border_offset = WindowBorderOffset {
+        width_offset: Cell::new(
+            (border_offset.width_offset.get() as f32 * border_ratio).round() as i32,
+        ),
+        height_offset: Cell::new(
+            (border_offset.height_offset.get() as f32 * border_ratio).round() as i32,
+        ),
+    };
+    placement.rcNormalPosition = calculate_window_rect(bounds, &border_offset);
     Ok(placement)
 }
 
