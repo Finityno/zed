@@ -652,20 +652,20 @@ impl MetalRenderer {
         let depth_bytes = self
             .depth_texture
             .as_ref()
-            .map_or(0, |texture| texture.allocated_size() as u64);
+            .map_or(0, |texture| texture.allocated_size());
         let path_intermediate_bytes = self
             .path_intermediate_texture
             .as_ref()
-            .map_or(0, |texture| texture.allocated_size() as u64)
+            .map_or(0, |texture| texture.allocated_size())
             + self
                 .path_intermediate_msaa_texture
                 .as_ref()
-                .map_or(0, |texture| texture.allocated_size() as u64);
+                .map_or(0, |texture| texture.allocated_size());
         const MB: u64 = 1024 * 1024;
         log::info!(
             "[gpu-stats] device_allocated={}MB atlas_monochrome={}MB atlas_polychrome={}MB \
              instance_pool={}x{}KB depth={}MB path_intermediates={}MB",
-            self.device.current_allocated_size() as u64 / MB,
+            self.device.current_allocated_size() / MB,
             monochrome_bytes / MB,
             polychrome_bytes / MB,
             pool_buffers,
