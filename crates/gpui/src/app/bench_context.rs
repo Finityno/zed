@@ -701,6 +701,10 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
     /// benchmark's frame report through the GPUI frame profiler.
     pub fn bench_iter(&mut self, mut benchmark: impl FnMut(&mut Self)) {
         let bencher = self.take_bencher("bench_iter");
+        // Release whatever the benchmark's setup left behind before the first
+        // sample, so entities dropped during construction cannot cascade into
+        // the measured iterations.
+        self.settle();
         self.dispatch_pending_frames(|| true);
         let collector = TraceScope::start(self.foreground_journal_collector());
         let mut benchmark = || {
@@ -829,6 +833,10 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         V: 'static + Render,
     {
         let bencher = self.take_bencher("bench_renderer");
+        // Release whatever the benchmark's setup left behind before the first
+        // sample, so entities dropped during construction cannot cascade into
+        // the measured iterations.
+        self.settle();
         let dispatcher = self.background_executor.dispatcher().clone();
         self.dispatch_pending_frames(|| true);
         let collector = TraceScope::start(self.foreground_journal_collector());
