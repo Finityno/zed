@@ -492,6 +492,7 @@ impl Platform for MacPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        install_main_thread_idle_observer();
         let mut state = self.0.lock();
         if state.headless {
             drop(state);
@@ -1569,4 +1570,49 @@ mod security {
     pub const errSecSuccess: OSStatus = 0;
     pub const errSecUserCanceled: OSStatus = -128;
     pub const errSecItemNotFound: OSStatus = -25300;
+}
+
+/// Installs a run-loop observer that fires GPUI's main-thread idle hook each
+/// time the main run loop is about to sleep.
+///
+/// `kCFRunLoopBeforeWaiting` is the one moment the main thread is reliably
+/// between units of work: every source, timer and block queued for this pass
+/// has run, and the next thing is `mach_msg`. An embedder that has per-thread
+/// bookkeeping to do — an allocator reclaiming the free space inside its
+/// still-used pages, say — has no other honest opportunity, because nothing
+/// else on the main thread knows it has finished rather than paused.
+///
+/// Deliberately *not* paired with a `kCFRunLoopAfterWaiting` counterpart. Other
+/// observers (AppKit's, Core Animation's) run after this one and do allocate
+/// before the thread actually sleeps, so anything held across the wait would be
+/// held while another observer is still working. The hook does its work
+/// synchronously and returns.
+fn install_main_thread_idle_observer() {
+    use core_foundation::runloop::{
+        CFRunLoopAddObserver, CFRunLoopGetMain, kCFRunLoopBeforeWaiting, kCFRunLoopCommonModes,
+    };
+    use core_foundation_sys::base::CFOptionFlags;
+    use core_foundation_sys::runloop::{CFRunLoopObserverCreate, CFRunLoopObserverRef};
+
+    extern "C" fn observe(_observer: CFRunLoopObserverRef, _activity: CFOptionFlags, _info: *mut c_void) {
+        gpui::main_thread_idle();
+    }
+
+    // SAFETY: called on the main thread during `run`, before the run loop is
+    // entered. The observer is created with a null context, so nothing is
+    // retained or released through it, and it is intentionally never removed --
+    // it lives as long as the process does.
+    unsafe {
+        let observer = CFRunLoopObserverCreate(
+            std::ptr::null(),
+            kCFRunLoopBeforeWaiting,
+            true as u8,  // repeats
+            0,           // order: run before observers that queue more work
+            observe,
+            std::ptr::null_mut(),
+        );
+        if !observer.is_null() {
+            CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+        }
+    }
 }

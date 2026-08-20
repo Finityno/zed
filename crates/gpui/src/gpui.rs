@@ -46,6 +46,7 @@ pub mod profiler;
 ))]
 #[expect(missing_docs)]
 pub mod queue;
+mod thread_park;
 mod scene;
 mod shared_uri;
 mod spring;
@@ -146,6 +147,9 @@ pub use platform::*;
 pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
+pub use thread_park::{
+    ThreadParkHook, main_thread_idle, set_main_thread_idle_hook, set_thread_park_hooks,
+};
 pub use refineable::*;
 pub use scene::*;
 pub use shared_uri::*;
