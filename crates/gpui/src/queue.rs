@@ -149,9 +149,9 @@ impl<T> PriorityQueueState<T> {
         while queues.is_empty() {
             // The one place every GPUI-owned worker blocks: the Linux and
             // Windows dispatcher pools and `ThreadedDispatcher` all park here.
-            // (macOS dispatches onto GCD, whose threads GPUI does not own and
-            // cannot announce for.)
-            let _parked = crate::thread_park::park();
+            // (macOS dispatches onto GCD, whose threads GPUI does not own; its
+            // backend announces from the dispatch trampoline instead.)
+            crate::thread_park::thread_idle();
             queues = self
                 .condvar
                 .wait(queues)
