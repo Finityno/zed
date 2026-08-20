@@ -1572,8 +1572,8 @@ mod security {
     pub const errSecItemNotFound: OSStatus = -25300;
 }
 
-/// Installs a run-loop observer that fires GPUI's main-thread idle hook each
-/// time the main run loop is about to sleep.
+/// Installs a run-loop observer that fires GPUI's idle hook each time the main
+/// run loop is about to sleep.
 ///
 /// `kCFRunLoopBeforeWaiting` is the one moment the main thread is reliably
 /// between units of work: every source, timer and block queued for this pass
@@ -1582,7 +1582,7 @@ mod security {
 /// still-used pages, say — has no other honest opportunity, because nothing
 /// else on the main thread knows it has finished rather than paused.
 ///
-/// Deliberately *not* paired with a `kCFRunLoopAfterWaiting` counterpart. Other
+/// There is deliberately no `kCFRunLoopAfterWaiting` counterpart. Other
 /// observers (AppKit's, Core Animation's) run after this one and do allocate
 /// before the thread actually sleeps, so anything held across the wait would be
 /// held while another observer is still working. The hook does its work
@@ -1595,7 +1595,7 @@ fn install_main_thread_idle_observer() {
     use core_foundation_sys::runloop::{CFRunLoopObserverCreate, CFRunLoopObserverRef};
 
     extern "C" fn observe(_observer: CFRunLoopObserverRef, _activity: CFOptionFlags, _info: *mut c_void) {
-        gpui::main_thread_idle();
+        gpui::thread_idle();
     }
 
     // SAFETY: called on the main thread during `run`, before the run loop is
