@@ -147,9 +147,7 @@ pub use platform::*;
 pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
-pub use thread_park::{
-    ThreadParkHook, main_thread_idle, set_main_thread_idle_hook, set_thread_park_hooks,
-};
+pub use thread_park::{ThreadIdleHook, set_thread_idle_hook, thread_idle};
 pub use refineable::*;
 pub use scene::*;
 pub use shared_uri::*;
