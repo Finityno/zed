@@ -465,8 +465,8 @@ impl Platform for WindowsPlatform {
             loop {
                 // `GetMessageW` is where the main thread sleeps, so this is the
                 // one point at which it is reliably between units of work
-                // rather than mid-frame. See `gpui::set_main_thread_idle_hook`.
-                gpui::main_thread_idle();
+                // rather than mid-frame. See `gpui::set_thread_idle_hook`.
+                gpui::thread_idle();
                 if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     break;
                 }
