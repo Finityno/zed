@@ -138,6 +138,13 @@ impl LinuxClient for HeadlessClient {
             .take()
             .expect("App is already running");
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        event_loop
+            .run(None, &mut self.clone(), |_| {
+                // calloop runs this once per iteration, after the events
+                // are dispatched and just before it blocks again: the main
+                // thread's idle point. See `gpui::set_main_thread_idle_hook`.
+                gpui::main_thread_idle();
+            })
+            .log_err();
     }
 }
