@@ -462,7 +462,14 @@ impl Platform for WindowsPlatform {
 
         let mut msg = MSG::default();
         unsafe {
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            loop {
+                // `GetMessageW` is where the main thread sleeps, so this is the
+                // one point at which it is reliably between units of work
+                // rather than mid-frame. See `gpui::set_main_thread_idle_hook`.
+                gpui::main_thread_idle();
+                if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    break;
+                }
                 if translate_accelerator(&msg, || {
                     self.raw_window_handles
                         .read()

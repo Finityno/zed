@@ -1200,7 +1200,13 @@ impl LinuxClient for WaylandClient {
             .run(
                 None,
                 &mut WaylandClientStatePtr(Rc::downgrade(&self.0)),
-                |_| {},
+                |_| {
+                    // calloop runs this once per iteration, after the events
+                    // are dispatched and just before it blocks again: the main
+                    // thread's idle point. See
+                    // `gpui::set_main_thread_idle_hook`.
+                    gpui::main_thread_idle();
+                },
             )
             .log_err();
     }
