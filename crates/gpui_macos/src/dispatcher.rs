@@ -172,4 +172,17 @@ extern "C" fn trampoline(context: *mut c_void) {
     gpui::profiler::update_running_task(spawned, location);
     runnable.run();
     gpui::profiler::save_task_timing();
+
+    // macOS dispatches onto GCD, so GPUI owns no background worker threads and
+    // there is no park of ours to announce from -- `queue.rs` is unreachable on
+    // this backend. A GCD worker instead sits idle between tasks, and it is
+    // long-lived: the pool reuses threads rather than retiring them, so any
+    // per-thread state an embedder keeps accumulates for the life of the
+    // process unless it hears about these moments.
+    //
+    // Just-finished-a-task is that moment. It fires far more often than a park
+    // would, so the hook is documented as needing to be cheap and
+    // self-rate-limiting; that is a better trade than leaving every background
+    // thread on this platform unannounced.
+    gpui::thread_idle();
 }
