@@ -151,7 +151,20 @@ impl<T> PriorityQueueState<T> {
             // Windows dispatcher pools and `ThreadedDispatcher` all park here.
             // (macOS dispatches onto GCD, whose threads GPUI does not own; its
             // backend announces from the dispatch trampoline instead.)
-            crate::thread_park::thread_idle();
+            if crate::thread_park::is_installed() {
+                // Release the queue lock for the duration of the hook. The
+                // hook's work can take milliseconds, and holding the lock
+                // across it would stall every sender and every other worker
+                // behind one thread's bookkeeping. A task that arrives while
+                // the lock is released is seen by the re-check below, so the
+                // `notify_one` it sent while nobody was waiting is not lost.
+                drop(queues);
+                crate::thread_park::thread_idle();
+                queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+                if !queues.is_empty() {
+                    continue;
+                }
+            }
             queues = self
                 .condvar
                 .wait(queues)
