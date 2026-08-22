@@ -36,12 +36,24 @@ static HOOK: OnceLock<ThreadIdleHook> = OnceLock::new();
 /// There is one hook per process, not per `Application`.
 ///
 /// It fires often — every trip round an idle run loop, and after every
-/// dispatched task on macOS — so it must be cheap and self-rate-limiting. It
-/// must not block, panic, or re-enter GPUI: at some sites it runs while the
-/// executor holds its queue lock, so anything slow is contention every other
-/// worker pays for.
+/// dispatched background task on macOS — so it must be cheap and
+/// self-rate-limiting. It must not block, panic, or re-enter GPUI. No site
+/// holds an executor lock across it, so a slow hook delays only the thread it
+/// runs on — but that thread may be the main thread about to sleep before the
+/// next frame.
 pub fn set_thread_idle_hook(hook: ThreadIdleHook) -> bool {
     HOOK.set(hook).is_ok()
+}
+
+/// Whether an idle hook has been installed, so a site can skip the setup
+/// around a call — releasing a lock, say — when there is nothing to call.
+///
+/// Public for the same reason as [`thread_idle`]; not part of the
+/// embedder-facing API. (Its one in-crate caller, `queue.rs`, is not compiled
+/// on macOS, which is also why this is not `pub(crate)`.)
+#[doc(hidden)]
+pub fn is_installed() -> bool {
+    HOOK.get().is_some()
 }
 
 /// Run the idle hook, if one is installed.

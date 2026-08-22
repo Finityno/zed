@@ -55,7 +55,7 @@ impl PlatformDispatcher for MacDispatcher {
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, _priority: Priority) {
         let context = runnable.into_raw().as_ptr() as *mut c_void;
         unsafe {
-            DispatchQueue::main().exec_async_f(context, trampoline);
+            DispatchQueue::main().exec_async_f(context, main_thread_trampoline);
         }
     }
 
@@ -163,7 +163,7 @@ fn set_audio_thread_priority() -> anyhow::Result<()> {
     Ok(())
 }
 
-extern "C" fn trampoline(context: *mut c_void) {
+fn run_runnable(context: *mut c_void) {
     let runnable =
         unsafe { Runnable::<RunnableMeta>::from_raw(NonNull::new_unchecked(context as *mut ())) };
 
@@ -172,6 +172,11 @@ extern "C" fn trampoline(context: *mut c_void) {
     gpui::profiler::update_running_task(spawned, location);
     runnable.run();
     gpui::profiler::save_task_timing();
+}
+
+/// The trampoline for the global (background) queues.
+extern "C" fn trampoline(context: *mut c_void) {
+    run_runnable(context);
 
     // macOS dispatches onto GCD, so GPUI owns no background worker threads and
     // there is no park of ours to announce from -- `queue.rs` is unreachable on
@@ -185,4 +190,15 @@ extern "C" fn trampoline(context: *mut c_void) {
     // self-rate-limiting; that is a better trade than leaving every background
     // thread on this platform unannounced.
     gpui::thread_idle();
+}
+
+/// The trampoline for the main queue. Deliberately does NOT announce an idle
+/// point: the main thread has a real one -- the `kCFRunLoopBeforeWaiting`
+/// observer in `platform.rs`, which fires once the run loop has drained
+/// everything and is about to sleep. Announcing after every dispatched task
+/// instead would fire mid-frame, between two tasks of the same burst, and a
+/// hook that paces itself would then spend its budget there and skip the
+/// genuine idle point that follows.
+extern "C" fn main_thread_trampoline(context: *mut c_void) {
+    run_runnable(context);
 }
