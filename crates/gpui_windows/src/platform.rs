@@ -465,8 +465,16 @@ impl Platform for WindowsPlatform {
             loop {
                 // `GetMessageW` is where the main thread sleeps, so this is the
                 // one point at which it is reliably between units of work
-                // rather than mid-frame. See `gpui::set_thread_idle_hook`.
-                gpui::thread_idle();
+                // rather than mid-frame -- but only when it is actually about
+                // to sleep. With messages still queued it returns at once, and
+                // announcing there would land the hook between two messages of
+                // the same burst; a hook that paces itself would then spend its
+                // budget mid-burst and skip the genuine idle point after it.
+                // The MFC-style `PM_NOREMOVE` peek is the conventional
+                // "is the queue empty" test. See `gpui::set_thread_idle_hook`.
+                if !PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE).as_bool() {
+                    gpui::thread_idle();
+                }
                 if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     break;
                 }
