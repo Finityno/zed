@@ -37,6 +37,15 @@ const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 /// very next redraw, while 300 *drawn* frames means sustained rendering that
 /// needed no paths at all.
 const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 300;
+/// Paths rasterize through a fixed MSAA tile of this size instead of a
+/// window-sized MSAA target. At 4K a window-sized 4-sample surface is 127.5MB
+/// of committed memory for the window's life (D3D11 has no memoryless storage,
+/// unlike Metal on Apple Silicon, so Windows pays real commit for it); a
+/// 512x512 tile is 4MB. Each tile a batch touches is rasterized, resolved and
+/// region-copied into the window-sized single-sample intermediate, and typical
+/// frames touch a handful of tiles (corner masks, small indicators), so total
+/// fill work goes down as well, not up.
+const PATH_RASTER_TILE_SIZE: u32 = 512;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -127,26 +136,41 @@ struct OverlayResources {
     render_target_view: Option<ID3D11RenderTargetView>,
 }
 
-/// The window-sized intermediates path rasterization renders through: an MSAA
-/// target the path triangles are drawn into and the single-sample texture it
-/// resolves to, which the path-sprite pass then samples.
+/// The intermediates path rasterization renders through. `texture` is the
+/// window-sized single-sample surface the path-sprite pass samples;
+/// `msaa_texture` is a fixed [`PATH_RASTER_TILE_SIZE`] MSAA tile the path
+/// triangles are drawn into, one touched tile at a time, and `resolve_texture`
+/// is the equally tile-sized single-sample surface each tile resolves to
+/// before being region-copied into `texture` (D3D11's `ResolveSubresource`
+/// has no partial form, so the copy is what places a tile at its window
+/// position).
 struct PathIntermediates {
     texture: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
     msaa_texture: ID3D11Texture2D,
     msaa_view: Option<ID3D11RenderTargetView>,
+    resolve_texture: ID3D11Texture2D,
 }
 
 impl PathIntermediates {
     fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
         let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
-        let (msaa_texture, msaa_view) =
-            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        let (msaa_texture, msaa_view) = create_path_intermediate_msaa_texture_and_view(
+            device,
+            PATH_RASTER_TILE_SIZE,
+            PATH_RASTER_TILE_SIZE,
+        )?;
+        let resolve_texture = create_path_intermediate_resolve_texture(
+            device,
+            PATH_RASTER_TILE_SIZE,
+            PATH_RASTER_TILE_SIZE,
+        )?;
         Ok(Self {
             texture,
             srv,
             msaa_texture,
             msaa_view,
+            resolve_texture,
         })
     }
 }
@@ -170,6 +194,8 @@ struct DirectXRenderPipelines {
 struct FrameScratch {
     path_vertices: Vec<PathRasterizationSprite>,
     path_sprites: Vec<PathSprite>,
+    /// Raster-tile occupancy grid for the current path batch.
+    path_tiles: Vec<bool>,
 }
 
 struct DirectXGlobalElements {
@@ -1161,22 +1187,36 @@ impl DirectXRenderer {
                 resources.path_intermediates.insert(created)
             }
         };
-        // Clear intermediate MSAA texture
-        unsafe {
-            devices.device_context.ClearRenderTargetView(
-                intermediates.msaa_view.as_ref().context("msaa view missing")?,
-                &[0.0; 4],
-            );
-            // Set intermediate MSAA texture as render target
-            self.pipelines
-                .opaque_quad_pipeline
-                .disable_depth(&devices.device_context);
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&intermediates.msaa_view)), None);
+        // Which raster tiles does this batch touch? Marked over a
+        // ceil(width/T) x ceil(height/T) grid from each path's clipped bounds.
+        let tile = PATH_RASTER_TILE_SIZE;
+        let tiles_x = self.width.div_ceil(tile).max(1);
+        let tiles_y = self.height.div_ceil(tile).max(1);
+        let touched = &mut self.frame_scratch.path_tiles;
+        touched.clear();
+        touched.resize((tiles_x * tiles_y) as usize, false);
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            let left = ((bounds.origin.x.0.max(0.0) as u32) / tile).min(tiles_x - 1);
+            let top = ((bounds.origin.y.0.max(0.0) as u32) / tile).min(tiles_y - 1);
+            let right = ((bounds.bottom_right().x.0.ceil().max(0.0) as u32)
+                .div_ceil(tile)
+                .max(1))
+            .min(tiles_x);
+            let bottom = ((bounds.bottom_right().y.0.ceil().max(0.0) as u32)
+                .div_ceil(tile)
+                .max(1))
+            .min(tiles_y);
+            for tile_y in top..bottom {
+                for tile_x in left..right {
+                    touched[(tile_y * tiles_x + tile_x) as usize] = true;
+                }
+            }
         }
 
-        // Collect all vertices and sprites for a single draw call
+        // Collect all vertices for a single upload; each touched tile re-draws
+        // the full set with a shifted viewport and the rasterizer clips to the
+        // tile, so every covered pixel is still rasterized exactly once.
         let vertices = &mut self.frame_scratch.path_vertices;
         vertices.clear();
         for path in paths {
@@ -1194,27 +1234,106 @@ impl DirectXRenderer {
             vertices,
         )?;
 
-        self.pipelines.path_rasterization_pipeline.draw(
-            &devices.device_context,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            vertices.len() as u32,
-            1,
-        )?;
-
-        // Resolve MSAA to non-MSAA intermediate texture
+        // The batch's depth-collapsed viewport must come back for the sprite
+        // pass that follows, so capture whatever is current rather than
+        // rebuilding it from resources.viewport.
+        let mut saved_viewports = [D3D11_VIEWPORT::default()];
+        let mut saved_viewport_count = 1u32;
         unsafe {
-            devices.device_context.ResolveSubresource(
-                &intermediates.texture,
-                0,
-                &intermediates.msaa_texture,
-                0,
-                RENDER_TARGET_FORMAT,
-            );
-            // Restore main render target
+            devices
+                .device_context
+                .RSGetViewports(&mut saved_viewport_count, Some(saved_viewports.as_mut_ptr()));
+        }
+
+        self.pipelines
+            .opaque_quad_pipeline
+            .disable_depth(&devices.device_context);
+
+        for tile_y in 0..tiles_y {
+            for tile_x in 0..tiles_x {
+                if !touched[(tile_y * tiles_x + tile_x) as usize] {
+                    continue;
+                }
+                let tile_left = tile_x * tile;
+                let tile_top = tile_y * tile;
+                unsafe {
+                    devices.device_context.ClearRenderTargetView(
+                        intermediates
+                            .msaa_view
+                            .as_ref()
+                            .context("msaa view missing")?,
+                        &[0.0; 4],
+                    );
+                    devices
+                        .device_context
+                        .OMSetRenderTargets(Some(slice::from_ref(&intermediates.msaa_view)), None);
+                    // A window-sized viewport with a negative origin: window-space
+                    // geometry keeps its NDC mapping and this tile's region lands
+                    // at the tile texture's origin, with the rasterizer clipping
+                    // to the tile's extent.
+                    let viewport = D3D11_VIEWPORT {
+                        TopLeftX: -(tile_left as f32),
+                        TopLeftY: -(tile_top as f32),
+                        Width: self.width as f32,
+                        Height: self.height as f32,
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    };
+                    devices
+                        .device_context
+                        .RSSetViewports(Some(slice::from_ref(&viewport)));
+                }
+
+                self.pipelines.path_rasterization_pipeline.draw(
+                    &devices.device_context,
+                    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                    vertices.len() as u32,
+                    1,
+                )?;
+
+                unsafe {
+                    devices.device_context.ResolveSubresource(
+                        &intermediates.resolve_texture,
+                        0,
+                        &intermediates.msaa_texture,
+                        0,
+                        RENDER_TARGET_FORMAT,
+                    );
+                    let copy_width = (self.width - tile_left).min(tile);
+                    let copy_height = (self.height - tile_top).min(tile);
+                    let source_box = D3D11_BOX {
+                        left: 0,
+                        top: 0,
+                        front: 0,
+                        right: copy_width,
+                        bottom: copy_height,
+                        back: 1,
+                    };
+                    devices.device_context.CopySubresourceRegion(
+                        &intermediates.texture,
+                        0,
+                        tile_left,
+                        tile_top,
+                        0,
+                        &intermediates.resolve_texture,
+                        0,
+                        Some(&source_box),
+                    );
+                }
+            }
+        }
+
+        // Restore main render target and the batch's viewport
+        unsafe {
             devices.device_context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.render_target_view)),
                 resources.depth_stencil_view.as_ref(),
             );
+            if saved_viewport_count > 0 {
+                devices
+                    .device_context
+                    .RSSetViewports(Some(&saved_viewports[..1]));
+            }
             self.pipelines
                 .opaque_quad_pipeline
                 .enable_depth_test(&devices.device_context);
@@ -2336,6 +2455,37 @@ fn create_path_intermediate_texture(
     Ok((texture, Some(shader_resource_view.unwrap())))
 }
 
+/// Single-sample tile the MSAA tile resolves into before being region-copied
+/// to its window position (`ResolveSubresource` has no partial form).
+#[inline]
+fn create_path_intermediate_resolve_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<ID3D11Texture2D> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output
+    };
+    texture.context("Creating path intermediate resolve texture")
+}
+
 #[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
@@ -3340,5 +3490,147 @@ mod rendered_pixel_tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    struct PathView;
+
+    impl Render for PathView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _cx| {
+                        // A filled rectangle spanning several 512px raster
+                        // tiles in both axes, so every seam between tiles runs
+                        // through its interior.
+                        let mut builder = gpui::PathBuilder::fill();
+                        builder.move_to(point(px(100.), px(100.)));
+                        builder.line_to(point(px(1100.), px(100.)));
+                        builder.line_to(point(px(1100.), px(700.)));
+                        builder.line_to(point(px(100.), px(700.)));
+                        builder.close();
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, hsla(0., 0., 1., 1.));
+                        }
+                        // A second path in a tile the rectangle never touches,
+                        // in the same batch — the far-tile case.
+                        let mut builder = gpui::PathBuilder::fill();
+                        builder.move_to(point(px(20.), px(730.)));
+                        builder.line_to(point(px(80.), px(730.)));
+                        builder.line_to(point(px(20.), px(790.)));
+                        builder.close();
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, hsla(0., 0., 1., 1.));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// Paths rasterize through a fixed 512px MSAA tile that is resolved and
+    /// region-copied per touched tile (see `PATH_RASTER_TILE_SIZE`). This
+    /// renders a filled rectangle whose interior crosses every tile seam of a
+    /// 1200x800 window plus a far-tile triangle, and asserts full coverage
+    /// inside, emptiness outside, and no seam artifacts along tile boundaries.
+    #[test]
+    fn paths_render_seamlessly_across_raster_tiles() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+            eprintln!("SKIPPED: no DirectWrite");
+            return;
+        };
+        if DirectXHeadlessRenderer::new().is_none() {
+            eprintln!("SKIPPED: no headless renderer");
+            return;
+        }
+
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(text_system),
+            Some(Box::new(|| {
+                DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+            })),
+        );
+
+        let window = cx.add_window(move |_, _| PathView);
+        let image = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.resize(size(px(1200.), px(800.)));
+                window.draw(cx).clear(cx);
+                window.render_to_image()
+            })
+            .unwrap()
+            .expect("rendering the scene should succeed");
+
+        if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
+            let path = std::path::Path::new(&directory).join("path-tiles.png");
+            image.save(&path).log_err();
+        }
+
+        // The image is device pixels; the paths were painted in logical
+        // pixels. The scale factor is whatever the test window used.
+        let scale = image.width() as f32 / 1200.0;
+        let device = |logical: f32| (logical * scale).round() as u32;
+        let lit = |x: u32, y: u32| {
+            let pixel = image.get_pixel(x, y);
+            pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > 380
+        };
+        // Interior: every device pixel well inside the rectangle must be lit.
+        // The dense scan crosses every 512-multiple tile seam, so a tile that
+        // failed to rasterize, resolved to the wrong place, or was skipped by
+        // the occupancy grid shows up as a 512-aligned hole or dark seam.
+        let mut dark_interior = 0u32;
+        for y in (device(102.0)..device(698.0)).step_by(3) {
+            for x in (device(102.0)..device(1098.0)).step_by(3) {
+                if !lit(x, y) {
+                    dark_interior += 1;
+                }
+            }
+        }
+        assert_eq!(
+            dark_interior, 0,
+            "dark pixels inside the filled rectangle (tile hole or seam)"
+        );
+        // Tile seams run at device-pixel multiples of 512; probe the columns
+        // and rows around every seam the rectangle's interior crosses.
+        let interior_x = device(105.0)..device(1095.0);
+        let interior_y = device(105.0)..device(695.0);
+        let mut seam = 512u32;
+        while seam < image.width() {
+            if interior_x.contains(&seam) {
+                for probe in seam - 2..=seam + 2 {
+                    assert!(lit(probe, device(400.0)), "seam column {probe} is dark");
+                }
+            }
+            if interior_y.contains(&seam) {
+                for probe in seam - 2..=seam + 2 {
+                    assert!(lit(device(600.0), probe), "seam row {probe} is dark");
+                }
+            }
+            seam += 512;
+        }
+        // Far tile: the triangle near (20..80, 730..790) landed.
+        assert!(
+            lit(device(30.0), device(740.0)),
+            "far-tile triangle did not render"
+        );
+        // Outside: no ink beyond the shapes (a tile copied to the wrong
+        // offset would smear ink into these).
+        for (x, y) in [
+            (device(50.0), device(50.0)),
+            (device(1150.0), device(100.0)),
+            (device(1150.0), device(750.0)),
+            (device(600.0), device(750.0)),
+            (device(97.0), device(97.0)),
+        ] {
+            assert!(!lit(x, y), "unexpected ink at ({x}, {y})");
+        }
     }
 }
