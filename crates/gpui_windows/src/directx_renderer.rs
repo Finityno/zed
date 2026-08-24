@@ -31,6 +31,12 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// Drawn frames without a path batch before the path intermediates are
+/// released. Frames, not time: an idle window stops drawing entirely, so a
+/// time-based ttl would fire while the surfaces might be wanted again on the
+/// very next redraw, while 300 *drawn* frames means sustained rendering that
+/// needed no paths at all.
+const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 300;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -63,6 +69,22 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// How many times the swap chain has been resized, and whether the
+    /// launch-storm summary (resize count at first present) was logged yet.
+    /// Instrumentation for the Windows memory baseline work: launch is a known
+    /// resize storm, and each resize used to stack a full generation of
+    /// window-sized GPU surfaces.
+    resize_count: u32,
+    logged_first_present: bool,
+
+    /// Path-batch census: what fraction of drawn frames carry any path batch
+    /// decides how the path intermediates are managed (they are created
+    /// lazily and released after [`PATH_INTERMEDIATE_IDLE_FRAMES`] path-free
+    /// frames).
+    frames_drawn: u64,
+    frames_with_paths: u64,
+    frames_since_paths: u32,
 }
 
 /// Direct3D objects
@@ -81,11 +103,15 @@ struct DirectXResources {
     swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
-    depth_stencil_texture: ID3D11Texture2D,
+    /// Created on the first frame that carries a path batch and released after
+    /// a stretch of path-free frames, not held for the window's life: these are
+    /// the two largest textures in the process (a 4-sample MSAA target plus its
+    /// resolve, ~160MB of commit at 4K), and D3D11 has no equivalent of the
+    /// Metal renderer's memoryless storage that would make them free.
+    path_intermediates: Option<PathIntermediates>,
+    // `Option` so a resize can drop the outgoing texture before the
+    // replacement is created; it is rebuilt in the same call.
+    depth_stencil_texture: Option<ID3D11Texture2D>,
     depth_stencil_view: Option<ID3D11DepthStencilView>,
     viewport: D3D11_VIEWPORT,
 
@@ -99,6 +125,30 @@ struct OverlayResources {
     swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
+}
+
+/// The window-sized intermediates path rasterization renders through: an MSAA
+/// target the path triangles are drawn into and the single-sample texture it
+/// resolves to, which the path-sprite pass then samples.
+struct PathIntermediates {
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa_texture: ID3D11Texture2D,
+    msaa_view: Option<ID3D11RenderTargetView>,
+}
+
+impl PathIntermediates {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let (msaa_texture, msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        Ok(Self {
+            texture,
+            srv,
+            msaa_texture,
+            msaa_view,
+        })
+    }
 }
 
 struct DirectXRenderPipelines {
@@ -240,6 +290,11 @@ impl DirectXRenderer {
             height: 1,
             headless: false,
             skip_draws: false,
+            resize_count: 0,
+            logged_first_present: false,
+            frames_drawn: 0,
+            frames_with_paths: 0,
+            frames_since_paths: 0,
         })
     }
 
@@ -279,6 +334,11 @@ impl DirectXRenderer {
             height: 1,
             headless: true,
             skip_draws: false,
+            resize_count: 0,
+            logged_first_present: false,
+            frames_drawn: 0,
+            frames_with_paths: 0,
+            frames_since_paths: 0,
         })
     }
 
@@ -412,7 +472,47 @@ impl DirectXRenderer {
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
+        if !self.logged_first_present {
+            self.logged_first_present = true;
+            // The launch resize storm in one line: how many swap-chain
+            // generations were built before anything reached the screen.
+            log::info!(
+                "[directx-mem] first present after {} swap-chain resizes (commit {})",
+                self.resize_count,
+                private_commit_label(),
+            );
+        }
         result.ok().context("Presenting swap chain failed")
+    }
+
+    /// Path-batch census, and the release half of the lazy path intermediates:
+    /// after a sustained run of drawn frames with no path batch, the ~160MB of
+    /// window-sized MSAA surfaces go away until some frame needs them again.
+    fn note_frame_paths(&mut self, frame_had_paths: bool) {
+        self.frames_drawn += 1;
+        if frame_had_paths {
+            self.frames_with_paths += 1;
+            self.frames_since_paths = 0;
+        } else {
+            self.frames_since_paths = self.frames_since_paths.saturating_add(1);
+            if self.frames_since_paths == PATH_INTERMEDIATE_IDLE_FRAMES
+                && let Some(resources) = self.resources.as_mut()
+                && resources.path_intermediates.take().is_some()
+            {
+                log::debug!(
+                    "[directx-mem] released path intermediates after \
+                     {PATH_INTERMEDIATE_IDLE_FRAMES} path-free frames (commit {})",
+                    private_commit_label(),
+                );
+            }
+        }
+        if self.frames_drawn.is_multiple_of(1000) {
+            log::debug!(
+                "[directx-mem] path census: {}/{} drawn frames carried a path batch",
+                self.frames_with_paths,
+                self.frames_drawn,
+            );
+        }
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
@@ -511,6 +611,7 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, clear_color)?;
+        self.note_frame_paths(!scene.paths.is_empty());
         self.present()
     }
 
@@ -568,6 +669,7 @@ impl DirectXRenderer {
             .clone();
         self.pre_draw(&overlay_view, &[0.0; 4])?;
         self.draw_scene(&overlay_scene)?;
+        self.note_frame_paths(!scene.paths.is_empty());
 
         unsafe {
             self.resources
@@ -878,6 +980,12 @@ impl DirectXRenderer {
         }
 
         resources.recreate_resources(devices, width, height)?;
+        self.resize_count += 1;
+        log::debug!(
+            "[directx-mem] resize #{} to {width}x{height} (commit {})",
+            self.resize_count,
+            private_commit_label(),
+        );
 
         if let Some(overlay) = self.overlay_resources.as_mut() {
             overlay.resize(devices, width, height)?;
@@ -1039,21 +1147,33 @@ impl DirectXRenderer {
         }
 
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let intermediates = match &mut resources.path_intermediates {
+            Some(intermediates) => intermediates,
+            None => {
+                let created = PathIntermediates::new(&devices.device, self.width, self.height)?;
+                log::debug!(
+                    "[directx-mem] created path intermediates at {}x{} (commit {})",
+                    self.width,
+                    self.height,
+                    private_commit_label(),
+                );
+                resources.path_intermediates.insert(created)
+            }
+        };
         // Clear intermediate MSAA texture
         unsafe {
             devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
+                intermediates.msaa_view.as_ref().context("msaa view missing")?,
                 &[0.0; 4],
             );
             // Set intermediate MSAA texture as render target
             self.pipelines
                 .opaque_quad_pipeline
                 .disable_depth(&devices.device_context);
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-                None,
-            );
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&intermediates.msaa_view)), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -1084,9 +1204,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+                &intermediates.texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                &intermediates.msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -1130,7 +1250,13 @@ impl DirectXRenderer {
         }
 
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
+        let intermediates = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .path_intermediates
+            .as_ref()
+            .context("path intermediates missing")?;
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
@@ -1140,7 +1266,7 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
+            slice::from_ref(&intermediates.srv),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
@@ -1313,17 +1439,8 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            depth_stencil_texture,
-            depth_stencil_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height, headless)?;
+        let (render_target, render_target_view, depth_stencil_texture, depth_stencil_view, viewport) =
+            create_resources(devices, &swap_chain, width, height, headless)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -1331,12 +1448,9 @@ impl DirectXResources {
             headless,
             render_target: Some(render_target),
             render_target_view,
-            depth_stencil_texture,
+            path_intermediates: None,
+            depth_stencil_texture: Some(depth_stencil_texture),
             depth_stencil_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
             viewport,
         })
     }
@@ -1348,25 +1462,28 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            depth_stencil_texture,
-            depth_stencil_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height, self.headless)?;
+        // Drop the outgoing generation before building its replacement, and
+        // flush so the deferred destructions actually retire. Creating first
+        // kept two full generations of window-sized surfaces committed across
+        // every resize, and with no flush the retired ones lingered until some
+        // later implicit flush — measured stacking up to a 2.1GB commit peak
+        // during the launch resize storm.
+        self.render_target = None;
+        self.render_target_view = None;
+        self.depth_stencil_view = None;
+        self.depth_stencil_texture = None;
+        // Not recreated here: the next frame that draws paths rebuilds them at
+        // the new size, and a resize while no paths are on screen never pays
+        // for them at all.
+        self.path_intermediates = None;
+        unsafe { devices.device_context.Flush() };
+
+        let (render_target, render_target_view, depth_stencil_texture, depth_stencil_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height, self.headless)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.depth_stencil_texture = depth_stencil_texture;
+        self.depth_stencil_texture = Some(depth_stencil_texture);
         self.depth_stencil_view = depth_stencil_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
         self.viewport = viewport;
         Ok(())
     }
@@ -2097,20 +2214,12 @@ fn create_resources(
     Option<ID3D11RenderTargetView>,
     ID3D11Texture2D,
     Option<ID3D11DepthStencilView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device, width, height, headless)?;
     let (depth_stencil_texture, depth_stencil_view) =
         create_depth_stencil_texture_and_view(&devices.device, width, height)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = D3D11_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,
@@ -2124,10 +2233,6 @@ fn create_resources(
         render_target_view,
         depth_stencil_texture,
         depth_stencil_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
         viewport,
     ))
 }
@@ -2260,6 +2365,38 @@ fn create_path_intermediate_msaa_texture_and_view(
     let mut msaa_view = None;
     unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
     Ok((msaa_texture, Some(msaa_view.unwrap())))
+}
+
+/// Private commit of this process formatted for the `[directx-mem]` log
+/// lines, or `"?"` when the counter read fails. Commit rather than working
+/// set because the GPU sysmem shadows these lines exist to watch are
+/// committed-never-touched: they never show up in the working set at all.
+fn private_commit_label() -> String {
+    use windows::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: EX begins with the exact PROCESS_MEMORY_COUNTERS layout and the
+    // API dispatches on cb, which names the EX size.
+    let result = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            std::ptr::from_mut(&mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        )
+    };
+    match result {
+        Ok(()) => format!(
+            "{:.1} MB",
+            counters.PrivateUsage as f64 / (1024.0 * 1024.0)
+        ),
+        Err(_) => "?".to_string(),
+    }
 }
 
 #[inline]
