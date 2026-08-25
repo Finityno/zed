@@ -274,7 +274,8 @@ impl Scene {
     fn partition_quads(&mut self) {
         self.blended_quad_indices.clear();
         self.opaque_quad_indices.clear();
-        let partitioning_enabled = opaque_quad_partitioning_enabled();
+        let partitioning_enabled =
+            opaque_quad_partitioning_enabled() && self.quads.len() <= MAX_DEPTH_PARTITIONED_QUADS;
         for (quad_id, quad) in self.quads.iter().enumerate() {
             let has_opaque_core = partitioning_enabled && quad.has_opaque_core();
             if has_opaque_core {
@@ -320,14 +321,25 @@ impl Scene {
     }
 }
 
+/// The most quads a frame can partition into the depth prepass: the depth
+/// mapping gives each of them its own 16-bit depth value, so a 16-bit depth
+/// attachment (half the memory of a 32-bit one) loses nothing. A frame with
+/// more quads than this skips partitioning and paints everything blended in
+/// painter's order, which needs no distinct depths at all.
+pub const MAX_DEPTH_PARTITIONED_QUADS: usize = 65534;
+
 /// Maps a quad's index in [`Scene::quads`] to depth, with greater values closer.
 ///
 /// Zero is reserved for the cleared depth buffer. `quad_depth(n)` also
 /// represents the cursor after the first `n` quads: with a strict greater-than
 /// test, it is above quads before the cursor and ties with the quad after it.
 /// Depth-based renderers must use this mapping in both CPU and shader code.
+///
+/// Steps are 1/65535 so that every partitioned quad (see
+/// [`MAX_DEPTH_PARTITIONED_QUADS`]) lands on its own value of a 16-bit
+/// unorm depth attachment as well as a 32-bit float one.
 pub fn quad_depth(quad_id: u32) -> f32 {
-    ((quad_id + 1) as f32 * (1.0 / 16777216.0)).min(1.0)
+    ((quad_id + 1) as f32 * (1.0 / 65535.0)).min(1.0)
 }
 
 static OPAQUE_QUAD_PARTITIONING_DISABLED: std::sync::atomic::AtomicBool =
@@ -387,6 +399,53 @@ mod tests {
         });
 
         assert!(!scene.is_empty());
+    }
+
+    /// A 16-bit unorm depth attachment stores `round(z * 65535)`; every quad
+    /// the prepass can partition must land on its own value there, and the
+    /// cleared buffer's zero must stay reserved.
+    #[test]
+    fn quad_depths_stay_distinct_in_a_16_bit_depth_attachment() {
+        let mut previous = 0u32;
+        for quad_id in 0..=MAX_DEPTH_PARTITIONED_QUADS as u32 {
+            let quantized = (quad_depth(quad_id) * 65535.0).round() as u32;
+            assert!(
+                quantized > previous,
+                "quad {quad_id} quantizes to {quantized}, not above {previous}"
+            );
+            previous = quantized;
+        }
+        assert_eq!(quad_depth(u32::MAX - 1), 1.0);
+    }
+
+    #[test]
+    fn frames_with_too_many_quads_for_the_depth_mapping_skip_partitioning() {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: ScaledPixels::from(100.),
+                height: ScaledPixels::from(100.),
+            },
+        };
+        let opaque_quad = || Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(Hsla::black()),
+            ..Default::default()
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(opaque_quad());
+        scene.finish();
+        assert_eq!(scene.opaque_quad_indices.len(), 1);
+
+        let mut scene = Scene::default();
+        for _ in 0..=MAX_DEPTH_PARTITIONED_QUADS {
+            scene.insert_primitive(opaque_quad());
+        }
+        scene.finish();
+        assert!(scene.opaque_quad_indices.is_empty());
+        assert_eq!(scene.blended_quad_indices.len(), MAX_DEPTH_PARTITIONED_QUADS + 1);
     }
 
     #[test]

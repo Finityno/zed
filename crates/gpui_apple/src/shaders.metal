@@ -1176,7 +1176,7 @@ float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
 
 // Must match `gpui::quad_depth`.
 float quad_depth(uint quad_id) {
-  return saturate(float(quad_id + 1u) * (1.0 / 16777216.0));
+  return saturate(float(quad_id + 1u) * (1.0 / 65535.0));
 }
 
 float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
