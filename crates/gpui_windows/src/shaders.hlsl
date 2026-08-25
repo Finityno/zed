@@ -113,7 +113,7 @@ float4 to_device_position(float2 unit_vertex, Bounds bounds) {
 // Must match gpui::quad_depth. Later quads are closer, and `+ 1` reserves
 // zero for the cleared depth buffer.
 float quad_depth(uint quad_id) {
-    return saturate(float(quad_id + 1u) * (1.0 / 16777216.0));
+    return saturate(float(quad_id + 1u) * (1.0 / 65535.0));
 }
 
 float4 distance_from_clip_rect_impl(float2 position, Bounds clip_bounds) {
