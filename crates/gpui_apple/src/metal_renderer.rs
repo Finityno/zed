@@ -38,11 +38,18 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
-/// Every bit of this format's mantissa is needed, since [`quad_depth`] maps
-/// each quad in the scene onto its own depth.
-const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
+/// [`quad_depth`] spaces quads 1/65535 apart and the scene stops partitioning
+/// beyond `MAX_DEPTH_PARTITIONED_QUADS`, so a 16-bit attachment resolves
+/// every depth the prepass can write at half the memory of a 32-bit one
+/// (2 bytes per drawable pixel).
+const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth16Unorm;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
+/// Frames without a path batch after which the drawable-sized path
+/// intermediate is dropped. Two seconds at 60fps: a window whose paths
+/// blink in and out (hover reveals, transient popups) keeps the texture;
+/// one that stopped drawing paths gives back its 4 bytes per pixel.
+const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 120;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -195,6 +202,14 @@ pub struct MetalRenderer {
     gpu_stats_last_log: Option<std::time::Instant>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    /// Set by [`Self::release_intermediate_textures`] while the window is
+    /// occluded: the intermediate textures stay dropped through drawable-size
+    /// updates and are rebuilt by the next `render_frame` without being
+    /// counted as a stale-texture heal.
+    intermediate_textures_released: bool,
+    /// Frames drawn since the path intermediate was last used; once it
+    /// reaches [`PATH_INTERMEDIATE_IDLE_FRAMES`] the texture is dropped.
+    path_intermediate_idle_frames: u32,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -465,6 +480,8 @@ impl MetalRenderer {
             core_video_texture_cache,
             depth_texture: None,
             stale_texture_heals: 0,
+            intermediate_textures_released: false,
+            path_intermediate_idle_frames: 0,
             gpu_stats_last_log: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -512,7 +529,31 @@ impl MetalRenderer {
         self.update_intermediate_textures(size);
     }
 
+    /// Drops the depth and path intermediate textures while the window is not
+    /// visible; the next `render_frame` recreates them at the drawable's size.
+    ///
+    /// These are private, drawable-sized textures — tens of MB per window at
+    /// retina full-screen — and unlike the layer's drawables, which the window
+    /// server purges once a window stops painting, nothing reclaims them
+    /// while the window sits minimized, on another Space, or behind another
+    /// app. Rebuilding is a fraction of a millisecond, well inside a frame.
+    ///
+    /// The instance buffer pool is process-wide and shared with visible
+    /// windows, so it is deliberately left alone.
+    pub fn release_intermediate_textures(&mut self) {
+        self.intermediate_textures_released = true;
+        self.depth_texture = None;
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
+    }
+
     fn update_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+        // A resize while occluded (display change, restore geometry) must not
+        // rebuild what release_intermediate_textures dropped; the first draw
+        // after the window is visible again does that.
+        if self.intermediate_textures_released {
+            return;
+        }
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -534,6 +575,58 @@ impl MetalRenderer {
         depth_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
         self.depth_texture = Some(self.device.new_texture(&depth_descriptor));
 
+        // The path intermediate is only needed by frames that contain a path
+        // batch, so it is not recreated here: one sized for another drawable
+        // is dropped and the next path batch allocates it on demand.
+        if !self.path_intermediate_matches(size) {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
+    }
+
+    fn path_intermediate_matches(&self, size: Size<DevicePixels>) -> bool {
+        self.path_intermediate_texture.as_ref().is_some_and(|texture| {
+            texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+        })
+    }
+
+    /// Returns the drawable-sized path intermediate, creating it on first use
+    /// and whenever the drawable size no longer matches.
+    fn ensure_path_intermediate_textures(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Result<metal::Texture> {
+        self.path_intermediate_idle_frames = 0;
+        if !self.path_intermediate_matches(size) {
+            anyhow::ensure!(
+                size.width.0 > 0 && size.height.0 > 0,
+                "path intermediate requested for an empty {}x{} drawable",
+                size.width.0,
+                size.height.0
+            );
+            self.create_path_intermediate_textures(size);
+        }
+        self.path_intermediate_texture
+            .clone()
+            .context("missing path intermediate texture")
+    }
+
+    /// Counts a drawn frame against the path intermediate and drops it once
+    /// enough frames have gone by without a path batch. The command buffer
+    /// of a frame that used it holds its own reference, so dropping here
+    /// never pulls a texture out from under an in-flight draw.
+    fn retire_idle_path_intermediate(&mut self) {
+        if self.path_intermediate_texture.is_none() {
+            return;
+        }
+        self.path_intermediate_idle_frames = self.path_intermediate_idle_frames.saturating_add(1);
+        if self.path_intermediate_idle_frames > PATH_INTERMEDIATE_IDLE_FRAMES {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
+    }
+
+    fn create_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
@@ -694,7 +787,13 @@ impl MetalRenderer {
             texture.width() == viewport_size.width.0 as u64
                 && texture.height() == viewport_size.height.0 as u64
         });
-        if !depth_texture_matches_viewport
+        if self.intermediate_textures_released
+            && viewport_size.width.0 > 0
+            && viewport_size.height.0 > 0
+        {
+            self.intermediate_textures_released = false;
+            self.update_intermediate_textures(viewport_size);
+        } else if !depth_texture_matches_viewport
             && viewport_size.width.0 > 0
             && viewport_size.height.0 > 0
         {
@@ -744,6 +843,7 @@ impl MetalRenderer {
             texture,
             viewport_size,
         )?;
+        self.retire_idle_path_intermediate();
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -1030,7 +1130,7 @@ impl MetalRenderer {
     }
 
     fn draw_paths_to_intermediate(
-        &self,
+        &mut self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
@@ -1039,10 +1139,8 @@ impl MetalRenderer {
         if paths.is_empty() {
             return Ok(false);
         }
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
+        let intermediate_texture = self.ensure_path_intermediate_textures(viewport_size)?;
+        let intermediate_texture = &intermediate_texture;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -2136,5 +2234,158 @@ mod stale_texture_healing_tests {
             center[0] > 200 && center[1] < 60 && center[2] < 60,
             "the opaque red quad must survive the healed render, got {center:?}"
         );
+    }
+
+    /// An occluded window releases its drawable-sized intermediate textures,
+    /// keeps them released across drawable-size updates, and rebuilds them on
+    /// the next draw — without that rebuild registering as a stale-texture
+    /// heal. Also prints the device-side bytes the release gives back for a
+    /// retina full-screen drawable.
+    #[test]
+    fn release_intermediate_textures_reclaims_device_memory_until_next_draw() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        const MB: u64 = 1024 * 1024;
+
+        let full_screen = gpui::size(DevicePixels(3456), DevicePixels(2168));
+        let baseline = renderer.device.current_allocated_size();
+        renderer.update_drawable_size(full_screen);
+        let with_textures = renderer.device.current_allocated_size();
+        let held = with_textures.saturating_sub(baseline);
+        assert!(renderer.depth_texture.is_some());
+        assert!(
+            renderer.path_intermediate_texture.is_none(),
+            "the path intermediate is allocated by the first path batch, not by a resize"
+        );
+
+        renderer.release_intermediate_textures();
+        let released = renderer.device.current_allocated_size();
+        assert!(renderer.depth_texture.is_none());
+        assert!(renderer.path_intermediate_texture.is_none());
+        assert!(renderer.path_intermediate_msaa_texture.is_none());
+        let reclaimed = with_textures.saturating_sub(released);
+        println!(
+            "intermediate textures for {}x{}: held {}MB, release reclaimed {}MB",
+            full_screen.width.0,
+            full_screen.height.0,
+            held / MB,
+            reclaimed / MB,
+        );
+        assert!(
+            reclaimed * 10 >= held * 9,
+            "release must give back the intermediate textures (held {held}, reclaimed {reclaimed})"
+        );
+
+        // A drawable-size update while occluded must not rebuild them.
+        renderer.update_drawable_size(gpui::size(DevicePixels(1728), DevicePixels(1084)));
+        assert!(
+            renderer.depth_texture.is_none(),
+            "resizing while released must keep the textures dropped"
+        );
+
+        // The next draw rebuilds them at the drawable's size, silently.
+        let heals_before = renderer.stale_texture_heals;
+        let small = gpui::size(DevicePixels(64), DevicePixels(64));
+        renderer
+            .render_scene_to_image(&solid_quad_scene(32.), small)
+            .expect("render after release succeeds");
+        let depth_texture = renderer
+            .depth_texture
+            .as_ref()
+            .expect("depth texture rebuilt by the draw");
+        assert_eq!(
+            (depth_texture.width(), depth_texture.height()),
+            (small.width.0 as u64, small.height.0 as u64)
+        );
+        assert!(!renderer.intermediate_textures_released);
+        assert_eq!(
+            renderer.stale_texture_heals, heals_before,
+            "a rebuild after release is not a stale-texture heal"
+        );
+    }
+
+    fn triangle_path_scene(extent: f32) -> Scene {
+        use gpui::{Path, Pixels, px};
+        let mut scene = Scene::default();
+        let mut path = Path::new(Point { x: px(0.), y: px(0.) });
+        path.line_to(Point {
+            x: px(extent),
+            y: px(0.),
+        });
+        path.line_to(Point {
+            x: px(extent),
+            y: px(extent),
+        });
+        path.color = Background::from(Hsla::red());
+        let mut path = path.scale(1.);
+        path.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.),
+                    y: ScaledPixels(0.),
+                },
+                size: gpui::size(ScaledPixels(extent), ScaledPixels(extent)),
+            },
+        };
+        scene.insert_primitive(path);
+        scene.finish();
+        let _: Pixels = px(0.);
+        scene
+    }
+
+    /// The path intermediate is 4 bytes per drawable pixel that only frames
+    /// with a path batch need: it is allocated by the first such frame at the
+    /// drawable's size and dropped again after enough path-free frames.
+    #[test]
+    fn path_intermediate_is_allocated_on_demand_and_retired_when_idle() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        let size = gpui::size(DevicePixels(64), DevicePixels(64));
+
+        renderer
+            .render_scene_to_image(&solid_quad_scene(32.), size)
+            .expect("quad-only render succeeds");
+        assert!(
+            renderer.path_intermediate_texture.is_none(),
+            "a frame without paths must not allocate the path intermediate"
+        );
+
+        renderer
+            .render_scene_to_image(&triangle_path_scene(32.), size)
+            .expect("path render succeeds");
+        let intermediate = renderer
+            .path_intermediate_texture
+            .as_ref()
+            .expect("the first path batch allocates the intermediate");
+        assert_eq!(
+            (intermediate.width(), intermediate.height()),
+            (size.width.0 as u64, size.height.0 as u64)
+        );
+
+        for _ in 1..super::PATH_INTERMEDIATE_IDLE_FRAMES {
+            renderer
+                .render_scene_to_image(&solid_quad_scene(32.), size)
+                .expect("quad-only render succeeds");
+        }
+        assert!(
+            renderer.path_intermediate_texture.is_some(),
+            "the intermediate survives until the idle window is used up"
+        );
+        renderer
+            .render_scene_to_image(&solid_quad_scene(32.), size)
+            .expect("quad-only render succeeds");
+        assert!(
+            renderer.path_intermediate_texture.is_none()
+                && renderer.path_intermediate_msaa_texture.is_none(),
+            "the PATH_INTERMEDIATE_IDLE_FRAMES-th path-free frame drops the intermediate"
+        );
+
+        // A later path frame simply allocates it again.
+        renderer
+            .render_scene_to_image(&triangle_path_scene(32.), size)
+            .expect("path render succeeds after retirement");
+        assert!(renderer.path_intermediate_texture.is_some());
     }
 }
