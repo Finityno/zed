@@ -195,6 +195,11 @@ pub struct MetalRenderer {
     gpu_stats_last_log: Option<std::time::Instant>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    /// Set by [`Self::release_intermediate_textures`] while the window is
+    /// occluded: the intermediate textures stay dropped through drawable-size
+    /// updates and are rebuilt by the next `render_frame` without being
+    /// counted as a stale-texture heal.
+    intermediate_textures_released: bool,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -465,6 +470,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             depth_texture: None,
             stale_texture_heals: 0,
+            intermediate_textures_released: false,
             gpu_stats_last_log: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -512,7 +518,31 @@ impl MetalRenderer {
         self.update_intermediate_textures(size);
     }
 
+    /// Drops the depth and path intermediate textures while the window is not
+    /// visible; the next `render_frame` recreates them at the drawable's size.
+    ///
+    /// These are private, drawable-sized textures — tens of MB per window at
+    /// retina full-screen — and unlike the layer's drawables, which the window
+    /// server purges once a window stops painting, nothing reclaims them
+    /// while the window sits minimized, on another Space, or behind another
+    /// app. Rebuilding is a fraction of a millisecond, well inside a frame.
+    ///
+    /// The instance buffer pool is process-wide and shared with visible
+    /// windows, so it is deliberately left alone.
+    pub fn release_intermediate_textures(&mut self) {
+        self.intermediate_textures_released = true;
+        self.depth_texture = None;
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
+    }
+
     fn update_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+        // A resize while occluded (display change, restore geometry) must not
+        // rebuild what release_intermediate_textures dropped; the first draw
+        // after the window is visible again does that.
+        if self.intermediate_textures_released {
+            return;
+        }
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -694,7 +724,13 @@ impl MetalRenderer {
             texture.width() == viewport_size.width.0 as u64
                 && texture.height() == viewport_size.height.0 as u64
         });
-        if !depth_texture_matches_viewport
+        if self.intermediate_textures_released
+            && viewport_size.width.0 > 0
+            && viewport_size.height.0 > 0
+        {
+            self.intermediate_textures_released = false;
+            self.update_intermediate_textures(viewport_size);
+        } else if !depth_texture_matches_viewport
             && viewport_size.width.0 > 0
             && viewport_size.height.0 > 0
         {
@@ -2135,6 +2171,73 @@ mod stale_texture_healing_tests {
         assert!(
             center[0] > 200 && center[1] < 60 && center[2] < 60,
             "the opaque red quad must survive the healed render, got {center:?}"
+        );
+    }
+
+    /// An occluded window releases its drawable-sized intermediate textures,
+    /// keeps them released across drawable-size updates, and rebuilds them on
+    /// the next draw — without that rebuild registering as a stale-texture
+    /// heal. Also prints the device-side bytes the release gives back for a
+    /// retina full-screen drawable.
+    #[test]
+    fn release_intermediate_textures_reclaims_device_memory_until_next_draw() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        const MB: u64 = 1024 * 1024;
+
+        let full_screen = gpui::size(DevicePixels(3456), DevicePixels(2168));
+        let baseline = renderer.device.current_allocated_size();
+        renderer.update_drawable_size(full_screen);
+        let with_textures = renderer.device.current_allocated_size();
+        let held = with_textures.saturating_sub(baseline);
+        assert!(
+            renderer.depth_texture.is_some() && renderer.path_intermediate_texture.is_some()
+        );
+
+        renderer.release_intermediate_textures();
+        let released = renderer.device.current_allocated_size();
+        assert!(renderer.depth_texture.is_none());
+        assert!(renderer.path_intermediate_texture.is_none());
+        assert!(renderer.path_intermediate_msaa_texture.is_none());
+        let reclaimed = with_textures.saturating_sub(released);
+        println!(
+            "intermediate textures for {}x{}: held {}MB, release reclaimed {}MB",
+            full_screen.width.0,
+            full_screen.height.0,
+            held / MB,
+            reclaimed / MB,
+        );
+        assert!(
+            reclaimed * 10 >= held * 9,
+            "release must give back the intermediate textures (held {held}, reclaimed {reclaimed})"
+        );
+
+        // A drawable-size update while occluded must not rebuild them.
+        renderer.update_drawable_size(gpui::size(DevicePixels(1728), DevicePixels(1084)));
+        assert!(
+            renderer.depth_texture.is_none(),
+            "resizing while released must keep the textures dropped"
+        );
+
+        // The next draw rebuilds them at the drawable's size, silently.
+        let heals_before = renderer.stale_texture_heals;
+        let small = gpui::size(DevicePixels(64), DevicePixels(64));
+        renderer
+            .render_scene_to_image(&solid_quad_scene(32.), small)
+            .expect("render after release succeeds");
+        let depth_texture = renderer
+            .depth_texture
+            .as_ref()
+            .expect("depth texture rebuilt by the draw");
+        assert_eq!(
+            (depth_texture.width(), depth_texture.height()),
+            (small.width.0 as u64, small.height.0 as u64)
+        );
+        assert!(!renderer.intermediate_textures_released);
+        assert_eq!(
+            renderer.stale_texture_heals, heals_before,
+            "a rebuild after release is not a stale-texture heal"
         );
     }
 }
