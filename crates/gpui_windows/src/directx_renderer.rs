@@ -630,12 +630,65 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Whether the Direct3D device has been removed (driver reset, TDR, adapter
+    /// change). `GetDeviceRemovedReason` is answered by the D3D runtime, so it
+    /// is safe to ask on a dead device — unlike every other call this renderer
+    /// makes, which is forwarded into the vendor's user-mode driver.
+    fn device_is_lost(&self) -> bool {
+        self.devices
+            .as_ref()
+            .is_none_or(|devices| unsafe { devices.device.GetDeviceRemovedReason() }.is_err())
+    }
+
+    /// Stops the renderer touching the driver once the device is gone, and
+    /// says whether it did.
+    ///
+    /// Recovery happens on the vsync thread (`handle_gpu_device_lost`), which
+    /// deliberately waits a few hundred milliseconds before recreating the
+    /// devices and only then hands them to this renderer through
+    /// `handle_device_lost`. Until that arrives the main thread keeps
+    /// receiving WM_PAINT, WM_SIZE and input-driven redraws, and each of
+    /// those would otherwise drive a removed device through the user-mode
+    /// driver. The D3D contract says such calls fail cleanly; in practice
+    /// AMD's driver has faulted inside the process heap on exactly this
+    /// path, taking the whole app down. So the first sign of removal parks
+    /// the renderer in `skip_draws` and every later entry point bails
+    /// before its first driver call. `handle_device_lost_impl` re-arms
+    /// `skip_draws` on the fresh devices and `mark_drawable` lifts it.
+    fn quiesce_if_device_lost(&mut self) -> bool {
+        if !self.device_is_lost() {
+            return false;
+        }
+        if !self.skip_draws {
+            log::warn!(
+                "DirectX device removed; skipping draws until the vsync thread recreates it"
+            );
+            self.skip_draws = true;
+        }
+        true
+    }
+
+    /// A draw that failed because the device went away mid-frame is not an
+    /// error worth reporting — the vsync thread is already on its way with
+    /// new devices — but it must park the renderer like a detected removal.
+    fn absorb_device_lost(&mut self, result: Result<()>) -> Result<()> {
+        if result.is_err() && self.quiesce_if_device_lost() {
+            return Ok(());
+        }
+        result
+    }
+
     pub(crate) fn draw(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
-        if self.skip_draws {
+        if self.skip_draws || self.quiesce_if_device_lost() {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        let result = self.draw_inner(scene, clear_color);
+        self.absorb_device_lost(result)
+    }
+
+    fn draw_inner(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
         self.render(scene, clear_color)?;
         self.note_frame_paths(!scene.paths.is_empty());
         self.present()
@@ -666,10 +719,19 @@ impl DirectXRenderer {
         if self.overlay_resources.is_none() {
             return self.draw(scene, clear_color);
         }
-        if self.skip_draws {
+        if self.skip_draws || self.quiesce_if_device_lost() {
             return Ok(());
         }
+        let result = self.draw_layered_inner(scene, overlay_start, clear_color);
+        self.absorb_device_lost(result)
+    }
 
+    fn draw_layered_inner(
+        &mut self,
+        scene: &Scene,
+        overlay_start: usize,
+        clear_color: [f32; 4],
+    ) -> Result<()> {
         let split = overlay_start.min(scene.len());
         let mut base_scene = Scene::default();
         base_scene.replay(0..split, scene);
@@ -980,6 +1042,12 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        // The size is recorded first: `handle_device_lost_impl` rebuilds the
+        // swap chain at `self.width`/`self.height`, so a resize that lands
+        // while the device is gone is applied by the recovery instead.
+        if self.quiesce_if_device_lost() {
+            return Ok(());
+        }
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;

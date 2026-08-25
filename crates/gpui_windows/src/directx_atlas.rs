@@ -85,6 +85,14 @@ impl PlatformAtlas for DirectXAtlas {
             let Some((size, bytes)) = build()? else {
                 return Ok(None);
             };
+            // Creating a texture or uploading into one on a removed device
+            // goes through the vendor driver, which is what the renderer is
+            // parked to avoid (see `DirectXRenderer::quiesce_if_device_lost`).
+            // Nothing is cached on this path, so the glyph is simply retried
+            // once `handle_device_lost` has installed the new device.
+            if lock.device_is_lost() {
+                anyhow::bail!("sprite atlas upload skipped: the DirectX device has been removed");
+            }
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
@@ -118,6 +126,12 @@ impl PlatformAtlas for DirectXAtlas {
 }
 
 impl DirectXAtlasState {
+    /// See `DirectXRenderer::device_is_lost`: a runtime-level query that is
+    /// safe on a removed device, unlike the texture calls below it.
+    fn device_is_lost(&self) -> bool {
+        unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+    }
+
     /// Returns a tile's space to its texture, freeing the texture itself once nothing
     /// references it. The caller is responsible for dropping the `tiles_by_key` entry.
     fn deallocate_tile(&mut self, tile: AtlasTile) {
@@ -409,6 +423,9 @@ impl DirectXAtlas {
             ..desc
         };
 
+        if lock.device_is_lost() {
+            return None;
+        }
         let mut staging: Option<ID3D11Texture2D> = None;
         unsafe {
             lock.device
