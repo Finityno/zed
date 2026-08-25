@@ -262,7 +262,12 @@ impl MetalRenderer {
         layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        // Two drawables instead of Core Animation's default three: one fewer
+        // drawable-sized IOSurface per window (4 bytes per pixel, 29MB at
+        // retina full-screen) while the window is painting. The frame after
+        // a slow one can wait on the previous present, which the per-window
+        // present-interval histogram makes visible if it ever matters.
+        layer.set_maximum_drawable_count(2);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
