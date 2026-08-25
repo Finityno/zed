@@ -95,6 +95,14 @@ impl AtlasBackend for DirectXAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> anyhow::Result<AtlasTile> {
+        // Creating a texture or uploading into one on a removed device
+        // goes through the vendor driver, which is what the renderer is
+        // parked to avoid (see `DirectXRenderer::quiesce_if_device_lost`).
+        // Nothing is cached on this path, so the glyph is simply retried
+        // once `handle_device_lost` has installed the new device.
+        if self.device_is_lost() {
+            anyhow::bail!("sprite atlas upload skipped: the DirectX device has been removed");
+        }
         let tile = self
             .allocate(size, kind)
             .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
@@ -143,6 +151,12 @@ impl AtlasBackend for DirectXAtlasTextures {
 }
 
 impl DirectXAtlasTextures {
+    /// See `DirectXRenderer::device_is_lost`: a runtime-level query that is
+    /// safe on a removed device, unlike the texture calls below it.
+    fn device_is_lost(&self) -> bool {
+        unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -401,6 +415,9 @@ impl DirectXAtlas {
             ..desc
         };
 
+        if textures.device_is_lost() {
+            return None;
+        }
         let mut staging: Option<ID3D11Texture2D> = None;
         unsafe {
             textures
