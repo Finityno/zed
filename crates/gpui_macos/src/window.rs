@@ -2116,11 +2116,19 @@ impl PlatformWindow for MacWindow {
 
         this.overlay_input_active
             .store(!overlay_scene.is_empty(), Ordering::Release);
+        this.renderer.note_scene_tiles(&overlay_scene);
         this.renderer.draw(&base_scene);
-        this.overlay_renderer
+        // The overlay draws with the base renderer's drawable-sized
+        // intermediates rather than a second set of its own.
+        let intermediates = this.renderer.take_intermediates();
+        let overlay_renderer = this
+            .overlay_renderer
             .as_mut()
-            .expect("overlay renderer checked above")
-            .draw(&overlay_scene);
+            .expect("overlay renderer checked above");
+        overlay_renderer.lend_intermediates(intermediates);
+        overlay_renderer.draw(&overlay_scene);
+        let intermediates = overlay_renderer.take_intermediates();
+        this.renderer.lend_intermediates(intermediates);
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {

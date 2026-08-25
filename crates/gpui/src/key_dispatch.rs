@@ -51,7 +51,7 @@
 
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
-    Keystroke, ModifiersChangedEvent, Window,
+    Keystroke, ModifiersChangedEvent, Window, util::CapacityShrink,
 };
 use collections::FxHashMap;
 use smallvec::SmallVec;
@@ -77,6 +77,9 @@ pub(crate) struct DispatchTree {
     view_node_ids: FxHashMap<EntityId, DispatchNodeId>,
     keymap: Rc<RefCell<Keymap>>,
     action_registry: Rc<ActionRegistry>,
+    /// Trackers for `nodes`, `focusable_node_ids` and `view_node_ids`; the
+    /// three stacks are bounded by tree depth and are not worth tracking.
+    shrink: [CapacityShrink; 3],
 }
 
 #[derive(Default)]
@@ -147,6 +150,7 @@ impl DispatchTree {
             view_node_ids: FxHashMap::default(),
             keymap,
             action_registry,
+            shrink: Default::default(),
         }
     }
 
@@ -154,9 +158,10 @@ impl DispatchTree {
         self.node_stack.clear();
         self.context_stack.clear();
         self.view_stack.clear();
-        self.nodes.clear();
-        self.focusable_node_ids.clear();
-        self.view_node_ids.clear();
+        let [nodes, focusable_node_ids, view_node_ids] = &mut self.shrink;
+        nodes.clear_vec(&mut self.nodes);
+        focusable_node_ids.clear_map(&mut self.focusable_node_ids);
+        view_node_ids.clear_map(&mut self.view_node_ids);
     }
 
     pub fn len(&self) -> usize {

@@ -1379,6 +1379,12 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+/// How many drawn frames a glyph or SVG tile may go unreferenced before an atlas
+/// is allowed to reclaim it (about ten seconds at 60Hz). Shared by the atlas that
+/// retires tiles and by [`Window`](crate::Window), which redraws without cached
+/// views when its retained scene is older than this and so may still name them.
+pub const ATLAS_TILE_MAX_IDLE_FRAMES: u64 = 600;
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
@@ -1387,6 +1393,26 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+
+    /// Advances the atlas's frame counter and records every tile `scene` references
+    /// as used in that frame. A tile reaches a scene either through
+    /// [`get_or_insert_with`](Self::get_or_insert_with) at paint time or by
+    /// [`Scene::replay`] copying a cached view's primitives forward, and only the
+    /// scene sees both, so this — not the lookup — is what keeps a tile alive.
+    /// Atlases that never retire tiles ignore it.
+    fn note_frame_drawn(&self, _scene: &Scene) {}
+
+    /// Frees glyph and SVG tiles that no drawn frame has referenced for at least
+    /// `max_idle_frames` frames, and the page they sat on once it holds nothing.
+    /// Image tiles are owned by [`Window::drop_image`](crate::Window::drop_image)
+    /// and are never touched. Amortised: examines at most one page per call.
+    fn retire_unused(&self, _max_idle_frames: u64) {}
+
+    /// The number of frames passed to [`note_frame_drawn`](Self::note_frame_drawn)
+    /// so far; `0` for atlases that never retire tiles.
+    fn frame_index(&self) -> u64 {
+        0
+    }
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
@@ -1471,7 +1497,7 @@ pub enum AtlasTextureKind {
     Subpixel = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct TileId(pub u32);

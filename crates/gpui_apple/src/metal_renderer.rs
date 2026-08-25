@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+use etagere::BucketedAtlasAllocator;
 use anyhow::{Context as _, Result};
 use block::ConcreteBlock;
 use cocoa::{
@@ -210,11 +211,58 @@ pub struct MetalRenderer {
     /// Frames drawn since the path intermediate was last used; once it
     /// reaches [`PATH_INTERMEDIATE_IDLE_FRAMES`] the texture is dropped.
     path_intermediate_idle_frames: u32,
+    /// An overlay renderer draws strictly after its window's base renderer
+    /// and never concurrently with it, so it borrows the base renderer's
+    /// intermediate textures for each draw ([`Self::take_intermediates`] /
+    /// [`Self::lend_intermediates`]) instead of allocating its own copies,
+    /// which would double the per-window drawable-sized memory.
+    borrows_intermediates: bool,
+    /// A private depth texture for frames whose path batches did not all fit
+    /// into the intermediate at once (see [`Self::plan_path_batches`]) and
+    /// therefore split the main render pass; the regular depth texture is
+    /// memoryless on Apple GPUs and cannot survive an encoder boundary.
+    fallback_depth_texture: Option<metal::Texture>,
+    fallback_depth_idle_frames: u32,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// One path batch's region of the path intermediate for the current frame.
+#[derive(Clone, Copy)]
+struct PathBatchSlot {
+    offset: Point<ScaledPixels>,
+    scissor: metal::MTLScissorRect,
+    empty: bool,
+}
+
+impl PathBatchSlot {
+    const EMPTY: Self = Self {
+        offset: Point {
+            x: ScaledPixels(0.),
+            y: ScaledPixels(0.),
+        },
+        scissor: metal::MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        empty: true,
+    };
+}
+
+/// The drawable-sized textures a frame renders through, moved between a
+/// window's base and overlay renderer by [`MetalRenderer::take_intermediates`].
+pub struct IntermediateTextures {
+    depth: Option<metal::Texture>,
+    path: Option<metal::Texture>,
+    path_msaa: Option<metal::Texture>,
+    path_idle_frames: u32,
+    fallback_depth: Option<metal::Texture>,
+    fallback_depth_idle_frames: u32,
 }
 
 #[repr(C)]
@@ -239,6 +287,7 @@ impl MetalRenderer {
             !transparent,
             instance_buffer_pool,
             None,
+            None,
         )
     }
 
@@ -247,7 +296,12 @@ impl MetalRenderer {
         layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        // Two drawables instead of Core Animation's default three: one fewer
+        // drawable-sized IOSurface per window (4 bytes per pixel, 29MB at
+        // retina full-screen) while the window is painting. The frame after
+        // a slow one can wait on the previous present, which the per-window
+        // present-interval histogram makes visible if it ever matters.
+        layer.set_maximum_drawable_count(2);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -270,13 +324,52 @@ impl MetalRenderer {
     ) -> Self {
         let device = self.device.clone();
         let layer = Self::new_layer(&device, transparent);
-        Self::new_internal(
+        let mut renderer = Self::new_internal(
             device,
             Some(layer),
             !transparent,
             instance_buffer_pool,
             Some(self.sprite_atlas.clone()),
-        )
+            Some(self.command_queue.clone()),
+        );
+        renderer.borrows_intermediates = true;
+        renderer
+    }
+
+    /// Records the sprite tiles `scene` references as used in the frame about
+    /// to be drawn, without advancing the atlas or retiring anything. A
+    /// layered window calls this for its overlay scene before drawing the
+    /// base scene, so the base draw's retirement has seen every tile the
+    /// present as a whole still needs.
+    pub fn note_scene_tiles(&self, scene: &Scene) {
+        self.sprite_atlas.note_scene_tiles(scene);
+    }
+
+    /// Moves the drawable-sized intermediate textures out of this renderer so
+    /// another renderer for the same drawable size can draw with them; pair
+    /// with [`Self::lend_intermediates`] to hand them on and back. A frame
+    /// that used them keeps its own references from its command buffer, so
+    /// moving the handles never affects an in-flight draw.
+    pub fn take_intermediates(&mut self) -> IntermediateTextures {
+        IntermediateTextures {
+            depth: self.depth_texture.take(),
+            path: self.path_intermediate_texture.take(),
+            path_msaa: self.path_intermediate_msaa_texture.take(),
+            path_idle_frames: self.path_intermediate_idle_frames,
+            fallback_depth: self.fallback_depth_texture.take(),
+            fallback_depth_idle_frames: self.fallback_depth_idle_frames,
+        }
+    }
+
+    /// Installs intermediate textures taken from another renderer; see
+    /// [`Self::take_intermediates`].
+    pub fn lend_intermediates(&mut self, intermediates: IntermediateTextures) {
+        self.depth_texture = intermediates.depth;
+        self.path_intermediate_texture = intermediates.path;
+        self.path_intermediate_msaa_texture = intermediates.path_msaa;
+        self.path_intermediate_idle_frames = intermediates.path_idle_frames;
+        self.fallback_depth_texture = intermediates.fallback_depth;
+        self.fallback_depth_idle_frames = intermediates.fallback_depth_idle_frames;
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -286,7 +379,7 @@ impl MetalRenderer {
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool, None)
+        Self::new_internal(device, None, true, instance_buffer_pool, None, None)
     }
 
     fn create_device() -> metal::Device {
@@ -317,6 +410,7 @@ impl MetalRenderer {
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
         shared_sprite_atlas: Option<Arc<MetalAtlas>>,
+        shared_command_queue: Option<CommandQueue>,
     ) -> Self {
         #[cfg(feature = "runtime_shaders")]
         let library = device
@@ -448,7 +542,10 @@ impl MetalRenderer {
         let depth_write_state = build_depth_stencil_state(&device, true);
         let depth_test_state = build_depth_stencil_state(&device, false);
 
-        let command_queue = device.new_command_queue();
+        // A renderer that borrows another's intermediate textures must also
+        // queue behind its command buffers: Metal orders command buffers
+        // within one queue, not across queues.
+        let command_queue = shared_command_queue.unwrap_or_else(|| device.new_command_queue());
         let sprite_atlas = shared_sprite_atlas
             .unwrap_or_else(|| Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu)));
         let core_video_texture_cache =
@@ -482,6 +579,9 @@ impl MetalRenderer {
             stale_texture_heals: 0,
             intermediate_textures_released: false,
             path_intermediate_idle_frames: 0,
+            borrows_intermediates: false,
+            fallback_depth_texture: None,
+            fallback_depth_idle_frames: 0,
             gpu_stats_last_log: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -541,17 +641,21 @@ impl MetalRenderer {
     /// The instance buffer pool is process-wide and shared with visible
     /// windows, so it is deliberately left alone.
     pub fn release_intermediate_textures(&mut self) {
+        if self.borrows_intermediates {
+            return;
+        }
         self.intermediate_textures_released = true;
         self.depth_texture = None;
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
+        self.fallback_depth_texture = None;
     }
 
     fn update_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         // A resize while occluded (display change, restore geometry) must not
         // rebuild what release_intermediate_textures dropped; the first draw
         // after the window is visible again does that.
-        if self.intermediate_textures_released {
+        if self.intermediate_textures_released || self.borrows_intermediates {
             return;
         }
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
@@ -561,6 +665,7 @@ impl MetalRenderer {
             self.depth_texture = None;
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            self.fallback_depth_texture = None;
             return;
         }
 
@@ -568,10 +673,15 @@ impl MetalRenderer {
         depth_descriptor.set_width(size.width.0 as u64);
         depth_descriptor.set_height(size.height.0 as u64);
         depth_descriptor.set_pixel_format(DEPTH_FORMAT);
-        // Path batches end the main render pass and start a new one, so unlike
-        // the MSAA texture below this cannot be memoryless: its contents have
-        // to survive from one encoder to the next.
-        depth_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        // All path batches are rasterized before the main render pass, so the
+        // depth attachment lives inside a single encoder and can be tile
+        // memory on Apple GPUs: no system memory at all. Frames that cannot
+        // be planned that way use `fallback_depth_texture` instead.
+        depth_descriptor.set_storage_mode(if self.is_apple_gpu {
+            metal::MTLStorageMode::Memoryless
+        } else {
+            metal::MTLStorageMode::Private
+        });
         depth_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
         self.depth_texture = Some(self.device.new_texture(&depth_descriptor));
 
@@ -616,14 +726,215 @@ impl MetalRenderer {
     /// of a frame that used it holds its own reference, so dropping here
     /// never pulls a texture out from under an in-flight draw.
     fn retire_idle_path_intermediate(&mut self) {
-        if self.path_intermediate_texture.is_none() {
+        // Borrowed textures are aged by their owner once per present.
+        if self.borrows_intermediates {
             return;
         }
-        self.path_intermediate_idle_frames = self.path_intermediate_idle_frames.saturating_add(1);
-        if self.path_intermediate_idle_frames > PATH_INTERMEDIATE_IDLE_FRAMES {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
+        if self.path_intermediate_texture.is_some() {
+            self.path_intermediate_idle_frames =
+                self.path_intermediate_idle_frames.saturating_add(1);
+            if self.path_intermediate_idle_frames > PATH_INTERMEDIATE_IDLE_FRAMES {
+                self.path_intermediate_texture = None;
+                self.path_intermediate_msaa_texture = None;
+            }
         }
+        if self.fallback_depth_texture.is_some() {
+            self.fallback_depth_idle_frames = self.fallback_depth_idle_frames.saturating_add(1);
+            if self.fallback_depth_idle_frames > PATH_INTERMEDIATE_IDLE_FRAMES {
+                self.fallback_depth_texture = None;
+            }
+        }
+    }
+
+    /// A private, drawable-sized depth texture for a frame whose main render
+    /// pass has to be split around path batches; created on demand and
+    /// retired like the path intermediate.
+    fn ensure_fallback_depth_texture(&mut self, size: Size<DevicePixels>) -> metal::Texture {
+        self.fallback_depth_idle_frames = 0;
+        let matches = self.fallback_depth_texture.as_ref().is_some_and(|texture| {
+            texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+        });
+        if !matches {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(size.width.0 as u64);
+            descriptor.set_height(size.height.0 as u64);
+            descriptor.set_pixel_format(DEPTH_FORMAT);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+            self.fallback_depth_texture = Some(self.device.new_texture(&descriptor));
+            log::debug!(
+                "[renderer] path batches did not fit the {}x{} intermediate; split pass through a private depth texture",
+                size.width.0,
+                size.height.0
+            );
+        }
+        self.fallback_depth_texture
+            .clone()
+            .expect("fallback depth texture was just ensured")
+    }
+
+    /// Assigns every path batch of the frame its own region of the path
+    /// intermediate so all of them can be rasterized in one pass ahead of
+    /// the main render pass. Returns `None` when they do not all fit, in
+    /// which case the frame rasterizes each batch just before it is drawn,
+    /// splitting the main pass around it.
+    fn plan_path_batches(
+        scene: &Scene,
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<Vec<PathBatchSlot>> {
+        let viewport_width = viewport_size.width.0.max(0);
+        let viewport_height = viewport_size.height.0.max(0);
+        let mut slots = Vec::new();
+        let mut allocator = None;
+        for batch in scene.batches() {
+            let PrimitiveBatch::Paths(range) = batch else {
+                continue;
+            };
+            let paths = &scene.paths[range];
+            let Some(first_path) = paths.first() else {
+                slots.push(PathBatchSlot::EMPTY);
+                continue;
+            };
+            let mut bounds = first_path.clipped_bounds();
+            for path in paths.iter().skip(1) {
+                bounds = bounds.union(&path.clipped_bounds());
+            }
+            // One pixel of padding on each side keeps the sprite's linear
+            // sampling from bleeding a neighbouring slot in.
+            let left = (bounds.origin.x.0.floor() as i32 - 1).max(0);
+            let top = (bounds.origin.y.0.floor() as i32 - 1).max(0);
+            let right = ((bounds.origin.x.0 + bounds.size.width.0).ceil() as i32 + 1)
+                .min(viewport_width);
+            let bottom = ((bounds.origin.y.0 + bounds.size.height.0).ceil() as i32 + 1)
+                .min(viewport_height);
+            if right <= left || bottom <= top {
+                slots.push(PathBatchSlot::EMPTY);
+                continue;
+            }
+            let allocator = allocator.get_or_insert_with(|| {
+                BucketedAtlasAllocator::new(etagere::size2(viewport_width, viewport_height))
+            });
+            let allocation = allocator.allocate(etagere::size2(right - left, bottom - top))?;
+            let slot = allocation.rectangle;
+            slots.push(PathBatchSlot {
+                offset: point(
+                    ScaledPixels((slot.min.x - left) as f32),
+                    ScaledPixels((slot.min.y - top) as f32),
+                ),
+                scissor: metal::MTLScissorRect {
+                    x: slot.min.x as u64,
+                    y: slot.min.y as u64,
+                    width: (right - left) as u64,
+                    height: (bottom - top) as u64,
+                },
+                empty: false,
+            });
+        }
+        Some(slots)
+    }
+
+    /// Rasterizes every path batch of the frame into its planned slot of the
+    /// path intermediate, in a single render pass.
+    fn rasterize_path_batches(
+        &mut self,
+        scene: &Scene,
+        slots: &[PathBatchSlot],
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        if slots.iter().all(|slot| slot.empty) {
+            return Ok(());
+        }
+        let intermediate_texture = self.ensure_path_intermediate_textures(viewport_size)?;
+        let command_encoder =
+            self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
+        command_encoder.set_vertex_bytes(
+            PathRasterizationInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+
+        let mut slots = slots.iter();
+        let mut vertices = Vec::new();
+        for batch in scene.batches() {
+            let PrimitiveBatch::Paths(range) = batch else {
+                continue;
+            };
+            let slot = slots
+                .next()
+                .context("path plan has fewer slots than the scene has path batches")?;
+            if slot.empty {
+                continue;
+            }
+            vertices.clear();
+            for path in &scene.paths[range] {
+                vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                    xy_position: v.xy_position,
+                    st_position: v.st_position,
+                    color: path.color,
+                    bounds: path.bounds.intersect(&path.content_mask.bounds),
+                }));
+            }
+            let vertex_instances = match writer.write(&vertices) {
+                Ok(vertex_instances) => vertex_instances,
+                Err(error) => {
+                    command_encoder.end_encoding();
+                    return Err(error);
+                }
+            };
+            let slot_offset = [slot.offset.x.0, slot.offset.y.0];
+            command_encoder.set_scissor_rect(slot.scissor);
+            command_encoder.set_vertex_bytes(
+                PathRasterizationInputIndex::SlotOffset as u64,
+                mem::size_of_val(&slot_offset) as u64,
+                slot_offset.as_ptr() as *const _,
+            );
+            command_encoder.set_vertex_buffer(
+                PathRasterizationInputIndex::Vertices as u64,
+                Some(&vertex_instances.buffer),
+                vertex_instances.offset as u64,
+            );
+            command_encoder.set_fragment_buffer(
+                PathRasterizationInputIndex::Vertices as u64,
+                Some(&vertex_instances.buffer),
+                vertex_instances.offset as u64,
+            );
+            command_encoder.draw_primitives(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                vertices.len() as u64,
+            );
+        }
+        command_encoder.end_encoding();
+        Ok(())
+    }
+
+    fn new_path_rasterization_encoder<'a>(
+        &self,
+        command_buffer: &'a metal::CommandBufferRef,
+        intermediate_texture: &metal::TextureRef,
+    ) -> &'a metal::RenderCommandEncoderRef {
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+
+        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+            color_attachment.set_texture(Some(msaa_texture));
+            color_attachment.set_resolve_texture(Some(intermediate_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
+        } else {
+            color_attachment.set_texture(Some(intermediate_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        }
+
+        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        command_encoder
     }
 
     fn create_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -819,6 +1130,10 @@ impl MetalRenderer {
             self.update_intermediate_textures(viewport_size);
         }
 
+        // Every present goes through here, so this is where a frame's sprite
+        // tiles count as used; it also retires tiles idle for too long.
+        self.sprite_atlas.on_frame_drawn(scene);
+
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
@@ -983,18 +1298,30 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        let depth_texture = self
-            .depth_texture
-            .clone()
-            .context("missing depth texture")?;
+        let path_plan = Self::plan_path_batches(scene, viewport_size);
+        let depth_texture = if path_plan.is_some() || !self.is_apple_gpu {
+            self.depth_texture
+                .clone()
+                .context("missing depth texture")?
+        } else {
+            self.ensure_fallback_depth_texture(viewport_size)
+        };
+        // Tile memory cannot be stored; the fallback texture must be, since
+        // the main pass reloads it after every path batch.
+        let store_depth = depth_texture.storage_mode() != metal::MTLStorageMode::Memoryless;
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        if let Some(slots) = &path_plan {
+            self.rasterize_path_batches(scene, slots, writer, viewport_size, command_buffer)?;
+        }
+        let mut planned_slots = path_plan.as_deref().map(|slots| slots.iter());
         let alpha = if self.opaque { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
             &depth_texture,
+            store_depth,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
@@ -1063,6 +1390,25 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
+                    if let Some(slots) = planned_slots.as_mut() {
+                        let Some(slot) = slots.next() else {
+                            command_encoder.end_encoding();
+                            anyhow::bail!("path plan has fewer slots than the scene has path batches");
+                        };
+                        if !slot.empty
+                            && let Err(error) = self.draw_paths_from_intermediate(
+                                paths,
+                                slot.offset,
+                                writer,
+                                viewport_size,
+                                command_encoder,
+                            )
+                        {
+                            command_encoder.end_encoding();
+                            return Err(error);
+                        }
+                        continue;
+                    }
                     command_encoder.end_encoding();
 
                     let did_draw = self.draw_paths_to_intermediate(
@@ -1076,6 +1422,7 @@ impl MetalRenderer {
                         command_buffer,
                         texture,
                         &depth_texture,
+                        store_depth,
                         viewport_size,
                         None,
                     );
@@ -1085,6 +1432,7 @@ impl MetalRenderer {
                     if did_draw {
                         if let Err(error) = self.draw_paths_from_intermediate(
                             paths,
+                            point(ScaledPixels(0.), ScaledPixels(0.)),
                             writer,
                             viewport_size,
                             command_encoder,
@@ -1140,27 +1488,14 @@ impl MetalRenderer {
             return Ok(false);
         }
         let intermediate_texture = self.ensure_path_intermediate_textures(viewport_size)?;
-        let intermediate_texture = &intermediate_texture;
-
-        let render_pass_descriptor = metal::RenderPassDescriptor::new();
-        let color_attachment = render_pass_descriptor
-            .color_attachments()
-            .object_at(0)
-            .unwrap();
-        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
-
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
-            color_attachment.set_texture(Some(msaa_texture));
-            color_attachment.set_resolve_texture(Some(intermediate_texture));
-            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
-        } else {
-            color_attachment.set_texture(Some(intermediate_texture));
-            color_attachment.set_store_action(metal::MTLStoreAction::Store);
-        }
-
-        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        let command_encoder =
+            self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
+        let slot_offset = [0f32, 0f32];
+        command_encoder.set_vertex_bytes(
+            PathRasterizationInputIndex::SlotOffset as u64,
+            mem::size_of_val(&slot_offset) as u64,
+            slot_offset.as_ptr() as *const _,
+        );
 
         let mut vertices = Vec::new();
         for path in paths {
@@ -1292,6 +1627,7 @@ impl MetalRenderer {
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        slot_offset: Point<ScaledPixels>,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -1334,6 +1670,7 @@ impl MetalRenderer {
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    slot_offset,
                 })
                 .collect();
         } else {
@@ -1341,7 +1678,10 @@ impl MetalRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            sprites = vec![PathSprite { bounds }];
+            sprites = vec![PathSprite {
+                bounds,
+                slot_offset,
+            }];
         }
 
         let sprite_instances = writer.write(&sprites)?;
@@ -1604,6 +1944,7 @@ fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
     depth_texture: &metal::TextureRef,
+    store_depth: bool,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
@@ -1617,7 +1958,11 @@ fn new_command_encoder_for_texture<'a>(
 
     let depth_attachment = render_pass_descriptor.depth_attachment().unwrap();
     depth_attachment.set_texture(Some(depth_texture));
-    depth_attachment.set_store_action(metal::MTLStoreAction::Store);
+    depth_attachment.set_store_action(if store_depth {
+        metal::MTLStoreAction::Store
+    } else {
+        metal::MTLStoreAction::DontCare
+    });
 
     if let Some(clear_color) = clear_color {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
@@ -2093,12 +2438,18 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+    /// Translation from screen space into the batch's slot of the path
+    /// intermediate, see [`MetalRenderer::plan_path_batches`].
+    SlotOffset = 2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
+    /// Where this sprite's pixels sit in the path intermediate relative to
+    /// their screen position.
+    pub slot_offset: Point<ScaledPixels>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2276,6 +2627,9 @@ mod stale_texture_healing_tests {
             reclaimed * 10 >= held * 9,
             "release must give back the intermediate textures (held {held}, reclaimed {reclaimed})"
         );
+        if renderer.is_apple_gpu {
+            assert_eq!(held, 0, "tile-memory depth holds no device memory");
+        }
 
         // A drawable-size update while occluded must not rebuild them.
         renderer.update_drawable_size(gpui::size(DevicePixels(1728), DevicePixels(1084)));
@@ -2305,19 +2659,70 @@ mod stale_texture_healing_tests {
         );
     }
 
-    fn triangle_path_scene(extent: f32) -> Scene {
-        use gpui::{Path, Pixels, px};
-        let mut scene = Scene::default();
-        let mut path = Path::new(Point { x: px(0.), y: px(0.) });
-        path.line_to(Point {
-            x: px(extent),
-            y: px(0.),
+    /// An overlay renderer never allocates drawable-sized intermediates of
+    /// its own: it draws with the base renderer's, handed over per draw.
+    #[test]
+    fn borrowing_renderer_draws_with_lent_intermediates_and_allocates_none() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut base = MetalRenderer::new_headless(pool.clone());
+        let mut overlay = MetalRenderer::new_headless(pool);
+        overlay.borrows_intermediates = true;
+        let size = gpui::size(DevicePixels(64), DevicePixels(64));
+
+        overlay.update_drawable_size(size);
+        assert!(
+            overlay.depth_texture.is_none(),
+            "a borrowing renderer must not allocate on resize"
+        );
+        overlay.release_intermediate_textures();
+        assert!(!overlay.intermediate_textures_released);
+
+        base.render_scene_to_image(&solid_quad_scene(32.), size)
+            .expect("base render succeeds");
+        let base_depth = base.depth_texture.clone().expect("base owns a depth texture");
+
+        overlay.lend_intermediates(base.take_intermediates());
+        assert!(base.depth_texture.is_none());
+        let image = overlay
+            .render_scene_to_image(&solid_quad_scene(32.), size)
+            .expect("overlay render succeeds with lent textures");
+        let center = image.get_pixel(16, 16);
+        assert!(center[0] > 200 && center[1] < 60 && center[2] < 60, "got {center:?}");
+        base.lend_intermediates(overlay.take_intermediates());
+
+        assert!(overlay.depth_texture.is_none());
+        let returned = base.depth_texture.as_ref().expect("textures returned to base");
+        assert_eq!(
+            returned.gpu_resource_id()._impl,
+            base_depth.gpu_resource_id()._impl,
+            "the same depth texture must come back, not a fresh allocation"
+        );
+    }
+
+    fn square_path(
+        origin: f32,
+        extent: f32,
+        color: Hsla,
+        mask: f32,
+    ) -> gpui::Path<ScaledPixels> {
+        use gpui::{Path, px};
+        let mut path = Path::new(Point {
+            x: px(origin),
+            y: px(origin),
         });
         path.line_to(Point {
-            x: px(extent),
-            y: px(extent),
+            x: px(origin + extent),
+            y: px(origin),
         });
-        path.color = Background::from(Hsla::red());
+        path.line_to(Point {
+            x: px(origin + extent),
+            y: px(origin + extent),
+        });
+        path.line_to(Point {
+            x: px(origin),
+            y: px(origin + extent),
+        });
+        path.color = Background::from(color);
         let mut path = path.scale(1.);
         path.content_mask = ContentMask {
             bounds: Bounds {
@@ -2325,13 +2730,170 @@ mod stale_texture_healing_tests {
                     x: ScaledPixels(0.),
                     y: ScaledPixels(0.),
                 },
-                size: gpui::size(ScaledPixels(extent), ScaledPixels(extent)),
+                size: gpui::size(ScaledPixels(mask), ScaledPixels(mask)),
             },
         };
-        scene.insert_primitive(path);
+        path
+    }
+
+    fn triangle_path_scene(extent: f32) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(square_path(0., extent, Hsla::red(), extent));
         scene.finish();
-        let _: Pixels = px(0.);
         scene
+    }
+
+    /// Two path batches whose screen rectangles overlap must each keep their
+    /// own pixels: with every batch rasterized up front into one intermediate,
+    /// the later batch would otherwise overwrite the earlier one's region.
+    /// Draw orders come from overlap: a quad overlapping the first path
+    /// draws above it, and the second path overlapping that quad draws above
+    /// both, which forces two path batches with the quad between them. The
+    /// later batch must still win where the paths overlap, exactly as
+    /// painter's order says.
+    fn overlapping_path_batches_scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(square_path(0., 40., Hsla::red(), 64.));
+        let bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(30.),
+                y: ScaledPixels(30.),
+            },
+            size: gpui::size(ScaledPixels(4.), ScaledPixels(4.)),
+        };
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(Hsla::white()),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene.insert_primitive(square_path(24., 40., Hsla::blue(), 64.));
+        scene.finish();
+        assert_eq!(
+            scene
+                .batches()
+                .filter(|batch| matches!(batch, gpui::PrimitiveBatch::Paths(_)))
+                .count(),
+            2,
+            "the scene must produce two path batches"
+        );
+        scene
+    }
+
+    fn assert_overlapping_batches_rendered(image: &image::RgbaImage) {
+        let red_only = image.get_pixel(8, 8);
+        assert!(
+            red_only[0] > 200 && red_only[2] < 60,
+            "first batch's own region must be red, got {red_only:?}"
+        );
+        let overlap = image.get_pixel(38, 38);
+        assert!(
+            overlap[2] > 200 && overlap[0] < 60,
+            "the later batch must win in the overlap, got {overlap:?}"
+        );
+        let blue_only = image.get_pixel(56, 56);
+        assert!(
+            blue_only[2] > 200 && blue_only[0] < 60,
+            "second batch's own region must be blue, got {blue_only:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_path_batches_keep_their_own_slots_in_the_single_path_pass() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        // Two 42x42 slots pack side by side into 128x128.
+        let size = gpui::size(DevicePixels(128), DevicePixels(128));
+        assert!(MetalRenderer::plan_path_batches(&overlapping_path_batches_scene(), size).is_some());
+        let image = renderer
+            .render_scene_to_image(&overlapping_path_batches_scene(), size)
+            .expect("render succeeds");
+        assert_overlapping_batches_rendered(&image);
+        if renderer.is_apple_gpu {
+            assert_eq!(
+                renderer
+                    .depth_texture
+                    .as_ref()
+                    .map(|texture| texture.storage_mode()),
+                Some(metal::MTLStorageMode::Memoryless),
+                "the planned frame renders through tile-memory depth"
+            );
+            assert!(
+                renderer.fallback_depth_texture.is_none(),
+                "a planned frame needs no private depth texture"
+            );
+        }
+    }
+
+    /// When the batches' slots do not fit into the intermediate the frame
+    /// falls back to rasterizing each batch just before drawing it, which
+    /// splits the main pass and needs a private depth texture — and the
+    /// result must be pixel-identical.
+    #[test]
+    fn path_batches_that_do_not_fit_fall_back_to_a_split_pass() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        let size = gpui::size(DevicePixels(64), DevicePixels(64));
+        // Each quad overlaps the path before it and the path after it
+        // overlaps the quad, so every path lands in its own batch.
+        let mut scene = Scene::default();
+        for index in 0..8 {
+            let origin = index as f32 * 2.;
+            scene.insert_primitive(square_path(origin, 40., Hsla::red(), 64.));
+            let bounds = Bounds {
+                origin: Point {
+                    x: ScaledPixels(origin + 30.),
+                    y: ScaledPixels(origin + 30.),
+                },
+                size: gpui::size(ScaledPixels(4.), ScaledPixels(4.)),
+            };
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: Default::default(),
+                bounds,
+                content_mask: ContentMask { bounds },
+                background: Background::from(Hsla::white()),
+                border_color: Hsla::transparent_black(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+            });
+        }
+        scene.finish();
+        assert_eq!(
+            scene
+                .batches()
+                .filter(|batch| matches!(batch, gpui::PrimitiveBatch::Paths(_)))
+                .count(),
+            8
+        );
+        assert!(
+            MetalRenderer::plan_path_batches(&scene, size).is_none(),
+            "eight 42x42 slots cannot be packed into 64x64"
+        );
+        let image = renderer
+            .render_scene_to_image(&scene, size)
+            .expect("fallback render succeeds");
+        let inside = image.get_pixel(20, 20);
+        assert!(inside[0] > 200 && inside[2] < 60, "got {inside:?}");
+        if renderer.is_apple_gpu {
+            assert!(
+                renderer.fallback_depth_texture.is_some(),
+                "the split pass rendered through the private fallback depth texture"
+            );
+        }
+        // Idle frames retire the fallback texture again.
+        for _ in 0..=super::PATH_INTERMEDIATE_IDLE_FRAMES {
+            renderer
+                .render_scene_to_image(&solid_quad_scene(32.), size)
+                .expect("quad-only render succeeds");
+        }
+        assert!(renderer.fallback_depth_texture.is_none());
     }
 
     /// The path intermediate is 4 bytes per drawable pixel that only frames

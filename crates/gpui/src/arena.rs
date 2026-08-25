@@ -1,3 +1,4 @@
+use crate::util::SHRINK_AFTER_FRAMES;
 use std::{
     alloc::{self, handle_alloc_error},
     cell::Cell,
@@ -85,6 +86,12 @@ pub struct Arena {
     current_chunk_index: usize,
     chunk_size: NonZeroUsize,
     scope_depth: usize,
+    /// Consecutive clears whose draw fit in fewer chunks than are allocated,
+    /// and the most chunks any of those draws used. Chunks are never freed
+    /// otherwise, so one elaborate draw would pin its whole arena for the life
+    /// of the process; see [`Self::force_clear`].
+    low_use_clears: u32,
+    max_recent_used_chunks: usize,
 }
 
 impl Drop for Arena {
@@ -103,6 +110,8 @@ impl Arena {
             current_chunk_index: 0,
             chunk_size,
             scope_depth: 0,
+            low_use_clears: 0,
+            max_recent_used_chunks: 0,
         }
     }
 
@@ -154,7 +163,29 @@ impl Arena {
         for chunk_index in 0..=self.current_chunk_index {
             self.chunks[chunk_index].reset();
         }
+        let used_chunks = self.current_chunk_index + 1;
         self.current_chunk_index = 0;
+
+        // Same hysteresis as the per-frame collections: a run of draws that
+        // all fit in fewer chunks than are allocated frees the surplus, and
+        // one draw that needs every chunk restarts the count. Nothing is live
+        // here, so any chunk past the largest recent draw can go.
+        if used_chunks < self.chunks.len() {
+            self.max_recent_used_chunks = self.max_recent_used_chunks.max(used_chunks);
+            self.low_use_clears += 1;
+            if self.low_use_clears >= SHRINK_AFTER_FRAMES {
+                self.chunks.truncate(self.max_recent_used_chunks.max(1));
+                self.low_use_clears = 0;
+                self.max_recent_used_chunks = 0;
+                log::trace!(
+                    "decreased element arena capacity to {}kb",
+                    self.capacity() / 1024,
+                );
+            }
+        } else {
+            self.low_use_clears = 0;
+            self.max_recent_used_chunks = 0;
+        }
     }
 
     #[inline(always)]
@@ -304,6 +335,50 @@ mod tests {
         arena.alloc(|| 4u32);
 
         assert_eq!(arena.capacity(), 24);
+    }
+
+    #[test]
+    fn test_arena_drops_surplus_chunks_after_idle_window() {
+        let mut arena = Arena::new(64);
+        for _ in 0..32 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        assert_eq!(arena.capacity(), 8 * 64);
+        arena.clear();
+
+        for _ in 0..SHRINK_AFTER_FRAMES - 1 {
+            arena.alloc(|| 1u64);
+            arena.clear();
+            assert_eq!(arena.capacity(), 8 * 64);
+        }
+        arena.alloc(|| 1u64);
+        arena.clear();
+        assert_eq!(arena.capacity(), 64);
+
+        // The arena keeps working, and regrows, after the surplus is gone.
+        for _ in 0..8 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        assert_eq!(arena.capacity(), 2 * 64);
+    }
+
+    #[test]
+    fn test_arena_keeps_chunks_while_big_draws_recur() {
+        let mut arena = Arena::new(64);
+        for _ in 0..32 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        arena.clear();
+        assert_eq!(arena.capacity(), 8 * 64);
+
+        for clear in 0..SHRINK_AFTER_FRAMES * 4 {
+            let allocations = if clear % 30 == 0 { 32 } else { 1 };
+            for _ in 0..allocations {
+                arena.alloc(|| [0u8; 16]);
+            }
+            arena.clear();
+            assert_eq!(arena.capacity(), 8 * 64);
+        }
     }
 
     #[test]
