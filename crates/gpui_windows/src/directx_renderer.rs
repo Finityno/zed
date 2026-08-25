@@ -2472,7 +2472,11 @@ fn create_depth_stencil_texture_and_view(
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_D32_FLOAT,
+            // `quad_depth` steps in 1/65535 increments and opaque-quad
+            // partitioning is capped at 65534 quads, so 16 unorm bits resolve
+            // every slot exactly at half the size of D32_FLOAT. Cleared to 0.0
+            // with a GREATER test, both of which are format-independent.
+            Format: DXGI_FORMAT_D16_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
