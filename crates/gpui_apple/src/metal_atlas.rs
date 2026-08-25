@@ -168,11 +168,24 @@ impl PlatformAtlas for MetalAtlas {
             })
             .map(|record| record.key.clone())
             .collect();
+        if idle_keys.is_empty() {
+            return;
+        }
+        let retired = idle_keys.len();
         for key in idle_keys {
             if let Some(tile) = lock.tiles_by_key.remove(&key) {
                 lock.release_tile(tile);
             }
         }
+        let page_freed = lock
+            .textures(kind)
+            .textures
+            .get(index)
+            .is_some_and(|slot| slot.is_none());
+        log::debug!(
+            "[atlas] retired {retired} idle {kind:?} tile(s) from page {index} at frame {frame}{}",
+            if page_freed { "; page freed" } else { "" }
+        );
     }
 
     fn frame_index(&self) -> u64 {

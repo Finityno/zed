@@ -743,6 +743,11 @@ impl MetalRenderer {
             descriptor.set_storage_mode(metal::MTLStorageMode::Private);
             descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
             self.fallback_depth_texture = Some(self.device.new_texture(&descriptor));
+            log::debug!(
+                "[renderer] path batches did not fit the {}x{} intermediate; split pass through a private depth texture",
+                size.width.0,
+                size.height.0
+            );
         }
         self.fallback_depth_texture
             .clone()
