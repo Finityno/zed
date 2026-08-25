@@ -210,11 +210,26 @@ pub struct MetalRenderer {
     /// Frames drawn since the path intermediate was last used; once it
     /// reaches [`PATH_INTERMEDIATE_IDLE_FRAMES`] the texture is dropped.
     path_intermediate_idle_frames: u32,
+    /// An overlay renderer draws strictly after its window's base renderer
+    /// and never concurrently with it, so it borrows the base renderer's
+    /// intermediate textures for each draw ([`Self::take_intermediates`] /
+    /// [`Self::lend_intermediates`]) instead of allocating its own copies,
+    /// which would double the per-window drawable-sized memory.
+    borrows_intermediates: bool,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// The drawable-sized textures a frame renders through, moved between a
+/// window's base and overlay renderer by [`MetalRenderer::take_intermediates`].
+pub struct IntermediateTextures {
+    depth: Option<metal::Texture>,
+    path: Option<metal::Texture>,
+    path_msaa: Option<metal::Texture>,
+    path_idle_frames: u32,
 }
 
 #[repr(C)]
@@ -270,13 +285,38 @@ impl MetalRenderer {
     ) -> Self {
         let device = self.device.clone();
         let layer = Self::new_layer(&device, transparent);
-        Self::new_internal(
+        let mut renderer = Self::new_internal(
             device,
             Some(layer),
             !transparent,
             instance_buffer_pool,
             Some(self.sprite_atlas.clone()),
-        )
+        );
+        renderer.borrows_intermediates = true;
+        renderer
+    }
+
+    /// Moves the drawable-sized intermediate textures out of this renderer so
+    /// another renderer for the same drawable size can draw with them; pair
+    /// with [`Self::lend_intermediates`] to hand them on and back. A frame
+    /// that used them keeps its own references from its command buffer, so
+    /// moving the handles never affects an in-flight draw.
+    pub fn take_intermediates(&mut self) -> IntermediateTextures {
+        IntermediateTextures {
+            depth: self.depth_texture.take(),
+            path: self.path_intermediate_texture.take(),
+            path_msaa: self.path_intermediate_msaa_texture.take(),
+            path_idle_frames: self.path_intermediate_idle_frames,
+        }
+    }
+
+    /// Installs intermediate textures taken from another renderer; see
+    /// [`Self::take_intermediates`].
+    pub fn lend_intermediates(&mut self, intermediates: IntermediateTextures) {
+        self.depth_texture = intermediates.depth;
+        self.path_intermediate_texture = intermediates.path;
+        self.path_intermediate_msaa_texture = intermediates.path_msaa;
+        self.path_intermediate_idle_frames = intermediates.path_idle_frames;
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -482,6 +522,7 @@ impl MetalRenderer {
             stale_texture_heals: 0,
             intermediate_textures_released: false,
             path_intermediate_idle_frames: 0,
+            borrows_intermediates: false,
             gpu_stats_last_log: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -541,6 +582,9 @@ impl MetalRenderer {
     /// The instance buffer pool is process-wide and shared with visible
     /// windows, so it is deliberately left alone.
     pub fn release_intermediate_textures(&mut self) {
+        if self.borrows_intermediates {
+            return;
+        }
         self.intermediate_textures_released = true;
         self.depth_texture = None;
         self.path_intermediate_texture = None;
@@ -551,7 +595,7 @@ impl MetalRenderer {
         // A resize while occluded (display change, restore geometry) must not
         // rebuild what release_intermediate_textures dropped; the first draw
         // after the window is visible again does that.
-        if self.intermediate_textures_released {
+        if self.intermediate_textures_released || self.borrows_intermediates {
             return;
         }
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
@@ -2302,6 +2346,46 @@ mod stale_texture_healing_tests {
         assert_eq!(
             renderer.stale_texture_heals, heals_before,
             "a rebuild after release is not a stale-texture heal"
+        );
+    }
+
+    /// An overlay renderer never allocates drawable-sized intermediates of
+    /// its own: it draws with the base renderer's, handed over per draw.
+    #[test]
+    fn borrowing_renderer_draws_with_lent_intermediates_and_allocates_none() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut base = MetalRenderer::new_headless(pool.clone());
+        let mut overlay = MetalRenderer::new_headless(pool);
+        overlay.borrows_intermediates = true;
+        let size = gpui::size(DevicePixels(64), DevicePixels(64));
+
+        overlay.update_drawable_size(size);
+        assert!(
+            overlay.depth_texture.is_none(),
+            "a borrowing renderer must not allocate on resize"
+        );
+        overlay.release_intermediate_textures();
+        assert!(!overlay.intermediate_textures_released);
+
+        base.render_scene_to_image(&solid_quad_scene(32.), size)
+            .expect("base render succeeds");
+        let base_depth = base.depth_texture.clone().expect("base owns a depth texture");
+
+        overlay.lend_intermediates(base.take_intermediates());
+        assert!(base.depth_texture.is_none());
+        let image = overlay
+            .render_scene_to_image(&solid_quad_scene(32.), size)
+            .expect("overlay render succeeds with lent textures");
+        let center = image.get_pixel(16, 16);
+        assert!(center[0] > 200 && center[1] < 60 && center[2] < 60, "got {center:?}");
+        base.lend_intermediates(overlay.take_intermediates());
+
+        assert!(overlay.depth_texture.is_none());
+        let returned = base.depth_texture.as_ref().expect("textures returned to base");
+        assert_eq!(
+            returned.gpu_resource_id()._impl,
+            base_depth.gpu_resource_id()._impl,
+            "the same depth texture must come back, not a fresh allocation"
         );
     }
 
