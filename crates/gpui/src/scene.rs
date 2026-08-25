@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, util::CapacityShrink,
 };
 use std::{
     fmt::Debug,
@@ -108,24 +108,40 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub blended_quad_indices: Vec<u32>,
     pub opaque_quad_indices: Vec<u32>,
+    /// One tracker per vector above, in the order `clear` destructures them.
+    shrink: [CapacityShrink; 12],
 }
 
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
-        self.paint_operations.clear();
+        let [
+            paint_operations,
+            layer_stack,
+            paths,
+            shadows,
+            quads,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            surfaces,
+            blended_quad_indices,
+            opaque_quad_indices,
+        ] = &mut self.shrink;
+        paint_operations.clear_vec(&mut self.paint_operations);
         self.primitive_bounds.clear();
-        self.layer_stack.clear();
-        self.paths.clear();
-        self.shadows.clear();
-        self.quads.clear();
-        self.underlines.clear();
-        self.monochrome_sprites.clear();
-        self.subpixel_sprites.clear();
-        self.polychrome_sprites.clear();
-        self.surfaces.clear();
-        self.blended_quad_indices.clear();
-        self.opaque_quad_indices.clear();
+        layer_stack.clear_vec(&mut self.layer_stack);
+        paths.clear_vec(&mut self.paths);
+        shadows.clear_vec(&mut self.shadows);
+        quads.clear_vec(&mut self.quads);
+        underlines.clear_vec(&mut self.underlines);
+        monochrome_sprites.clear_vec(&mut self.monochrome_sprites);
+        subpixel_sprites.clear_vec(&mut self.subpixel_sprites);
+        polychrome_sprites.clear_vec(&mut self.polychrome_sprites);
+        surfaces.clear_vec(&mut self.surfaces);
+        blended_quad_indices.clear_vec(&mut self.blended_quad_indices);
+        opaque_quad_indices.clear_vec(&mut self.opaque_quad_indices);
     }
 
     pub fn len(&self) -> usize {
@@ -362,6 +378,66 @@ fn opaque_quad_partitioning_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::{MIN_RETAINED_CAPACITY, SHRINK_AFTER_FRAMES};
+
+    fn paint_frame(scene: &mut Scene, quads: usize) {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: ScaledPixels::from(100.),
+                height: ScaledPixels::from(100.),
+            },
+        };
+        scene.push_layer(bounds);
+        for _ in 0..quads {
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..Default::default()
+            });
+        }
+        scene.pop_layer();
+        scene.finish();
+    }
+
+    #[test]
+    fn one_huge_frame_followed_by_small_ones_releases_its_capacity() {
+        let mut scene = Scene::default();
+        paint_frame(&mut scene, 10_000);
+        scene.clear();
+        let high_water = scene.quads.capacity();
+        let operations_high_water = scene.paint_operations.capacity();
+        assert!(high_water >= 10_000);
+
+        for _ in 0..SHRINK_AFTER_FRAMES - 1 {
+            paint_frame(&mut scene, 5);
+            scene.clear();
+            assert_eq!(scene.quads.capacity(), high_water);
+            assert_eq!(scene.paint_operations.capacity(), operations_high_water);
+        }
+        paint_frame(&mut scene, 5);
+        scene.clear();
+        assert!(scene.quads.capacity() <= MIN_RETAINED_CAPACITY);
+        assert!(scene.paint_operations.capacity() <= MIN_RETAINED_CAPACITY);
+        assert!(scene.opaque_quad_indices.capacity() <= MIN_RETAINED_CAPACITY);
+    }
+
+    #[test]
+    fn a_workload_that_alternates_big_and_small_frames_never_shrinks() {
+        let mut scene = Scene::default();
+        paint_frame(&mut scene, 10_000);
+        scene.clear();
+        let high_water = scene.quads.capacity();
+
+        for frame in 0..SHRINK_AFTER_FRAMES * 5 {
+            // Over half the high-water capacity, so every recurrence resets
+            // the low-use count.
+            let quads = if frame % 30 == 0 { 10_000 } else { 5 };
+            paint_frame(&mut scene, quads);
+            scene.clear();
+            assert_eq!(scene.quads.capacity(), high_water);
+        }
+    }
 
     #[test]
     fn empty_layers_do_not_make_a_scene_drawable() {
