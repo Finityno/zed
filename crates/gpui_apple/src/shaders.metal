@@ -912,10 +912,11 @@ struct PathRasterizationFragmentInput {
 vertex PathRasterizationVertexOutput path_rasterization_vertex(
   uint vertex_id [[vertex_id]],
   constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]],
+  constant float2 *slot_offset [[buffer(PathRasterizationInputIndex_SlotOffset)]]
 ) {
   PathRasterizationVertex v = vertices[vertex_id];
-  float2 vertex_position = float2(v.xy_position.x, v.xy_position.y);
+  float2 vertex_position = float2(v.xy_position.x, v.xy_position.y) + *slot_offset;
   float4 position = float4(
     vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
     0.,
@@ -996,7 +997,8 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
       to_device_position(unit_vertex, sprite.bounds, viewport_size);
 
   float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
+  float2 slot_position = screen_position + float2(sprite.slot_offset.x, sprite.slot_offset.y);
+  float2 texture_coords = slot_position / float2(viewport_size->width, viewport_size->height);
 
   return PathSpriteVertexOutput{
     device_position,
