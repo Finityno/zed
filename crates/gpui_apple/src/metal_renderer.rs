@@ -38,9 +38,11 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
-/// Every bit of this format's mantissa is needed, since [`quad_depth`] maps
-/// each quad in the scene onto its own depth.
-const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
+/// [`quad_depth`] spaces quads 1/65535 apart and the scene stops partitioning
+/// beyond `MAX_DEPTH_PARTITIONED_QUADS`, so a 16-bit attachment resolves
+/// every depth the prepass can write at half the memory of a 32-bit one
+/// (2 bytes per drawable pixel).
+const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth16Unorm;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 /// Frames without a path batch after which the drawable-sized path
