@@ -180,7 +180,7 @@ fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec4<f32> {
 
 // Must match `gpui::quad_depth`.
 fn quad_depth(quad_id: u32) -> f32 {
-    return saturate(f32(quad_id + 1u) * (1.0 / 16777216.0));
+    return saturate(f32(quad_id + 1u) * (1.0 / 65535.0));
 }
 
 fn to_device_position_transformed(unit_vertex: vec2<f32>, bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {

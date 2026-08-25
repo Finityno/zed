@@ -3045,6 +3045,13 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             lock.start_display_link();
         } else {
             lock.stop_display_link();
+            // Nothing paints an occluded window, so its drawable-sized
+            // intermediate textures can go; the first draw after it becomes
+            // visible again recreates them.
+            lock.renderer.release_intermediate_textures();
+            if let Some(renderer) = lock.overlay_renderer.as_mut() {
+                renderer.release_intermediate_textures();
+            }
         }
     }
 }
