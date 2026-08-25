@@ -123,7 +123,13 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// `quad_depth` steps in 1/65535 increments and opaque-quad partitioning is
+/// capped at 65534 quads, so 16 bits of unorm depth resolve every slot exactly
+/// and the texture is half the size of `Depth32Float`. Chosen per adapter in
+/// [`RenderingParameters::new`], which falls back to [`FALLBACK_DEPTH_FORMAT`]
+/// on any backend that cannot attach it.
+const PREFERRED_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth16Unorm;
+const FALLBACK_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
@@ -694,6 +700,7 @@ impl WgpuRendererCore {
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
         path_sample_count: u32,
+        depth_format: wgpu::TextureFormat,
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
     ) -> WgpuPipelines {
@@ -754,7 +761,7 @@ impl WgpuRendererCore {
 
         let depth_stencil = |depth_write_enabled: bool| {
             Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
+                format: depth_format,
                 depth_write_enabled: Some(depth_write_enabled),
                 depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: wgpu::StencilState::default(),
@@ -1018,6 +1025,7 @@ impl WgpuRendererCore {
 
     fn create_depth_texture(
         device: &wgpu::Device,
+        depth_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
     ) -> (wgpu::Texture, wgpu::TextureView) {
@@ -1031,7 +1039,7 @@ impl WgpuRendererCore {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
+            format: depth_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -1178,6 +1186,7 @@ impl WgpuRenderer {
             format,
             new_alpha_mode,
             core.rendering_params.path_sample_count,
+            core.rendering_params.depth_format,
             core.dual_source_blending,
             core.uses_webgl_instance_data,
         );
@@ -1338,6 +1347,7 @@ impl WgpuRendererCore {
             target_format,
             alpha_mode,
             rendering_params.path_sample_count,
+            rendering_params.depth_format,
             dual_source_blending,
             uses_webgl_instance_data,
         );
@@ -1505,10 +1515,11 @@ impl WgpuRendererCore {
 
         let format = self.target_format;
         let path_sample_count = self.rendering_params.path_sample_count;
+        let depth_format = self.rendering_params.depth_format;
         let resources = &mut self.resources;
 
         let (depth_texture, depth_view) =
-            Self::create_depth_texture(&resources.device, width, height);
+            Self::create_depth_texture(&resources.device, depth_format, width, height);
         resources.depth_texture = Some(depth_texture);
         resources.depth_view = Some(depth_view);
 
@@ -2827,6 +2838,7 @@ fn create_surface(
 
 struct RenderingParameters {
     path_sample_count: u32,
+    depth_format: wgpu::TextureFormat,
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
@@ -2841,6 +2853,27 @@ impl RenderingParameters {
             .into_iter()
             .find(|&n| format_features.flags.sample_count_supported(n))
             .unwrap_or(1);
+
+        // Depth16Unorm is a core WebGPU format that wgpu reports as
+        // depth-renderable on Vulkan, Metal, DX12 and GL (WebGL2 exposes it
+        // as DEPTH_COMPONENT16), so the fallback is only a guard against an
+        // adapter that omits it; the pipelines and the attachment are created
+        // from this one value so they can never disagree.
+        let depth_format = if adapter
+            .get_texture_format_features(PREFERRED_DEPTH_FORMAT)
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            PREFERRED_DEPTH_FORMAT
+        } else {
+            log::warn!(
+                "adapter {:?} cannot render to {:?}; using {:?} for the depth buffer",
+                adapter.get_info().name,
+                PREFERRED_DEPTH_FORMAT,
+                FALLBACK_DEPTH_FORMAT
+            );
+            FALLBACK_DEPTH_FORMAT
+        };
 
         let gamma = env::var("ZED_FONTS_GAMMA")
             .ok()
@@ -2863,6 +2896,7 @@ impl RenderingParameters {
 
         Self {
             path_sample_count,
+            depth_format,
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,

@@ -250,3 +250,122 @@ mod tests {
             .expect_err("timeout");
     }
 }
+
+/// How many consecutive low-use frames it takes to shrink a per-frame
+/// collection back down. Two seconds at 60fps, matching the renderer's
+/// instance-buffer pool: long enough that a burst of complex frames with brief
+/// pauses never thrashes, short enough that one elaborate frame does not set
+/// the allocation for the rest of the session.
+pub(crate) const SHRINK_AFTER_FRAMES: u32 = 120;
+
+/// A per-frame collection is never shrunk below this many elements.
+pub(crate) const MIN_RETAINED_CAPACITY: usize = 32;
+
+/// Hysteresis for collections that are refilled every frame and cleared with
+/// their capacity retained.
+///
+/// `Vec::clear` keeps the high-water capacity, so one elaborate frame — a long
+/// chat transcript scrolled past, a big review diff — pins that memory for the
+/// life of the window, and a window holds two frames of it. This notes each
+/// frame's fill against the capacity and, after [`SHRINK_AFTER_FRAMES`]
+/// consecutive frames that filled at most half of it, shrinks to twice the
+/// largest fill seen in that window. The doubled target leaves headroom so the
+/// next frame does not immediately regrow, and any frame that needs more than
+/// half the capacity resets the count, so a workload that alternates between
+/// big and small frames never shrinks at all.
+#[derive(Debug, Default)]
+pub(crate) struct CapacityShrink {
+    low_use_frames: u32,
+    max_recent_len: usize,
+}
+
+impl CapacityShrink {
+    /// Notes one frame's `len` against `capacity` and returns the capacity to
+    /// shrink to, if this frame completes the low-use window.
+    pub(crate) fn record(&mut self, len: usize, capacity: usize) -> Option<usize> {
+        if capacity <= MIN_RETAINED_CAPACITY || len.saturating_mul(2) > capacity {
+            self.low_use_frames = 0;
+            self.max_recent_len = 0;
+            return None;
+        }
+        self.max_recent_len = self.max_recent_len.max(len);
+        self.low_use_frames += 1;
+        if self.low_use_frames < SHRINK_AFTER_FRAMES {
+            return None;
+        }
+        self.low_use_frames = 0;
+        let target = self
+            .max_recent_len
+            .saturating_mul(2)
+            .max(MIN_RETAINED_CAPACITY);
+        self.max_recent_len = 0;
+        Some(target)
+    }
+
+    /// Clears `vec` for the next frame, shrinking it once it has been
+    /// over-provisioned for long enough.
+    pub(crate) fn clear_vec<T>(&mut self, vec: &mut Vec<T>) {
+        let target = self.record(vec.len(), vec.capacity());
+        vec.clear();
+        if let Some(target) = target {
+            vec.shrink_to(target);
+        }
+    }
+
+    /// Clears `map` for the next frame, shrinking it once it has been
+    /// over-provisioned for long enough.
+    pub(crate) fn clear_map<K, V, S>(&mut self, map: &mut std::collections::HashMap<K, V, S>)
+    where
+        K: Eq + std::hash::Hash,
+        S: std::hash::BuildHasher,
+    {
+        let target = self.record(map.len(), map.capacity());
+        map.clear();
+        if let Some(target) = target {
+            map.shrink_to(target);
+        }
+    }
+}
+
+#[cfg(test)]
+mod capacity_shrink_tests {
+    use super::*;
+
+    #[test]
+    fn shrinks_after_a_full_window_of_low_use_frames() {
+        let mut vec: Vec<u64> = Vec::with_capacity(10_000);
+        let mut shrink = CapacityShrink::default();
+        for _ in 0..SHRINK_AFTER_FRAMES - 1 {
+            vec.extend(0..10);
+            shrink.clear_vec(&mut vec);
+            assert_eq!(vec.capacity(), 10_000);
+        }
+        vec.extend(0..10);
+        shrink.clear_vec(&mut vec);
+        assert!(vec.capacity() <= MIN_RETAINED_CAPACITY.max(20));
+    }
+
+    #[test]
+    fn a_busy_frame_resets_the_window() {
+        let mut vec: Vec<u64> = Vec::with_capacity(10_000);
+        let mut shrink = CapacityShrink::default();
+        for frame in 0..SHRINK_AFTER_FRAMES * 4 {
+            let fill = if frame % 100 == 0 { 6_000 } else { 10 };
+            vec.extend(0..fill);
+            shrink.clear_vec(&mut vec);
+            assert_eq!(vec.capacity(), 10_000);
+        }
+    }
+
+    #[test]
+    fn never_shrinks_below_the_floor() {
+        let mut shrink = CapacityShrink::default();
+        for _ in 0..SHRINK_AFTER_FRAMES * 2 {
+            assert_eq!(shrink.record(0, MIN_RETAINED_CAPACITY), None);
+        }
+        for _ in 0..SHRINK_AFTER_FRAMES - 1 {
+            assert_eq!(shrink.record(1, 1_000), None);
+        }
+        assert_eq!(shrink.record(1, 1_000), Some(MIN_RETAINED_CAPACITY));
+    }
+}

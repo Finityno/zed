@@ -1,4 +1,4 @@
-use crate::{Bounds, Half};
+use crate::{Bounds, Half, util::CapacityShrink};
 use std::{
     cmp,
     fmt::Debug,
@@ -32,6 +32,9 @@ where
     insert_path: Vec<usize>,
     /// Reusable stack for search operations.
     search_stack: Vec<NonNull<Node<U>>>,
+    /// Shrinks `nodes` after a run of frames that needed far fewer of them.
+    /// The two stacks are bounded by tree depth and are not worth tracking.
+    nodes_shrink: CapacityShrink,
 }
 
 /// A node in the bounds tree.
@@ -106,7 +109,7 @@ where
 {
     /// Clears all nodes from the tree.
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        self.nodes_shrink.clear_vec(&mut self.nodes);
         self.root = None;
         self.max_leaf = None;
         self.insert_path.clear();
@@ -367,6 +370,7 @@ where
             max_leaf: None,
             insert_path: Vec::new(),
             search_stack: Vec::new(),
+            nodes_shrink: CapacityShrink::default(),
         }
     }
 }
