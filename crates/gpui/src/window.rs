@@ -71,8 +71,9 @@ use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
 use crate::util::{
-    atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
-    round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
+    CapacityShrink, atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel,
+    round_half_toward_zero, round_half_toward_zero_f64, round_stroke_to_device_pixel,
+    round_to_device_pixel,
 };
 pub use prompts::*;
 
@@ -987,6 +988,27 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    shrink: FrameShrink,
+}
+
+/// Hysteresis trackers for the per-frame collections a `Frame` refills every
+/// draw; see [`CapacityShrink`].
+#[derive(Default)]
+struct FrameShrink {
+    /// Fed from [`Frame::finish`] rather than [`Frame::clear`]: live element
+    /// states are moved forward into the new frame there, so by the time the
+    /// old frame is cleared its map holds only the states that died, and
+    /// measuring that would shrink the map every window and regrow it the
+    /// next frame.
+    element_states: CapacityShrink,
+    accessed_element_states: CapacityShrink,
+    mouse_listeners: CapacityShrink,
+    hitboxes: CapacityShrink,
+    window_control_hitboxes: CapacityShrink,
+    deferred_draws: CapacityShrink,
+    input_handlers: CapacityShrink,
+    tooltip_requests: CapacityShrink,
+    cursor_styles: CapacityShrink,
 }
 
 #[derive(Clone, Default)]
@@ -1037,22 +1059,28 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            shrink: FrameShrink::default(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
+        let shrink = &mut self.shrink;
         self.element_states.clear();
-        self.accessed_element_states.clear();
-        self.mouse_listeners.clear();
+        shrink
+            .accessed_element_states
+            .clear_vec(&mut self.accessed_element_states);
+        shrink.mouse_listeners.clear_vec(&mut self.mouse_listeners);
         self.dispatch_tree.clear();
         self.scene.clear();
         self.overlay_scene_start = 0;
-        self.input_handlers.clear();
-        self.tooltip_requests.clear();
-        self.cursor_styles.clear();
-        self.hitboxes.clear();
-        self.window_control_hitboxes.clear();
-        self.deferred_draws.clear();
+        shrink.input_handlers.clear_vec(&mut self.input_handlers);
+        shrink.tooltip_requests.clear_vec(&mut self.tooltip_requests);
+        shrink.cursor_styles.clear_vec(&mut self.cursor_styles);
+        shrink.hitboxes.clear_vec(&mut self.hitboxes);
+        shrink
+            .window_control_hitboxes
+            .clear_vec(&mut self.window_control_hitboxes);
+        shrink.deferred_draws.clear_vec(&mut self.deferred_draws);
         self.tab_stops.clear();
         self.focus = None;
 
@@ -1120,6 +1148,16 @@ impl Frame {
             {
                 self.element_states.insert(element_state_key, element_state);
             }
+        }
+        // The old frame's map is nearly empty now, so shrinking it here is a
+        // rehash of a handful of dead entries; it comes back as the live map
+        // next frame at a capacity sized for the live count.
+        if let Some(target) = prev_frame
+            .shrink
+            .element_states
+            .record(self.element_states.len(), prev_frame.element_states.capacity())
+        {
+            prev_frame.element_states.shrink_to(target);
         }
 
         self.scene.finish();
