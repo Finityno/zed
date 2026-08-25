@@ -59,6 +59,13 @@ pub(crate) struct WindowsDispatcher {
     /// that is now empty — precisely the ratchet the re-arm exists to undo.
     /// Bumping the generation makes that stale exchange fail instead.
     queue_alarm: AtomicU64,
+    /// Set while wake-up posts are failing so a failure streak logs one error,
+    /// not one per producer: once the platform window is destroyed at shutdown
+    /// every post fails with ERROR_INVALID_WINDOW_HANDLE, and logging each one
+    /// emitted dozens of identical error reports in milliseconds. Cleared by
+    /// the first successful post, which logs how many failures went unlogged.
+    wake_post_failing: AtomicBool,
+    suppressed_wake_post_failures: AtomicU64,
 }
 
 impl WindowsDispatcher {
@@ -77,6 +84,8 @@ impl WindowsDispatcher {
             validation_number,
             wake_posted: AtomicBool::new(false),
             queue_alarm: AtomicU64::new(MAIN_THREAD_QUEUE_ALARM_DEPTH as u64),
+            wake_post_failing: AtomicBool::new(false),
+            suppressed_wake_post_failures: AtomicU64::new(0),
         }
     }
 
@@ -146,15 +155,21 @@ impl WindowsDispatcher {
                 return;
             }
             match self.post_wake_message() {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.note_wake_post_success();
+                    return;
+                }
                 Err(error) => last_error = Some(error),
             }
             self.wake_posted.store(false, Ordering::Release);
         }
-        log::error!(
-            "failed to post the main-thread wake-up {WAKE_POST_ATTEMPTS} times ({last_error:?}); \
-             queued runnables will not run until the next dispatch posts one"
-        );
+        if self.claim_wake_post_failure_log() {
+            log::error!(
+                "failed to post the main-thread wake-up {WAKE_POST_ATTEMPTS} times ({last_error:?}); \
+                 queued runnables will not run until the next dispatch posts one; \
+                 suppressing further failures until a post succeeds"
+            );
+        }
     }
 
     /// Re-arms the wake from inside a drain that is yielding with work still
@@ -165,15 +180,50 @@ impl WindowsDispatcher {
         let mut last_error = None;
         for _ in 0..WAKE_POST_ATTEMPTS {
             match self.post_wake_message() {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.note_wake_post_success();
+                    return;
+                }
                 Err(error) => last_error = Some(error),
             }
         }
         self.wake_posted.store(false, Ordering::Release);
-        log::error!(
-            "failed to re-post the main-thread wake-up {WAKE_POST_ATTEMPTS} times ({last_error:?}); \
-             the remaining foreground work will not run until the next dispatch posts one"
-        );
+        if self.claim_wake_post_failure_log() {
+            log::error!(
+                "failed to re-post the main-thread wake-up {WAKE_POST_ATTEMPTS} times ({last_error:?}); \
+                 the remaining foreground work will not run until the next dispatch posts one; \
+                 suppressing further failures until a post succeeds"
+            );
+        }
+    }
+
+    /// Returns whether this failure starts a streak and should be the one that
+    /// logs it. Every wake-up post fails for the same reason once it starts —
+    /// the message queue is at quota, USER handles are exhausted, or the
+    /// window is gone at shutdown — so the repeats are counted for the
+    /// recovery line instead of each producing an identical error.
+    fn claim_wake_post_failure_log(&self) -> bool {
+        if self.wake_post_failing.swap(true, Ordering::Relaxed) {
+            self.suppressed_wake_post_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Ends a failure streak, surfacing how many failures went unlogged. The
+    /// load-before-swap keeps the successful-post hot path to a read.
+    fn note_wake_post_success(&self) {
+        if self.wake_post_failing.load(Ordering::Relaxed)
+            && self.wake_post_failing.swap(false, Ordering::Relaxed)
+        {
+            let suppressed = self
+                .suppressed_wake_post_failures
+                .swap(0, Ordering::Relaxed);
+            log::warn!(
+                "main-thread wake-up posts recovered after {suppressed} suppressed failures"
+            );
+        }
     }
 
     fn post_wake_message(&self) -> windows::core::Result<()> {
