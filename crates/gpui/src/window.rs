@@ -3199,11 +3199,17 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let atlas_frame_before_draw = self.sprite_atlas.frame_index();
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
         );
-        self.atlas_frame_at_last_present = self.sprite_atlas.frame_index();
+        // A draw that bailed before rendering (no drawable, a render error)
+        // marked nothing, so the scene's tiles are no newer than they were.
+        let atlas_frame_after_draw = self.sprite_atlas.frame_index();
+        if atlas_frame_after_draw > atlas_frame_before_draw {
+            self.atlas_frame_at_last_present = atlas_frame_after_draw;
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,

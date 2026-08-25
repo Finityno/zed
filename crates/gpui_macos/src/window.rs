@@ -2113,6 +2113,7 @@ impl PlatformWindow for MacWindow {
 
         this.overlay_input_active
             .store(!overlay_scene.is_empty(), Ordering::Release);
+        this.renderer.note_scene_tiles(&overlay_scene);
         this.renderer.draw(&base_scene);
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.

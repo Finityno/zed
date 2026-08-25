@@ -287,6 +287,7 @@ impl MetalRenderer {
             !transparent,
             instance_buffer_pool,
             None,
+            None,
         )
     }
 
@@ -329,9 +330,19 @@ impl MetalRenderer {
             !transparent,
             instance_buffer_pool,
             Some(self.sprite_atlas.clone()),
+            Some(self.command_queue.clone()),
         );
         renderer.borrows_intermediates = true;
         renderer
+    }
+
+    /// Records the sprite tiles `scene` references as used in the frame about
+    /// to be drawn, without advancing the atlas or retiring anything. A
+    /// layered window calls this for its overlay scene before drawing the
+    /// base scene, so the base draw's retirement has seen every tile the
+    /// present as a whole still needs.
+    pub fn note_scene_tiles(&self, scene: &Scene) {
+        self.sprite_atlas.note_scene_tiles(scene);
     }
 
     /// Moves the drawable-sized intermediate textures out of this renderer so
@@ -368,7 +379,7 @@ impl MetalRenderer {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool, None)
+        Self::new_internal(device, None, true, instance_buffer_pool, None, None)
     }
 
     fn create_device() -> metal::Device {
@@ -399,6 +410,7 @@ impl MetalRenderer {
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
         shared_sprite_atlas: Option<Arc<MetalAtlas>>,
+        shared_command_queue: Option<CommandQueue>,
     ) -> Self {
         #[cfg(feature = "runtime_shaders")]
         let library = device
@@ -530,7 +542,10 @@ impl MetalRenderer {
         let depth_write_state = build_depth_stencil_state(&device, true);
         let depth_test_state = build_depth_stencil_state(&device, false);
 
-        let command_queue = device.new_command_queue();
+        // A renderer that borrows another's intermediate textures must also
+        // queue behind its command buffers: Metal orders command buffers
+        // within one queue, not across queues.
+        let command_queue = shared_command_queue.unwrap_or_else(|| device.new_command_queue());
         let sprite_atlas = shared_sprite_atlas
             .unwrap_or_else(|| Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu)));
         let core_video_texture_cache =
@@ -711,6 +726,10 @@ impl MetalRenderer {
     /// of a frame that used it holds its own reference, so dropping here
     /// never pulls a texture out from under an in-flight draw.
     fn retire_idle_path_intermediate(&mut self) {
+        // Borrowed textures are aged by their owner once per present.
+        if self.borrows_intermediates {
+            return;
+        }
         if self.path_intermediate_texture.is_some() {
             self.path_intermediate_idle_frames =
                 self.path_intermediate_idle_frames.saturating_add(1);

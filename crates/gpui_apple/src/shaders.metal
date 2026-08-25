@@ -899,6 +899,9 @@ fragment float4 polychrome_sprite_fragment(
 struct PathRasterizationVertexOutput {
   float4 position [[position]];
   float2 st_position;
+  // Screen-space position: `position` lands in the batch's slot of the
+  // intermediate, but fills are defined against the path's screen bounds.
+  float2 screen_position;
   uint vertex_id [[flat]];
   float clip_rect_distance [[clip_distance]][4];
 };
@@ -906,6 +909,7 @@ struct PathRasterizationVertexOutput {
 struct PathRasterizationFragmentInput {
   float4 position [[position]];
   float2 st_position;
+  float2 screen_position;
   uint vertex_id [[flat]];
 };
 
@@ -916,7 +920,8 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
   constant float2 *slot_offset [[buffer(PathRasterizationInputIndex_SlotOffset)]]
 ) {
   PathRasterizationVertex v = vertices[vertex_id];
-  float2 vertex_position = float2(v.xy_position.x, v.xy_position.y) + *slot_offset;
+  float2 screen_position = float2(v.xy_position.x, v.xy_position.y);
+  float2 vertex_position = screen_position + *slot_offset;
   float4 position = float4(
     vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
     0.,
@@ -925,6 +930,7 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
   return PathRasterizationVertexOutput{
       position,
       float2(v.st_position.x, v.st_position.y),
+      screen_position,
       vertex_id,
       {
         v.xy_position.x - v.bounds.origin.x,
@@ -968,7 +974,7 @@ fragment float4 path_rasterization_fragment(
 
   float4 color = fill_color(
     background,
-    input.position.xy,
+    input.screen_position,
     path_bounds,
     gradient_color.solid,
     gradient_color.color0,

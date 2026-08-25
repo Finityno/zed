@@ -36,6 +36,12 @@ impl MetalAtlas {
         self.note_frame_drawn(scene);
         self.retire_unused(ATLAS_TILE_MAX_IDLE_FRAMES);
     }
+
+    /// Marks `scene`'s tiles as used in the current frame without advancing
+    /// it; see [`MetalRenderer::note_scene_tiles`].
+    pub fn note_scene_tiles(&self, scene: &Scene) {
+        self.0.lock().mark_scene_tiles(scene);
+    }
 }
 
 impl MetalAtlas {
@@ -120,24 +126,7 @@ impl PlatformAtlas for MetalAtlas {
     fn note_frame_drawn(&self, scene: &Scene) {
         let mut lock = self.0.lock();
         lock.frame += 1;
-        let frame = lock.frame;
-        // `Scene::finish` sorts each sprite list by tile id within a draw order, so
-        // a glyph repeated across a line of text collapses to one lookup here.
-        let mut previous: Option<(AtlasTextureId, TileId)> = None;
-        let tiles = scene
-            .monochrome_sprites
-            .iter()
-            .map(|sprite| sprite.tile)
-            .chain(scene.subpixel_sprites.iter().map(|sprite| sprite.tile))
-            .chain(scene.polychrome_sprites.iter().map(|sprite| sprite.tile));
-        for tile in tiles {
-            let identity = (tile.texture_id, tile.tile_id);
-            if previous == Some(identity) {
-                continue;
-            }
-            previous = Some(identity);
-            lock.touch(tile, frame);
-        }
+        lock.mark_scene_tiles(scene);
     }
 
     fn retire_unused(&self, max_idle_frames: u64) {
@@ -194,6 +183,28 @@ impl PlatformAtlas for MetalAtlas {
 }
 
 impl MetalAtlasState {
+    /// Records every tile `scene` references as used in the current frame.
+    fn mark_scene_tiles(&mut self, scene: &Scene) {
+        let frame = self.frame;
+        // `Scene::finish` sorts each sprite list by tile id within a draw order, so
+        // a glyph repeated across a line of text collapses to one lookup here.
+        let mut previous: Option<(AtlasTextureId, TileId)> = None;
+        let tiles = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| sprite.tile)
+            .chain(scene.subpixel_sprites.iter().map(|sprite| sprite.tile))
+            .chain(scene.polychrome_sprites.iter().map(|sprite| sprite.tile));
+        for tile in tiles {
+            let identity = (tile.texture_id, tile.tile_id);
+            if previous == Some(identity) {
+                continue;
+            }
+            previous = Some(identity);
+            self.touch(tile, frame);
+        }
+    }
+
     fn textures(&self, kind: AtlasTextureKind) -> &AtlasTextureList<MetalAtlasTexture> {
         match kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
