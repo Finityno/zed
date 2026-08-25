@@ -1181,6 +1181,10 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    /// The sprite atlas's frame counter when this window last presented. The
+    /// retained scene's tiles were all marked used at that frame, so while it is
+    /// recent they cannot have been retired; see `rendered_scene_may_reference_retired_tiles`.
+    atlas_frame_at_last_present: u64,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1690,7 +1694,19 @@ impl Window {
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| {
+                            if window.rendered_scene_may_reference_retired_tiles() {
+                                // The retained scene is old enough that the atlas may
+                                // have reclaimed tiles it names. Rebuild it without
+                                // cached-view replay so every tile is fetched afresh.
+                                window.refresh();
+                                let arena_clear_needed = window.draw(cx);
+                                window.present();
+                                arena_clear_needed.clear(cx);
+                            } else {
+                                window.present();
+                            }
+                        })
                         .log_err();
                 }
 
@@ -1879,6 +1895,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            atlas_frame_at_last_present: 0,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3024,6 +3041,12 @@ impl Window {
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
+        if self.rendered_scene_may_reference_retired_tiles() {
+            // Cached views replay last frame's primitives, tiles included, without
+            // going back to the atlas. If that frame is older than the atlas's idle
+            // window those tiles may be gone, so bypass reuse for this draw.
+            self.refresh();
+        }
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
 
@@ -3180,6 +3203,7 @@ impl Window {
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
         );
+        self.atlas_frame_at_last_present = self.sprite_atlas.frame_index();
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3189,6 +3213,17 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Whether the retained scene was last presented so long ago, in sprite-atlas
+    /// frames, that glyph or SVG tiles it references may since have been retired
+    /// by [`PlatformAtlas::retire_unused`]. The atlas can be shared by several
+    /// windows, so another window's frames age this one's scene too.
+    fn rendered_scene_may_reference_retired_tiles(&self) -> bool {
+        self.sprite_atlas
+            .frame_index()
+            .saturating_sub(self.atlas_frame_at_last_present)
+            >= crate::ATLAS_TILE_MAX_IDLE_FRAMES
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
