@@ -832,6 +832,27 @@ impl MacWindowState {
         }
     }
 
+    /// A display-link tick already queued when the window went occluded can
+    /// still draw once, rebuilding the intermediate textures that
+    /// `windowDidChangeOcclusionState:` released, with no later transition to
+    /// release them again. Dropping them after any draw made while not
+    /// visible keeps an occluded window at zero; the frame's command buffer
+    /// holds its own references until the GPU is done.
+    fn release_intermediates_if_occluded(&mut self) {
+        let visible = unsafe {
+            self.native_window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+        };
+        if visible {
+            return;
+        }
+        self.renderer.release_intermediate_textures();
+        if let Some(renderer) = self.overlay_renderer.as_mut() {
+            renderer.release_intermediate_textures();
+        }
+    }
+
     fn start_display_link(&mut self) {
         self.stop_display_link();
         unsafe {
@@ -2096,6 +2117,7 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        this.release_intermediates_if_occluded();
     }
 
     fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) {
@@ -2129,6 +2151,7 @@ impl PlatformWindow for MacWindow {
         overlay_renderer.draw(&overlay_scene);
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
+        this.release_intermediates_if_occluded();
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
