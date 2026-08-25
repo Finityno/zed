@@ -1106,6 +1106,10 @@ impl MetalRenderer {
             self.update_intermediate_textures(viewport_size);
         }
 
+        // Every present goes through here, so this is where a frame's sprite
+        // tiles count as used; it also retires tiles idle for too long.
+        self.sprite_atlas.on_frame_drawn(scene);
+
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
