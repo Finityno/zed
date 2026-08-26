@@ -981,6 +981,14 @@ impl ListState {
             .last_layout_bounds
             .map_or(px(0.), |bounds| bounds.size.height);
         let logical_scroll_top = state.logical_scroll_top();
+        let max_scroll_offset = state.max_scroll_offset();
+        let scroll_offset = if state.logical_scroll_top.is_none()
+            && state.alignment == ListAlignment::Bottom
+        {
+            max_scroll_offset
+        } else {
+            state.scroll_top(&logical_scroll_top)
+        };
         ListStateDiagnostics {
             item_count: summary.count,
             measured_item_count: summary.rendered_count,
@@ -988,8 +996,8 @@ impl ListState {
             unknown_item_count,
             content_height: summary.height + padding.top + padding.bottom,
             viewport_height,
-            scroll_offset: state.scroll_top(&logical_scroll_top),
-            max_scroll_offset: state.max_scroll_offset(),
+            scroll_offset,
+            max_scroll_offset,
             logical_scroll_top,
             is_following_tail: state.follow_state.is_following(),
             is_scrollbar_dragging: state.scrollbar_drag_start_height.is_some(),
