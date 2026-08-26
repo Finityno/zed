@@ -100,6 +100,33 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    height_hint_measurements: HeightHintMeasurements,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HeightHintMeasurements {
+    count: usize,
+    signed_error: Pixels,
+    absolute_error: Pixels,
+    max_absolute_error: Pixels,
+}
+
+impl HeightHintMeasurements {
+    fn record(&mut self, item: &ListItem, measured_height: Pixels) {
+        let ListItem::Unmeasured {
+            size_hint: Some(size_hint),
+            ..
+        } = item
+        else {
+            return;
+        };
+        let error = measured_height - size_hint.height;
+        let absolute_error = px(f32::from(error).abs());
+        self.count = self.count.saturating_add(1);
+        self.signed_error += error;
+        self.absolute_error += absolute_error;
+        self.max_absolute_error = self.max_absolute_error.max(absolute_error);
+    }
 }
 
 /// A zero-allocation snapshot of the state used to size and position a list.
@@ -127,6 +154,14 @@ pub struct ListStateDiagnostics {
     pub is_following_tail: bool,
     /// Whether the scrollbar is holding the content extent fixed during a drag.
     pub is_scrollbar_dragging: bool,
+    /// Hinted items that have since been measured exactly in this reset cycle.
+    pub height_hint_measurement_count: usize,
+    /// Sum of `measured - hinted` height across those items.
+    pub height_hint_signed_error: Pixels,
+    /// Sum of absolute hint error across those items.
+    pub height_hint_absolute_error: Pixels,
+    /// Largest absolute error observed for one hinted item.
+    pub height_hint_max_absolute_error: Pixels,
 }
 
 /// The height information retained for one list item.
@@ -391,6 +426,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            height_hint_measurements: HeightHintMeasurements::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -426,6 +462,7 @@ impl ListState {
             state.logical_scroll_top = None;
             state.pending_scroll = None;
             state.scrollbar_drag_start_height = None;
+            state.height_hint_measurements = HeightHintMeasurements::default();
             state.items.summary().count
         };
 
@@ -449,6 +486,7 @@ impl ListState {
         state.logical_scroll_top = None;
         state.pending_scroll = None;
         state.scrollbar_drag_start_height = None;
+        state.height_hint_measurements = HeightHintMeasurements::default();
         state.items = SumTree::from_iter(
             heights.into_iter().map(|height| ListItem::Unmeasured {
                 size_hint: Some(size(px(0.), height)),
@@ -1015,6 +1053,10 @@ impl ListState {
             logical_scroll_top,
             is_following_tail: state.follow_state.is_following(),
             is_scrollbar_dragging: state.scrollbar_drag_start_height.is_some(),
+            height_hint_measurement_count: state.height_hint_measurements.count,
+            height_hint_signed_error: state.height_hint_measurements.signed_error,
+            height_hint_absolute_error: state.height_hint_measurements.absolute_error,
+            height_hint_max_absolute_error: state.height_hint_measurements.max_absolute_error,
         }
     }
 
@@ -1244,12 +1286,16 @@ impl StateInner {
         );
 
         let mut measured_items = Vec::default();
+        let height_hint_measurements = &mut self.height_hint_measurements;
 
         for (ix, item) in cursor.enumerate() {
             let size = item.size().unwrap_or_else(|| {
                 let mut element = render_item(ix, window, cx);
                 element.layout_as_root(available_item_space, window, cx)
             });
+            if item.size().is_none() {
+                height_hint_measurements.record(item, size.height);
+            }
 
             measured_items.push(ListItem::Measured {
                 size,
@@ -1294,6 +1340,7 @@ impl StateInner {
         );
 
         let mut cursor = old_items.cursor::<Count>(());
+        let height_hint_measurements = &mut self.height_hint_measurements;
 
         // Render items after the scroll top, including those in the trailing overdraw
         cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
@@ -1312,6 +1359,9 @@ impl StateInner {
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
                 size = Some(element_size);
+                if item.size().is_none() {
+                    height_hint_measurements.record(item, element_size.height);
+                }
 
                 // If there's a pending scroll adjustment for the scroll-top
                 // item, apply it.
@@ -1372,6 +1422,9 @@ impl StateInner {
                     let item_index = cursor.start().0;
                     let mut element = render_item(item_index, window, cx);
                     let element_size = element.layout_as_root(available_item_space, window, cx);
+                    if item.size().is_none() {
+                        height_hint_measurements.record(item, element_size.height);
+                    }
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
                     measured_items.push_front(ListItem::Measured {
@@ -1420,7 +1473,9 @@ impl StateInner {
                     *size
                 } else {
                     let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root(available_item_space, window, cx)
+                    let size = element.layout_as_root(available_item_space, window, cx);
+                    height_hint_measurements.record(item, size.height);
+                    size
                 };
 
                 leading_overdraw += size.height;
@@ -2015,6 +2070,41 @@ mod test {
                 (3, ListItemHeight::Hint(px(50.))),
             ]
         );
+    }
+
+    #[gpui::test]
+    fn height_hint_diagnostics_record_measurement_error_without_retaining_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(0, ListAlignment::Top, px(0.));
+        state.reset_with_item_heights([px(10.), px(20.), px(30.)]);
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |index, _, _| {
+                    let height = match index {
+                        0 => px(12.),
+                        1 => px(18.),
+                        _ => px(35.),
+                    };
+                    div().h(height).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| TestView(state.clone())).into_any_element()
+        });
+
+        let diagnostics = state.diagnostics();
+        assert_eq!(diagnostics.height_hint_measurement_count, 3);
+        assert_eq!(diagnostics.height_hint_signed_error, px(5.));
+        assert_eq!(diagnostics.height_hint_absolute_error, px(9.));
+        assert_eq!(diagnostics.height_hint_max_absolute_error, px(5.));
     }
 
     #[gpui::test]
