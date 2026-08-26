@@ -508,6 +508,20 @@ impl ListState {
         self.remeasure_items_with_scroll_anchor(range, ScrollAnchor::Absolute);
     }
 
+    /// Mark items in `range` for remeasurement and replace their provisional
+    /// heights while preserving the same pixel offset into the scroll-top item.
+    pub fn remeasure_items_with_item_heights(
+        &self,
+        range: Range<usize>,
+        heights: impl IntoIterator<Item = Pixels>,
+    ) {
+        self.remeasure_items_with_scroll_anchor_and_heights(
+            range,
+            ScrollAnchor::Absolute,
+            heights.into_iter(),
+        );
+    }
+
     fn remeasure_items_with_scroll_anchor(&self, range: Range<usize>, scroll_anchor: ScrollAnchor) {
         let state = &mut *self.0.borrow_mut();
         Self::preserve_scroll_for_remeasurement(state, &range, scroll_anchor);
@@ -1987,14 +2001,17 @@ mod test {
         assert_eq!(diagnostics.hinted_item_count, 4);
         assert_eq!(diagnostics.content_height, px(140.));
 
+        state.remeasure_items_with_item_heights(1..3, [px(5.), px(6.)]);
+        assert_eq!(state.diagnostics().content_height, px(81.));
+
         let mut heights = Vec::new();
         state.inspect_item_heights(|index, height| heights.push((index, height)));
         assert_eq!(
             heights,
             vec![
                 (0, ListItemHeight::Hint(px(20.))),
-                (1, ListItemHeight::Hint(px(30.))),
-                (2, ListItemHeight::Hint(px(40.))),
+                (1, ListItemHeight::Hint(px(5.))),
+                (2, ListItemHeight::Hint(px(6.))),
                 (3, ListItemHeight::Hint(px(50.))),
             ]
         );
