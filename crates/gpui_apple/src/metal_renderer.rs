@@ -296,12 +296,29 @@ impl MetalRenderer {
         layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_opaque(!transparent);
-        // Two drawables instead of Core Animation's default three: one fewer
-        // drawable-sized IOSurface per window (4 bytes per pixel, 29MB at
-        // retina full-screen) while the window is painting. The frame after
-        // a slow one can wait on the previous present, which the per-window
-        // present-interval histogram makes visible if it ever matters.
-        layer.set_maximum_drawable_count(2);
+        // Core Animation's default three, deliberately.
+        //
+        // Two was tried, for one fewer drawable-sized IOSurface per window
+        // (4 bytes per pixel, 29MB at retina full-screen) while the window is
+        // painting, on the reasoning that the frame after a slow one could
+        // wait on the previous present. It mattered, and not as a slow frame:
+        // with `setAllowsNextDrawableTimeout: NO` below, a request made while
+        // both drawables are in flight blocks the calling thread outright,
+        // and the WindowServer does not hand one back promptly for a window
+        // it is not compositing — occluded, just deactivated, or mid
+        // app-switch. Sampled 2026-08-26 during app switching: 1195 of the
+        // main thread's 8050 samples (~2.2s of 15s, 58% of every sample where
+        // it was doing anything at all) sat in `nextDrawable` on
+        // `semaphore_timedwait_trap`. Blocked there, the app cannot answer
+        // AppKit's activation handshake, so macOS defers HID delivery
+        // system-wide and the whole desktop freezes for about a second per
+        // switch.
+        //
+        // The third drawable costs its IOSurface only while the window is
+        // actually painting; the WindowServer purges idle ones. Apple
+        // documents 2 and 3 as the only permitted values, so there is no
+        // middle ground to take instead.
+        layer.set_maximum_drawable_count(3);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
