@@ -354,6 +354,19 @@ enum ListItem {
 }
 
 impl ListItem {
+    fn height_state(&self) -> ListItemHeight {
+        match self {
+            ListItem::Unmeasured {
+                size_hint: Some(size),
+                ..
+            } => ListItemHeight::Hint(size.height),
+            ListItem::Unmeasured {
+                size_hint: None, ..
+            } => ListItemHeight::Unknown,
+            ListItem::Measured { size, .. } => ListItemHeight::Measured(size.height),
+        }
+    }
+
     fn size(&self) -> Option<Size<Pixels>> {
         if let ListItem::Measured { size, .. } = self {
             Some(*size)
@@ -1060,21 +1073,19 @@ impl ListState {
         }
     }
 
+    /// Return the retained height state for one item.
+    pub fn item_height(&self, index: usize) -> Option<ListItemHeight> {
+        let state = self.0.borrow();
+        let mut cursor = state.items.cursor::<Count>(());
+        cursor.seek(&Count(index), Bias::Right);
+        cursor.item().map(ListItem::height_state)
+    }
+
     /// Visit item height states without allocating a parallel diagnostics vector.
     pub fn inspect_item_heights(&self, mut inspect: impl FnMut(usize, ListItemHeight)) {
         let state = self.0.borrow();
         for (index, item) in state.items.iter().enumerate() {
-            let height = match item {
-                ListItem::Unmeasured {
-                    size_hint: Some(size),
-                    ..
-                } => ListItemHeight::Hint(size.height),
-                ListItem::Unmeasured {
-                    size_hint: None, ..
-                } => ListItemHeight::Unknown,
-                ListItem::Measured { size, .. } => ListItemHeight::Measured(size.height),
-            };
-            inspect(index, height);
+            inspect(index, item.height_state());
         }
     }
 
@@ -2058,6 +2069,9 @@ mod test {
 
         state.remeasure_items_with_item_heights(1..3, [px(5.), px(6.)]);
         assert_eq!(state.diagnostics().content_height, px(81.));
+        assert_eq!(state.item_height(0), Some(ListItemHeight::Hint(px(20.))));
+        assert_eq!(state.item_height(2), Some(ListItemHeight::Hint(px(6.))));
+        assert_eq!(state.item_height(4), None);
 
         let mut heights = Vec::new();
         state.inspect_item_heights(|index, height| heights.push((index, height)));
