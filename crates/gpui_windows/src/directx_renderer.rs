@@ -147,6 +147,10 @@ struct OverlayResources {
 struct PathIntermediates {
     texture: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
+    /// For clearing `texture` before a mixed-draw-order batch, whose sprite
+    /// pass samples a spanning rect that can cross tiles the batch never
+    /// rewrites (see `draw_paths_to_intermediate`).
+    render_target_view: Option<ID3D11RenderTargetView>,
     msaa_texture: ID3D11Texture2D,
     msaa_view: Option<ID3D11RenderTargetView>,
     resolve_texture: ID3D11Texture2D,
@@ -154,7 +158,8 @@ struct PathIntermediates {
 
 impl PathIntermediates {
     fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
-        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let (texture, srv, render_target_view) =
+            create_path_intermediate_texture(device, width, height)?;
         let (msaa_texture, msaa_view) = create_path_intermediate_msaa_texture_and_view(
             device,
             PATH_RASTER_TILE_SIZE,
@@ -168,6 +173,7 @@ impl PathIntermediates {
         Ok(Self {
             texture,
             srv,
+            render_target_view,
             msaa_texture,
             msaa_view,
             resolve_texture,
@@ -1255,6 +1261,30 @@ impl DirectXRenderer {
                 resources.path_intermediates.insert(created)
             }
         };
+        // A batch that mixes draw orders is sampled back through ONE spanning
+        // rect (see `draw_paths_from_intermediate`), and that rect can cross
+        // tiles no path in this batch touches. Those texels hold whatever an
+        // earlier batch left in the intermediate — or driver-recycled garbage
+        // on a texture rebuilt after a resize — and without this clear they
+        // re-composite to the screen every frame: a dismissed selection
+        // highlight or a moved corner mask stays visible as a ghost. A
+        // uniform-order batch samples only per-path bounds, whose tiles are
+        // all rewritten below, so it skips the window-sized clear.
+        let mixed_orders = match (paths.first(), paths.last()) {
+            (Some(first), Some(last)) => first.order != last.order,
+            _ => false,
+        };
+        if mixed_orders {
+            unsafe {
+                devices.device_context.ClearRenderTargetView(
+                    intermediates
+                        .render_target_view
+                        .as_ref()
+                        .context("path intermediate render target view missing")?,
+                    &[0.0; 4],
+                );
+            }
+        }
         // Which raster tiles does this batch touch? Marked over a
         // ceil(width/T) x ceil(height/T) grid from each path's clipped bounds.
         let tile = PATH_RASTER_TILE_SIZE;
@@ -2499,7 +2529,11 @@ fn create_path_intermediate_texture(
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
+) -> Result<(
+    ID3D11Texture2D,
+    Option<ID3D11ShaderResourceView>,
+    Option<ID3D11RenderTargetView>,
+)> {
     let texture = unsafe {
         let mut output = None;
         let desc = D3D11_TEXTURE2D_DESC {
@@ -2523,8 +2557,10 @@ fn create_path_intermediate_texture(
 
     let mut shader_resource_view = None;
     unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+    let mut render_target_view = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))? };
 
-    Ok((texture, Some(shader_resource_view.unwrap())))
+    Ok((texture, Some(shader_resource_view.unwrap()), render_target_view))
 }
 
 /// Single-sample tile the MSAA tile resolves into before being region-copied
@@ -3704,5 +3740,142 @@ mod rendered_pixel_tests {
         ] {
             assert!(!lit(x, y), "unexpected ink at ({x}, {y})");
         }
+    }
+
+    struct GhostView {
+        second_frame: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Render for GhostView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let second_frame = self.second_frame.get();
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _cx| {
+                        let square = |left: f32, top: f32, side: f32| {
+                            let mut builder = gpui::PathBuilder::fill();
+                            builder.move_to(point(px(left), px(top)));
+                            builder.line_to(point(px(left + side), px(top)));
+                            builder.line_to(point(px(left + side), px(top + side)));
+                            builder.line_to(point(px(left), px(top + side)));
+                            builder.close();
+                            builder.build()
+                        };
+                        if second_frame {
+                            // Two OVERLAPPING squares (the bounds tree gives the
+                            // second a higher draw order, so the batch mixes
+                            // orders and the sprite pass samples one spanning
+                            // rect) plus a far square that stretches that rect
+                            // across the tile where frame one's ink was left.
+                            for path in [
+                                square(100., 100., 80.),
+                                square(140., 140., 80.),
+                                square(1000., 700., 50.),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                window.paint_path(path, hsla(0., 0., 1., 1.));
+                            }
+                        } else if let Ok(path) = square(580., 480., 40.) {
+                            window.paint_path(path, hsla(0., 0., 1., 1.));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// A mixed-draw-order path batch is sampled from the intermediate through
+    /// one spanning rect, which can cross raster tiles the batch never
+    /// rewrites. Ink a previous frame left in those tiles must not be
+    /// re-composited: frame one draws a lone square, frame two draws a
+    /// mixed-order batch whose spanning rect covers the (now path-free) spot
+    /// where that square was, and the spot must render dark.
+    #[test]
+    fn stale_path_ink_does_not_ghost_through_spanning_rect() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+            eprintln!("SKIPPED: no DirectWrite");
+            return;
+        };
+        if DirectXHeadlessRenderer::new().is_none() {
+            eprintln!("SKIPPED: no headless renderer");
+            return;
+        }
+
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(text_system),
+            Some(Box::new(|| {
+                DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+            })),
+        );
+
+        let second_frame = std::rc::Rc::new(std::cell::Cell::new(false));
+        let window = cx.add_window({
+            let second_frame = second_frame.clone();
+            move |_, _| GhostView { second_frame }
+        });
+
+        let first_image = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.resize(size(px(1200.), px(800.)));
+                window.draw(cx).clear(cx);
+                window.render_to_image()
+            })
+            .unwrap()
+            .expect("rendering the first frame should succeed");
+
+        second_frame.set(true);
+        let second_image = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.render_to_image()
+            })
+            .unwrap()
+            .expect("rendering the second frame should succeed");
+
+        if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
+            let directory = std::path::Path::new(&directory);
+            first_image.save(&directory.join("path-ghost-1.png")).log_err();
+            second_image.save(&directory.join("path-ghost-2.png")).log_err();
+        }
+
+        let scale = first_image.width() as f32 / 1200.0;
+        let device = |logical: f32| (logical * scale).round() as u32;
+        let lit = |image: &image::RgbaImage, x: u32, y: u32| {
+            let pixel = image.get_pixel(x, y);
+            pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > 380
+        };
+
+        // Frame one: the lone square landed.
+        assert!(
+            lit(&first_image, device(600.0), device(500.0)),
+            "frame one's square did not render"
+        );
+        // Frame two: its own paths landed...
+        assert!(
+            lit(&second_image, device(160.0), device(160.0)),
+            "the overlapping pair did not render"
+        );
+        assert!(
+            lit(&second_image, device(1025.0), device(725.0)),
+            "the far square did not render"
+        );
+        // ...and frame one's square is gone, not ghosting through the
+        // spanning rect from a raster tile this batch never rewrote.
+        assert!(
+            !lit(&second_image, device(600.0), device(500.0)),
+            "stale path ink from the previous frame ghosted back"
+        );
     }
 }
