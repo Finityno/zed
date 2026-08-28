@@ -23,6 +23,7 @@ test-support = [
     "gpui_macos/test-support",
     "gpui_windows/test-support",
 ]
+bench = ["gpui/bench", "gpui_macos/bench", "gpui_windows/bench"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
