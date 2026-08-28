@@ -90,15 +90,13 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
         ))
     }
 
-    // gpui_windows exports its headless renderer only under test-support, so a
-    // bench-support-only build on Windows falls through to `None` like upstream.
-    #[cfg(all(target_os = "windows", feature = "test-support"))]
+    #[cfg(target_os = "windows")]
     {
         gpui_windows::DirectXHeadlessRenderer::new()
             .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
     }
 
-    #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "test-support"))))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }

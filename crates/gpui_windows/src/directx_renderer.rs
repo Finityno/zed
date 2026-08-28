@@ -336,7 +336,7 @@ impl DirectXRenderer {
     /// and skips DirectComposition entirely (that does need an HWND). Everything downstream —
     /// pipelines, shaders, blend states, the atlas — is the same as the windowed path, which is
     /// the point: an image produced here went through the real renderer.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(feature = "bench-support", feature = "test-support"))]
     pub(crate) fn new_headless(directx_devices: &DirectXDevices) -> Result<Self> {
         let devices = DirectXRendererDevices::new(directx_devices, false)
             .context("Creating DirectX devices")?;
@@ -378,7 +378,7 @@ impl DirectXRenderer {
     ///
     /// Must be called after `draw` and before any present. The render target is
     /// `DXGI_FORMAT_B8G8R8A8_UNORM`, so the channels are swapped on the way out.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(feature = "bench-support", feature = "test-support"))]
     pub(crate) fn read_back_render_target(&self) -> Result<image::RgbaImage> {
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING,
@@ -3339,12 +3339,12 @@ mod dxgi {
 
 /// Renders scenes to images with no window, so tests can assert on the pixels the real
 /// DirectX pipeline actually produces rather than on the scene that was handed to it.
-#[cfg(feature = "test-support")]
+#[cfg(any(feature = "bench-support", feature = "test-support"))]
 pub struct DirectXHeadlessRenderer {
     renderer: DirectXRenderer,
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(feature = "bench-support", feature = "test-support"))]
 impl DirectXHeadlessRenderer {
     /// Returns `None` when no usable D3D11 adapter is available, so callers can skip rather
     /// than fail for a reason unrelated to what they are testing.
@@ -3355,7 +3355,7 @@ impl DirectXHeadlessRenderer {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(feature = "bench-support", feature = "test-support"))]
 impl gpui::PlatformHeadlessRenderer for DirectXHeadlessRenderer {
     fn render_scene_to_image(
         &mut self,
