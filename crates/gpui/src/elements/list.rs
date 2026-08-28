@@ -138,6 +138,8 @@ pub struct ListStateDiagnostics {
     pub measured_item_count: usize,
     /// Unmeasured items that contribute a height hint to the scroll extent.
     pub hinted_item_count: usize,
+    /// Unmeasured items whose caller-provided height is exact for the current layout key.
+    pub exact_unmeasured_item_count: usize,
     /// Unmeasured items that currently contribute no height to the scroll extent.
     pub unknown_item_count: usize,
     /// Current content height, including list padding.
@@ -171,8 +173,31 @@ pub enum ListItemHeight {
     Unknown,
     /// The item has not been measured, but contributes this height to the extent.
     Hint(Pixels),
+    /// The item has not been rendered, but its height is exact for the current layout key.
+    Exact(Pixels),
     /// The item has been laid out at this exact height.
     Measured(Pixels),
+}
+
+/// Caller-provided height knowledge for an item that has not been rendered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListItemHeightEstimate {
+    /// The height is provisional and should be verified throughout the overdraw band.
+    Hint(Pixels),
+    /// The height is exact for the current layout key and only needs layout when visible.
+    Exact(Pixels),
+}
+
+impl ListItemHeightEstimate {
+    fn height(self) -> Pixels {
+        match self {
+            Self::Hint(height) | Self::Exact(height) => height,
+        }
+    }
+
+    fn is_exact(self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -345,6 +370,7 @@ pub struct ListPrepaintState {
 enum ListItem {
     Unmeasured {
         size_hint: Option<Size<Pixels>>,
+        height_is_exact: bool,
         focus_handle: Option<FocusHandle>,
     },
     Measured {
@@ -356,6 +382,11 @@ enum ListItem {
 impl ListItem {
     fn height_state(&self) -> ListItemHeight {
         match self {
+            ListItem::Unmeasured {
+                size_hint: Some(size),
+                height_is_exact: true,
+                ..
+            } => ListItemHeight::Exact(size.height),
             ListItem::Unmeasured {
                 size_hint: Some(size),
                 ..
@@ -372,6 +403,18 @@ impl ListItem {
             Some(*size)
         } else {
             None
+        }
+    }
+
+    fn extent_size(&self) -> Option<Size<Pixels>> {
+        match self {
+            ListItem::Unmeasured {
+                size_hint,
+                height_is_exact: true,
+                ..
+            } => *size_hint,
+            ListItem::Unmeasured { .. } => None,
+            ListItem::Measured { size, .. } => Some(*size),
         }
     }
 
@@ -493,6 +536,16 @@ impl ListState {
     /// Replace every item and seed the scroll extent with a content-derived height
     /// for each replacement. The iterator length becomes the new item count.
     pub fn reset_with_item_heights(&self, heights: impl IntoIterator<Item = Pixels>) {
+        self.reset_with_item_height_estimates(
+            heights.into_iter().map(ListItemHeightEstimate::Hint),
+        );
+    }
+
+    /// Replace every item with an unrendered item carrying explicit height knowledge.
+    pub fn reset_with_item_height_estimates(
+        &self,
+        estimates: impl IntoIterator<Item = ListItemHeightEstimate>,
+    ) {
         let state = &mut *self.0.borrow_mut();
         state.reset = true;
         state.measuring_behavior.reset();
@@ -501,8 +554,9 @@ impl ListState {
         state.scrollbar_drag_start_height = None;
         state.height_hint_measurements = HeightHintMeasurements::default();
         state.items = SumTree::from_iter(
-            heights.into_iter().map(|height| ListItem::Unmeasured {
-                size_hint: Some(size(px(0.), height)),
+            estimates.into_iter().map(|estimate| ListItem::Unmeasured {
+                size_hint: Some(size(px(0.), estimate.height())),
+                height_is_exact: estimate.is_exact(),
                 focus_handle: None,
             }),
             (),
@@ -520,6 +574,7 @@ impl ListState {
             .iter()
             .map(|item| ListItem::Unmeasured {
                 size_hint: Some(item.size_hint().unwrap_or(size_hint)),
+                height_is_exact: false,
                 focus_handle: item.focus_handle(),
             })
             .collect::<Vec<_>>();
@@ -540,11 +595,21 @@ impl ListState {
     /// Remeasure every item while replacing its old height with a fresh content-derived
     /// hint. Missing iterator entries retain their previous measurement as a hint.
     pub fn remeasure_with_item_heights(&self, heights: impl IntoIterator<Item = Pixels>) {
+        self.remeasure_with_item_height_estimates(
+            heights.into_iter().map(ListItemHeightEstimate::Hint),
+        );
+    }
+
+    /// Remeasure every item while replacing its previous height knowledge.
+    pub fn remeasure_with_item_height_estimates(
+        &self,
+        estimates: impl IntoIterator<Item = ListItemHeightEstimate>,
+    ) {
         let count = self.item_count();
-        self.remeasure_items_with_scroll_anchor_and_heights(
+        self.remeasure_items_with_scroll_anchor_and_estimates(
             0..count,
             ScrollAnchor::Proportional,
-            heights.into_iter(),
+            estimates.into_iter(),
         );
     }
 
@@ -566,10 +631,10 @@ impl ListState {
         range: Range<usize>,
         heights: impl IntoIterator<Item = Pixels>,
     ) {
-        self.remeasure_items_with_scroll_anchor_and_heights(
+        self.remeasure_items_with_scroll_anchor_and_estimates(
             range,
             ScrollAnchor::Absolute,
-            heights.into_iter(),
+            heights.into_iter().map(ListItemHeightEstimate::Hint),
         );
     }
 
@@ -586,6 +651,7 @@ impl ListState {
             new_items.extend(
                 invalidated.iter().map(|item| ListItem::Unmeasured {
                     size_hint: item.size_hint(),
+                    height_is_exact: false,
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -597,11 +663,11 @@ impl ListState {
         state.measuring_behavior.reset();
     }
 
-    fn remeasure_items_with_scroll_anchor_and_heights(
+    fn remeasure_items_with_scroll_anchor_and_estimates(
         &self,
         range: Range<usize>,
         scroll_anchor: ScrollAnchor,
-        mut heights: impl Iterator<Item = Pixels>,
+        mut estimates: impl Iterator<Item = ListItemHeightEstimate>,
     ) {
         let state = &mut *self.0.borrow_mut();
         Self::preserve_scroll_for_remeasurement(state, &range, scroll_anchor);
@@ -611,12 +677,15 @@ impl ListState {
             let mut new_items = cursor.slice(&Count(range.start), Bias::Right);
             let invalidated = cursor.slice(&Count(range.end), Bias::Right);
             new_items.extend(
-                invalidated.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: heights
-                        .next()
-                        .map(|height| size(px(0.), height))
-                        .or_else(|| item.size_hint()),
-                    focus_handle: item.focus_handle(),
+                invalidated.iter().map(|item| {
+                    let estimate = estimates.next();
+                    ListItem::Unmeasured {
+                        size_hint: estimate
+                            .map(|estimate| size(px(0.), estimate.height()))
+                            .or_else(|| item.size_hint()),
+                        height_is_exact: estimate.is_some_and(ListItemHeightEstimate::is_exact),
+                        focus_handle: item.focus_handle(),
+                    }
                 }),
                 (),
             );
@@ -650,7 +719,7 @@ impl ListState {
                 cursor
                     .item()
                     .and_then(|item| {
-                        item.size().map(|size| {
+                        item.extent_size().map(|size| {
                             let fraction = if size.height.0 > 0.0 {
                                 (scroll_top.offset_in_item.0 / size.height.0).clamp(0.0, 1.0)
                             } else {
@@ -704,11 +773,27 @@ impl ListState {
         old_range: Range<usize>,
         heights: impl IntoIterator<Item = Pixels>,
     ) {
+        self.splice_with_item_height_estimates(
+            old_range,
+            heights.into_iter().map(ListItemHeightEstimate::Hint),
+        );
+    }
+
+    /// Replace `old_range` with unrendered items carrying explicit height knowledge.
+    pub fn splice_with_item_height_estimates(
+        &self,
+        old_range: Range<usize>,
+        estimates: impl IntoIterator<Item = ListItemHeightEstimate>,
+    ) {
         self.splice_with_item_data(
             old_range,
-            heights
-                .into_iter()
-                .map(|height| (Some(size(px(0.), height)), None)),
+            estimates.into_iter().map(|estimate| {
+                (
+                    Some(size(px(0.), estimate.height())),
+                    estimate.is_exact(),
+                    None,
+                )
+            }),
         );
     }
 
@@ -725,14 +810,14 @@ impl ListState {
             old_range,
             focus_handles
                 .into_iter()
-                .map(|focus_handle| (None, focus_handle)),
+                .map(|focus_handle| (None, false, focus_handle)),
         );
     }
 
     fn splice_with_item_data(
         &self,
         old_range: Range<usize>,
-        items: impl IntoIterator<Item = (Option<Size<Pixels>>, Option<FocusHandle>)>,
+        items: impl IntoIterator<Item = (Option<Size<Pixels>>, bool, Option<FocusHandle>)>,
     ) {
         let state = &mut *self.0.borrow_mut();
 
@@ -742,10 +827,11 @@ impl ListState {
 
         let mut spliced_count = 0;
         new_items.extend(
-            items.into_iter().map(|(size_hint, focus_handle)| {
+            items.into_iter().map(|(size_hint, height_is_exact, focus_handle)| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
                     size_hint,
+                    height_is_exact,
                     focus_handle,
                 }
             }),
@@ -1027,11 +1113,18 @@ impl ListState {
         let state = self.0.borrow();
         let summary = state.items.summary();
         let mut hinted_item_count = 0;
+        let mut exact_unmeasured_item_count = 0;
         let mut unknown_item_count = 0;
         for item in state.items.iter() {
             match item {
                 ListItem::Unmeasured {
                     size_hint: Some(_),
+                    height_is_exact: true,
+                    ..
+                } => exact_unmeasured_item_count += 1,
+                ListItem::Unmeasured {
+                    size_hint: Some(_),
+                    height_is_exact: false,
                     ..
                 } => hinted_item_count += 1,
                 ListItem::Unmeasured {
@@ -1058,6 +1151,7 @@ impl ListState {
             item_count: summary.count,
             measured_item_count: summary.rendered_count,
             hinted_item_count,
+            exact_unmeasured_item_count,
             unknown_item_count,
             content_height: summary.height + padding.top + padding.bottom,
             viewport_height,
@@ -1361,15 +1455,17 @@ impl StateInner {
                 break;
             }
 
-            // Use the previously cached height and focus handle if available
-            let mut size = item.size();
+            // Exact unrendered heights are sufficient outside the viewport. Provisional
+            // hints still render throughout the overdraw band so they can converge.
+            let mut item_size = item.extent_size();
+            let mut replacement_item = None;
 
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
-            if visible_height < available_height || size.is_none() {
+            if visible_height < available_height || item_size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
-                size = Some(element_size);
+                item_size = Some(element_size);
                 if item.size().is_none() {
                     height_hint_measurements.record(item, element_size.height);
                 }
@@ -1409,15 +1505,17 @@ impl StateInner {
                         rendered_focused_item = true;
                     }
                 }
+
+                replacement_item = Some(ListItem::Measured {
+                    size: element_size,
+                    focus_handle: item.focus_handle(),
+                });
             }
 
-            let size = size.unwrap();
-            rendered_height += size.height;
-            max_item_width = max_item_width.max(size.width);
-            measured_items.push_back(ListItem::Measured {
-                size,
-                focus_handle: item.focus_handle(),
-            });
+            let item_size = item_size.unwrap();
+            rendered_height += item_size.height;
+            max_item_width = max_item_width.max(item_size.width);
+            measured_items.push_back(replacement_item.unwrap_or_else(|| item.clone()));
         }
         rendered_height += padding.bottom;
 
@@ -1480,20 +1578,23 @@ impl StateInner {
         while leading_overdraw < self.overdraw {
             cursor.prev();
             if let Some(item) = cursor.item() {
-                let size = if let ListItem::Measured { size, .. } = item {
-                    *size
+                let (item_size, replacement_item) = if let Some(item_size) = item.extent_size() {
+                    (item_size, item.clone())
                 } else {
                     let mut element = render_item(cursor.start().0, window, cx);
-                    let size = element.layout_as_root(available_item_space, window, cx);
-                    height_hint_measurements.record(item, size.height);
-                    size
+                    let item_size = element.layout_as_root(available_item_space, window, cx);
+                    height_hint_measurements.record(item, item_size.height);
+                    (
+                        item_size,
+                        ListItem::Measured {
+                            size: item_size,
+                            focus_handle: item.focus_handle(),
+                        },
+                    )
                 };
 
-                leading_overdraw += size.height;
-                measured_items.push_front(ListItem::Measured {
-                    size,
-                    focus_handle: item.focus_handle(),
-                });
+                leading_overdraw += item_size.height;
+                measured_items.push_front(replacement_item);
             } else {
                 break;
             }
@@ -1608,7 +1709,7 @@ impl StateInner {
                                         offset_in_item = Pixels::ZERO;
                                         break;
                                     };
-                                    let size = prev_item.size().unwrap_or_else(|| {
+                                    let size = prev_item.extent_size().unwrap_or_else(|| {
                                         let mut element = render_item(cursor.start().0, window, cx);
                                         let item_available_size = size(
                                             bounds.size.width.into(),
@@ -1638,7 +1739,7 @@ impl StateInner {
                                 cursor.prev();
                                 let Some(item) = cursor.item() else { break };
 
-                                let size = item.size().unwrap_or_else(|| {
+                                let size = item.extent_size().unwrap_or_else(|| {
                                     let mut item = render_item(cursor.start().0, window, cx);
                                     let item_available_size =
                                         size(bounds.size.width.into(), AvailableSpace::MinContent);
@@ -1853,6 +1954,7 @@ impl Element for List {
             .last_measured_item_width
             .is_none_or(|last_width| last_width != measured_item_width)
         {
+            let preserve_initial_exact_heights = state.last_measured_item_width.is_none();
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     // Carry the old measurement forward as an estimate. It is
@@ -1862,6 +1964,14 @@ impl Element for List {
                     // the scrollbar thumb and any proportional pending scroll
                     // all lurch until the items are re-measured.
                     size_hint: item.size_hint(),
+                    height_is_exact: preserve_initial_exact_heights
+                        && matches!(
+                            item,
+                            ListItem::Unmeasured {
+                                height_is_exact: true,
+                                ..
+                            }
+                        ),
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -1958,6 +2068,7 @@ impl sum_tree::Item for ListItem {
             ListItem::Unmeasured {
                 size_hint,
                 focus_handle,
+                ..
             } => ListItemSummary {
                 count: 1,
                 rendered_count: 0,
@@ -2040,8 +2151,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListAlignment, ListItemHeight, ListState, ParentElement, Render, Styled,
-        TestAppContext, Window, canvas, div, list, point, px, size,
+        IntoElement, ListAlignment, ListItemHeight, ListItemHeightEstimate, ListState,
+        ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, point, px, size,
     };
 
     #[test]
@@ -2053,6 +2164,7 @@ mod test {
         assert_eq!(diagnostics.item_count, 3);
         assert_eq!(diagnostics.measured_item_count, 0);
         assert_eq!(diagnostics.hinted_item_count, 3);
+        assert_eq!(diagnostics.exact_unmeasured_item_count, 0);
         assert_eq!(diagnostics.unknown_item_count, 0);
         assert_eq!(diagnostics.content_height, px(72.));
 
@@ -2084,6 +2196,97 @@ mod test {
                 (3, ListItemHeight::Hint(px(50.))),
             ]
         );
+    }
+
+    #[gpui::test]
+    fn exact_unrendered_heights_skip_overdraw_but_measure_visible_items(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(0, ListAlignment::Top, px(1000.));
+        state.reset_with_item_height_estimates(
+            (0..10).map(|_| ListItemHeightEstimate::Exact(px(50.))),
+        );
+        let rendered = Rc::new(RefCell::new(Vec::new()));
+
+        struct TestView {
+            state: ListState,
+            rendered: Rc<RefCell<Vec<usize>>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rendered = self.rendered.clone();
+                list(self.state.clone(), move |index, _, _| {
+                    rendered.borrow_mut().push(index);
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state.clone(),
+                rendered: rendered.clone(),
+            })
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        assert_eq!(&*rendered.borrow(), &[0, 1]);
+        let diagnostics = state.diagnostics();
+        assert_eq!(diagnostics.measured_item_count, 2);
+        assert_eq!(diagnostics.exact_unmeasured_item_count, 8);
+        assert_eq!(diagnostics.hinted_item_count, 0);
+
+        rendered.borrow_mut().clear();
+        cx.draw(point(px(0.), px(0.)), size(px(120.), px(100.)), |_, _| {
+            view.into_any_element()
+        });
+
+        assert!(rendered.borrow().contains(&9));
+        assert_eq!(state.diagnostics().exact_unmeasured_item_count, 0);
+    }
+
+    #[gpui::test]
+    fn provisional_height_hints_still_measure_the_overdraw_band(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(0, ListAlignment::Top, px(1000.));
+        state.reset_with_item_heights((0..10).map(|_| px(50.)));
+        let rendered = Rc::new(Cell::new(0));
+
+        struct TestView {
+            state: ListState,
+            rendered: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rendered = self.rendered.clone();
+                list(self.state.clone(), move |_, _, _| {
+                    rendered.set(rendered.get() + 1);
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state.clone(),
+                rendered: rendered.clone(),
+            })
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.into_any_element()
+        });
+
+        assert_eq!(rendered.get(), 10);
+        assert_eq!(state.diagnostics().measured_item_count, 10);
     }
 
     #[gpui::test]
