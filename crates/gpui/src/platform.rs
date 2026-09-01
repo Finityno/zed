@@ -951,6 +951,27 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn move_tab_to_new_window(&self) {}
     fn toggle_window_tab_overview(&self) {}
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
+    /// Whether [`PlatformWindow::show_native_context_menu`] presents an OS-drawn
+    /// menu on this platform. Callers should fall back to a GPUI-drawn menu when
+    /// this returns `false`.
+    fn can_show_native_context_menu(&self) -> bool {
+        false
+    }
+    /// Presents a native (OS-drawn) context menu at the given position in window
+    /// content coordinates. Implementations must build the menu synchronously (the
+    /// keymap borrow does not outlive this call) and must invoke `on_select`
+    /// exactly once: with the depth-first index of the chosen entry (counting only
+    /// [`NativeMenuItem::Entry`] items), or `None` if the menu was dismissed. The
+    /// default implementation reports a dismissal.
+    fn show_native_context_menu(
+        &self,
+        _menu: Vec<NativeMenuItem>,
+        _position: Point<Pixels>,
+        _keymap: &Keymap,
+        on_select: Box<dyn FnOnce(Option<usize>)>,
+    ) {
+        on_select(None);
+    }
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;

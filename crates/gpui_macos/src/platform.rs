@@ -30,7 +30,8 @@ use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
+    KeyContext, KeybindingKeystroke, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
@@ -308,14 +309,106 @@ impl MacPlatform {
         }
     }
 
+    pub(crate) fn keystrokes_for_menu_action<'a>(
+        action: &'a dyn Action,
+        keymap: &'a Keymap,
+    ) -> Option<&'a [KeybindingKeystroke]> {
+        static DEFAULT_CONTEXT: OnceLock<Vec<KeyContext>> = OnceLock::new();
+
+        // Note that this is intentionally using earlier bindings, whereas typically
+        // later ones take display precedence. See the discussion on
+        // https://github.com/zed-industries/zed/issues/23621
+        keymap
+            .bindings_for_action(action)
+            .find_or_first(|binding| {
+                binding.predicate().is_none_or(|predicate| {
+                    predicate.eval(DEFAULT_CONTEXT.get_or_init(|| {
+                        let mut workspace_context = KeyContext::new_with_defaults();
+                        workspace_context.add("Workspace");
+                        let mut pane_context = KeyContext::new_with_defaults();
+                        pane_context.add("Pane");
+                        let mut editor_context = KeyContext::new_with_defaults();
+                        editor_context.add("Editor");
+
+                        pane_context.extend(&editor_context);
+                        workspace_context.extend(&pane_context);
+                        vec![workspace_context]
+                    }))
+                })
+            })
+            .map(|binding| binding.keystrokes())
+    }
+
+    pub(crate) unsafe fn new_menu_item_with_key_equivalent(
+        name: &str,
+        selector: Sel,
+        keystrokes: Option<&[KeybindingKeystroke]>,
+    ) -> id {
+        unsafe {
+            let item;
+            if let Some(keystrokes) = keystrokes {
+                if keystrokes.len() == 1 {
+                    let keystroke = &keystrokes[0];
+                    let mut mask = NSEventModifierFlags::empty();
+                    for (modifier, flag) in &[
+                        (
+                            keystroke.modifiers().platform,
+                            NSEventModifierFlags::NSCommandKeyMask,
+                        ),
+                        (
+                            keystroke.modifiers().control,
+                            NSEventModifierFlags::NSControlKeyMask,
+                        ),
+                        (
+                            keystroke.modifiers().alt,
+                            NSEventModifierFlags::NSAlternateKeyMask,
+                        ),
+                        (
+                            keystroke.modifiers().shift,
+                            NSEventModifierFlags::NSShiftKeyMask,
+                        ),
+                    ] {
+                        if *modifier {
+                            mask |= *flag;
+                        }
+                    }
+
+                    item = NSMenuItem::alloc(nil)
+                        .initWithTitle_action_keyEquivalent_(
+                            ns_string(name),
+                            selector,
+                            ns_string(key_to_native(keystroke.key()).as_ref()),
+                        )
+                        .autorelease();
+                    if Self::os_version() >= Version::new(12, 0, 0) {
+                        let _: () =
+                            msg_send![item, setAllowsAutomaticKeyEquivalentLocalization: NO];
+                    }
+                    item.setKeyEquivalentModifierMask_(mask);
+                } else {
+                    item = NSMenuItem::alloc(nil)
+                        .initWithTitle_action_keyEquivalent_(
+                            ns_string(name),
+                            selector,
+                            ns_string(""),
+                        )
+                        .autorelease();
+                }
+            } else {
+                item = NSMenuItem::alloc(nil)
+                    .initWithTitle_action_keyEquivalent_(ns_string(name), selector, ns_string(""))
+                    .autorelease();
+            }
+            item
+        }
+    }
+
     unsafe fn create_menu_item(
         item: &MenuItem,
         delegate: id,
         actions: &mut Vec<Box<dyn Action>>,
         keymap: &Keymap,
     ) -> id {
-        static DEFAULT_CONTEXT: OnceLock<Vec<KeyContext>> = OnceLock::new();
-
         unsafe {
             match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(nil),
@@ -326,28 +419,7 @@ impl MacPlatform {
                     checked,
                     disabled,
                 } => {
-                    // Note that this is intentionally using earlier bindings, whereas typically
-                    // later ones take display precedence. See the discussion on
-                    // https://github.com/zed-industries/zed/issues/23621
-                    let keystrokes = keymap
-                        .bindings_for_action(action.as_ref())
-                        .find_or_first(|binding| {
-                            binding.predicate().is_none_or(|predicate| {
-                                predicate.eval(DEFAULT_CONTEXT.get_or_init(|| {
-                                    let mut workspace_context = KeyContext::new_with_defaults();
-                                    workspace_context.add("Workspace");
-                                    let mut pane_context = KeyContext::new_with_defaults();
-                                    pane_context.add("Pane");
-                                    let mut editor_context = KeyContext::new_with_defaults();
-                                    editor_context.add("Editor");
-
-                                    pane_context.extend(&editor_context);
-                                    workspace_context.extend(&pane_context);
-                                    vec![workspace_context]
-                                }))
-                            })
-                        })
-                        .map(|binding| binding.keystrokes());
+                    let keystrokes = Self::keystrokes_for_menu_action(action.as_ref(), keymap);
 
                     let selector = match os_action {
                         Some(gpui::OsAction::Cut) => selector("cut:"),
@@ -361,63 +433,7 @@ impl MacPlatform {
                         None => selector("handleGPUIMenuItem:"),
                     };
 
-                    let item;
-                    if let Some(keystrokes) = keystrokes {
-                        if keystrokes.len() == 1 {
-                            let keystroke = &keystrokes[0];
-                            let mut mask = NSEventModifierFlags::empty();
-                            for (modifier, flag) in &[
-                                (
-                                    keystroke.modifiers().platform,
-                                    NSEventModifierFlags::NSCommandKeyMask,
-                                ),
-                                (
-                                    keystroke.modifiers().control,
-                                    NSEventModifierFlags::NSControlKeyMask,
-                                ),
-                                (
-                                    keystroke.modifiers().alt,
-                                    NSEventModifierFlags::NSAlternateKeyMask,
-                                ),
-                                (
-                                    keystroke.modifiers().shift,
-                                    NSEventModifierFlags::NSShiftKeyMask,
-                                ),
-                            ] {
-                                if *modifier {
-                                    mask |= *flag;
-                                }
-                            }
-
-                            item = NSMenuItem::alloc(nil)
-                                .initWithTitle_action_keyEquivalent_(
-                                    ns_string(name),
-                                    selector,
-                                    ns_string(key_to_native(keystroke.key()).as_ref()),
-                                )
-                                .autorelease();
-                            if Self::os_version() >= Version::new(12, 0, 0) {
-                                let _: () = msg_send![item, setAllowsAutomaticKeyEquivalentLocalization: NO];
-                            }
-                            item.setKeyEquivalentModifierMask_(mask);
-                        } else {
-                            item = NSMenuItem::alloc(nil)
-                                .initWithTitle_action_keyEquivalent_(
-                                    ns_string(name),
-                                    selector,
-                                    ns_string(""),
-                                )
-                                .autorelease();
-                        }
-                    } else {
-                        item = NSMenuItem::alloc(nil)
-                            .initWithTitle_action_keyEquivalent_(
-                                ns_string(name),
-                                selector,
-                                ns_string(""),
-                            )
-                            .autorelease();
-                    }
+                    let item = Self::new_menu_item_with_key_equivalent(name, selector, keystrokes);
 
                     if *checked {
                         item.setState_(NSVisualEffectState::Active);

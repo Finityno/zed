@@ -12,7 +12,8 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeMenuItem, Path, Pixels,
+    PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
@@ -2811,6 +2812,59 @@ impl Window {
     /// Show the platform character palette.
     pub fn show_character_palette(&self) {
         self.platform_window.show_character_palette();
+    }
+
+    /// Whether the platform can present a native (OS-drawn) context menu for this
+    /// window. Currently macOS only; callers should fall back to a GPUI-drawn menu
+    /// when this returns `false`.
+    pub fn can_show_native_context_menu(&self) -> bool {
+        self.platform_window.can_show_native_context_menu()
+    }
+
+    /// Presents a native (OS-drawn) context menu at `position`, in window content
+    /// coordinates. Entry handlers run inside this window's update context. On
+    /// platforms without native context menus nothing is shown; check
+    /// [`Self::can_show_native_context_menu`] first.
+    pub fn show_native_context_menu(
+        &self,
+        mut menu: Vec<NativeMenuItem>,
+        position: Point<Pixels>,
+        cx: &mut App,
+    ) {
+        fn take_handlers(
+            items: &mut [NativeMenuItem],
+            handlers: &mut Vec<Option<Box<dyn FnOnce(&mut Window, &mut App)>>>,
+        ) {
+            for item in items {
+                match item {
+                    NativeMenuItem::Entry(entry) => handlers.push(entry.handler.take()),
+                    NativeMenuItem::Submenu { items, .. } => take_handlers(items, handlers),
+                    NativeMenuItem::Separator => {}
+                }
+            }
+        }
+
+        let mut handlers = Vec::new();
+        take_handlers(&mut menu, &mut handlers);
+        let handle = self.handle;
+        let mut async_cx = cx.to_async();
+        let keymap = cx.keymap.clone();
+        self.platform_window.show_native_context_menu(
+            menu,
+            position,
+            &keymap.borrow(),
+            Box::new(move |selected| {
+                let Some(handler) = selected
+                    .and_then(|index| handlers.get_mut(index))
+                    .and_then(|handler| handler.take())
+                else {
+                    return;
+                };
+                handle
+                    .update(&mut async_cx, |_, window, cx| handler(window, cx))
+                    .log_err();
+            }),
+        );
     }
 
     /// The scale factor of the display associated with the window. For example, it could

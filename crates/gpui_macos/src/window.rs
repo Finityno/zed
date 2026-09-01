@@ -1,5 +1,5 @@
 use crate::{
-    BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
+    BoolExt, MacDisplay, MacPlatform, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
@@ -10,11 +10,12 @@ use block::ConcreteBlock;
 use block2::RcBlock;
 use cocoa::{
     appkit::{
-        NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags, NSEventType,
-        NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
-        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial, NSVisualEffectState,
-        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
-        NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSApplication, NSBackingStoreBuffered, NSColor, NSControl as _, NSEvent,
+        NSEventModifierFlags, NSEventType,
+        NSFilenamesPboardType, NSMenu, NSMenuItem, NSPasteboard, NSRequestUserAttentionType,
+        NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
+        NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
+        NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -26,8 +27,9 @@ use cocoa::{
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keymap, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    NativeMenuItem, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle,
@@ -83,6 +85,9 @@ static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
+static mut CONTEXT_MENU_TARGET_CLASS: *const Class = ptr::null();
+
+const CONTEXT_MENU_SELECTION_IVAR: &str = "contextMenuSelection";
 
 #[allow(non_upper_case_globals)]
 const NSWindowStyleMaskNonactivatingPanel: NSWindowStyleMask =
@@ -155,6 +160,21 @@ unsafe fn build_classes() {
     unsafe {
         WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
+        CONTEXT_MENU_TARGET_CLASS = match ClassDecl::new("GPUIContextMenuTarget", class!(NSObject))
+        {
+            Some(mut decl) => {
+                decl.add_ivar::<*mut c_void>(CONTEXT_MENU_SELECTION_IVAR);
+                decl.add_method(
+                    sel!(handleGPUIContextMenuItem:),
+                    handle_context_menu_item as extern "C" fn(&Object, Sel, id),
+                );
+                decl.register()
+            }
+            // Objective-C class names are process-global, so another loaded
+            // image may have registered the name already; native context menus
+            // then stay unavailable instead of panicking at startup.
+            None => ptr::null(),
+        };
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
@@ -381,6 +401,70 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
         // macOS screen coordinates are relative to bottom left
         window_height - px(position.y as f32),
     )
+}
+
+unsafe fn create_native_context_menu(
+    items: &[NativeMenuItem],
+    target: id,
+    keymap: &Keymap,
+    next_tag: &mut NSInteger,
+) -> id {
+    unsafe {
+        let menu = NSMenu::new(nil);
+        // The items are enabled explicitly below; the target deliberately does not
+        // implement `validateMenuItem:`, so automatic enabling must stay off.
+        let _: () = msg_send![menu, setAutoenablesItems: NO];
+        for item in items {
+            let ns_item = match item {
+                NativeMenuItem::Separator => NSMenuItem::separatorItem(nil),
+                NativeMenuItem::Submenu {
+                    name,
+                    items,
+                    disabled,
+                } => {
+                    let ns_item = NSMenuItem::new(nil).autorelease();
+                    let submenu = create_native_context_menu(items, target, keymap, next_tag);
+                    ns_item.setSubmenu_(submenu);
+                    let _: () = msg_send![submenu, release];
+                    ns_item.setTitle_(ns_string(name));
+                    ns_item.setEnabled_(if *disabled { NO } else { YES });
+                    ns_item
+                }
+                NativeMenuItem::Entry(entry) => {
+                    let keystrokes = entry.action.as_ref().and_then(|action| {
+                        MacPlatform::keystrokes_for_menu_action(action.as_ref(), keymap)
+                    });
+                    let ns_item = MacPlatform::new_menu_item_with_key_equivalent(
+                        &entry.name,
+                        sel!(handleGPUIContextMenuItem:),
+                        keystrokes,
+                    );
+                    if entry.checked {
+                        ns_item.setState_(NSVisualEffectState::Active);
+                    }
+                    ns_item.setEnabled_(if entry.disabled { NO } else { YES });
+                    let _: () = msg_send![ns_item, setTarget: target];
+                    let _: () = msg_send![ns_item, setTag: *next_tag];
+                    *next_tag += 1;
+                    ns_item
+                }
+            };
+            menu.addItem_(ns_item);
+        }
+        menu
+    }
+}
+
+extern "C" fn handle_context_menu_item(this: &Object, _: Sel, item: id) {
+    unsafe {
+        let selection =
+            *this.get_ivar::<*mut c_void>(CONTEXT_MENU_SELECTION_IVAR) as *mut Cell<isize>;
+        if selection.is_null() {
+            return;
+        }
+        let tag: NSInteger = msg_send![item, tag];
+        (*selection).set(tag as isize);
+    }
 }
 
 /// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
@@ -704,6 +788,76 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    /// The most recently presented native context menu. Held here — not
+    /// released when its selection is reported — so a stray action message
+    /// delivered after the tracking session still lands on live objects; the
+    /// next presented menu (or the window state going away) drops this
+    /// reference, and the invocation's own popup/report task holds the other,
+    /// so nothing is freed while an invocation is still in flight.
+    active_context_menu: Option<Arc<ActiveContextMenu>>,
+    /// Distinguishes context-menu invocations, so a popup task queued behind a
+    /// newer invocation can tell it was superseded and skip presenting.
+    context_menu_generation: u64,
+}
+
+/// Everything a presented native context menu keeps alive: the `NSMenu`, its
+/// `GPUIContextMenuTarget`, and the selection cell the target writes into.
+///
+/// Shared through an `Arc` rather than an `Rc` because one reference sits in
+/// `MacWindowState`, which is `Send`: the last reference can be released from
+/// whichever thread drops the window state, so the count must be atomic and
+/// the AppKit teardown must hop to the main thread when it is not already
+/// there.
+struct ActiveContextMenu {
+    generation: u64,
+    menu: id,
+    target: id,
+    selection: *mut Cell<isize>,
+}
+
+/// The pointers an `ActiveContextMenu` owns, detached from it so the teardown
+/// can be handed to the main queue whole when the last reference goes away on
+/// another thread.
+struct ContextMenuTeardown {
+    menu: id,
+    target: id,
+    selection: *mut Cell<isize>,
+}
+
+impl ContextMenuTeardown {
+    unsafe fn run(self) {
+        unsafe {
+            (*self.target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, ptr::null_mut::<c_void>());
+            let _: () = msg_send![self.menu, release];
+            let _: () = msg_send![self.target, release];
+            drop(Box::from_raw(self.selection));
+        }
+    }
+}
+
+impl Drop for ActiveContextMenu {
+    fn drop(&mut self) {
+        extern "C" fn teardown_on_main(context: *mut c_void) {
+            unsafe {
+                Box::from_raw(context as *mut ContextMenuTeardown).run();
+            }
+        }
+
+        let teardown = ContextMenuTeardown {
+            menu: self.menu,
+            target: self.target,
+            selection: self.selection,
+        };
+        let is_main_thread: BOOL = unsafe { msg_send![class!(NSThread), isMainThread] };
+        if is_main_thread == YES {
+            unsafe { teardown.run() }
+        } else {
+            unsafe {
+                let context = Box::into_raw(Box::new(teardown)) as *mut c_void;
+                DispatchQueue::main().exec_async_f(context, teardown_on_main);
+            }
+        }
+    }
 }
 
 impl MacWindowState {
@@ -1169,6 +1323,8 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                active_context_menu: None,
+                context_menu_generation: 0,
             }));
             let mut window = Self(state, marker);
 
@@ -1946,6 +2102,113 @@ impl PlatformWindow for MacWindow {
                 }
             })
             .detach();
+    }
+
+    fn can_show_native_context_menu(&self) -> bool {
+        unsafe { !CONTEXT_MENU_TARGET_CLASS.is_null() }
+    }
+
+    fn show_native_context_menu(
+        &self,
+        menu: Vec<NativeMenuItem>,
+        position: Point<Pixels>,
+        keymap: &Keymap,
+        on_select: Box<dyn FnOnce(Option<usize>)>,
+    ) {
+        let target_class = unsafe { CONTEXT_MENU_TARGET_CLASS };
+        if target_class.is_null() {
+            on_select(None);
+            return;
+        }
+        let this = self.0.clone();
+        let mut lock = self.0.lock();
+        let native_view = lock.native_view.as_ptr();
+        let content_height = lock.content_size().height;
+        let executor = lock.foreground_executor.clone();
+
+        unsafe {
+            let selection = Box::into_raw(Box::new(Cell::new(-1isize)));
+            let target: id = msg_send![target_class, alloc];
+            let target: id = msg_send![target, init];
+            (*target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, selection as *mut c_void);
+
+            let mut next_tag: NSInteger = 0;
+            let ns_menu = create_native_context_menu(&menu, target, keymap, &mut next_tag);
+            lock.context_menu_generation += 1;
+            let generation = lock.context_menu_generation;
+            let invocation = Arc::new(ActiveContextMenu {
+                generation,
+                menu: ns_menu,
+                target,
+                selection,
+            });
+            // Replaces the previous invocation's slot. If that invocation is
+            // still in flight its popup/report task holds the other reference,
+            // so nothing is freed under it; once both are gone the menu closed
+            // long ago and anything it could still be sent has been delivered.
+            lock.active_context_menu = Some(Arc::clone(&invocation));
+            drop(lock);
+
+            let native_view: id = msg_send![native_view, retain];
+
+            let ns_position = NSPoint::new(
+                f64::from(position.x),
+                f64::from(content_height - position.y),
+            );
+            // Popping up the menu runs a nested, modal event loop, so it must not
+            // happen while a state lock is held or from inside the current event's
+            // dispatch — defer it to the executor.
+            let inner_executor = executor.clone();
+            executor
+                .spawn(async move {
+                    // A later invocation queued before this one ran has already
+                    // replaced it as the window's current menu; presenting a
+                    // stale menu on top of (or instead of) the newer one would
+                    // be wrong, so skip the popup and report a dismissal. Once
+                    // the check passes no input event can supersede this
+                    // invocation before the popup returns: the check and the
+                    // popup share the main thread, and the tracking session
+                    // consumes input. The popup's nested run loop does still
+                    // service timers and other run-loop sources, so one of
+                    // those can replace the window's slot mid-popup; that is
+                    // harmless because this task owns its own reference to the
+                    // invocation and reports through it, not through the slot.
+                    let superseded = {
+                        let state = this.lock();
+                        state
+                            .active_context_menu
+                            .as_ref()
+                            .map(|active| active.generation)
+                            != Some(generation)
+                    };
+                    if superseded {
+                        on_select(None);
+                        let _: () = msg_send![native_view, release];
+                        return;
+                    }
+                    let _: BOOL = msg_send![
+                        invocation.menu,
+                        popUpMenuPositioningItem: nil
+                        atLocation: ns_position
+                        inView: native_view
+                    ];
+                    // The chosen item's action message can be delivered through
+                    // the main run loop after the tracking session ends, so read
+                    // the selection on the next tick, not immediately. The task
+                    // owns its invocation, so the read hits this menu's own
+                    // still-live cell even if a newer menu has replaced it in
+                    // the window state, and a completed selection is never
+                    // converted into a dismissal by that replacement.
+                    inner_executor
+                        .spawn(async move {
+                            let picked = (*invocation.selection).get();
+                            on_select((picked >= 0).then_some(picked as usize));
+                            let _: () = msg_send![native_view, release];
+                        })
+                        .detach();
+                })
+                .detach();
+        }
     }
 
     fn minimize(&self) {
