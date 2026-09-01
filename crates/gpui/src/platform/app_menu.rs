@@ -1,4 +1,4 @@
-use crate::{Action, App, Platform, SharedString};
+use crate::{Action, App, Platform, SharedString, Window};
 
 /// A menu of the application, either a main menu or a submenu
 pub struct Menu {
@@ -297,6 +297,110 @@ impl Clone for OwnedMenuItem {
             },
             OwnedMenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.clone()),
         }
+    }
+}
+
+/// A selectable entry in a native (OS-drawn) context menu, shown with
+/// [`Window::show_native_context_menu`](crate::Window::show_native_context_menu).
+pub struct NativeMenuEntry {
+    /// The label of this entry.
+    pub name: SharedString,
+
+    /// An action whose keymap binding, if any, is displayed as the entry's key
+    /// equivalent. The action itself is never dispatched — choosing the entry
+    /// invokes `handler`.
+    pub action: Option<Box<dyn Action>>,
+
+    /// Whether this entry shows a checkmark.
+    pub checked: bool,
+
+    /// Whether this entry is disabled.
+    pub disabled: bool,
+
+    /// Invoked inside the window's update context when the entry is chosen.
+    /// [`Window::show_native_context_menu`](crate::Window::show_native_context_menu)
+    /// takes the handler before the menu reaches the platform layer. An entry
+    /// constructed with `None` is inert: it renders normally, but choosing it
+    /// does nothing.
+    pub handler: Option<Box<dyn FnOnce(&mut Window, &mut App)>>,
+}
+
+/// An item in a native (OS-drawn) context menu, shown with
+/// [`Window::show_native_context_menu`](crate::Window::show_native_context_menu).
+pub enum NativeMenuItem {
+    /// A separator between items.
+    Separator,
+
+    /// A submenu.
+    Submenu {
+        /// The label of the submenu.
+        name: SharedString,
+
+        /// The items of the submenu.
+        items: Vec<NativeMenuItem>,
+
+        /// Whether the submenu is disabled.
+        disabled: bool,
+    },
+
+    /// A selectable entry.
+    Entry(NativeMenuEntry),
+}
+
+impl NativeMenuItem {
+    /// Creates a separator item.
+    pub fn separator() -> Self {
+        Self::Separator
+    }
+
+    /// Creates a selectable entry that invokes `handler` when chosen.
+    pub fn entry(
+        name: impl Into<SharedString>,
+        handler: impl FnOnce(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self::Entry(NativeMenuEntry {
+            name: name.into(),
+            action: None,
+            checked: false,
+            disabled: false,
+            handler: Some(Box::new(handler)),
+        })
+    }
+
+    /// Creates a submenu item holding the given items.
+    pub fn submenu(name: impl Into<SharedString>, items: Vec<NativeMenuItem>) -> Self {
+        Self::Submenu {
+            name: name.into(),
+            items,
+            disabled: false,
+        }
+    }
+
+    /// Associates an action with this entry so its keymap binding, if any, is
+    /// displayed as the entry's key equivalent. Ignored for other item kinds.
+    pub fn with_action(mut self, action: impl Action) -> Self {
+        if let Self::Entry(entry) = &mut self {
+            entry.action = Some(Box::new(action));
+        }
+        self
+    }
+
+    /// Sets whether this entry shows a checkmark. Ignored for other item kinds.
+    pub fn checked(mut self, checked: bool) -> Self {
+        if let Self::Entry(entry) = &mut self {
+            entry.checked = checked;
+        }
+        self
+    }
+
+    /// Sets whether this item is disabled.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        match &mut self {
+            Self::Entry(entry) => entry.disabled = disabled,
+            Self::Submenu { disabled: old, .. } => *old = disabled,
+            Self::Separator => {}
+        }
+        self
     }
 }
 
