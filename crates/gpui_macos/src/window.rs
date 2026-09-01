@@ -790,11 +790,12 @@ struct MacWindowState {
     /// The most recently presented native context menu. Held here — not
     /// released when its selection is reported — so a stray action message
     /// delivered after the tracking session still lands on live objects; the
-    /// next presented menu (or the window state going away) releases it.
-    active_context_menu: Option<ActiveContextMenu>,
-    /// Distinguishes context-menu invocations, so a report task whose menu was
-    /// already replaced reports a dismissal instead of reading the newer
-    /// menu's selection.
+    /// next presented menu (or the window state going away) drops this
+    /// reference, and the invocation's own popup/report task holds the other,
+    /// so nothing is freed while an invocation is still in flight.
+    active_context_menu: Option<Rc<ActiveContextMenu>>,
+    /// Distinguishes context-menu invocations, so a popup task queued behind a
+    /// newer invocation can tell it was superseded and skip presenting.
     context_menu_generation: u64,
 }
 
@@ -2092,20 +2093,19 @@ impl PlatformWindow for MacWindow {
             let ns_menu = create_native_context_menu(&menu, target, keymap, &mut next_tag);
             lock.context_menu_generation += 1;
             let generation = lock.context_menu_generation;
-            // Replaces — and thereby releases — whatever the previous
-            // invocation kept alive; that menu closed long ago, so anything it
-            // could still be sent has been delivered by now.
-            lock.active_context_menu = Some(ActiveContextMenu {
+            let invocation = Rc::new(ActiveContextMenu {
                 generation,
                 menu: ns_menu,
                 target,
                 selection,
             });
+            // Replaces the previous invocation's slot. If that invocation is
+            // still in flight its popup/report task holds the other reference,
+            // so nothing is freed under it; once both are gone the menu closed
+            // long ago and anything it could still be sent has been delivered.
+            lock.active_context_menu = Some(Rc::clone(&invocation));
             drop(lock);
 
-            // Retained for this invocation's own use across the deferred popup,
-            // independent of the window state releasing the ActiveContextMenu.
-            let ns_menu: id = msg_send![ns_menu, retain];
             let native_view: id = msg_send![native_view, retain];
 
             let ns_position = NSPoint::new(
@@ -2116,18 +2116,17 @@ impl PlatformWindow for MacWindow {
             // happen while a state lock is held or from inside the current event's
             // dispatch — defer it to the executor.
             let inner_executor = executor.clone();
-            let inner_this = this.clone();
             executor
                 .spawn(async move {
                     // A later invocation queued before this one ran has already
-                    // replaced — and freed — this menu's target and selection
-                    // cell, so presenting it would let a selection message a
-                    // dead object. Skip the popup and report a dismissal. Once
+                    // replaced it as the window's current menu; presenting a
+                    // stale menu on top of (or instead of) the newer one would
+                    // be wrong, so skip the popup and report a dismissal. Once
                     // the check passes nothing can supersede this invocation
                     // until the popup returns: the check and the popup share
                     // the main thread, and the tracking session consumes input.
                     let superseded = {
-                        let state = inner_this.lock();
+                        let state = this.lock();
                         state
                             .active_context_menu
                             .as_ref()
@@ -2136,37 +2135,26 @@ impl PlatformWindow for MacWindow {
                     };
                     if superseded {
                         on_select(None);
-                        let _: () = msg_send![ns_menu, release];
                         let _: () = msg_send![native_view, release];
                         return;
                     }
                     let _: BOOL = msg_send![
-                        ns_menu,
+                        invocation.menu,
                         popUpMenuPositioningItem: nil
                         atLocation: ns_position
                         inView: native_view
                     ];
                     // The chosen item's action message can be delivered through
                     // the main run loop after the tracking session ends, so read
-                    // the selection on the next tick, not immediately. The cell
-                    // is read back through the window state so a menu that was
-                    // already replaced reports a dismissal instead of touching
-                    // freed memory; an action arriving even later than this
-                    // still lands on the live objects the state holds and is
-                    // simply ignored.
+                    // the selection on the next tick, not immediately. The task
+                    // owns its invocation, so the read hits this menu's own
+                    // still-live cell even if a newer menu has replaced it in
+                    // the window state, and a completed selection is never
+                    // converted into a dismissal by that replacement.
                     inner_executor
                         .spawn(async move {
-                            let picked = {
-                                let state = this.lock();
-                                state
-                                    .active_context_menu
-                                    .as_ref()
-                                    .filter(|active| active.generation == generation)
-                                    .map(|active| (*active.selection).get())
-                                    .unwrap_or(-1)
-                            };
+                            let picked = (*invocation.selection).get();
                             on_select((picked >= 0).then_some(picked as usize));
-                            let _: () = msg_send![ns_menu, release];
                             let _: () = msg_send![native_view, release];
                         })
                         .detach();
