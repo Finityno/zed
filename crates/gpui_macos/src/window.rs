@@ -2116,8 +2116,30 @@ impl PlatformWindow for MacWindow {
             // happen while a state lock is held or from inside the current event's
             // dispatch — defer it to the executor.
             let inner_executor = executor.clone();
+            let inner_this = this.clone();
             executor
                 .spawn(async move {
+                    // A later invocation queued before this one ran has already
+                    // replaced — and freed — this menu's target and selection
+                    // cell, so presenting it would let a selection message a
+                    // dead object. Skip the popup and report a dismissal. Once
+                    // the check passes nothing can supersede this invocation
+                    // until the popup returns: the check and the popup share
+                    // the main thread, and the tracking session consumes input.
+                    let superseded = {
+                        let state = inner_this.lock();
+                        state
+                            .active_context_menu
+                            .as_ref()
+                            .map(|active| active.generation)
+                            != Some(generation)
+                    };
+                    if superseded {
+                        on_select(None);
+                        let _: () = msg_send![ns_menu, release];
+                        let _: () = msg_send![native_view, release];
+                        return;
+                    }
                     let _: BOOL = msg_send![
                         ns_menu,
                         popUpMenuPositioningItem: nil
