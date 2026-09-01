@@ -159,14 +159,20 @@ unsafe fn build_classes() {
     unsafe {
         WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
-        CONTEXT_MENU_TARGET_CLASS = {
-            let mut decl = ClassDecl::new("GPUIContextMenuTarget", class!(NSObject)).unwrap();
-            decl.add_ivar::<*mut c_void>(CONTEXT_MENU_SELECTION_IVAR);
-            decl.add_method(
-                sel!(handleGPUIContextMenuItem:),
-                handle_context_menu_item as extern "C" fn(&Object, Sel, id),
-            );
-            decl.register()
+        CONTEXT_MENU_TARGET_CLASS = match ClassDecl::new("GPUIContextMenuTarget", class!(NSObject))
+        {
+            Some(mut decl) => {
+                decl.add_ivar::<*mut c_void>(CONTEXT_MENU_SELECTION_IVAR);
+                decl.add_method(
+                    sel!(handleGPUIContextMenuItem:),
+                    handle_context_menu_item as extern "C" fn(&Object, Sel, id),
+                );
+                decl.register()
+            }
+            // Objective-C class names are process-global, so another loaded
+            // image may have registered the name already; native context menus
+            // then stay unavailable instead of panicking at startup.
+            None => ptr::null(),
         };
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
@@ -781,6 +787,35 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    /// The most recently presented native context menu. Held here — not
+    /// released when its selection is reported — so a stray action message
+    /// delivered after the tracking session still lands on live objects; the
+    /// next presented menu (or the window state going away) releases it.
+    active_context_menu: Option<ActiveContextMenu>,
+    /// Distinguishes context-menu invocations, so a report task whose menu was
+    /// already replaced reports a dismissal instead of reading the newer
+    /// menu's selection.
+    context_menu_generation: u64,
+}
+
+/// Everything a presented native context menu keeps alive: the `NSMenu`, its
+/// `GPUIContextMenuTarget`, and the selection cell the target writes into.
+struct ActiveContextMenu {
+    generation: u64,
+    menu: id,
+    target: id,
+    selection: *mut Cell<isize>,
+}
+
+impl Drop for ActiveContextMenu {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, ptr::null_mut::<c_void>());
+            let _: () = msg_send![self.menu, release];
+            let _: () = msg_send![self.target, release];
+            drop(Box::from_raw(self.selection));
+        }
+    }
 }
 
 impl MacWindowState {
@@ -1245,6 +1280,8 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                active_context_menu: None,
+                context_menu_generation: 0,
             })));
 
             (*native_window).set_ivar(
@@ -2024,7 +2061,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn can_show_native_context_menu(&self) -> bool {
-        true
+        unsafe { !CONTEXT_MENU_TARGET_CLASS.is_null() }
     }
 
     fn show_native_context_menu(
@@ -2034,20 +2071,41 @@ impl PlatformWindow for MacWindow {
         keymap: &Keymap,
         on_select: Box<dyn FnOnce(Option<usize>)>,
     ) {
-        let lock = self.0.lock();
+        let target_class = unsafe { CONTEXT_MENU_TARGET_CLASS };
+        if target_class.is_null() {
+            on_select(None);
+            return;
+        }
+        let this = self.0.clone();
+        let mut lock = self.0.lock();
         let native_view = lock.native_view.as_ptr();
         let content_height = lock.content_size().height;
         let executor = lock.foreground_executor.clone();
-        drop(lock);
 
         unsafe {
             let selection = Box::into_raw(Box::new(Cell::new(-1isize)));
-            let target: id = msg_send![CONTEXT_MENU_TARGET_CLASS, alloc];
+            let target: id = msg_send![target_class, alloc];
             let target: id = msg_send![target, init];
             (*target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, selection as *mut c_void);
 
             let mut next_tag: NSInteger = 0;
             let ns_menu = create_native_context_menu(&menu, target, keymap, &mut next_tag);
+            lock.context_menu_generation += 1;
+            let generation = lock.context_menu_generation;
+            // Replaces — and thereby releases — whatever the previous
+            // invocation kept alive; that menu closed long ago, so anything it
+            // could still be sent has been delivered by now.
+            lock.active_context_menu = Some(ActiveContextMenu {
+                generation,
+                menu: ns_menu,
+                target,
+                selection,
+            });
+            drop(lock);
+
+            // Retained for this invocation's own use across the deferred popup,
+            // independent of the window state releasing the ActiveContextMenu.
+            let ns_menu: id = msg_send![ns_menu, retain];
             let native_view: id = msg_send![native_view, retain];
 
             let ns_position = NSPoint::new(
@@ -2068,19 +2126,26 @@ impl PlatformWindow for MacWindow {
                     ];
                     // The chosen item's action message can be delivered through
                     // the main run loop after the tracking session ends, so read
-                    // the selection on the next tick, not immediately.
+                    // the selection on the next tick, not immediately. The cell
+                    // is read back through the window state so a menu that was
+                    // already replaced reports a dismissal instead of touching
+                    // freed memory; an action arriving even later than this
+                    // still lands on the live objects the state holds and is
+                    // simply ignored.
                     inner_executor
                         .spawn(async move {
-                            let picked = (*selection).get();
+                            let picked = {
+                                let state = this.lock();
+                                state
+                                    .active_context_menu
+                                    .as_ref()
+                                    .filter(|active| active.generation == generation)
+                                    .map(|active| (*active.selection).get())
+                                    .unwrap_or(-1)
+                            };
                             on_select((picked >= 0).then_some(picked as usize));
-                            (*target).set_ivar(
-                                CONTEXT_MENU_SELECTION_IVAR,
-                                ptr::null_mut::<c_void>(),
-                            );
-                            let _: () = msg_send![target, release];
                             let _: () = msg_send![ns_menu, release];
                             let _: () = msg_send![native_view, release];
-                            drop(Box::from_raw(selection));
                         })
                         .detach();
                 })

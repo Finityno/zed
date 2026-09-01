@@ -319,7 +319,9 @@ pub struct NativeMenuEntry {
 
     /// Invoked inside the window's update context when the entry is chosen.
     /// [`Window::show_native_context_menu`](crate::Window::show_native_context_menu)
-    /// takes the handler before the menu reaches the platform layer.
+    /// takes the handler before the menu reaches the platform layer. An entry
+    /// constructed with `None` is inert: it renders normally, but choosing it
+    /// does nothing.
     pub handler: Option<Box<dyn FnOnce(&mut Window, &mut App)>>,
 }
 
