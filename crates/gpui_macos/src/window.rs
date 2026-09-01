@@ -793,7 +793,7 @@ struct MacWindowState {
     /// next presented menu (or the window state going away) drops this
     /// reference, and the invocation's own popup/report task holds the other,
     /// so nothing is freed while an invocation is still in flight.
-    active_context_menu: Option<Rc<ActiveContextMenu>>,
+    active_context_menu: Option<Arc<ActiveContextMenu>>,
     /// Distinguishes context-menu invocations, so a popup task queued behind a
     /// newer invocation can tell it was superseded and skip presenting.
     context_menu_generation: u64,
@@ -801,6 +801,12 @@ struct MacWindowState {
 
 /// Everything a presented native context menu keeps alive: the `NSMenu`, its
 /// `GPUIContextMenuTarget`, and the selection cell the target writes into.
+///
+/// Shared through an `Arc` rather than an `Rc` because one reference sits in
+/// `MacWindowState`, which is `Send`: the last reference can be released from
+/// whichever thread drops the window state, so the count must be atomic and
+/// the AppKit teardown must hop to the main thread when it is not already
+/// there.
 struct ActiveContextMenu {
     generation: u64,
     menu: id,
@@ -808,13 +814,47 @@ struct ActiveContextMenu {
     selection: *mut Cell<isize>,
 }
 
-impl Drop for ActiveContextMenu {
-    fn drop(&mut self) {
+/// The pointers an `ActiveContextMenu` owns, detached from it so the teardown
+/// can be handed to the main queue whole when the last reference goes away on
+/// another thread.
+struct ContextMenuTeardown {
+    menu: id,
+    target: id,
+    selection: *mut Cell<isize>,
+}
+
+impl ContextMenuTeardown {
+    unsafe fn run(self) {
         unsafe {
             (*self.target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, ptr::null_mut::<c_void>());
             let _: () = msg_send![self.menu, release];
             let _: () = msg_send![self.target, release];
             drop(Box::from_raw(self.selection));
+        }
+    }
+}
+
+impl Drop for ActiveContextMenu {
+    fn drop(&mut self) {
+        extern "C" fn teardown_on_main(context: *mut c_void) {
+            unsafe {
+                Box::from_raw(context as *mut ContextMenuTeardown).run();
+            }
+        }
+
+        let teardown = ContextMenuTeardown {
+            menu: self.menu,
+            target: self.target,
+            selection: self.selection,
+        };
+        let is_main_thread: BOOL = unsafe { msg_send![class!(NSThread), isMainThread] };
+        if is_main_thread == YES {
+            unsafe { teardown.run() }
+        } else {
+            unsafe {
+                let context = Box::into_raw(Box::new(teardown)) as *mut c_void;
+                DispatchQueue::main().exec_async_f(context, teardown_on_main);
+            }
         }
     }
 }
@@ -2093,7 +2133,7 @@ impl PlatformWindow for MacWindow {
             let ns_menu = create_native_context_menu(&menu, target, keymap, &mut next_tag);
             lock.context_menu_generation += 1;
             let generation = lock.context_menu_generation;
-            let invocation = Rc::new(ActiveContextMenu {
+            let invocation = Arc::new(ActiveContextMenu {
                 generation,
                 menu: ns_menu,
                 target,
@@ -2103,7 +2143,7 @@ impl PlatformWindow for MacWindow {
             // still in flight its popup/report task holds the other reference,
             // so nothing is freed under it; once both are gone the menu closed
             // long ago and anything it could still be sent has been delivered.
-            lock.active_context_menu = Some(Rc::clone(&invocation));
+            lock.active_context_menu = Some(Arc::clone(&invocation));
             drop(lock);
 
             let native_view: id = msg_send![native_view, retain];
@@ -2122,9 +2162,14 @@ impl PlatformWindow for MacWindow {
                     // replaced it as the window's current menu; presenting a
                     // stale menu on top of (or instead of) the newer one would
                     // be wrong, so skip the popup and report a dismissal. Once
-                    // the check passes nothing can supersede this invocation
-                    // until the popup returns: the check and the popup share
-                    // the main thread, and the tracking session consumes input.
+                    // the check passes no input event can supersede this
+                    // invocation before the popup returns: the check and the
+                    // popup share the main thread, and the tracking session
+                    // consumes input. The popup's nested run loop does still
+                    // service timers and other run-loop sources, so one of
+                    // those can replace the window's slot mid-popup; that is
+                    // harmless because this task owns its own reference to the
+                    // invocation and reports through it, not through the slot.
                     let superseded = {
                         let state = this.lock();
                         state
