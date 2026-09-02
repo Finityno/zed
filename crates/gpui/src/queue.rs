@@ -144,10 +144,12 @@ impl<T> PriorityQueueState<T> {
         }
 
         while queues.is_empty() {
-            // The one place every GPUI-owned worker blocks: the Linux and
-            // Windows dispatcher pools and `ThreadedDispatcher` all park here.
-            // (macOS dispatches onto GCD, whose threads GPUI does not own; its
-            // backend announces from the dispatch trampoline instead.)
+            // The one place every GPUI-owned worker blocks: the Linux
+            // dispatcher pool and `ThreadedDispatcher` park here. (macOS
+            // dispatches onto GCD and Windows onto the OS thread pool, whose
+            // threads GPUI does not own; those backends announce from their
+            // dispatch callbacks instead, and the Windows main thread drains
+            // with `try_pop`.)
             if crate::thread_park::is_installed() {
                 // Release the queue lock for the duration of the hook. The
                 // hook's work can take milliseconds, and holding the lock
