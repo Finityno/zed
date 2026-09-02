@@ -356,6 +356,14 @@ unsafe fn build_classes() {
                 sel!(hitTest:),
                 overlay_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
             );
+            // Same answer as the base view: while the overlay holds content
+            // (a popover left open when the user switched apps) it is the
+            // view AppKit asks, and NSView's default NO would activate the
+            // window and swallow that first click instead of delivering it.
+            decl.add_method(
+                sel!(acceptsFirstMouse:),
+                accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
+            );
             for selector in [
                 sel!(mouseDown:),
                 sel!(mouseUp:),
@@ -2386,7 +2394,12 @@ impl PlatformWindow for MacWindow {
     fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) {
         let mut this = self.0.lock();
         if this.overlay_renderer.is_none() {
+            // Every present comes through here (gpui core never calls `draw`),
+            // so the occluded-window release has to happen on this branch too
+            // or a window without an overlay keeps the intermediates a stray
+            // draw rebuilt while it was hidden.
             this.renderer.draw(scene);
+            this.release_intermediates_if_occluded();
             return;
         }
 
