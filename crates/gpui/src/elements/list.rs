@@ -954,6 +954,23 @@ impl ListState {
         self.0.borrow_mut().follow_state.stop_following();
     }
 
+    /// Change where content shorter than the viewport rests: against the top
+    /// edge for [`ListAlignment::Top`], against the bottom edge for
+    /// [`ListAlignment::Bottom`]. Takes effect at the next layout and leaves
+    /// the scroll position and follow state alone, so a list can switch while
+    /// it is following its tail — a chat that paints the last few rows of a
+    /// transcript before the rest has loaded wants them where the full
+    /// transcript will put them, not resting at the top for the frames the
+    /// load takes.
+    pub fn set_alignment(&self, alignment: ListAlignment) {
+        self.0.borrow_mut().alignment = alignment;
+    }
+
+    /// Where content shorter than the viewport rests.
+    pub fn alignment(&self) -> ListAlignment {
+        self.0.borrow().alignment
+    }
+
     /// Returns whether the list is currently actively following the
     /// tail (snapping to the end on each layout).
     pub fn is_following_tail(&self) -> bool {
@@ -2152,8 +2169,82 @@ mod test {
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
         IntoElement, ListAlignment, ListItemHeight, ListItemHeightEstimate, ListState,
-        ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, point, px, size,
+        ParentElement, Pixels, Render, Styled, TestAppContext, Window, canvas, div, list, point,
+        px, size,
     };
+
+    /// Alignment can change between frames: rows shorter than the viewport
+    /// move from the top edge to the bottom edge on the next layout, without
+    /// disturbing a list that is following its tail.
+    #[gpui::test]
+    fn set_alignment_moves_short_content_between_the_edges(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(2, ListAlignment::Top, px(0.));
+        state.set_follow_mode(FollowMode::Tail);
+        let last_row_bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+
+        struct TestView {
+            state: ListState,
+            last_row_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let last_row_bounds = self.last_row_bounds.clone();
+                list(self.state.clone(), move |ix, _, _| {
+                    if ix == 1 {
+                        let last_row_bounds = last_row_bounds.clone();
+                        canvas(
+                            move |bounds, _, _| last_row_bounds.set(Some(bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .h(px(20.))
+                        .w_full()
+                        .into_any()
+                    } else {
+                        div().h(px(20.)).w_full().into_any()
+                    }
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let mut draw = |cx: &mut gpui::VisualTestContext| {
+            let state = state.clone();
+            let last_row_bounds = last_row_bounds.clone();
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+                cx.new(|_| TestView {
+                    state,
+                    last_row_bounds,
+                })
+                .into_any_element()
+            });
+        };
+
+        draw(cx);
+        assert_eq!(
+            last_row_bounds.get().map(|bounds| bounds.bottom()),
+            Some(px(40.)),
+            "40px of rows in a 100px viewport rest at the top by default"
+        );
+
+        state.set_alignment(ListAlignment::Bottom);
+        draw(cx);
+        assert_eq!(
+            last_row_bounds.get().map(|bounds| bounds.bottom()),
+            Some(px(100.)),
+            "the same rows rest against the bottom edge once bottom-aligned"
+        );
+        assert!(state.is_following_tail());
+
+        state.set_alignment(ListAlignment::Top);
+        draw(cx);
+        assert_eq!(
+            last_row_bounds.get().map(|bounds| bounds.bottom()),
+            Some(px(40.)),
+            "switching back returns them to the top edge"
+        );
+    }
 
     #[test]
     fn content_height_hints_establish_and_update_the_unmeasured_extent() {
