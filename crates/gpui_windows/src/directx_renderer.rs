@@ -798,6 +798,29 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Detaches and drops the overlay swap chain, so the next draw renders the
+    /// whole scene into the base swap chain again. Portals already created by
+    /// [`Self::create_native_surface`] keep their visuals; the caller disables
+    /// the overlay only once the last of them is gone.
+    pub(crate) fn disable_scene_overlay(&mut self) {
+        let Some(overlay) = self.overlay_resources.take() else {
+            return;
+        };
+        if let Some(composition) = self.direct_composition.as_ref() {
+            composition
+                .clear_overlay_swap_chain()
+                .context("detaching the overlay swap chain from its visual")
+                .log_err();
+        }
+        // The visual no longer references the swap chain, so dropping it here
+        // is the last release; flush so the buffers actually retire instead of
+        // lingering until some later implicit flush (see `recreate_resources`).
+        drop(overlay);
+        if let Some(devices) = self.devices.as_ref() {
+            unsafe { devices.device_context.Flush() };
+        }
+    }
+
     pub(crate) fn create_native_surface(&mut self) -> Result<Rc<dyn PlatformNativeSurface>> {
         self.enable_scene_overlay()?;
         Ok(Rc::new(
@@ -1820,6 +1843,15 @@ impl DirectComposition {
     pub fn set_overlay_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             self.overlay_visual.SetContent(swap_chain)?;
+            self.comp_device.Commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_overlay_swap_chain(&self) -> Result<()> {
+        unsafe {
+            self.overlay_visual
+                .SetContent(None::<&windows::core::IUnknown>)?;
             self.comp_device.Commit()?;
         }
         Ok(())

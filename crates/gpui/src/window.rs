@@ -957,6 +957,9 @@ pub(crate) struct TooltipRequest {
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
+    /// Painted before every overlay-plane deferred draw and left on the base
+    /// scene plane; see [`Window::defer_draw_beneath_native_surfaces`].
+    beneath_native_surfaces: bool,
     parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
@@ -1213,6 +1216,10 @@ pub struct Window {
     /// input session can restart the IME connection).
     last_text_input_configuration: Option<TextInputConfiguration>,
     focused_text_input_active: bool,
+    /// While a deferred draw is being prepainted, whether it sits beneath native
+    /// surfaces, so a deferred draw it registers inherits the overlay plane
+    /// when its parent is there.
+    prepainting_deferred_draw_beneath_native_surfaces: Option<bool>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
@@ -1926,6 +1933,7 @@ impl Window {
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
+            prepainting_deferred_draw_beneath_native_surfaces: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
@@ -2152,9 +2160,23 @@ impl Window {
     /// views hosted by this window.
     ///
     /// The root scene remains on the primary surface. Deferred elements and
-    /// window-level overlays are rendered on the transparent plane.
+    /// window-level overlays are rendered on the transparent plane, except
+    /// deferred draws registered through
+    /// [`Self::defer_draw_beneath_native_surfaces`], which stay on the base
+    /// plane.
     pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         self.platform_window.enable_scene_overlay()
+    }
+
+    /// Tears down the transparent scene plane [`Self::enable_scene_overlay`]
+    /// created, returning the window to single-surface rendering: every
+    /// deferred draw is painted on the primary surface again, and the overlay
+    /// surface's GPU memory is released. A no-op when no overlay is enabled.
+    ///
+    /// Call it once the last native child view is gone. While one is still
+    /// hosted, disabling the overlay puts popups and menus back behind it.
+    pub fn disable_scene_overlay(&self) {
+        self.platform_window.disable_scene_overlay()
     }
 
     /// Creates a native surface slot between the root scene and GPUI's
@@ -3458,12 +3480,12 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
-        // Native surfaces are composited after the root scene and before all
-        // deferred/window-level overlays. Platform backends with layered scene
-        // support use this boundary to render the remainder on a transparent
-        // surface above native children such as WebViews.
-        self.next_frame.overlay_scene_start = self.next_frame.scene.len();
-
+        // Records `overlay_scene_start`: native surfaces are composited after
+        // the root scene and the deferred draws that stay beneath them, and
+        // before every other deferred draw and window-level overlay. Platform
+        // backends with layered scene support use this boundary to render the
+        // remainder on a transparent surface above native children such as
+        // WebViews.
         self.paint_deferred_draws(cx);
 
         if let Some(mut prompt_element) = prompt_element {
@@ -3598,12 +3620,24 @@ impl Window {
             assert!(depth < 10, "Exceeded maximum (10) deferred depth");
             depth += 1;
 
-            // Sort this round by priority.
+            // Sort this round the way `paint_deferred_draws` will paint, so
+            // hitboxes are registered in draw order.
             let mut traversal_order = (round_start..round_end).collect::<SmallVec<[usize; 8]>>();
-            traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+            traversal_order.sort_by_key(|ix| {
+                let deferred_draw = &self.next_frame.deferred_draws[*ix];
+                (!deferred_draw.beneath_native_surfaces, deferred_draw.priority)
+            });
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    prepaint_range,
+                    beneath_native_surfaces,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3616,12 +3650,15 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
+                        deferred_draw.beneath_native_surfaces,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
+                    self.prepainting_deferred_draw_beneath_native_surfaces =
+                        Some(beneath_native_surfaces);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -3629,6 +3666,7 @@ impl Window {
                             });
                         });
                     });
+                    self.prepainting_deferred_draw_beneath_native_surfaces = None;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -3647,16 +3685,23 @@ impl Window {
     fn paint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
 
-        // Paint all deferred draws in priority order.
-        // Since prepaint has already processed nested deferreds, we just paint them all.
-        if self.next_frame.deferred_draws.len() == 0 {
-            return;
-        }
-
+        // Paint all deferred draws in priority order, those kept beneath
+        // native surfaces first. Since prepaint has already processed nested
+        // deferreds, we just paint them all.
+        //
+        // The overlay plane starts at the first draw that is not kept beneath
+        // native surfaces; a frame with none leaves the boundary at the end of
+        // the scene, so only the prompt, drag and tooltip elements painted
+        // after this land on the overlay.
+        let mut overlay_scene_started = false;
         let traversal_order = self.deferred_draw_traversal_order();
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
+            if !overlay_scene_started && !deferred_draw.beneath_native_surfaces {
+                self.next_frame.overlay_scene_start = self.next_frame.scene.len();
+                overlay_scene_started = true;
+            }
             self.element_id_stack
                 .clone_from(&deferred_draw.element_id_stack);
             self.next_frame
@@ -3681,12 +3726,18 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
+        if !overlay_scene_started {
+            self.next_frame.overlay_scene_start = self.next_frame.scene.len();
+        }
     }
 
     fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
         let deferred_count = self.next_frame.deferred_draws.len();
         let mut sorted_indices = (0..deferred_count).collect::<SmallVec<[_; 8]>>();
-        sorted_indices.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+        sorted_indices.sort_by_key(|ix| {
+            let deferred_draw = &self.next_frame.deferred_draws[*ix];
+            (!deferred_draw.beneath_native_surfaces, deferred_draw.priority)
+        });
         sorted_indices
     }
 
@@ -3744,6 +3795,7 @@ impl Window {
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
+                    beneath_native_surfaces: deferred_draw.beneath_native_surfaces,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
@@ -4256,6 +4308,47 @@ impl Window {
         priority: usize,
         content_mask: Option<ContentMask<Pixels>>,
     ) {
+        self.defer_draw_on_plane(element, absolute_offset, priority, content_mask, false);
+    }
+
+    /// Like [`Self::defer_draw`], but keeps the element on the window's base
+    /// scene plane, beneath any native child surface, when a scene overlay is
+    /// enabled ([`Self::enable_scene_overlay`]). Such draws are painted before
+    /// every overlay-plane deferred draw regardless of `priority`, ordered by
+    /// `priority` among themselves, and never count as overlay content.
+    ///
+    /// A draw registered while an overlay-plane deferred draw is being
+    /// prepainted stays on the overlay plane: content nested in a popup must
+    /// not paint beneath the popup.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn defer_draw_beneath_native_surfaces(
+        &mut self,
+        element: AnyElement,
+        absolute_offset: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+    ) {
+        let beneath_native_surfaces = self
+            .prepainting_deferred_draw_beneath_native_surfaces
+            .unwrap_or(true);
+        self.defer_draw_on_plane(
+            element,
+            absolute_offset,
+            priority,
+            content_mask,
+            beneath_native_surfaces,
+        );
+    }
+
+    fn defer_draw_on_plane(
+        &mut self,
+        element: AnyElement,
+        absolute_offset: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+        beneath_native_surfaces: bool,
+    ) {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
@@ -4266,6 +4359,7 @@ impl Window {
             content_mask,
             rem_size: self.rem_size(),
             priority,
+            beneath_native_surfaces,
             element: Some(element),
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),

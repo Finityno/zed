@@ -914,6 +914,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         anyhow::bail!("layered GPUI scenes are not supported on this platform")
     }
+    /// Tears down the surface [`Self::enable_scene_overlay`] created and
+    /// releases its GPU memory; subsequent [`Self::draw_layered`] calls draw
+    /// the whole scene on the primary surface. A no-op when no overlay exists.
+    fn disable_scene_overlay(&self) {}
     /// Creates a native surface slot between GPUI's base and overlay planes.
     fn create_native_surface(&self) -> Result<Rc<dyn PlatformNativeSurface>> {
         anyhow::bail!("native surface portals are not supported on this platform")

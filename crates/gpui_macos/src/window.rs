@@ -2483,6 +2483,27 @@ impl PlatformWindow for MacWindow {
         Ok(())
     }
 
+    fn disable_scene_overlay(&self) {
+        let mut this = self.0.lock();
+        let Some(overlay_view) = this.overlay_view.take() else {
+            return;
+        };
+        // The overlay must stop claiming input before the view goes: a hit
+        // test racing the removal would otherwise route a click into a view
+        // that is being torn down.
+        this.overlay_input_active.store(false, Ordering::Release);
+        // The superview held the only strong reference (the view was added
+        // autoreleased), so removing it deallocates the view, which drops the
+        // window-state and input-flag references its ivars carried.
+        unsafe {
+            NSView::removeFromSuperview(overlay_view.as_ptr() as id);
+        }
+        // Dropping the renderer releases the overlay's CAMetalLayer and its
+        // drawables. Its borrowed intermediates were handed back to the base
+        // renderer at the end of the last layered draw, so nothing is lost.
+        this.overlay_renderer = None;
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }

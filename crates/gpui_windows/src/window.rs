@@ -1136,6 +1136,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow_mut().enable_scene_overlay()
     }
 
+    fn disable_scene_overlay(&self) {
+        self.state.renderer.borrow_mut().disable_scene_overlay();
+    }
+
     fn create_native_surface(&self) -> anyhow::Result<Rc<dyn PlatformNativeSurface>> {
         self.state.renderer.borrow_mut().create_native_surface()
     }
