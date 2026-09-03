@@ -375,6 +375,11 @@ impl WindowsWindowInner {
             while let Some(Ok(runnable)) = runnables.next() {
                 WindowsDispatcher::execute_runnable(runnable);
             }
+            // This drain bypasses the platform's, which re-stamps the depth
+            // at exit; a crash report during a size/move loop would otherwise
+            // claim work that has already run.
+            gpui::queue::MAIN_THREAD_QUEUE_DEPTH
+                .store(self.main_receiver.len(), std::sync::atomic::Ordering::Relaxed);
             self.handle_paint_msg(handle)
         } else {
             None

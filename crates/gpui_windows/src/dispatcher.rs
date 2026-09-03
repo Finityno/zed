@@ -17,7 +17,7 @@ use windows::Win32::{
         TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY, TP_CALLBACK_PRIORITY_HIGH,
         TP_CALLBACK_PRIORITY_LOW, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
     },
-    UI::WindowsAndMessaging::PostMessageW,
+    UI::WindowsAndMessaging::{PostMessageW, SetTimer},
 };
 
 use crate::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
@@ -33,6 +33,12 @@ const MAIN_THREAD_QUEUE_ALARM_DEPTH: usize = 128 * 1024;
 /// How many times to try posting the foreground wake-up before giving up on
 /// it. See [`WindowsDispatcher::wake_main_thread`].
 const WAKE_POST_ATTEMPTS: usize = 3;
+
+/// Timer id of the wake-up retry armed on the platform window once every
+/// post attempt has failed; see [`WindowsDispatcher::arm_wake_retry`].
+pub(crate) const WAKE_RETRY_TIMER_ID: usize = 0x4750_5549;
+/// How long the retry waits before posting the wake-up again.
+const WAKE_RETRY_DELAY_MS: u32 = 16;
 
 const QUEUE_ALARM_GENERATION_STEP: u64 = 1 << 32;
 const QUEUE_ALARM_DEPTH_MASK: u64 = QUEUE_ALARM_GENERATION_STEP - 1;
@@ -166,9 +172,30 @@ impl WindowsDispatcher {
         if self.claim_wake_post_failure_log() {
             log::error!(
                 "failed to post the main-thread wake-up {WAKE_POST_ATTEMPTS} times ({last_error:?}); \
-                 queued runnables will not run until the next dispatch posts one; \
+                 queued runnables wait for the retry timer or the next dispatch; \
                  suppressing further failures until a post succeeds"
             );
+        }
+        self.arm_wake_retry();
+    }
+
+    /// Every post attempt failed, so nothing is scheduled to drain the queue:
+    /// arm a USER timer on the platform window. `WM_TIMER` is never posted —
+    /// the message loop synthesizes it once the queue holds nothing else — so
+    /// it gets through exactly when a queue at its quota, the usual reason a
+    /// post fails, has drained enough for a post to land again. Its handler
+    /// calls [`Self::wake_main_thread`], which posts or arms this again.
+    fn arm_wake_retry(&self) {
+        let armed = unsafe {
+            SetTimer(
+                Some(self.platform_window_handle.as_raw()),
+                WAKE_RETRY_TIMER_ID,
+                WAKE_RETRY_DELAY_MS,
+                None,
+            )
+        };
+        if armed == 0 {
+            log::debug!("could not arm the main-thread wake-up retry timer");
         }
     }
 
@@ -191,10 +218,11 @@ impl WindowsDispatcher {
         if self.claim_wake_post_failure_log() {
             log::error!(
                 "failed to re-post the main-thread wake-up {WAKE_POST_ATTEMPTS} times ({last_error:?}); \
-                 the remaining foreground work will not run until the next dispatch posts one; \
+                 the remaining foreground work waits for the retry timer or the next dispatch; \
                  suppressing further failures until a post succeeds"
             );
         }
+        self.arm_wake_retry();
     }
 
     /// Returns whether this failure starts a streak and should be the one that

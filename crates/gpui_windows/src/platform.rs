@@ -1041,6 +1041,17 @@ impl WindowsPlatformInner {
             | WM_GPUI_GPU_DEVICE_LOST
             | WM_GPUI_END_SESSION => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
+            // The wake-up post failed every time it was tried; see
+            // `WindowsDispatcher::arm_wake_retry`.
+            WM_TIMER if wparam.0 == crate::dispatcher::WAKE_RETRY_TIMER_ID => {
+                if let Err(error) =
+                    unsafe { KillTimer(Some(handle), crate::dispatcher::WAKE_RETRY_TIMER_ID) }
+                {
+                    log::debug!("could not disarm the main-thread wake-up retry timer: {error}");
+                }
+                self.dispatcher.wake_main_thread();
+                Some(0)
+            }
             _ => None,
         };
         if let Some(result) = handled {
