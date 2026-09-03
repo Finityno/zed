@@ -787,22 +787,26 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                 }
             },
             |measured_input| {
-                let task = benchmark(&mut measured_input.input, &mut benchmark_context);
-                benchmark_context.dispatch_pending_frames(|| true);
-                let output = Rc::new(RefCell::new(None));
-                let completion = foreground_executor.spawn({
-                    let output = output.clone();
-                    async move {
-                        *output.borrow_mut() = Some(task.await);
+                // Same per-iteration pool as `bench_iter`: a task that draws
+                // a window leaves autoreleased Metal state behind otherwise.
+                with_autorelease_pool(|| {
+                    let task = benchmark(&mut measured_input.input, &mut benchmark_context);
+                    benchmark_context.dispatch_pending_frames(|| true);
+                    let output = Rc::new(RefCell::new(None));
+                    let completion = foreground_executor.spawn({
+                        let output = output.clone();
+                        async move {
+                            *output.borrow_mut() = Some(task.await);
+                        }
+                    });
+                    let output = benchmark_context.run_until(|| output.borrow_mut().take());
+                    drop(completion);
+                    MeasuredTaskOutput {
+                        trace_scope: measured_input.trace_scope.take(),
+                        report: report.clone(),
+                        _output: output,
                     }
-                });
-                let output = benchmark_context.run_until(|| output.borrow_mut().take());
-                drop(completion);
-                MeasuredTaskOutput {
-                    trace_scope: measured_input.trace_scope.take(),
-                    report: report.clone(),
-                    _output: output,
-                }
+                })
             },
             criterion::BatchSize::PerIteration,
         );
