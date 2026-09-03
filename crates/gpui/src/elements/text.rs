@@ -1219,11 +1219,13 @@ impl TextLayout {
 
         // Lines are aligned inside `bounds` by `text_align`; the band has to
         // follow the glyphs, not the element box. Multi-line text aligns each
-        // line by its own width, so this follows the widest.
+        // line by its own width, so this follows the widest. Signed: text
+        // wider than its bounds is painted at a negative offset, and the band
+        // goes with it.
         let align_offset = match text_style.text_align {
             TextAlign::Left => Pixels::ZERO,
-            TextAlign::Center => ((bounds.size.width - text_size.width) / 2.0).max(Pixels::ZERO),
-            TextAlign::Right => (bounds.size.width - text_size.width).max(Pixels::ZERO),
+            TextAlign::Center => (bounds.size.width - text_size.width) / 2.0,
+            TextAlign::Right => bounds.size.width - text_size.width,
         };
         let shimmer_origin = crate::point(bounds.origin.x + align_offset, bounds.origin.y);
 

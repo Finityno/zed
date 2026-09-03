@@ -1,5 +1,8 @@
 use crate::util::SHRINK_AFTER_FRAMES;
-use std::time::{Duration, Instant};
+// The crate's clock, not `std::time::Instant`: the wasm target has no native
+// monotonic clock and `Instant::now()` aborts there.
+use scheduler::Instant;
+use std::time::Duration;
 
 /// A low-use run has to last this long as well as span `SHRINK_AFTER_FRAMES`
 /// clears. The arena is cleared once per window draw, so with several windows
@@ -361,32 +364,31 @@ mod tests {
         assert_eq!(arena.capacity(), 24);
     }
 
-    /// One clear per frame at sixty frames a second: the count and the
-    /// duration thresholds line up exactly on the last clear.
-    fn frame_time(frame: u32) -> Instant {
-        EPOCH.with(|epoch| *epoch + SHRINK_AFTER_DURATION * frame / SHRINK_AFTER_FRAMES)
-    }
-
-    thread_local! {
-        static EPOCH: Instant = Instant::now();
+    /// One clear per frame at sixty frames a second, counted from an epoch
+    /// taken after the arena exists (its construction stamps the last
+    /// high-use time), so the count and the duration thresholds line up
+    /// exactly on the last clear.
+    fn frame_time(epoch: Instant, frame: u32) -> Instant {
+        epoch + SHRINK_AFTER_DURATION * frame / SHRINK_AFTER_FRAMES
     }
 
     #[test]
     fn test_arena_drops_surplus_chunks_after_idle_window() {
         let mut arena = Arena::new(64);
+        let epoch = Instant::now();
         for _ in 0..32 {
             arena.alloc(|| [0u8; 16]);
         }
         assert_eq!(arena.capacity(), 8 * 64);
-        arena.clear_at(frame_time(0));
+        arena.clear_at(frame_time(epoch, 0));
 
         for frame in 1..SHRINK_AFTER_FRAMES {
             arena.alloc(|| 1u64);
-            arena.clear_at(frame_time(frame));
+            arena.clear_at(frame_time(epoch, frame));
             assert_eq!(arena.capacity(), 8 * 64);
         }
         arena.alloc(|| 1u64);
-        arena.clear_at(frame_time(SHRINK_AFTER_FRAMES));
+        arena.clear_at(frame_time(epoch, SHRINK_AFTER_FRAMES));
         assert_eq!(arena.capacity(), 64);
 
         // The arena keeps working, and regrows, after the surplus is gone.
@@ -399,6 +401,7 @@ mod tests {
     #[test]
     fn test_arena_keeps_chunks_while_big_draws_recur() {
         let mut arena = Arena::new(64);
+        let epoch = Instant::now();
         for _ in 0..32 {
             arena.alloc(|| [0u8; 16]);
         }
@@ -410,7 +413,7 @@ mod tests {
             for _ in 0..allocations {
                 arena.alloc(|| [0u8; 16]);
             }
-            arena.clear_at(frame_time(clear + 1));
+            arena.clear_at(frame_time(epoch, clear + 1));
             assert_eq!(arena.capacity(), 8 * 64);
         }
     }
@@ -421,22 +424,23 @@ mod tests {
     #[test]
     fn test_arena_keeps_chunks_while_several_windows_clear_it_per_frame() {
         let mut arena = Arena::new(64);
+        let epoch = Instant::now();
         for _ in 0..32 {
             arena.alloc(|| [0u8; 16]);
         }
-        arena.clear_at(frame_time(0));
+        arena.clear_at(frame_time(epoch, 0));
         assert_eq!(arena.capacity(), 8 * 64);
 
         // Four windows: four clears per frame, so the count threshold is met
         // after a quarter of the window.
         for clear in 1..=SHRINK_AFTER_FRAMES * 2 {
             arena.alloc(|| 1u64);
-            arena.clear_at(frame_time(clear / 4));
+            arena.clear_at(frame_time(epoch, clear / 4));
             assert_eq!(arena.capacity(), 8 * 64, "clear {clear} shrank too early");
         }
         for clear in SHRINK_AFTER_FRAMES * 2 + 1..=SHRINK_AFTER_FRAMES * 4 {
             arena.alloc(|| 1u64);
-            arena.clear_at(frame_time(clear / 4));
+            arena.clear_at(frame_time(epoch, clear / 4));
         }
         assert_eq!(arena.capacity(), 64);
     }

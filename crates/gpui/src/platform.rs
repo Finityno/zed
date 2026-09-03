@@ -1243,6 +1243,13 @@ impl PlatformTextSystem for NoopTextSystem {
         }
     }
 
+    /// The dummy typographic bounds below are non-zero, but this backend
+    /// never rasterizes anything, so every glyph is a blank to be cached as
+    /// such rather than retried on every frame.
+    fn glyph_has_ink(&self, _font_id: FontId, _glyph_id: GlyphId) -> Result<bool> {
+        Ok(false)
+    }
+
     fn typographic_bounds(&self, _font_id: FontId, _glyph_id: GlyphId) -> Result<Bounds<f32>> {
         Ok(Bounds {
             origin: Point { x: 54.0, y: 0.0 },

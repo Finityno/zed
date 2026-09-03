@@ -49,9 +49,9 @@ pub fn set_thread_idle_hook(hook: ThreadIdleHook) -> bool {
 /// around a call — releasing a lock, say — when there is nothing to call.
 ///
 /// Not part of the embedder-facing API: its one caller is the worker park in
-/// `queue.rs`, which no macOS thread reaches (GCD owns the workers there), so
-/// on that platform the function is dead code by design.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// `queue.rs`, a module that is only compiled on the targets with GPUI-owned
+/// worker threads, so elsewhere this function is dead code by design.
+#[allow(dead_code)]
 pub(crate) fn is_installed() -> bool {
     HOOK.get().is_some()
 }
