@@ -142,6 +142,12 @@ rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
 unicode-segmentation = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The native_webview example hosts a WKWebView through the legacy cocoa/objc
+# bindings gpui_macos uses; gpui itself does not depend on them.
+cocoa.workspace = true
+objc.workspace = true
+
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }

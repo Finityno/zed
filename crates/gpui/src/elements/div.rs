@@ -2454,8 +2454,6 @@ impl Interactivity {
                         .insert(debug_selector.clone(), bounds);
                 }
 
-                self.paint_hover_group_handler(window, cx);
-
                 if style.visibility == Visibility::Hidden {
                     return ((), element_state);
                 }
@@ -3244,24 +3242,6 @@ impl Interactivity {
         }
     }
 
-    fn paint_hover_group_handler(&self, window: &mut Window, cx: &mut App) {
-        let group_hitbox = self
-            .group_hover_style
-            .as_ref()
-            .and_then(|group_hover| GroupHitboxes::get(&group_hover.group, cx));
-
-        if let Some(group_hitbox) = group_hitbox {
-            let was_hovered = group_hitbox.is_hovered(window);
-            let current_view = window.current_view();
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = group_hitbox.is_hovered(window);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    cx.notify(current_view);
-                }
-            });
-        }
-    }
-
     fn paint_scroll_listener(
         &self,
         hitbox: &Hitbox,
@@ -3302,7 +3282,7 @@ impl Interactivity {
                                 delta.y
                             };
                             delta = point(magnitude, Pixels::ZERO);
-                            gesture.lock_to(Axis::Horizontal);
+                            gesture.lock_to(Axis::Horizontal, event.touch_phase);
                         } else {
                             gesture.filter(&scroll_axis_lock, &mut delta, event.touch_phase);
                         }
@@ -5618,6 +5598,52 @@ mod tests {
         }
 
         (inner.offset().y, outer.offset().y)
+    }
+
+    struct OwnHandlerScroller {
+        handle: ScrollHandle,
+    }
+
+    impl Render for OwnHandlerScroller {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("own")
+                .size(px(100.))
+                .overflow_scroll()
+                .track_scroll(&self.handle)
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(div().w(px(100.)).h(px(400.)))
+        }
+    }
+
+    /// The built-in scroll listener is registered ahead of the element's own handlers, so
+    /// bubble dispatch (reverse registration order) gives `on_scroll_wheel` first refusal: a
+    /// handler that stops propagation prevents the scroll rather than observing one that
+    /// already happened. Upstream registers them the other way round; nested-scroll chaining
+    /// and the embedder's scroll routing both depend on this order, so it is pinned here.
+    #[gpui::test]
+    fn test_own_scroll_wheel_handler_runs_before_the_builtin_scroll(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let handle = ScrollHandle::new();
+        let view_handle = handle.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| OwnHandlerScroller {
+                handle: view_handle,
+            })
+            .into_any_element()
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(10.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            handle.offset().y,
+            Pixels::ZERO,
+            "a handler that stops propagation must prevent the built-in scroll"
+        );
     }
 
     /// GPUI's default: the event keeps bubbling, so both scrollers move on every wheel.

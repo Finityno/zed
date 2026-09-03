@@ -632,11 +632,18 @@ mod macos {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let webview = Rc::new(NativeWebView::new(window).unwrap());
+                    let webview = NativeWebView::new(window).unwrap_or_else(|error| {
+                        eprintln!("could not create the native webview: {error:#}");
+                        std::process::exit(1);
+                    });
+                    let webview = Rc::new(webview);
 
                     // Insert the transparent GPUI overlay after the native
                     // WebView so AppKit places it above the browser view.
-                    window.enable_scene_overlay().unwrap();
+                    if let Err(error) = window.enable_scene_overlay() {
+                        eprintln!("could not enable the scene overlay: {error:#}");
+                        std::process::exit(1);
+                    }
 
                     cx.new(|_| NativeWebViewExample {
                         webview,
@@ -647,7 +654,10 @@ mod macos {
                     })
                 },
             )
-            .unwrap();
+            .unwrap_or_else(|error| {
+                eprintln!("could not open the example window: {error:#}");
+                std::process::exit(1);
+            });
             cx.activate(true);
         });
     }

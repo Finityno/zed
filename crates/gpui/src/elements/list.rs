@@ -115,6 +115,7 @@ impl HeightHintMeasurements {
     fn record(&mut self, item: &ListItem, measured_height: Pixels) {
         let ListItem::Unmeasured {
             size_hint: Some(size_hint),
+            height_is_exact: false,
             ..
         } = item
         else {
@@ -963,7 +964,20 @@ impl ListState {
     /// transcript will put them, not resting at the top for the frames the
     /// load takes.
     pub fn set_alignment(&self, alignment: ListAlignment) {
-        self.0.borrow_mut().alignment = alignment;
+        let mut state = self.0.borrow_mut();
+        // `None` means "pinned to the end" under `Bottom` and "at the top"
+        // under `Top`, so the sentinel has to be spelled out across a switch
+        // or a list resting at its end jumps to its first item.
+        if state.alignment == ListAlignment::Bottom
+            && alignment == ListAlignment::Top
+            && state.logical_scroll_top.is_none()
+        {
+            state.logical_scroll_top = Some(ListOffset {
+                item_ix: state.items.summary().count,
+                offset_in_item: px(0.),
+            });
+        }
+        state.alignment = alignment;
     }
 
     /// Where content shorter than the viewport rests.
@@ -1280,7 +1294,11 @@ impl StateInner {
         let height = self
             .scrollbar_drag_start_height
             .unwrap_or_else(|| self.items.summary().height);
-        (height - bounds.size.height).max(px(0.))
+        // The same range `scroll` clamps to: the padding scrolls with the
+        // content, so a scrollbar or a diagnostic that leaves it out reports a
+        // range the list can in fact scroll past.
+        let padding = self.last_padding.unwrap_or_default();
+        (height + padding.top + padding.bottom - bounds.size.height).max(px(0.))
     }
 
     fn visible_range(
@@ -2176,6 +2194,20 @@ mod test {
     /// Alignment can change between frames: rows shorter than the viewport
     /// move from the top edge to the bottom edge on the next layout, without
     /// disturbing a list that is following its tail.
+    #[test]
+    fn set_alignment_keeps_a_list_resting_at_its_end_there_from_bottom_to_top() {
+        let state = ListState::new(5, ListAlignment::Bottom, px(0.));
+        assert_eq!(state.logical_scroll_top().item_ix, 5, "bottom rests at the end");
+
+        state.set_alignment(ListAlignment::Top);
+
+        assert_eq!(
+            state.logical_scroll_top().item_ix,
+            5,
+            "the end anchor survives the switch instead of decaying to item 0"
+        );
+    }
+
     #[gpui::test]
     fn set_alignment_moves_short_content_between_the_edges(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();

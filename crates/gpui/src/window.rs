@@ -2071,7 +2071,7 @@ impl TextShimmerStyle {
 /// changing anything else about the scene. The primitive stream keeps the same
 /// shape and count, so an A/B of the same binary isolates exactly what the
 /// shimmer costs on the GPU (see fincode's `docs/gpu-profiling.md`).
-fn text_shimmer_disabled() -> bool {
+pub(crate) fn text_shimmer_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
         std::env::var("GPUI_DISABLE_TEXT_SHIMMER")
@@ -4751,101 +4751,6 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             }
-        }
-        Ok(())
-    }
-
-    /// Paints a monochrome glyph with pre-computed raster bounds.
-    ///
-    /// This is faster than `paint_glyph` because it skips the per-glyph cache lookup.
-    /// Use `ShapedLine::compute_glyph_raster_data` to batch-compute raster bounds during prepaint.
-    pub fn paint_glyph_with_raster_bounds(
-        &mut self,
-        origin: Point<Pixels>,
-        _font_id: FontId,
-        _glyph_id: GlyphId,
-        _font_size: Pixels,
-        color: Hsla,
-        raster_bounds: Bounds<DevicePixels>,
-        params: &RenderGlyphParams,
-    ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
-            self.next_frame.scene.insert_primitive(MonochromeSprite {
-                order: 0,
-                pad: 0,
-                bounds,
-                content_mask,
-                color: color.opacity(element_opacity),
-                effect: self.current_text_effect(),
-                tile,
-                transformation: TransformationMatrix::unit(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Paints an emoji glyph with pre-computed raster bounds.
-    ///
-    /// This is faster than `paint_emoji` because it skips the per-glyph cache lookup.
-    /// Use `ShapedLine::compute_glyph_raster_data` to batch-compute raster bounds during prepaint.
-    pub fn paint_emoji_with_raster_bounds(
-        &mut self,
-        origin: Point<Pixels>,
-        _font_id: FontId,
-        _glyph_id: GlyphId,
-        _font_size: Pixels,
-        raster_bounds: Bounds<DevicePixels>,
-        params: &RenderGlyphParams,
-    ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-
-            let bounds = Bounds {
-                origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
-            let opacity = self.element_opacity();
-
-            self.next_frame.scene.insert_primitive(PolychromeSprite {
-                order: 0,
-                pad: 0,
-                grayscale: false.into(),
-                bounds,
-                corner_radii: Default::default(),
-                content_mask,
-                tile,
-                opacity,
-            });
         }
         Ok(())
     }

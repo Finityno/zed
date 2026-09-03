@@ -1,23 +1,11 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
+    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, StrikethroughStyle,
+    TextAlign, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
 use std::sync::Arc;
-
-/// Pre-computed glyph data for efficient painting without per-glyph cache lookups.
-///
-/// This is produced by `ShapedLine::compute_glyph_raster_data` during prepaint
-/// and consumed by `ShapedLine::paint_with_raster_data` during paint.
-#[derive(Clone, Debug)]
-pub struct GlyphRasterData {
-    /// The raster bounds for each glyph, in paint order.
-    pub bounds: Vec<Bounds<DevicePixels>>,
-    /// The render params for each glyph (needed for sprite atlas lookup).
-    pub params: Vec<RenderGlyphParams>,
-}
 
 /// Set the text decoration for a run of text.
 #[derive(Debug, Clone)]
@@ -549,7 +537,11 @@ fn paint_line(
                 let vertical_offset = point(px(0.0), glyph.position.y);
                 let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
                 let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
-                let ink_bottom = baseline_y - max_glyph_box.origin.y;
+                // A backend whose box has a zero origin (advance metrics rather
+                // than outline extents, as the cosmic-text one reports) has
+                // left the descent out of it, so take that from the font.
+                let descent = text_system.descent(run.font_id, layout.font_size).abs();
+                let ink_bottom = (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
                 // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
                 // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
                 // texture bounds include the antialiasing skirt, and some fonts report a box

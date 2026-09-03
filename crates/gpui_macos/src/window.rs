@@ -2144,6 +2144,11 @@ impl PlatformWindow for MacWindow {
             let ns_menu = create_native_context_menu(&menu, target, keymap, &mut next_tag);
             lock.context_menu_generation += 1;
             let generation = lock.context_menu_generation;
+            // Deliberately an `Arc` of a non-`Send` type: see the struct's
+            // doc — the count must be atomic because `MacWindowState` is
+            // `Send`, while every AppKit call in the teardown hops to the
+            // main thread itself.
+            #[allow(clippy::arc_with_non_send_sync)]
             let invocation = Arc::new(ActiveContextMenu {
                 generation,
                 menu: ns_menu,
