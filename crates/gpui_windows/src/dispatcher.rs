@@ -368,6 +368,14 @@ unsafe extern "system" fn run_work_callback(
 ) {
     let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
     WindowsDispatcher::execute_runnable(runnable);
+    // Background work runs on the OS thread pool, whose threads GPUI does not
+    // own and never parks: the blocking `recv` in `queue.rs` that announces
+    // idle for GPUI-owned workers is unreachable on this backend. The pool
+    // reuses its threads for the life of the process, so per-thread state an
+    // embedder keeps from the hook would otherwise accumulate on every worker
+    // forever. Just-finished-a-task is the only idle moment these threads
+    // expose, the same trade the macOS GCD trampoline makes.
+    gpui::thread_idle();
 }
 
 unsafe extern "system" fn run_timer_callback(
@@ -378,4 +386,5 @@ unsafe extern "system" fn run_timer_callback(
     let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
     WindowsDispatcher::execute_runnable(runnable);
     unsafe { CloseThreadpoolTimer(timer) };
+    gpui::thread_idle();
 }
