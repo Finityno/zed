@@ -2455,6 +2455,11 @@ mod glyph_pipeline_tests {
                 let Some(glyph_id) = system.glyph_for_char(*font_id, ch) else {
                     continue;
                 };
+                // Glyph 0 is .notdef: a face that lacks the character would otherwise
+                // be probed on its fallback box and fail spuriously.
+                if glyph_id.0 == 0 {
+                    continue;
+                }
                 for &font_size in FONT_SIZES {
                     for &scale_factor in SCALE_FACTORS {
                         for subpixel_rendering in [true, false] {
@@ -2515,6 +2520,11 @@ mod glyph_pipeline_tests {
                 let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
                     continue;
                 };
+                // Glyph 0 is .notdef: a face that lacks the character would otherwise
+                // be probed on its fallback box and fail spuriously.
+                if glyph_id.0 == 0 {
+                    continue;
+                }
                 // Design-unit ink box; zero for glyphs that legitimately paint nothing.
                 let typographic_ink = system
                     .typographic_bounds(*font_id, glyph_id)
@@ -2605,6 +2615,7 @@ mod glyph_pipeline_tests {
         };
         let chars = probe_chars();
         let mut failures = Vec::new();
+        let mut probed = 0usize;
         // How far the ink escapes the OLD box, per leading ratio. fincode renders at
         // `theme.line_height = 1.5`, so this is what says whether the defect could ever have
         // fired in the app rather than only in a synthetic case.
@@ -2648,6 +2659,11 @@ mod glyph_pipeline_tests {
                         let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
                             continue;
                         };
+                        // Glyph 0 is .notdef: a face that lacks the character would otherwise
+                        // be probed on its fallback box and fail spuriously.
+                        if glyph_id.0 == 0 {
+                            continue;
+                        }
                         let params =
                             glyph_params(*font_id, glyph_id, font_size, 1.0, 0, true);
                         let Some(raster) = system.glyph_raster_bounds(&params).log_err() else {
@@ -2656,6 +2672,7 @@ mod glyph_pipeline_tests {
                         if !has_ink(raster) {
                             continue;
                         }
+                        probed += 1;
 
                         // Where the sprite actually lands, in the same space as the cull box.
                         let ink_top = baseline_offset + px(raster.origin.y.0 as f32);
@@ -2711,6 +2728,12 @@ mod glyph_pipeline_tests {
             eprintln!("  {scale}x leading: {count} glyph configs, worst overflow {worst:.2}px");
         }
 
+        // Every raster call erroring would leave `failures` empty and pass
+        // without ever checking the invariant.
+        assert!(
+            probed > 0,
+            "no glyph could be rasterized, so the cull invariant was never checked"
+        );
         report(
             &failures,
             "paint outside the pre-cull box, so they can be dropped while visible",
@@ -2746,6 +2769,11 @@ mod glyph_pipeline_tests {
                 let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
                     continue;
                 };
+                // Glyph 0 is .notdef: a face that lacks the character would otherwise
+                // be probed on its fallback box and fail spuriously.
+                if glyph_id.0 == 0 {
+                    continue;
+                }
                 for &font_size in FONT_SIZES {
                     for &scale_factor in SCALE_FACTORS {
                         for subpixel_rendering in [true, false] {
@@ -2874,6 +2902,11 @@ mod glyph_pipeline_tests {
                 let Some(glyph_id) = system.glyph_for_char(*font_id, *ch) else {
                     continue;
                 };
+                // Glyph 0 is .notdef: a face that lacks the character would otherwise
+                // be probed on its fallback box and fail spuriously.
+                if glyph_id.0 == 0 {
+                    continue;
+                }
                 for &font_size in FONT_SIZES {
                     for &scale_factor in SCALE_FACTORS {
                         for subpixel_rendering in [true, false] {
