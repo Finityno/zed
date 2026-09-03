@@ -31,11 +31,14 @@ pub const DEFAULT_SHIMMER_ANGLE: f32 = 120.0;
 /// fraction of the cycle for the band to sit off the end of the text, which
 /// reads as a pause between sweeps.
 fn shimmer_delta(period: Duration, hold: f32) -> f32 {
-    let period = period.as_secs_f32();
+    let period = period.as_secs_f64();
     if period <= 0.0 {
         return 0.0;
     }
-    let phase = (SHIMMER_EPOCH.elapsed().as_secs_f32() / period) % 1.0;
+    // Uptime in f32 loses about 8 ms per ulp after a day and 62 ms after a
+    // week and a half, which quantizes the sweep into visible steps; only
+    // the unit phase is narrowed.
+    let phase = (SHIMMER_EPOCH.elapsed().as_secs_f64() / period).rem_euclid(1.0) as f32;
     let sweep = 1.0 - hold.clamp(0.0, 0.95);
     (phase / sweep).min(1.0)
 }
