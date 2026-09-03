@@ -81,8 +81,10 @@ pub trait PlatformNativeSurface {
     fn set_bounds(&self, bounds: Bounds<DevicePixels>) -> Result<()>;
     /// Updates whether the native surface participates in composition.
     fn set_visible(&self, visible: bool) -> Result<()>;
-    /// Returns the platform attachment object, such as an
-    /// `IDCompositionVisual` on Windows.
+    /// Returns the platform attachment object. On Windows it is the portal's
+    /// `IDCompositionVisual` as a raw `IUnknown` pointer (`*mut c_void`),
+    /// borrowed for the surface's lifetime, so a host built against any
+    /// `windows-core` release can recover it; take a reference to keep it.
     fn platform_handle(&self) -> Box<dyn Any>;
 }
 use strum::EnumIter;
