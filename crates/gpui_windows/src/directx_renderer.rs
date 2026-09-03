@@ -1980,11 +1980,13 @@ impl PlatformNativeSurface for DirectCompositionPortal {
     }
 
     fn platform_handle(&self) -> Box<dyn std::any::Any> {
-        Box::new(
-            self.visual
-                .cast::<windows::core::IUnknown>()
-                .expect("IDCompositionVisual must implement IUnknown"),
-        )
+        // The visual's `IUnknown` as a raw COM pointer, not as a
+        // `windows::core::IUnknown`: `Any` downcasts by type identity, and a
+        // host built against another `windows-core` release (WebView2's
+        // bindings trail gpui's) could never recover the typed value. The
+        // pointer is borrowed: valid as long as this portal is, and the host
+        // adds a reference of its own to keep it longer.
+        Box::new(self.visual.as_raw())
     }
 }
 
