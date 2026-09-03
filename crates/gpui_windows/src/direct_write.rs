@@ -2672,10 +2672,10 @@ mod glyph_pipeline_tests {
                         let Some(raster) = system.glyph_raster_bounds(&params).log_err() else {
                             continue;
                         };
-                        probed += 1;
                         if !has_ink(raster) {
                             continue;
                         }
+                        probed += 1;
 
                         // Where the sprite actually lands, in the same space as the cull box.
                         let ink_top = baseline_offset + px(raster.origin.y.0 as f32);

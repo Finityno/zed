@@ -541,10 +541,14 @@ impl DirectXRenderer {
             self.frames_since_paths = self.frames_since_paths.saturating_add(1);
             if self.frames_since_paths == PATH_INTERMEDIATE_IDLE_FRAMES {
                 // The last path-sprite draw left the intermediate bound at
-                // pixel-shader slot 0, and a bound resource stays alive however
-                // many references drop; unbind it so the release is real.
+                // slot 0 of both shader stages, and a bound resource stays
+                // alive however many references drop; unbind it so the
+                // release is real.
                 if let Some(devices) = self.devices.as_ref() {
-                    unsafe { devices.device_context.PSSetShaderResources(0, Some(&[None])) };
+                    unsafe {
+                        devices.device_context.VSSetShaderResources(0, Some(&[None]));
+                        devices.device_context.PSSetShaderResources(0, Some(&[None]));
+                    }
                 }
                 if let Some(resources) = self.resources.as_mut()
                     && resources.path_intermediates.take().is_some()
@@ -1751,9 +1755,12 @@ impl DirectXResources {
         self.depth_stencil_texture = None;
         // Not recreated here: the next frame that draws paths rebuilds them at
         // the new size, and a resize while no paths are on screen never pays
-        // for them at all. Unbound from pixel-shader slot 0 first, or the
-        // context's reference keeps the old intermediate alive.
-        unsafe { devices.device_context.PSSetShaderResources(0, Some(&[None])) };
+        // for them at all. Unbound from slot 0 of both shader stages first,
+        // or the context's reference keeps the old intermediate alive.
+        unsafe {
+            devices.device_context.VSSetShaderResources(0, Some(&[None]));
+            devices.device_context.PSSetShaderResources(0, Some(&[None]));
+        }
         self.path_intermediates = None;
         unsafe { devices.device_context.Flush() };
 

@@ -1,7 +1,10 @@
 use std::{
     ffi::c_void,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::{ThreadId, current},
     time::Duration,
 };
@@ -16,8 +19,9 @@ use windows::Win32::{
         PTP_TIMER, SetThreadPriority, SetThreadpoolTimer, THREAD_PRIORITY_TIME_CRITICAL,
         TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY, TP_CALLBACK_PRIORITY_HIGH,
         TP_CALLBACK_PRIORITY_LOW, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
+        WaitForThreadpoolTimerCallbacks,
     },
-    UI::WindowsAndMessaging::{PostMessageW, SetTimer},
+    UI::WindowsAndMessaging::PostMessageW,
 };
 
 use crate::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
@@ -34,11 +38,19 @@ const MAIN_THREAD_QUEUE_ALARM_DEPTH: usize = 128 * 1024;
 /// it. See [`WindowsDispatcher::wake_main_thread`].
 const WAKE_POST_ATTEMPTS: usize = 3;
 
-/// Timer id of the wake-up retry armed on the platform window once every
-/// post attempt has failed; see [`WindowsDispatcher::arm_wake_retry`].
-pub(crate) const WAKE_RETRY_TIMER_ID: usize = 0x4750_5549;
-/// How long the retry waits before posting the wake-up again.
-const WAKE_RETRY_DELAY_MS: u32 = 16;
+/// How long the wake-up retry waits before posting again; see
+/// [`WindowsDispatcher::arm_wake_retry`].
+const WAKE_RETRY_DELAY: Duration = Duration::from_millis(16);
+
+/// The thread-pool timer behind [`WindowsDispatcher::arm_wake_retry`]. A raw
+/// pool handle; the dispatcher owns it and closes it, with any in-flight
+/// callback waited out, before it drops.
+struct WakeRetryTimer(PTP_TIMER);
+
+// SAFETY: a thread-pool timer handle is used from any thread by design; the
+// only mutation is through the thread-pool API, which serializes itself.
+unsafe impl Send for WakeRetryTimer {}
+unsafe impl Sync for WakeRetryTimer {}
 
 const QUEUE_ALARM_GENERATION_STEP: u64 = 1 << 32;
 const QUEUE_ALARM_DEPTH_MASK: u64 = QUEUE_ALARM_GENERATION_STEP - 1;
@@ -72,6 +84,7 @@ pub(crate) struct WindowsDispatcher {
     /// the first successful post, which logs how many failures went unlogged.
     wake_post_failing: AtomicBool,
     suppressed_wake_post_failures: AtomicU64,
+    wake_retry_timer: OnceLock<Option<WakeRetryTimer>>,
 }
 
 impl WindowsDispatcher {
@@ -92,6 +105,7 @@ impl WindowsDispatcher {
             queue_alarm: AtomicU64::new(MAIN_THREAD_QUEUE_ALARM_DEPTH as u64),
             wake_post_failing: AtomicBool::new(false),
             suppressed_wake_post_failures: AtomicU64::new(0),
+            wake_retry_timer: OnceLock::new(),
         }
     }
 
@@ -180,23 +194,35 @@ impl WindowsDispatcher {
     }
 
     /// Every post attempt failed, so nothing is scheduled to drain the queue:
-    /// arm a USER timer on the platform window. `WM_TIMER` is never posted —
-    /// the message loop synthesizes it once the queue holds nothing else — so
-    /// it gets through exactly when a queue at its quota, the usual reason a
-    /// post fails, has drained enough for a post to land again. Its handler
-    /// calls [`Self::wake_main_thread`], which posts or arms this again.
+    /// arm a thread-pool timer that calls [`Self::wake_main_thread`] again
+    /// shortly, which posts or arms this once more. A thread-pool timer
+    /// rather than a USER timer, since producers post from any thread and a
+    /// window timer can only be set by the window's own thread. The retry
+    /// lands once a queue at its quota — the usual reason a post fails — has
+    /// drained enough for a post to succeed.
     fn arm_wake_retry(&self) {
-        let armed = unsafe {
-            SetTimer(
-                Some(self.platform_window_handle.as_raw()),
-                WAKE_RETRY_TIMER_ID,
-                WAKE_RETRY_DELAY_MS,
-                None,
-            )
+        let timer = self.wake_retry_timer.get_or_init(|| {
+            // The context is this dispatcher. It lives in an `Arc` for the
+            // life of the process, and `Drop` closes the timer with its
+            // callbacks waited out, so the pointer is never dangling when a
+            // callback runs.
+            let context = self as *const Self as *mut c_void;
+            unsafe { CreateThreadpoolTimer(Some(run_wake_retry_callback), Some(context), None) }
+                .log_err()
+                .map(WakeRetryTimer)
+        });
+        let Some(timer) = timer else {
+            log::debug!("no main-thread wake-up retry timer; the queue waits for the next dispatch");
+            return;
         };
-        if armed == 0 {
-            log::debug!("could not arm the main-thread wake-up retry timer");
-        }
+        // Negative FILETIME expresses a relative delay in 100ns ticks.
+        let ticks = (WAKE_RETRY_DELAY.as_nanos() / 100).min(i64::MAX as u128) as i64;
+        let due = (-ticks) as u64;
+        let due_time = FILETIME {
+            dwLowDateTime: due as u32,
+            dwHighDateTime: (due >> 32) as u32,
+        };
+        unsafe { SetThreadpoolTimer(timer.0, Some(&due_time), 0, None) };
     }
 
     /// Re-arms the wake from inside a drain that is yielding with work still
@@ -310,6 +336,31 @@ impl WindowsDispatcher {
         runnable.run();
         gpui::profiler::save_task_timing();
     }
+}
+
+impl Drop for WindowsDispatcher {
+    fn drop(&mut self) {
+        if let Some(Some(timer)) = self.wake_retry_timer.get() {
+            unsafe {
+                // Cancel anything pending, wait out a callback already
+                // running (it borrows `self`), then close.
+                SetThreadpoolTimer(timer.0, None, 0, None);
+                WaitForThreadpoolTimerCallbacks(timer.0, true);
+                CloseThreadpoolTimer(timer.0);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn run_wake_retry_callback(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _timer: PTP_TIMER,
+) {
+    // SAFETY: `context` is the dispatcher that armed the timer, which stays
+    // alive until its `Drop` has waited this callback out.
+    let dispatcher = unsafe { &*(context as *const WindowsDispatcher) };
+    dispatcher.wake_main_thread();
 }
 
 impl PlatformDispatcher for WindowsDispatcher {
