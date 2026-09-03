@@ -60,6 +60,11 @@ pub(crate) struct DirectXRenderer {
     devices: Option<DirectXRendererDevices>,
     resources: Option<DirectXResources>,
     overlay_resources: Option<OverlayResources>,
+    /// The render target the frame in progress is drawing into: the base
+    /// swap chain's, or the overlay's while `draw_layered` encodes the overlay
+    /// scene. Anything that rebinds render targets mid-scene (the path
+    /// intermediate) must come back to this one, not to the base plane's.
+    active_render_target_view: Option<ID3D11RenderTargetView>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
@@ -313,6 +318,7 @@ impl DirectXRenderer {
             devices: Some(devices),
             resources: Some(resources),
             overlay_resources: None,
+            active_render_target_view: None,
             globals,
             pipelines,
             direct_composition,
@@ -360,6 +366,7 @@ impl DirectXRenderer {
             // tree, which a headless renderer has no window for. Rendering to an owned texture
             // never needs one.
             overlay_resources: None,
+            active_render_target_view: None,
             font_info: Self::get_font_info(),
             frame_scratch: FrameScratch::default(),
             width: 1,
@@ -442,10 +449,11 @@ impl DirectXRenderer {
     }
 
     fn pre_draw(
-        &self,
+        &mut self,
         render_target_view: &Option<ID3D11RenderTargetView>,
         clear_color: &[f32; 4],
     ) -> Result<()> {
+        self.active_render_target_view = render_target_view.clone();
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -1444,10 +1452,16 @@ impl DirectXRenderer {
             }
         }
 
-        // Restore main render target and the batch's viewport
+        // Restore the render target this scene is drawing into (the overlay's
+        // while `draw_layered` encodes the overlay scene, not always the base
+        // plane's) and the batch's viewport.
+        let active_render_target_view = self
+            .active_render_target_view
+            .clone()
+            .or_else(|| resources.render_target_view.clone());
         unsafe {
             devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.render_target_view)),
+                Some(slice::from_ref(&active_render_target_view)),
                 resources.depth_stencil_view.as_ref(),
             );
             if saved_viewport_count > 0 {
@@ -2712,6 +2726,17 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
     Ok(())
 }
 
+/// The ordinary "over" blend. The shaders emit straight (non-premultiplied)
+/// colour, so `rgb = src * a + dst * (1 - a)` and `alpha = a + dst_a * (1 - a)`
+/// together are exactly premultiplied-over against the premultiplied render
+/// target the composition swap chains are declared as. The alpha term matters
+/// on any target that is not already opaque: the transparent overlay plane
+/// above a native surface, and a Mica or blurred window's translucent
+/// surfaces. With an additive `DestBlendAlpha = ONE` a translucent surface over
+/// its own shadow saturated to alpha 1 while its colour still carried only the
+/// surface's share, so the composited pixel was the surface over black instead
+/// of the surface over the page — popups on the overlay plane rendered darker
+/// and less see-through than the same popups on the base plane.
 #[inline]
 fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
@@ -2721,7 +2746,7 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -3629,6 +3654,78 @@ mod rendered_pixel_tests {
             "{} origin(s) lost text between the scene and the framebuffer:\n{}",
             failures.len(),
             failures.join("\n")
+        );
+    }
+
+    struct TranslucentStackView;
+
+    impl Render for TranslucentStackView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // A half-transparent black "shadow" with a half-transparent white
+            // surface over it, the way a popup's box shadow sits under its fill.
+            div()
+                .size_full()
+                .bg(hsla(0., 0., 0., 0.5))
+                .child(div().size_full().bg(hsla(0., 0., 1., 0.5)))
+        }
+    }
+
+    /// The ordinary blend must be premultiplied-over in alpha as well as
+    /// colour. Over a transparent target (the overlay swap chain above a
+    /// composition-hosted WebView2, a Mica window's translucent surfaces) an
+    /// additive destination alpha saturates the alpha of stacked translucent
+    /// primitives while their colour still carries only their own share, so
+    /// the composited pixel reads as the top surface over black — a popup on
+    /// the overlay plane darker and less see-through than on the base plane.
+    #[test]
+    fn translucent_quads_over_a_transparent_target_composite_as_over() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+            eprintln!("SKIPPED: no DirectWrite");
+            return;
+        };
+        if DirectXHeadlessRenderer::new().is_none() {
+            eprintln!("SKIPPED: no headless renderer");
+            return;
+        }
+
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(text_system),
+            Some(Box::new(|| {
+                DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+            })),
+        );
+
+        let window = cx.add_window(move |_, _| TranslucentStackView);
+        let image = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
+                window.resize(size(px(64.), px(64.)));
+                window.draw(cx).clear(cx);
+                window.render_to_image()
+            })
+            .unwrap()
+            .expect("rendering the scene should succeed");
+
+        let pixel = image.get_pixel(image.width() / 2, image.height() / 2);
+        // Premultiplied over: colour 0.5 (the white surface's own share), alpha
+        // 0.5 + 0.5 * (1 - 0.5) = 0.75. The additive blend produced alpha 1.0
+        // for the same colour: white at half strength over black, opaque.
+        let expected_alpha = (0.75 * 255.0f32).round() as i32;
+        let expected_color = (0.5 * 255.0f32).round() as i32;
+        assert!(
+            (pixel[3] as i32 - expected_alpha).abs() <= 2,
+            "alpha must be the over-composite of the two quads, got {pixel:?}"
+        );
+        assert!(
+            (0..3).all(|channel| (pixel[channel] as i32 - expected_color).abs() <= 2),
+            "colour must be the white surface's premultiplied share, got {pixel:?}"
         );
     }
 
