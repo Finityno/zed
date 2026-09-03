@@ -1,7 +1,8 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextAlign,
+    TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
@@ -126,7 +127,8 @@ impl ShimmerStyle {
         let width = match self.spread {
             ShimmerSpread::TextWidths(ratio) => text_width * ratio.max(0.0),
             ShimmerSpread::CharWidths(chars) => average_char_width * chars.max(0.0),
-            ShimmerSpread::Pixels(width) => width,
+            // Absolute by definition, so only the zero-width guard applies.
+            ShimmerSpread::Pixels(width) => return width.max(px(1.0)),
         };
         width.max(average_char_width.max(px(1.0)))
     }
@@ -992,8 +994,7 @@ impl TextLayout {
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
                     && wrap_width == text_layout.wrap_width
-                    && truncate_width.is_none()
-                    && text_layout.truncate_width.is_none()
+                    && truncate_width == text_layout.truncate_width
                 {
                     return size;
                 }
@@ -1211,11 +1212,35 @@ impl TextLayout {
         let band_origin =
             px(axis_min) - band_width + travel * shimmer_delta(style.period, style.hold);
         let mut highlight_color = highlight_color;
-        highlight_color.a *= style.intensity.clamp(0.0, 1.0);
+        // The highlight is painted as a separate overlay from the glyphs, so an
+        // ancestor's opacity has to be applied here or the text fades while
+        // its shimmer stays at full strength.
+        highlight_color.a *= style.intensity.clamp(0.0, 1.0) * window.element_opacity();
+
+        // Lines are aligned inside `bounds` by `text_align`; the band has to
+        // follow the glyphs, not the element box. Multi-line text aligns each
+        // line by its own width, so this follows the widest. Signed: text
+        // wider than its bounds is painted at a negative offset, and the band
+        // goes with it.
+        let align_offset = match text_style.text_align {
+            TextAlign::Left => Pixels::ZERO,
+            TextAlign::Center => (bounds.size.width - text_size.width) / 2.0,
+            TextAlign::Right => bounds.size.width - text_size.width,
+        };
+        let shimmer_origin = crate::point(bounds.origin.x + align_offset, bounds.origin.y);
+
+        // The band's position is a function of time, so an otherwise idle
+        // window has to keep drawing for it to move at all.
+        if highlight_color.a > 0.0
+            && !style.period.is_zero()
+            && !crate::window::text_shimmer_disabled()
+        {
+            window.request_animation_frame();
+        }
 
         window.with_text_shimmer(
             crate::window::TextShimmerStyle {
-                origin: bounds.origin,
+                origin: shimmer_origin,
                 highlight_color,
                 band_origin,
                 band_width,

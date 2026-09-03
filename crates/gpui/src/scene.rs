@@ -380,6 +380,32 @@ mod tests {
     use super::*;
     use crate::util::{MIN_RETAINED_CAPACITY, SHRINK_AFTER_FRAMES};
 
+    /// `quad_depth` is mirrored in every backend's shader by hand, and upstream
+    /// spaces it differently. A sync that takes an upstream shader while
+    /// keeping this file compiles clean and gives viewport-collapsed batches
+    /// depths hundreds of times larger than the quads: text drawn before an
+    /// opaque quad then passes the GREATER test over it.
+    #[test]
+    fn quad_depth_step_matches_every_shader() {
+        let step = format!("1.0 / {}.0", MAX_DEPTH_PARTITIONED_QUADS + 1);
+        assert_eq!(step, "1.0 / 65535.0");
+        for (name, source) in [
+            ("metal", include_str!("../../gpui_apple/src/shaders.metal")),
+            ("hlsl", include_str!("../../gpui_windows/src/shaders.hlsl")),
+            ("wgsl", include_str!("../../gpui_wgpu/src/shaders.wgsl")),
+        ] {
+            // The definition, not a forward declaration: any occurrence whose
+            // next few hundred characters carry the step.
+            let defined_with_step = source.match_indices("quad_depth(").any(|(index, _)| {
+                source[index..(index + 400).min(source.len())].contains(&step)
+            });
+            assert!(
+                defined_with_step,
+                "the {name} shader's quad_depth must step by {step}, as scene.rs does"
+            );
+        }
+    }
+
     fn paint_frame(scene: &mut Scene, quads: usize) {
         let bounds = Bounds {
             origin: Point::default(),
