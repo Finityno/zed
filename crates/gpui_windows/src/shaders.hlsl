@@ -1082,6 +1082,11 @@ struct PathVertexOutput {
     float4 position: SV_Position;
     float2 st_position: TEXCOORD0;
     nointerpolation uint vertex_id: TEXCOORD1;
+    // Paths rasterize through a 512px tile with a viewport whose origin is
+    // shifted to the tile, so `SV_Position` is tile-local in the fragment
+    // stage. The fill is authored against window-space `bounds`, so it needs
+    // the window-space position carried through.
+    float2 window_position: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1089,6 +1094,7 @@ struct PathFragmentInput {
     float4 position: SV_Position;
     float2 st_position: TEXCOORD0;
     nointerpolation uint vertex_id: TEXCOORD1;
+    float2 window_position: TEXCOORD2;
 };
 
 PathVertexOutput path_rasterization_vertex(uint vertex_id: SV_VertexID) {
@@ -1098,6 +1104,7 @@ PathVertexOutput path_rasterization_vertex(uint vertex_id: SV_VertexID) {
     output.position = to_device_position_impl(sprite.xy_position);
     output.st_position = sprite.st_position;
     output.vertex_id = vertex_id;
+    output.window_position = sprite.xy_position;
     output.clip_distance = distance_from_clip_rect_impl(sprite.xy_position, sprite.bounds);
 
     return output;
@@ -1124,7 +1131,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float4 color = gradient_color(background, input.window_position, bounds,
         gradient.solid, gradient.color0, gradient.color1);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
