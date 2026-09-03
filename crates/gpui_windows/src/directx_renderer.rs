@@ -60,11 +60,15 @@ pub(crate) struct DirectXRenderer {
     devices: Option<DirectXRendererDevices>,
     resources: Option<DirectXResources>,
     overlay_resources: Option<OverlayResources>,
-    /// The render target the frame in progress is drawing into: the base
-    /// swap chain's, or the overlay's while `draw_layered` encodes the overlay
-    /// scene. Anything that rebinds render targets mid-scene (the path
-    /// intermediate) must come back to this one, not to the base plane's.
-    active_render_target_view: Option<ID3D11RenderTargetView>,
+    /// The plane the frame in progress is drawing into: the base swap chain,
+    /// or the overlay while `draw_layered` encodes the overlay scene. Anything
+    /// that rebinds render targets mid-scene (the path intermediate) must come
+    /// back to that plane's target, not always the base plane's.
+    ///
+    /// The plane, never its render target view: a view kept here across
+    /// frames is an outstanding reference to a swap chain back buffer, and
+    /// `ResizeBuffers` refuses while one exists.
+    active_plane: ScenePlane,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
@@ -133,6 +137,15 @@ struct DirectXResources {
     /// flip-model back buffer is not a dependable `CopyResource` source, so headless
     /// rendering needs a target it can actually read back.
     headless: bool,
+}
+
+/// One of the two surfaces a layered frame is encoded into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScenePlane {
+    /// The base swap chain, beneath every native surface.
+    Base,
+    /// The transparent swap chain above them ([`OverlayResources`]).
+    Overlay,
 }
 
 struct OverlayResources {
@@ -322,7 +335,7 @@ impl DirectXRenderer {
             devices: Some(devices),
             resources: Some(resources),
             overlay_resources: None,
-            active_render_target_view: None,
+            active_plane: ScenePlane::Base,
             globals,
             pipelines,
             direct_composition,
@@ -348,10 +361,20 @@ impl DirectXRenderer {
     /// the point: an image produced here went through the real renderer.
     #[cfg(any(feature = "bench-support", feature = "test-support"))]
     pub(crate) fn new_headless(directx_devices: &DirectXDevices) -> Result<Self> {
+        Self::new_windowless(directx_devices, true)
+    }
+
+    /// A renderer on a composition swap chain with no window and no
+    /// DirectComposition tree. `headless` renders into an owned texture that
+    /// can be read back; otherwise the render target is the swap chain's own
+    /// back buffer, as a windowed renderer's is, so a test can exercise the
+    /// contract `ResizeBuffers` holds a windowed renderer to.
+    #[cfg(any(feature = "bench-support", feature = "test-support", test))]
+    fn new_windowless(directx_devices: &DirectXDevices, headless: bool) -> Result<Self> {
         let devices = DirectXRendererDevices::new(directx_devices, false)
             .context("Creating DirectX devices")?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
-        let resources = DirectXResources::new(&devices, 1, 1, HWND::default(), false, true)
+        let resources = DirectXResources::new(&devices, 1, 1, HWND::default(), false, headless)
             .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectX global elements")?;
@@ -370,12 +393,12 @@ impl DirectXRenderer {
             // tree, which a headless renderer has no window for. Rendering to an owned texture
             // never needs one.
             overlay_resources: None,
-            active_render_target_view: None,
+            active_plane: ScenePlane::Base,
             font_info: Self::get_font_info(),
             frame_scratch: FrameScratch::default(),
             width: 1,
             height: 1,
-            headless: true,
+            headless,
             skip_draws: false,
             resize_count: 0,
             logged_first_present: false,
@@ -452,12 +475,28 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(
-        &mut self,
-        render_target_view: &Option<ID3D11RenderTargetView>,
-        clear_color: &[f32; 4],
-    ) -> Result<()> {
-        self.active_render_target_view = render_target_view.clone();
+    /// The render target view of `plane`, while that plane has a surface.
+    fn plane_render_target_view(
+        &self,
+        plane: ScenePlane,
+    ) -> Result<&Option<ID3D11RenderTargetView>> {
+        match plane {
+            ScenePlane::Base => Ok(&self
+                .resources
+                .as_ref()
+                .context("resources missing")?
+                .render_target_view),
+            ScenePlane::Overlay => Ok(&self
+                .overlay_resources
+                .as_ref()
+                .context("overlay resources missing")?
+                .render_target_view),
+        }
+    }
+
+    fn pre_draw(&mut self, plane: ScenePlane, clear_color: &[f32; 4]) -> Result<()> {
+        self.active_plane = plane;
+        let render_target_view = self.plane_render_target_view(plane)?;
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -729,13 +768,7 @@ impl DirectXRenderer {
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
     /// instead), so the two cannot drift.
     fn render(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
-        let render_target_view = self
-            .resources
-            .as_ref()
-            .context("resources missing")?
-            .render_target_view
-            .clone();
-        self.pre_draw(&render_target_view, &clear_color)?;
+        self.pre_draw(ScenePlane::Base, &clear_color)?;
         self.draw_scene(scene)
     }
 
@@ -785,22 +818,10 @@ impl DirectXRenderer {
         overlay_scene: &Scene,
         clear_color: [f32; 4],
     ) -> Result<()> {
-        let base_view = self
-            .resources
-            .as_ref()
-            .context("resources missing")?
-            .render_target_view
-            .clone();
-        self.pre_draw(&base_view, &clear_color)?;
+        self.pre_draw(ScenePlane::Base, &clear_color)?;
         self.draw_scene(base_scene)?;
 
-        let overlay_view = self
-            .overlay_resources
-            .as_ref()
-            .context("overlay resources missing")?
-            .render_target_view
-            .clone();
-        self.pre_draw(&overlay_view, &[0.0; 4])?;
+        self.pre_draw(ScenePlane::Overlay, &[0.0; 4])?;
         self.draw_scene(overlay_scene)?;
         self.note_frame_paths(!scene.paths.is_empty());
 
@@ -1482,13 +1503,17 @@ impl DirectXRenderer {
         // Restore the render target this scene is drawing into (the overlay's
         // while `draw_layered` encodes the overlay scene, not always the base
         // plane's) and the batch's viewport.
-        let active_render_target_view = self
-            .active_render_target_view
-            .clone()
-            .or_else(|| resources.render_target_view.clone());
+        let active_render_target_view = match self.active_plane {
+            ScenePlane::Base => &resources.render_target_view,
+            ScenePlane::Overlay => &self
+                .overlay_resources
+                .as_ref()
+                .context("overlay resources missing")?
+                .render_target_view,
+        };
         unsafe {
             devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&active_render_target_view)),
+                Some(slice::from_ref(active_render_target_view)),
                 resources.depth_stencil_view.as_ref(),
             );
             if saved_viewport_count > 0 {
@@ -3467,6 +3492,67 @@ impl gpui::PlatformHeadlessRenderer for DirectXHeadlessRenderer {
     }
 }
 
+
+/// The DXGI contract behind every resize: `ResizeBuffers` refuses while any
+/// reference to a back buffer is outstanding, a render target view included.
+#[cfg(test)]
+mod swap_chain_tests {
+    use super::DirectXRenderer;
+    use crate::DirectXDevices;
+    use gpui::{DevicePixels, Scene, size};
+    use gpui_util::ResultExt as _;
+
+    /// A frame must leave no reference to the swap chain's back buffer
+    /// behind, or the next resize is refused. The window answers that refusal
+    /// by invalidating the GPU devices, and the recovery builds a new
+    /// DirectComposition tree, which strands every native surface portal
+    /// created under the old one: a composition-hosted WebView2 keeps
+    /// rendering into a visual that is no longer in the window.
+    #[test]
+    fn a_rendered_frame_leaves_no_reference_to_the_back_buffer() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(mut renderer) = DirectXRenderer::new_windowless(&devices, false).log_err()
+        else {
+            eprintln!("SKIPPED: no composition swap chain");
+            return;
+        };
+        renderer
+            .resize(size(DevicePixels(64), DevicePixels(64)))
+            .expect("the first resize has nothing outstanding");
+
+        // The contract itself, so that a pass below is not vacuous.
+        let outstanding_view = renderer
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.render_target_view.clone());
+        assert!(outstanding_view.is_some(), "the swap chain has a render target view");
+        assert!(
+            renderer
+                .resize(size(DevicePixels(80), DevicePixels(80)))
+                .is_err(),
+            "ResizeBuffers must refuse while a back-buffer view is held"
+        );
+        drop(outstanding_view);
+        renderer
+            .resize(size(DevicePixels(96), DevicePixels(96)))
+            .expect("the resize goes through once the view is released");
+
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer
+            .render(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("a frame renders");
+        renderer
+            .resize(size(DevicePixels(128), DevicePixels(128)))
+            .expect("a rendered frame must not leave the back buffer referenced");
+        renderer
+            .render(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("a frame renders after the resize");
+    }
+}
 
 /// Pixel-level verification through the real DirectX pipeline.
 ///
