@@ -3451,7 +3451,7 @@ mod rendered_pixel_tests {
     use gpui::{
         AppContext as _, ContentMask, Context, IntoElement, ParentElement as _, Pixels, Point,
         Render, Styled as _, TestAppContext, TestDispatcher, TextAlign, TextRun, Window, canvas,
-        div, font, hsla, point, px, size,
+        div, font, hsla, linear_color_stop, linear_gradient, point, px, size,
     };
     use gpui_util::ResultExt as _;
     use std::sync::Arc;
@@ -3727,6 +3727,115 @@ mod rendered_pixel_tests {
             (0..3).all(|channel| (pixel[channel] as i32 - expected_color).abs() <= 2),
             "colour must be the white surface's premultiplied share, got {pixel:?}"
         );
+    }
+
+    struct GradientPathView;
+
+    impl Render for GradientPathView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _cx| {
+                        // A left-to-right black-to-white gradient across a
+                        // rectangle spanning several 512px raster tiles.
+                        let mut builder = gpui::PathBuilder::fill();
+                        builder.move_to(point(px(100.), px(100.)));
+                        builder.line_to(point(px(1100.), px(100.)));
+                        builder.line_to(point(px(1100.), px(700.)));
+                        builder.line_to(point(px(100.), px(700.)));
+                        builder.close();
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(
+                                path,
+                                linear_gradient(
+                                    90.,
+                                    linear_color_stop(hsla(0., 0., 0., 1.), 0.),
+                                    linear_color_stop(hsla(0., 0., 1., 1.), 1.),
+                                ),
+                            );
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// The tile pass rasterizes each 512px tile through a viewport whose
+    /// origin is shifted to the tile, which makes `SV_Position` tile-local in
+    /// the fragment stage. A fill authored against window-space bounds (linear
+    /// gradients, stripe and checkerboard patterns) must still be evaluated at
+    /// the window-space position, or it restarts at every tile seam.
+    #[test]
+    fn path_gradient_fills_are_continuous_across_raster_tiles() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+            eprintln!("SKIPPED: no DirectWrite");
+            return;
+        };
+        if DirectXHeadlessRenderer::new().is_none() {
+            eprintln!("SKIPPED: no headless renderer");
+            return;
+        }
+
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(text_system),
+            Some(Box::new(|| {
+                DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+            })),
+        );
+
+        let window = cx.add_window(move |_, _| GradientPathView);
+        let image = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.resize(size(px(1200.), px(800.)));
+                window.draw(cx).clear(cx);
+                window.render_to_image()
+            })
+            .unwrap()
+            .expect("rendering the scene should succeed");
+
+        if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
+            let path = std::path::Path::new(&directory).join("path-gradient.png");
+            image.save(&path).log_err();
+        }
+
+        let scale = image.width() as f32 / 1200.0;
+        let device = |logical: f32| (logical * scale).round() as u32;
+        let brightness = |x: u32, y: u32| {
+            let pixel = image.get_pixel(x, y);
+            (pixel[0] as i32 + pixel[1] as i32 + pixel[2] as i32) / 3
+        };
+
+        // Left to right along the rectangle's middle row the gradient must
+        // climb monotonically (a few levels of dither aside) and cover most
+        // of the range; a fill evaluated at tile-local positions restarts
+        // from black at every 512-multiple seam instead.
+        let y = device(400.0);
+        let first = brightness(device(110.0), y);
+        let last = brightness(device(1090.0), y);
+        assert!(
+            last - first > 150,
+            "gradient did not span the rectangle: {first} at the left, {last} at the right"
+        );
+        let mut previous = first;
+        let mut x = device(110.0);
+        while x <= device(1090.0) {
+            let current = brightness(x, y);
+            assert!(
+                current >= previous - 4,
+                "brightness fell from {previous} to {current} at device column {x} (tile seam restart)"
+            );
+            previous = current;
+            x += 8;
+        }
     }
 
     struct PathView;
