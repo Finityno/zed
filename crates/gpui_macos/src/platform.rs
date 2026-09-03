@@ -7,7 +7,7 @@ use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight, NSApplication,
+        NSApplication,
         NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular, NSControl as _,
         NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSSavePanel,
         NSVisualEffectState, NSVisualEffectView, NSWindow,
@@ -714,15 +714,7 @@ impl Platform for MacPlatform {
             let ns_appearance: id = match appearance {
                 None => nil,
                 Some(appearance) => {
-                    let name: id = match appearance {
-                        WindowAppearance::Light => crate::window_appearance::NSAppearanceNameAqua,
-                        WindowAppearance::Dark => {
-                            crate::window_appearance::NSAppearanceNameDarkAqua
-                        }
-                        WindowAppearance::VibrantLight => NSAppearanceNameVibrantLight,
-                        WindowAppearance::VibrantDark => NSAppearanceNameVibrantDark,
-                    };
-                    msg_send![class!(NSAppearance), appearanceNamed: name]
+                    crate::window_appearance::window_appearance_to_native(appearance)
                 }
             };
             let _: () = msg_send![app, setAppearance: ns_appearance];
@@ -1629,6 +1621,9 @@ fn install_main_thread_idle_observer() {
         );
         if !observer.is_null() {
             CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+            // The run loop holds its own reference from here on; the
+            // create-time one would otherwise leak.
+            core_foundation_sys::base::CFRelease(observer as _);
         }
     }
 }

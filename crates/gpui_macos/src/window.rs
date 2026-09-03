@@ -757,6 +757,9 @@ struct MacWindowState {
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
+    /// The layered present's two halves; see `draw_layered`.
+    base_scene: gpui::Scene,
+    overlay_scene: gpui::Scene,
     renderer_context: renderer::Context,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -1294,6 +1297,8 @@ impl MacWindow {
                     false,
                 ),
                 overlay_renderer: None,
+                base_scene: gpui::Scene::default(),
+                overlay_scene: gpui::Scene::default(),
                 renderer_context,
                 request_frame_callback: None,
                 event_callback: None,
@@ -1398,6 +1403,13 @@ impl MacWindow {
                         let _: () = msg_send![native_window, setHidesOnDeactivate: NO];
                         // Let the window float keep above normal windows.
                         native_window.setLevel_(NSFloatingWindowLevel);
+                        // "Always on top" has to hold across Spaces and over
+                        // fullscreen apps too, or the panel is simply left
+                        // behind on the Space it was opened on.
+                        native_window.setCollectionBehavior_(
+                            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+                                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
+                        );
                     } else {
                         native_window.setLevel_(NSNormalWindowLevel);
                     }
@@ -2041,6 +2053,15 @@ impl PlatformWindow for MacWindow {
                     positioned: NSWindowOrderingMode::NSWindowBelow
                     relativeTo: nil
                 ];
+                // Start in the state the key-status observer keeps it in
+                // afterwards; a blur created for an inactive window otherwise
+                // shows until the next key change. Only the blurred mode: the
+                // observer hides that one alone, and a Mica backdrop follows
+                // the window's active state through its own material state.
+                if background_appearance == WindowBackgroundAppearance::Blurred {
+                    let is_key = this.native_window.isKeyWindow() == YES;
+                    let _: () = msg_send![blur_view, setHidden: (!is_key) as BOOL];
+                }
                 this.blurred_view = Some(blur_view.autorelease());
             }
         }
@@ -2408,19 +2429,23 @@ impl PlatformWindow for MacWindow {
             return;
         }
 
+        let this = &mut *this;
         let split = overlay_start.min(scene.len());
-        let mut base_scene = gpui::Scene::default();
-        base_scene.replay(0..split, scene);
-        base_scene.finish();
+        // The two halves are kept across presents so their vectors hold
+        // their capacity, instead of being allocated and freed per frame for
+        // as long as the overlay exists.
+        this.base_scene.clear();
+        this.base_scene.replay(0..split, scene);
+        this.base_scene.finish();
 
-        let mut overlay_scene = gpui::Scene::default();
-        overlay_scene.replay(split..scene.len(), scene);
-        overlay_scene.finish();
+        this.overlay_scene.clear();
+        this.overlay_scene.replay(split..scene.len(), scene);
+        this.overlay_scene.finish();
 
         this.overlay_input_active
-            .store(!overlay_scene.is_empty(), Ordering::Release);
-        this.renderer.note_scene_tiles(&overlay_scene);
-        this.renderer.draw(&base_scene);
+            .store(!this.overlay_scene.is_empty(), Ordering::Release);
+        this.renderer.note_scene_tiles(&this.overlay_scene);
+        this.renderer.draw(&this.base_scene);
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
@@ -2429,7 +2454,7 @@ impl PlatformWindow for MacWindow {
             .as_mut()
             .expect("overlay renderer checked above");
         overlay_renderer.lend_intermediates(intermediates);
-        overlay_renderer.draw(&overlay_scene);
+        overlay_renderer.draw(&this.overlay_scene);
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
         this.release_intermediates_if_occluded();
