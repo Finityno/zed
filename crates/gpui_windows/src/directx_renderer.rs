@@ -207,6 +207,10 @@ struct FrameScratch {
     path_sprites: Vec<PathSprite>,
     /// Raster-tile occupancy grid for the current path batch.
     path_tiles: Vec<bool>,
+    /// The layered present's two halves, kept so their vectors hold their
+    /// capacity across frames instead of being allocated per present.
+    base_scene: Scene,
+    overlay_scene: Scene,
 }
 
 struct DirectXGlobalElements {
@@ -535,15 +539,26 @@ impl DirectXRenderer {
             self.frames_since_paths = 0;
         } else {
             self.frames_since_paths = self.frames_since_paths.saturating_add(1);
-            if self.frames_since_paths == PATH_INTERMEDIATE_IDLE_FRAMES
-                && let Some(resources) = self.resources.as_mut()
-                && resources.path_intermediates.take().is_some()
-            {
-                log::debug!(
-                    "[directx-mem] released path intermediates after \
-                     {PATH_INTERMEDIATE_IDLE_FRAMES} path-free frames (commit {})",
-                    private_commit_label(),
-                );
+            if self.frames_since_paths == PATH_INTERMEDIATE_IDLE_FRAMES {
+                // The last path-sprite draw left the intermediate bound at
+                // slot 0 of both shader stages, and a bound resource stays
+                // alive however many references drop; unbind it so the
+                // release is real.
+                if let Some(devices) = self.devices.as_ref() {
+                    unsafe {
+                        devices.device_context.VSSetShaderResources(0, Some(&[None]));
+                        devices.device_context.PSSetShaderResources(0, Some(&[None]));
+                    }
+                }
+                if let Some(resources) = self.resources.as_mut()
+                    && resources.path_intermediates.take().is_some()
+                {
+                    log::debug!(
+                        "[directx-mem] released path intermediates after \
+                         {PATH_INTERMEDIATE_IDLE_FRAMES} path-free frames (commit {})",
+                        private_commit_label(),
+                    );
+                }
             }
         }
         if self.frames_drawn.is_multiple_of(1000) {
@@ -747,13 +762,29 @@ impl DirectXRenderer {
         clear_color: [f32; 4],
     ) -> Result<()> {
         let split = overlay_start.min(scene.len());
-        let mut base_scene = Scene::default();
+        // Taken out of the scratch for the draw, since drawing needs the
+        // renderer mutably, and put back afterwards whatever happened.
+        let mut base_scene = std::mem::take(&mut self.frame_scratch.base_scene);
+        let mut overlay_scene = std::mem::take(&mut self.frame_scratch.overlay_scene);
+        base_scene.clear();
         base_scene.replay(0..split, scene);
         base_scene.finish();
-        let mut overlay_scene = Scene::default();
+        overlay_scene.clear();
         overlay_scene.replay(split..scene.len(), scene);
         overlay_scene.finish();
+        let result = self.draw_layered_scenes(scene, &base_scene, &overlay_scene, clear_color);
+        self.frame_scratch.base_scene = base_scene;
+        self.frame_scratch.overlay_scene = overlay_scene;
+        result
+    }
 
+    fn draw_layered_scenes(
+        &mut self,
+        scene: &Scene,
+        base_scene: &Scene,
+        overlay_scene: &Scene,
+        clear_color: [f32; 4],
+    ) -> Result<()> {
         let base_view = self
             .resources
             .as_ref()
@@ -761,7 +792,7 @@ impl DirectXRenderer {
             .render_target_view
             .clone();
         self.pre_draw(&base_view, &clear_color)?;
-        self.draw_scene(&base_scene)?;
+        self.draw_scene(base_scene)?;
 
         let overlay_view = self
             .overlay_resources
@@ -770,7 +801,7 @@ impl DirectXRenderer {
             .render_target_view
             .clone();
         self.pre_draw(&overlay_view, &[0.0; 4])?;
-        self.draw_scene(&overlay_scene)?;
+        self.draw_scene(overlay_scene)?;
         self.note_frame_paths(!scene.paths.is_empty());
 
         unsafe {
@@ -952,7 +983,7 @@ impl DirectXRenderer {
     pub(crate) fn render_to_image(
         &mut self,
         scene: &Scene,
-        background_appearance: WindowBackgroundAppearance,
+        clear_color: [f32; 4],
     ) -> Result<image::RgbaImage> {
         // A pending device-lost recovery (`skip_draws`) leaves the atlas holding
         // tile references from the previous device; drawing before the forced
@@ -961,13 +992,9 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
-        self.render(
-            scene,
-            match background_appearance {
-                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-                _ => [0.0f32; 4],
-            },
-        )?;
+        // The window's effective clear colour, so a capture agrees with the
+        // live frame for dark and inactive windows too.
+        self.render(scene, clear_color)?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let device = &devices.device;
@@ -1728,7 +1755,12 @@ impl DirectXResources {
         self.depth_stencil_texture = None;
         // Not recreated here: the next frame that draws paths rebuilds them at
         // the new size, and a resize while no paths are on screen never pays
-        // for them at all.
+        // for them at all. Unbound from slot 0 of both shader stages first,
+        // or the context's reference keeps the old intermediate alive.
+        unsafe {
+            devices.device_context.VSSetShaderResources(0, Some(&[None]));
+            devices.device_context.PSSetShaderResources(0, Some(&[None]));
+        }
         self.path_intermediates = None;
         unsafe { devices.device_context.Flush() };
 
