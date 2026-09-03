@@ -514,6 +514,7 @@ impl MetalRenderer {
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
             metal::MTLBlendFactor::Zero,
+            metal::MTLBlendFactor::One,
         );
         let opaque_quads_pipeline_state = build_opaque_quads_pipeline_state(
             &device,
@@ -2059,9 +2060,17 @@ fn build_pipeline_state(
         vertex_fn_name,
         fragment_fn_name,
         pixel_format,
-        // Standard premultiplied-style "over" blend; the source alpha is added
-        // into the destination so stacked translucent elements accumulate.
+        // The ordinary "over" blend. The shaders emit straight colour, so
+        // `rgb = src * a + dst * (1 - a)` with `alpha = a + dst_a * (1 - a)` is
+        // exactly premultiplied-over against the premultiplied drawable. The
+        // alpha term only shows on a target that is not already opaque — the
+        // transparent overlay layer above a native view, or a glass window's
+        // translucent surfaces — where an additive destination factor let a
+        // translucent surface over its own shadow saturate to alpha 1 while
+        // its colour still carried only the surface's share: the surface over
+        // black rather than over the page.
         metal::MTLBlendFactor::One,
+        metal::MTLBlendFactor::OneMinusSourceAlpha,
     )
 }
 
@@ -2073,6 +2082,7 @@ fn build_pipeline_state_with_blend(
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
     source_alpha_blend_factor: metal::MTLBlendFactor,
+    destination_alpha_blend_factor: metal::MTLBlendFactor,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
@@ -2092,12 +2102,12 @@ fn build_pipeline_state_with_blend(
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
-    // With `Zero`, this quad keeps the destination alpha unchanged (used for
-    // glass content, so its anti-aliased edge does not punch through the
-    // translucent glass surface beneath it).
+    // `(Zero, One)` keeps the destination alpha unchanged (glass content, so
+    // its anti-aliased edge does not punch through the translucent glass
+    // surface beneath it); `(One, OneMinusSourceAlpha)` is premultiplied-over.
     color_attachment.set_source_alpha_blend_factor(source_alpha_blend_factor);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(destination_alpha_blend_factor);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -2168,10 +2178,12 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    // Path sprites arrive premultiplied from the intermediate, so this is the
+    // same premultiplied-over as `build_pipeline_state`, alpha term included.
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -2506,6 +2518,87 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+/// The ordinary blend must be premultiplied-over in alpha as well as colour.
+/// Over a transparent target (the overlay layer above a native view, a glass
+/// window's translucent surfaces) an additive destination alpha saturates the
+/// alpha of stacked translucent primitives while their colour still carries
+/// only their own share, so the composited pixel reads as the top surface over
+/// black — a popup on the overlay plane darker and less see-through than the
+/// same popup on the base plane.
+#[cfg(test)]
+mod alpha_blend_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{
+        Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Point, Quad,
+        ScaledPixels, Scene,
+    };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    const EXTENT: f32 = 64.;
+
+    fn translucent_quad(order: u32, color: Hsla) -> Quad {
+        let bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.),
+                y: ScaledPixels(0.),
+            },
+            size: gpui::size(ScaledPixels(EXTENT), ScaledPixels(EXTENT)),
+        };
+        Quad {
+            order,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(color),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    #[test]
+    fn translucent_quads_over_a_transparent_target_composite_as_over() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        renderer.update_transparency(true);
+
+        // A half-transparent black "shadow" with a half-transparent white
+        // surface over it, the way a popup's box shadow sits under its fill.
+        let mut scene = Scene::default();
+        scene
+            .quads
+            .push(translucent_quad(0, Hsla::black().opacity(0.5)));
+        scene
+            .quads
+            .push(translucent_quad(1, Hsla::white().opacity(0.5)));
+        scene.finish();
+
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                gpui::size(DevicePixels(EXTENT as i32), DevicePixels(EXTENT as i32)),
+            )
+            .expect("headless render succeeds");
+        let pixel = image.get_pixel(EXTENT as u32 / 2, EXTENT as u32 / 2);
+
+        // Premultiplied over: colour 0.5 (the white surface's own share), alpha
+        // 0.5 + 0.5 * (1 - 0.5) = 0.75. The additive blend produced alpha 1.0
+        // for the same colour: white at half strength over black, opaque.
+        let expected_alpha = (0.75 * 255.0f32).round() as i32;
+        let expected_color = (0.5 * 255.0f32).round() as i32;
+        assert!(
+            (pixel[3] as i32 - expected_alpha).abs() <= 2,
+            "alpha must be the over-composite of the two quads, got {pixel:?}"
+        );
+        assert!(
+            (0..3).all(|channel| (pixel[channel] as i32 - expected_color).abs() <= 2),
+            "colour must be the white surface's premultiplied share, got {pixel:?}"
+        );
     }
 }
 
