@@ -73,9 +73,10 @@ pub fn new_overlay_renderer(context: self::Context, base: &Renderer) -> Renderer
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
-    /// Consecutive frames that used no more than half of `buffer_size`.
-    /// Drives the shrink in [`Self::record_frame_usage`].
-    low_use_frames: u32,
+    /// Frames reported in the current shrink window, and the most any one of
+    /// them wrote. Drives the shrink in [`Self::record_frame_usage`].
+    window_frames: u32,
+    window_peak_bytes: usize,
 }
 
 /// A pool buffer can never shrink below this; it is also the size every
@@ -93,7 +94,8 @@ impl Default for InstanceBufferPool {
         Self {
             buffer_size: INSTANCE_BUFFER_FLOOR_SIZE,
             buffers: Vec::new(),
-            low_use_frames: 0,
+            window_frames: 0,
+            window_peak_bytes: 0,
         }
     }
 }
@@ -139,7 +141,7 @@ impl InstanceBufferPool {
     }
 
     /// Notes how many instance bytes a finished frame actually wrote, and
-    /// halves `buffer_size` once enough consecutive frames used less than
+    /// halves `buffer_size` once a whole window of frames has stayed under
     /// half of it.
     ///
     /// Growth is a ratchet without this: one elaborate frame doubles the
@@ -149,18 +151,26 @@ impl InstanceBufferPool {
     /// already drops returned buffers of the old size), and stops at the
     /// floor every window starts from. A frame that needs more space again
     /// grows exactly as before.
+    ///
+    /// The pool is shared by every renderer in the process and each reports
+    /// its own frames here, so the window is judged by its peak across all of
+    /// them: a small window animating at full rate cannot shrink the buffer
+    /// out from under a large one that draws rarely, which made the large one
+    /// regrow it — a fresh buffer and a split frame — every couple of seconds.
     pub(crate) fn record_frame_usage(&mut self, used_bytes: usize) {
+        self.window_peak_bytes = self.window_peak_bytes.max(used_bytes);
+        self.window_frames += 1;
+        if self.window_frames < INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            return;
+        }
+        let peak_bytes = self.window_peak_bytes;
+        self.window_frames = 0;
+        self.window_peak_bytes = 0;
         if self.buffer_size <= INSTANCE_BUFFER_FLOOR_SIZE
-            || used_bytes.saturating_mul(2) > self.buffer_size
+            || peak_bytes.saturating_mul(2) > self.buffer_size
         {
-            self.low_use_frames = 0;
             return;
         }
-        self.low_use_frames += 1;
-        if self.low_use_frames < INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
-            return;
-        }
-        self.low_use_frames = 0;
         let buffer_size = (self.buffer_size / 2).max(INSTANCE_BUFFER_FLOOR_SIZE);
         log::info!("decreased instance buffer size to {buffer_size}");
         self.reset(buffer_size);
@@ -217,6 +227,10 @@ pub struct MetalRenderer {
     /// [`Self::lend_intermediates`]) instead of allocating its own copies,
     /// which would double the per-window drawable-sized memory.
     borrows_intermediates: bool,
+    /// An overlay renderer shares the base renderer's atlas and draws in the
+    /// same present, whose tiles the base draw has already marked (see
+    /// [`Self::note_scene_tiles`]); it must not mark or age the atlas again.
+    shares_atlas_frame: bool,
     /// A private depth texture for frames whose path batches did not all fit
     /// into the intermediate at once (see [`Self::plan_path_batches`]) and
     /// therefore split the main render pass; the regular depth texture is
@@ -350,6 +364,7 @@ impl MetalRenderer {
             Some(self.command_queue.clone()),
         );
         renderer.borrows_intermediates = true;
+        renderer.shares_atlas_frame = true;
         renderer
     }
 
@@ -598,6 +613,7 @@ impl MetalRenderer {
             intermediate_textures_released: false,
             path_intermediate_idle_frames: 0,
             borrows_intermediates: false,
+            shares_atlas_frame: false,
             fallback_depth_texture: None,
             fallback_depth_idle_frames: 0,
             gpu_stats_last_log: None,
@@ -676,6 +692,15 @@ impl MetalRenderer {
         if self.intermediate_textures_released || self.borrows_intermediates {
             return;
         }
+        self.recreate_intermediate_textures(size);
+    }
+
+    /// The creation half of [`Self::update_intermediate_textures`], without
+    /// its guards. The render-time heal calls this on a borrowing overlay
+    /// renderer as well: a lent texture that does not match the drawable is
+    /// exactly the case the heal exists for, and the fresh textures travel
+    /// back to the base renderer with the rest when the draw hands them over.
+    fn recreate_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -684,6 +709,19 @@ impl MetalRenderer {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
             self.fallback_depth_texture = None;
+            return;
+        }
+
+        // A depth texture of this size is kept: the headless path calls this
+        // per render, and a fresh allocation per frame is pure churn.
+        let depth_matches = self.depth_texture.as_ref().is_some_and(|texture| {
+            texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+        });
+        if depth_matches {
+            if !self.path_intermediate_matches(size) {
+                self.path_intermediate_texture = None;
+                self.path_intermediate_msaa_texture = None;
+            }
             return;
         }
 
@@ -1145,12 +1183,8 @@ impl MetalRenderer {
                     self.stale_texture_heals,
                 );
             }
-            self.update_intermediate_textures(viewport_size);
+            self.recreate_intermediate_textures(viewport_size);
         }
-
-        // Every present goes through here, so this is where a frame's sprite
-        // tiles count as used; it also retires tiles idle for too long.
-        self.sprite_atlas.on_frame_drawn(scene);
 
         let mut writer = InstanceBufferWriter::new(
             &self.device,
@@ -1187,6 +1221,16 @@ impl MetalRenderer {
         });
         let block = block.copy();
         command_buffer.add_completed_handler(&block);
+
+        // Every present goes through here, so this is where a frame's sprite
+        // tiles count as used; it also retires tiles idle for too long. Only
+        // once the frame has actually been encoded: a frame that failed above
+        // drew nothing, so it must not age the atlas. An overlay renderer's
+        // scene was marked by its window's base draw and belongs to the same
+        // present, so it neither marks nor advances (see `note_scene_tiles`).
+        if !self.shares_atlas_frame {
+            self.sprite_atlas.on_frame_drawn(scene);
+        }
 
         Ok(command_buffer)
     }
@@ -2599,6 +2643,51 @@ mod alpha_blend_tests {
             (0..3).all(|channel| (pixel[channel] as i32 - expected_color).abs() <= 2),
             "colour must be the white surface's premultiplied share, got {pixel:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod instance_buffer_pool_tests {
+    use super::{
+        INSTANCE_BUFFER_FLOOR_SIZE, INSTANCE_BUFFER_SHRINK_AFTER_FRAMES, InstanceBufferPool,
+    };
+
+    fn pool_at(buffer_size: usize) -> InstanceBufferPool {
+        let mut pool = InstanceBufferPool::default();
+        pool.reset(buffer_size);
+        pool
+    }
+
+    /// One large frame inside the window — a big window drawing once while a
+    /// small one animates — keeps the buffer at its size.
+    #[test]
+    fn a_single_large_frame_in_the_window_vetoes_the_shrink() {
+        let size = INSTANCE_BUFFER_FLOOR_SIZE * 4;
+        let mut pool = pool_at(size);
+        for frame in 0..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES * 3 {
+            let used = if frame % INSTANCE_BUFFER_SHRINK_AFTER_FRAMES == 7 {
+                size * 3 / 4
+            } else {
+                1024
+            };
+            pool.record_frame_usage(used);
+            assert_eq!(pool.buffer_size, size, "frame {frame} shrank the buffer");
+        }
+    }
+
+    /// A whole window of small frames halves it, and it never goes below the floor.
+    #[test]
+    fn a_window_of_small_frames_halves_the_buffer_down_to_the_floor() {
+        let size = INSTANCE_BUFFER_FLOOR_SIZE * 4;
+        let mut pool = pool_at(size);
+        for _ in 0..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            pool.record_frame_usage(1024);
+        }
+        assert_eq!(pool.buffer_size, size / 2);
+        for _ in 0..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES * 4 {
+            pool.record_frame_usage(1024);
+        }
+        assert_eq!(pool.buffer_size, INSTANCE_BUFFER_FLOOR_SIZE);
     }
 }
 
