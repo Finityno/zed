@@ -2054,10 +2054,14 @@ impl PlatformWindow for MacWindow {
                     relativeTo: nil
                 ];
                 // Start in the state the key-status observer keeps it in
-                // afterwards; a backdrop created for an inactive window
-                // otherwise shows until the next key change.
-                let is_key = this.native_window.isKeyWindow() == YES;
-                let _: () = msg_send![blur_view, setHidden: (!is_key) as BOOL];
+                // afterwards; a blur created for an inactive window otherwise
+                // shows until the next key change. Only the blurred mode: the
+                // observer hides that one alone, and a Mica backdrop follows
+                // the window's active state through its own material state.
+                if background_appearance == WindowBackgroundAppearance::Blurred {
+                    let is_key = this.native_window.isKeyWindow() == YES;
+                    let _: () = msg_send![blur_view, setHidden: (!is_key) as BOOL];
+                }
                 this.blurred_view = Some(blur_view.autorelease());
             }
         }
