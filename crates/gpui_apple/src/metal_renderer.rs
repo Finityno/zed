@@ -2691,6 +2691,78 @@ mod instance_buffer_pool_tests {
     }
 }
 
+/// The stripe pattern (tag 4) reads its colour from the solid slot the
+/// vertex stage prepares, and that stage only prepared it for the solid,
+/// pattern-slash and checkerboard tags, so every stripe fill sampled an
+/// unset colour. Each backend's shader mirrors this branch by hand.
+#[cfg(test)]
+mod stripe_pattern_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{
+        Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Point, Quad, ScaledPixels, Scene,
+        pattern_stripe,
+    };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[test]
+    fn stripes_are_painted_in_their_configured_color() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        renderer.update_transparency(true);
+
+        let extent = 32.;
+        let bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.),
+                y: ScaledPixels(0.),
+            },
+            size: gpui::size(ScaledPixels(extent), ScaledPixels(extent)),
+        };
+        let mut scene = Scene::default();
+        scene.quads.push(Quad {
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            // 8px white stripes with 8px gaps, along the X axis.
+            background: pattern_stripe(Hsla::white(), 8., 8.),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene.finish();
+
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                gpui::size(DevicePixels(extent as i32), DevicePixels(extent as i32)),
+            )
+            .expect("headless render succeeds");
+
+        let column = extent as u32 / 2;
+        let lit_rows = (0..extent as u32)
+            .filter(|&row| image.get_pixel(column, row)[3] > 200)
+            .count();
+        let dark_rows = (0..extent as u32)
+            .filter(|&row| image.get_pixel(column, row)[3] < 30)
+            .count();
+        assert!(
+            lit_rows >= 12 && dark_rows >= 12,
+            "expected about half the rows striped white and half clear, got {lit_rows} lit and {dark_rows} clear"
+        );
+        let lit = (0..extent as u32)
+            .map(|row| image.get_pixel(column, row))
+            .find(|pixel| pixel[3] > 200)
+            .expect("at least one striped row");
+        assert!(
+            lit[0] > 200 && lit[1] > 200 && lit[2] > 200,
+            "the stripe must carry the configured white, got {lit:?}"
+        );
+    }
+}
+
 /// A window that lives through a display or backing change can keep
 /// intermediate textures (depth above all) sized for a stale drawable, and a
 /// mismatched depth attachment makes every depth test undefined — observed
