@@ -48,11 +48,11 @@ pub fn set_thread_idle_hook(hook: ThreadIdleHook) -> bool {
 /// Whether an idle hook has been installed, so a site can skip the setup
 /// around a call — releasing a lock, say — when there is nothing to call.
 ///
-/// Public for the same reason as [`thread_idle`]; not part of the
-/// embedder-facing API. (Its one in-crate caller, `queue.rs`, is not compiled
-/// on macOS, which is also why this is not `pub(crate)`.)
-#[doc(hidden)]
-pub fn is_installed() -> bool {
+/// Not part of the embedder-facing API: its one caller is the worker park in
+/// `queue.rs`, a module that is only compiled on the targets with GPUI-owned
+/// worker threads, so elsewhere this function is dead code by design.
+#[allow(dead_code)]
+pub(crate) fn is_installed() -> bool {
     HOOK.get().is_some()
 }
 
@@ -74,27 +74,29 @@ mod tests {
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    /// The hook is a process-wide `OnceLock`, so this test installs it for the
+    /// rest of the test binary and cannot assume it was first to do so: every
+    /// assertion below is conditional on which hook actually won.
     #[test]
     fn the_hook_runs_and_installs_only_once() {
-        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
-        thread_idle();
-        assert_eq!(
-            CALLS.load(Ordering::Relaxed),
-            0,
-            "an uninstalled hook must be a no-op, not a panic"
-        );
-
-        assert!(set_thread_idle_hook(|| {
+        let installed = set_thread_idle_hook(|| {
             CALLS.fetch_add(1, Ordering::Relaxed);
-        }));
-        thread_idle();
-        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        });
+        assert!(is_installed());
+        if installed {
+            let before = CALLS.load(Ordering::Relaxed);
+            thread_idle();
+            assert_eq!(CALLS.load(Ordering::Relaxed), before + 1);
+        }
 
         // A second install keeps the first hook rather than racing.
         assert!(!set_thread_idle_hook(|| {
             CALLS.fetch_add(100, Ordering::Relaxed);
         }));
-        thread_idle();
-        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        if installed {
+            let before = CALLS.load(Ordering::Relaxed);
+            thread_idle();
+            assert_eq!(CALLS.load(Ordering::Relaxed), before + 1);
+        }
     }
 }

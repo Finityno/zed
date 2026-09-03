@@ -1163,6 +1163,16 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     /// Get typographic bounds for a glyph.
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
+    /// Whether the glyph marks any pixels at all, as opposed to a blank such
+    /// as a space. Consulted only when a raster came back empty, to tell an
+    /// expected blank (cached) from a glyph that failed to rasterize (retried
+    /// next frame). Backends whose `typographic_bounds` are outline extents
+    /// need no override; one that reports advance metrics must, or every
+    /// blank is retried on every frame.
+    fn glyph_has_ink(&self, font_id: FontId, glyph_id: GlyphId) -> Result<bool> {
+        let bounds = self.typographic_bounds(font_id, glyph_id)?;
+        Ok(bounds.size.width > 0.0 && bounds.size.height > 0.0)
+    }
     /// Get the advance width for a glyph.
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
     /// Get the glyph ID for a character.
@@ -1231,6 +1241,13 @@ impl PlatformTextSystem for NoopTextSystem {
                 },
             },
         }
+    }
+
+    /// The dummy typographic bounds below are non-zero, but this backend
+    /// never rasterizes anything, so every glyph is a blank to be cached as
+    /// such rather than retried on every frame.
+    fn glyph_has_ink(&self, _font_id: FontId, _glyph_id: GlyphId) -> Result<bool> {
+        Ok(false)
     }
 
     fn typographic_bounds(&self, _font_id: FontId, _glyph_id: GlyphId) -> Result<Bounds<f32>> {

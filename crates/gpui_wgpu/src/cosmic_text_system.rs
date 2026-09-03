@@ -202,6 +202,12 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.read().advance(font_id, glyph_id)
     }
 
+    /// `typographic_bounds` above is built from advances, which a space has
+    /// too, so it cannot answer this; the outline can.
+    fn glyph_has_ink(&self, font_id: FontId, glyph_id: GlyphId) -> Result<bool> {
+        Ok(self.0.write().glyph_has_ink(font_id, glyph_id))
+    }
+
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
         self.0.read().glyph_for_char(font_id, ch)
     }
@@ -383,6 +389,21 @@ impl CosmicTextSystemState {
             None
         } else {
             Some(GlyphId(glyph_id.into()))
+        }
+    }
+
+    fn glyph_has_ink(&mut self, font_id: FontId, glyph_id: GlyphId) -> bool {
+        let font_ref = self.loaded_fonts[font_id.0].font.as_swash();
+        let mut scaler = self.swash_scale_context.builder(font_ref).build();
+        let glyph_id = glyph_id.0 as u16;
+        match scaler.scale_outline(glyph_id) {
+            Some(outline) => {
+                let bounds = outline.bounds();
+                bounds.width() > 0.0 && bounds.height() > 0.0
+            }
+            // No outline: a bitmap or colour glyph, or a font this scaler
+            // cannot read. Either way "has ink" is the recoverable answer.
+            None => true,
         }
     }
 

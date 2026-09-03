@@ -754,13 +754,17 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                 }
             },
             |measured_input| {
-                let task = benchmark(&mut measured_input.input, &mut benchmark_context);
-                let output = run_task_to_completion(&foreground_executor, task);
-                MeasuredTaskOutput {
-                    trace_scope: measured_input.trace_scope.take(),
-                    report: report.clone(),
-                    _output: output,
-                }
+                // Same per-iteration pool as `bench_iter`: a task that draws
+                // a window leaves autoreleased Metal state behind otherwise.
+                with_autorelease_pool(|| {
+                    let task = benchmark(&mut measured_input.input, &mut benchmark_context);
+                    let output = run_task_to_completion(&foreground_executor, task);
+                    MeasuredTaskOutput {
+                        trace_scope: measured_input.trace_scope.take(),
+                        report: report.clone(),
+                        _output: output,
+                    }
+                })
             },
             criterion::BatchSize::PerIteration,
         );

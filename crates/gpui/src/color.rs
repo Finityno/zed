@@ -858,6 +858,15 @@ pub fn checkerboard(color: impl Into<Hsla>, size: f32) -> Background {
 /// The stripe runs along the X axis and repeats along the Y axis using
 /// `width + interval` as the period.
 pub fn pattern_stripe(color: impl Into<Hsla>, width: f32, interval: f32) -> Background {
+    // The shader's anti-aliasing reads a zero-width stripe as one faint pixel
+    // per period and gives a zero-interval pattern a half-covered seam, so
+    // both degenerate cases are answered here instead.
+    if width <= 0.0 {
+        return Background::from(Hsla::transparent_black());
+    }
+    if interval <= 0.0 {
+        return solid_background(color);
+    }
     Background {
         tag: BackgroundTag::PatternStripe,
         solid: color.into(),

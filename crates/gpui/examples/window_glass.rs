@@ -6,6 +6,9 @@ use gpui::{
 };
 use gpui_platform::application;
 
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 /// A small AI chat client demonstrating [`Styled::glass`].
 ///
 /// The window uses a system glass background, so the wallpaper shows through.
@@ -138,6 +141,9 @@ impl Render for ChatApp {
 
 fn run_example() {
     application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         let bounds = Bounds::centered(None, size(px(680.), px(500.)), cx);
         cx.open_window(
             WindowOptions {

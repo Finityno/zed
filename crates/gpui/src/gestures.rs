@@ -83,8 +83,12 @@ impl ScrollAxisLock {
     fn dominates(&self, major: Pixels, minor: Pixels, percent: f32) -> bool {
         let major = major.abs();
         let minor = minor.abs();
-        major >= self.unlock_lower_bound
-            && (minor < self.unlock_lower_bound || major >= minor * percent)
+        // Strict, so a tie never claims the major axis: vertical is the ambient
+        // axis of nearly every layout, and the balanced start policy (percent
+        // 1.0) must read equal movement as vertical. The ratio applies however
+        // small the minor component is; waiving it under the noise floor let a
+        // locked vertical gesture come off its lock on nearly equal parts.
+        major >= self.unlock_lower_bound && major > minor * percent
     }
 }
 
@@ -112,6 +116,10 @@ fn movements_oppose(left: Point<Pixels>, right: Point<Pixels>) -> bool {
 pub struct OngoingScroll {
     last_event: Option<Instant>,
     axis: Option<Axis>,
+    /// Travel accumulated since the gesture began, while it has not committed
+    /// to an axis yet. `None` once it has committed, or once it came off a
+    /// lock, in which case the rest of the gesture passes through unfiltered.
+    pending: Option<Point<Pixels>>,
 }
 
 impl OngoingScroll {
@@ -122,9 +130,19 @@ impl OngoingScroll {
 
     /// Pin the gesture to `axis` for the rest of its duration, bypassing the usual dominance
     /// test. Used for input that names its axis outright, such as a Shift-modified wheel.
-    pub fn lock_to(&mut self, axis: Axis) {
+    ///
+    /// Takes the event's phase so a gesture that ends while still named this way is closed
+    /// like any other; a lock left behind would otherwise be inherited by the next one.
+    pub fn lock_to(&mut self, axis: Axis, touch_phase: TouchPhase) {
+        if matches!(touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.last_event = None;
+            self.axis = None;
+            self.pending = None;
+            return;
+        }
         self.last_event = Some(Instant::now());
         self.axis = Some(axis);
+        self.pending = None;
     }
 
     /// Filters the given delta to the dominant axis of the current scroll gesture.
@@ -150,6 +168,7 @@ impl OngoingScroll {
         if matches!(touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             self.last_event = None;
             self.axis = None;
+            self.pending = None;
             return;
         }
 
@@ -159,6 +178,7 @@ impl OngoingScroll {
             if touch_phase == TouchPhase::Started {
                 self.last_event = None;
                 self.axis = None;
+                self.pending = None;
             }
             return;
         }
@@ -167,23 +187,45 @@ impl OngoingScroll {
             || self.last_event.is_none_or(|last_event| {
                 now.duration_since(last_event) >= tuning.gesture_separation
             });
-        let mut axis = self.axis;
         if starts_new_gesture {
-            axis = if tuning.dominates(x, y, tuning.start_percent) {
-                Some(Axis::Horizontal)
-            } else {
-                Some(Axis::Vertical)
-            };
-        } else if x.max(y) >= tuning.unlock_lower_bound {
-            match axis {
-                Some(Axis::Vertical) if tuning.dominates(x, y, tuning.unlock_percent) => {
-                    axis = None;
+            self.axis = None;
+            self.pending = Some(Point::default());
+        }
+        let mut axis = self.axis;
+        match axis {
+            None => {
+                // Not committed yet. Deciding on the first event alone locked a
+                // slow sideways pan vertical for its whole life: every event
+                // stayed under the noise floor, so the floor read each one as
+                // noise, and the lock then zeroed the very axis the user was
+                // moving on. Accumulate instead, and decide on the gesture's
+                // travel once it clears the floor. Until then the delta passes
+                // through on both axes.
+                if let Some(pending) = self.pending.as_mut() {
+                    pending.x += delta.x;
+                    pending.y += delta.y;
+                    let pending_x = pending.x.abs();
+                    let pending_y = pending.y.abs();
+                    if pending_x.max(pending_y) >= tuning.unlock_lower_bound {
+                        axis = if tuning.dominates(pending_x, pending_y, tuning.start_percent) {
+                            Some(Axis::Horizontal)
+                        } else {
+                            Some(Axis::Vertical)
+                        };
+                        self.pending = None;
+                    }
                 }
-                Some(Axis::Horizontal) if tuning.dominates(y, x, tuning.unlock_percent) => {
-                    axis = None;
-                }
-                _ => {}
             }
+            Some(locked) if x.max(y) >= tuning.unlock_lower_bound => {
+                let unlocks = match locked {
+                    Axis::Vertical => tuning.dominates(x, y, tuning.unlock_percent),
+                    Axis::Horizontal => tuning.dominates(y, x, tuning.unlock_percent),
+                };
+                if unlocks {
+                    axis = None;
+                }
+            }
+            Some(_) => {}
         }
 
         self.last_event = Some(now);
@@ -1282,15 +1324,27 @@ mod tests {
         );
         assert_eq!(ongoing_scroll.axis, None);
 
-        let mut vertical_delta = point(px(2.), px(3.));
+        // The gesture after the reset starts undecided: a delta under the noise
+        // floor passes through, and the first one to clear it picks the axis.
+        let mut small_delta = point(px(2.), px(3.));
+        ongoing_scroll.filter_at(
+            &TUNING,
+            &mut small_delta,
+            TouchPhase::Moved,
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(ongoing_scroll.axis, None);
+        assert_eq!(small_delta, point(px(2.), px(3.)));
+
+        let mut vertical_delta = point(px(1.), px(9.));
         ongoing_scroll.filter_at(
             &TUNING,
             &mut vertical_delta,
             TouchPhase::Moved,
-            now + Duration::from_millis(2),
+            now + Duration::from_millis(3),
         );
         assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
-        assert_eq!(vertical_delta, point(px(0.), px(3.)));
+        assert_eq!(vertical_delta, point(px(0.), px(9.)));
     }
 
     #[test]
@@ -2305,17 +2359,88 @@ mod tests {
         }
     }
 
-    /// The balanced tuning treats sub-`unlock_lower_bound` movement as noise and reads it as
-    /// vertical, rather than committing to horizontal on a 1px sideways wobble.
+    /// Sub-`unlock_lower_bound` movement is noise: it neither commits the gesture to an axis
+    /// nor gets filtered, so a 1px sideways wobble cannot lock a gesture horizontal.
     #[test]
-    fn balanced_tuning_reads_tiny_deltas_as_vertical() {
+    fn balanced_tuning_defers_the_axis_on_tiny_deltas() {
         let now = Instant::now();
         let mut ongoing_scroll = OngoingScroll::default();
         let mut jitter = point(px(2.), px(1.));
 
         ongoing_scroll.filter_at(&TUNING, &mut jitter, TouchPhase::Started, now);
 
+        assert_eq!(ongoing_scroll.axis, None);
+        assert_eq!(jitter, point(px(2.), px(1.)), "undecided deltas pass through");
+    }
+
+    /// A slow sideways pan never produces a single event over the floor, but its travel adds
+    /// up: the gesture commits to the axis of the accumulated vector, not of the first wobble.
+    #[test]
+    fn slow_sideways_pan_commits_horizontal_once_its_travel_clears_the_floor() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut first = point(px(2.), px(1.));
+        ongoing_scroll.filter_at(&TUNING, &mut first, TouchPhase::Started, now);
+        let mut second = point(px(2.), px(0.));
+        ongoing_scroll.filter_at(&TUNING, &mut second, TouchPhase::Moved, now + Duration::from_millis(1));
+        assert_eq!(ongoing_scroll.axis, None, "4px of travel is still under the floor");
+
+        let mut third = point(px(2.), px(1.));
+        ongoing_scroll.filter_at(&TUNING, &mut third, TouchPhase::Moved, now + Duration::from_millis(2));
+
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Horizontal));
+        assert_eq!(third, point(px(2.), px(0.)), "the committing event is filtered too");
+    }
+
+    /// Equal movement on both axes is vertical under the balanced policy: the strict dominance
+    /// test never lets a tie claim the horizontal axis.
+    #[test]
+    fn balanced_tuning_reads_a_tie_as_vertical() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut tie = point(px(8.), px(8.));
+
+        ongoing_scroll.filter_at(&TUNING, &mut tie, TouchPhase::Started, now);
+
         assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
+    }
+
+    /// A vertical lock is only released by the configured ratio, even when the vertical part
+    /// of the event sits under the noise floor.
+    #[test]
+    fn vertical_lock_holds_against_a_near_diagonal_under_the_floor() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut vertical = point(px(0.), px(30.));
+        ongoing_scroll.filter_at(&TUNING, &mut vertical, TouchPhase::Started, now);
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
+
+        let mut near_diagonal = point(px(6.), px(5.));
+        ongoing_scroll.filter_at(
+            &TUNING,
+            &mut near_diagonal,
+            TouchPhase::Moved,
+            now + Duration::from_millis(1),
+        );
+
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
+        assert_eq!(near_diagonal, point(px(0.), px(5.)));
+    }
+
+    /// A gesture that ends while Shift still names its axis is closed like any other, so the
+    /// next gesture starts undecided instead of inheriting the horizontal lock.
+    #[test]
+    fn lock_to_closes_the_gesture_on_its_terminal_phase() {
+        let mut ongoing_scroll = OngoingScroll::default();
+        ongoing_scroll.lock_to(Axis::Horizontal, TouchPhase::Moved);
+        assert_eq!(ongoing_scroll.axis(), Some(Axis::Horizontal));
+
+        ongoing_scroll.lock_to(Axis::Horizontal, TouchPhase::Ended);
+
+        assert_eq!(ongoing_scroll.axis(), None);
+        let mut vertical = point(px(0.), px(30.));
+        ongoing_scroll.filter(&TUNING, &mut vertical, TouchPhase::Moved);
+        assert_eq!(ongoing_scroll.axis(), Some(Axis::Vertical));
     }
 
     /// The eager tuning is the one a small embedded horizontal region wants: it claims a gesture
@@ -2391,7 +2516,7 @@ mod tests {
     #[test]
     fn lock_to_pins_the_axis_without_a_dominant_delta() {
         let mut ongoing_scroll = OngoingScroll::default();
-        ongoing_scroll.lock_to(Axis::Horizontal);
+        ongoing_scroll.lock_to(Axis::Horizontal, TouchPhase::Moved);
         assert_eq!(ongoing_scroll.axis(), Some(Axis::Horizontal));
 
         // Vertically dominant, but under the noise floor, so the lock stands and the vertical
@@ -2408,7 +2533,7 @@ mod tests {
     #[test]
     fn lock_to_still_releases_on_clear_opposing_intent() {
         let mut ongoing_scroll = OngoingScroll::default();
-        ongoing_scroll.lock_to(Axis::Horizontal);
+        ongoing_scroll.lock_to(Axis::Horizontal, TouchPhase::Moved);
 
         let mut vertical_delta = point(px(1.), px(9.));
         ongoing_scroll.filter(&TUNING, &mut vertical_delta, TouchPhase::Moved);

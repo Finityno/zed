@@ -17,7 +17,9 @@ output=$(cargo tree \
   --edges features \
   --invert gpui)
 
-if echo "${output}" | grep --quiet 'gpui feature "test-support"'; then
+# A here-string rather than a pipe: `grep -q` exits on its first match and
+# `pipefail` would then report `echo`'s broken pipe as the check failing.
+if grep -q 'gpui feature "test-support"' <<<"${output}"; then
   echo "gpui's \"bench\" feature pulls in \"test-support\":"
   echo "${output}"
   exit 1
@@ -42,7 +44,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       --edges features \
       --invert "${platform_crate}")
 
-    if echo "${output}" | grep --quiet "${platform_crate} feature \"test-support\""; then
+    if grep -q "${platform_crate} feature \"test-support\"" <<<"${output}"; then
       echo "benchmarks pulls \"test-support\" into \"${platform_crate}\":"
       echo "${output}"
       exit 1

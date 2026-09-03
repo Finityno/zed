@@ -393,13 +393,9 @@ impl TextSystem {
     /// frame for a glyph that is genuinely blank. Only the second is recoverable, and a
     /// `typographic_bounds` failure is exactly the moment the first would be chosen.
     fn glyph_may_have_ink(&self, params: &RenderGlyphParams) -> bool {
-        match self
-            .platform_text_system
-            .typographic_bounds(params.font_id, params.glyph_id)
-        {
-            Ok(bounds) => bounds.size.width > 0.0 && bounds.size.height > 0.0,
-            Err(_) => true,
-        }
+        self.platform_text_system
+            .glyph_has_ink(params.font_id, params.glyph_id)
+            .unwrap_or(true)
     }
 
     /// Reports a glyph that has design ink but rasterized to nothing. Because the result is
