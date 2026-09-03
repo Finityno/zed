@@ -384,8 +384,16 @@ impl WindowsWindowInner {
                 // and silently failed, so bring it to the foreground here.
                 if !unsafe { IsWindowVisible(this.hwnd) }.as_bool() {
                     unsafe {
-                        ShowWindowAsync(this.hwnd, SW_SHOW).ok().log_err();
-                        SetForegroundWindow(this.hwnd).as_bool();
+                        // Shown synchronously: `SetForegroundWindow` refuses a
+                        // window that is still hidden, and an asynchronous
+                        // show has not happened by the next line. The return
+                        // value is the previous visibility, not an error.
+                        let _was_visible = ShowWindow(this.hwnd, SW_SHOW);
+                        if !SetForegroundWindow(this.hwnd).as_bool() {
+                            log::warn!(
+                                "Windows refused to bring the fullscreen window to the foreground"
+                            );
+                        }
                     }
                 }
             })
@@ -779,6 +787,16 @@ impl PlatformWindow for WindowsWindow {
         self.state.appearance_override.set(appearance);
         let effective = appearance.unwrap_or_else(|| self.state.appearance.get());
         configure_dwm_dark_mode(self.0.hwnd, effective);
+        // GPUI caches the appearance it was last told about, so a pin has to
+        // be announced the way a system change is; and the opaque base colour
+        // follows the effective appearance, so the swap chain needs a frame.
+        if let Some(mut callback) = self.state.callbacks.appearance_changed.take() {
+            callback();
+            self.state.callbacks.appearance_changed.set(Some(callback));
+        }
+        unsafe { InvalidateRect(Some(self.0.hwnd), None, false) }
+            .ok()
+            .log_err();
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
@@ -1120,7 +1138,7 @@ impl PlatformWindow for WindowsWindow {
         self.state
             .renderer
             .borrow_mut()
-            .render_to_image(scene, self.state.background_appearance.get())
+            .render_to_image(scene, self.effective_clear_color())
     }
 
     fn draw_layered(&self, scene: &Scene, overlay_start: usize) {
