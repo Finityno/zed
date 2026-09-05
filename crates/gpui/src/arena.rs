@@ -9,7 +9,7 @@ use std::time::Duration;
 /// drawing the count alone is reached in `SHRINK_AFTER_FRAMES / windows`
 /// frames, and a large window that sat still while a small one animated
 /// would lose its chunks and regrow them on its next draw.
-const SHRINK_AFTER_DURATION: Duration = Duration::from_secs(2);
+pub(crate) const SHRINK_AFTER_DURATION: Duration = Duration::from_secs(2);
 use std::{
     alloc::{self, handle_alloc_error},
     cell::Cell,

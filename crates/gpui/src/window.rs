@@ -7611,8 +7611,10 @@ mod tests {
         InputEvent as _, InteractiveElement as _, IntoElement, LongPressEvent, MouseButton,
         MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
+        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, rgb,
+        size, util::MIN_RETAINED_CAPACITY,
     };
+    use crate::arena::SHRINK_AFTER_DURATION;
 
     struct EmptyView;
 
@@ -7670,6 +7672,170 @@ mod tests {
         // subsequent draws of both windows work against a fresh arena.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+
+    /// A root that paints `quads` one-pixel quads. Each child is a layout
+    /// node, an arena-allocated element and a scene quad, so the count sizes
+    /// every per-frame store the idle reclaim covers; 20,000 is the order of
+    /// a dozen long chat transcripts drawn side by side.
+    struct QuadGrid {
+        quads: Rc<Cell<usize>>,
+    }
+
+    impl Render for QuadGrid {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_wrap()
+                .children((0..self.quads.get()).map(|_| div().size(px(1.)).bg(rgb(0xff0000))))
+        }
+    }
+
+    fn draw_window(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+
+    /// What the window holds for its next draw: the retired frame's quad
+    /// vector capacity and the element arena's capacity.
+    fn retained_capacity(cx: &mut TestAppContext, window: AnyWindowHandle) -> (usize, usize) {
+        cx.update_window(window, |_, window, cx| {
+            (
+                window.next_frame.scene.quads.capacity(),
+                cx.element_arena.borrow().capacity(),
+            )
+        })
+        .unwrap()
+    }
+
+    /// The draw-driven shrink policies only advance on draws, so a heavy
+    /// scene followed by a quiet window kept its high-water capacity for as
+    /// long as it stayed quiet. A window that has not drawn for the shrink
+    /// duration must give it back without being drawn.
+    #[gpui::test]
+    fn test_quiet_window_reclaims_idle_capacity(cx: &mut TestAppContext) {
+        const HEAVY: usize = 20_000;
+        let quads = Rc::new(Cell::new(HEAVY));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        // add_window drew once; a second draw puts the heavy scene through
+        // the other frame lineage too.
+        draw_window(cx, window.into());
+        let (heavy_quads, heavy_arena) = retained_capacity(cx, window.into());
+        assert!(heavy_quads >= HEAVY);
+        assert!(
+            heavy_arena > 1024 * 1024,
+            "the heavy scene must grow the arena past its first chunk"
+        );
+
+        // Far fewer small frames than the draw-driven policy needs.
+        quads.set(1);
+        draw_window(cx, window.into());
+        draw_window(cx, window.into());
+        assert_eq!(
+            retained_capacity(cx, window.into()),
+            (heavy_quads, heavy_arena)
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        let (idle_quads, idle_arena) = retained_capacity(cx, window.into());
+        assert!(
+            idle_quads <= MIN_RETAINED_CAPACITY,
+            "quad capacity {idle_quads} was not reclaimed from {heavy_quads}"
+        );
+        assert_eq!(
+            idle_arena,
+            1024 * 1024,
+            "the arena kept {heavy_arena} bytes for a one-quad scene"
+        );
+
+        // The window still draws, and regrows what the next scene needs.
+        quads.set(HEAVY);
+        draw_window(cx, window.into());
+        let rendered_quads = cx
+            .update_window(window.into(), |_, window, _| {
+                window.rendered_frame.scene.quads.len()
+            })
+            .unwrap();
+        assert!(rendered_quads >= HEAVY);
+    }
+
+    /// A window that keeps drawing is never reclaimed: a timer that fires
+    /// within the shrink duration of a draw waits out the remainder.
+    #[gpui::test]
+    fn test_idle_reclaim_waits_for_a_full_quiet_period(cx: &mut TestAppContext) {
+        let quads = Rc::new(Cell::new(20_000));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        draw_window(cx, window.into());
+        let heavy = retained_capacity(cx, window.into());
+        quads.set(1);
+        draw_window(cx, window.into());
+
+        cx.executor()
+            .advance_clock(SHRINK_AFTER_DURATION * 3 / 4);
+        draw_window(cx, window.into());
+        cx.executor()
+            .advance_clock(SHRINK_AFTER_DURATION * 3 / 4);
+        cx.run_until_parked();
+        assert_eq!(
+            retained_capacity(cx, window.into()),
+            heavy,
+            "a window drawn within the shrink duration must keep its capacity"
+        );
+
+        cx.executor()
+            .advance_clock(SHRINK_AFTER_DURATION / 2);
+        cx.run_until_parked();
+        let (quads_after, arena_after) = retained_capacity(cx, window.into());
+        assert!(quads_after < heavy.0);
+        assert!(arena_after < heavy.1);
+    }
+
+    /// Prints how long the first heavy draw after an idle reclaim takes next
+    /// to the same draw with the high-water capacity still retained, three
+    /// runs each. Run with `--release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn regrow_after_idle_reclaim_timing() {
+        const HEAVY: usize = 20_000;
+        let mut cx = TestAppContext::single();
+        let quads = Rc::new(Cell::new(HEAVY));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        let mut retained = Vec::new();
+        let mut regrown = Vec::new();
+        for _ in 0..3 {
+            quads.set(HEAVY);
+            draw_window(&mut cx, window.into());
+            quads.set(1);
+            draw_window(&mut cx, window.into());
+            quads.set(HEAVY);
+            let start = std::time::Instant::now();
+            draw_window(&mut cx, window.into());
+            retained.push(start.elapsed());
+
+            quads.set(1);
+            draw_window(&mut cx, window.into());
+            cx.executor().advance_clock(Duration::from_secs(3));
+            cx.run_until_parked();
+            let (quads_capacity, arena_capacity) = retained_capacity(&mut cx, window.into());
+            assert!(quads_capacity <= MIN_RETAINED_CAPACITY && arena_capacity == 1024 * 1024);
+            quads.set(HEAVY);
+            let start = std::time::Instant::now();
+            draw_window(&mut cx, window.into());
+            regrown.push(start.elapsed());
+        }
+        println!("first heavy draw with capacity retained: {retained:?}");
+        println!("first heavy draw after idle reclaim:     {regrown:?}");
     }
 
     /// Platforms that stop requesting frames for idle windows (currently web)
