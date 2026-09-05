@@ -144,6 +144,42 @@ impl Scene {
         opaque_quad_indices.clear_vec(&mut self.opaque_quad_indices);
     }
 
+    /// Shrinks this cleared scene's vectors to twice the fill of `rendered`,
+    /// the scene still on screen, once the window has stopped drawing; see
+    /// [`CapacityShrink::idle_target`].
+    pub(crate) fn shrink_idle(&mut self, rendered: &Scene) {
+        let [
+            paint_operations,
+            layer_stack,
+            paths,
+            shadows,
+            quads,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            surfaces,
+            blended_quad_indices,
+            opaque_quad_indices,
+        ] = &mut self.shrink;
+        paint_operations.shrink_vec_idle(&mut self.paint_operations, rendered.paint_operations.len());
+        layer_stack.shrink_vec_idle(&mut self.layer_stack, rendered.layer_stack.len());
+        paths.shrink_vec_idle(&mut self.paths, rendered.paths.len());
+        shadows.shrink_vec_idle(&mut self.shadows, rendered.shadows.len());
+        quads.shrink_vec_idle(&mut self.quads, rendered.quads.len());
+        underlines.shrink_vec_idle(&mut self.underlines, rendered.underlines.len());
+        monochrome_sprites
+            .shrink_vec_idle(&mut self.monochrome_sprites, rendered.monochrome_sprites.len());
+        subpixel_sprites.shrink_vec_idle(&mut self.subpixel_sprites, rendered.subpixel_sprites.len());
+        polychrome_sprites
+            .shrink_vec_idle(&mut self.polychrome_sprites, rendered.polychrome_sprites.len());
+        surfaces.shrink_vec_idle(&mut self.surfaces, rendered.surfaces.len());
+        blended_quad_indices
+            .shrink_vec_idle(&mut self.blended_quad_indices, rendered.blended_quad_indices.len());
+        opaque_quad_indices
+            .shrink_vec_idle(&mut self.opaque_quad_indices, rendered.opaque_quad_indices.len());
+    }
+
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }
