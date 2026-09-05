@@ -2,8 +2,8 @@ use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
     Style, Window, size,
     util::{
-        ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
-        round_to_device_pixel,
+        MIN_RETAINED_CAPACITY, ceil_to_device_pixel, round_half_toward_zero,
+        round_stroke_to_device_pixel, round_to_device_pixel,
     },
 };
 use collections::{FxHashMap, FxHashSet};
@@ -35,6 +35,13 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// Nodes the last cleared frame held, and the most any frame has held
+    /// since the tree was last built. `TaffyTree::clear` empties its node
+    /// slotmaps but keeps their capacity, which is at least the high-water
+    /// mark, so one elaborate frame sizes them for the life of the window
+    /// unless [`Self::reclaim_idle_capacity`] rebuilds the tree.
+    last_frame_node_count: usize,
+    node_high_water: usize,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -49,14 +56,57 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            last_frame_node_count: 0,
+            node_high_water: 0,
         }
     }
 
     pub fn clear(&mut self) {
+        let node_count = self.taffy.total_node_count();
+        self.last_frame_node_count = node_count;
+        self.node_high_water = self.node_high_water.max(node_count);
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+    }
+
+    /// Rebuilds the cleared tree at twice the last frame's node count, for a
+    /// window that has stopped drawing, when it has held more than that.
+    ///
+    /// Layout ids are handed out while a draw requests layout and consumed by
+    /// that same draw's prepaint; the tree is cleared at the end of every draw
+    /// and nothing keeps an id across the clear, so between draws no id names
+    /// a node in this tree and replacing it is safe. The doubled capacity is
+    /// the headroom the per-frame collections keep, so the frame still on
+    /// screen redraws without reallocating. Returns whether it rebuilt.
+    pub fn reclaim_idle_capacity(&mut self) -> bool {
+        if self.taffy.total_node_count() != 0 {
+            return false;
+        }
+        let target = self
+            .last_frame_node_count
+            .saturating_mul(2)
+            .max(MIN_RETAINED_CAPACITY);
+        if self.node_high_water <= target {
+            return false;
+        }
+        let mut taffy = TaffyTree::with_capacity(target);
+        taffy.disable_rounding();
+        self.taffy = taffy;
+        self.node_high_water = target;
+        self.absolute_layout_bounds.shrink_to(target);
+        self.absolute_outer_origins.shrink_to(target);
+        self.computed_layouts.shrink_to(target);
+        // Emptied by every recompute that fills it, so between draws it holds
+        // only the capacity of the largest subtree ever walked.
+        self.layout_bounds_scratch_space.shrink_to(target);
+        true
+    }
+
+    #[cfg(test)]
+    fn node_high_water(&self) -> usize {
+        self.node_high_water
     }
 
     pub fn request_layout(
@@ -772,5 +822,58 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+
+    fn request_leaves(engine: &mut TaffyLayoutEngine, count: usize) {
+        for _ in 0..count {
+            engine.request_layout(Style::default(), crate::px(16.), 1.0, &[]);
+        }
+    }
+
+    /// `TaffyTree::clear` keeps its node slotmaps' capacity, so a quiet
+    /// window would hold its largest frame's layout tree; the idle rebuild
+    /// sizes it to the frame still on screen instead.
+    #[test]
+    fn idle_rebuild_sizes_the_tree_to_the_last_frame() {
+        let mut engine = TaffyLayoutEngine::new();
+        let ids: Vec<LayoutId> = (0..10_000)
+            .map(|_| engine.request_layout(Style::default(), crate::px(16.), 1.0, &[]))
+            .collect();
+        // What a recompute over the whole tree leaves behind: the scratch
+        // stack has held every node and is empty again.
+        engine.layout_bounds_scratch_space.extend(ids);
+        engine.layout_bounds_scratch_space.clear();
+        engine.clear();
+        assert_eq!(engine.node_high_water(), 10_000);
+        assert!(engine.layout_bounds_scratch_space.capacity() >= 10_000);
+
+        // A frame that still fills more than half of it keeps the tree.
+        request_leaves(&mut engine, 6_000);
+        engine.clear();
+        assert!(!engine.reclaim_idle_capacity());
+        assert_eq!(engine.node_high_water(), 10_000);
+
+        request_leaves(&mut engine, 100);
+        engine.clear();
+        assert!(engine.reclaim_idle_capacity());
+        assert_eq!(engine.node_high_water(), 200);
+        assert!(engine.layout_bounds_scratch_space.capacity() <= 200);
+        assert!(!engine.reclaim_idle_capacity());
+
+        // The rebuilt tree hands out ids and grows again.
+        request_leaves(&mut engine, 300);
+        assert_eq!(engine.taffy.total_node_count(), 300);
+        engine.clear();
+        assert_eq!(engine.node_high_water(), 300);
+    }
+
+    #[test]
+    fn idle_rebuild_never_replaces_a_tree_holding_nodes() {
+        let mut engine = TaffyLayoutEngine::new();
+        request_leaves(&mut engine, 10_000);
+        engine.clear();
+        request_leaves(&mut engine, 1);
+        assert!(!engine.reclaim_idle_capacity());
+        assert_eq!(engine.taffy.total_node_count(), 1);
     }
 }

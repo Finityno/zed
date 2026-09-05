@@ -116,6 +116,14 @@ where
         self.search_stack.clear();
     }
 
+    /// Shrinks this cleared tree's node storage to twice the size of
+    /// `rendered`, the tree still on screen, once the window has stopped
+    /// drawing; see [`CapacityShrink::idle_target`].
+    pub fn shrink_idle(&mut self, rendered: &Self) {
+        self.nodes_shrink
+            .shrink_vec_idle(&mut self.nodes, rendered.nodes.len());
+    }
+
     /// Inserts bounds into the tree and returns its assigned ordering.
     ///
     /// The ordering is one greater than the maximum ordering of any
@@ -472,5 +480,39 @@ mod tests {
                 assert_eq!(actual_ordering, expected_ordering);
             }
         }
+    }
+
+    fn unit_bounds(index: usize) -> Bounds<f32> {
+        Bounds {
+            origin: Point {
+                x: (index % 100) as f32 * 2.0,
+                y: (index / 100) as f32 * 2.0,
+            },
+            size: Size {
+                width: 1.0,
+                height: 1.0,
+            },
+        }
+    }
+
+    /// A tree cleared after a heavy frame keeps every node's storage; the
+    /// idle release sizes it to the tree still on screen.
+    #[test]
+    fn idle_release_sizes_nodes_to_the_rendered_tree() {
+        let mut retired = BoundsTree::<f32>::default();
+        for index in 0..10_000 {
+            retired.insert(unit_bounds(index));
+        }
+        retired.clear();
+        assert!(retired.nodes.capacity() >= 10_000);
+
+        let mut rendered = BoundsTree::<f32>::default();
+        rendered.insert(unit_bounds(0));
+        retired.shrink_idle(&rendered);
+        assert!(retired.nodes.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
+
+        // Still a working tree afterwards.
+        assert_eq!(retired.insert(unit_bounds(0)), 1);
+        assert_eq!(retired.insert(unit_bounds(0)), 2);
     }
 }

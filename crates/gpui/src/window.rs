@@ -73,6 +73,7 @@ pub use a11y::A11ySubtreeBuilder;
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+use crate::arena::SHRINK_AFTER_DURATION;
 use crate::util::{
     CapacityShrink, atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel,
     round_half_toward_zero, round_half_toward_zero_f64, round_stroke_to_device_pixel,
@@ -486,7 +487,8 @@ impl ArenaClearNeeded {
             std::ptr::eq(self.arena, &cx.element_arena),
             "ArenaClearNeeded::clear called with a different App than the draw ran against"
         );
-        cx.element_arena.borrow_mut().clear();
+        let now = cx.background_executor().now();
+        cx.element_arena.borrow_mut().clear_at(now);
     }
 }
 
@@ -1102,6 +1104,46 @@ impl Frame {
         }
     }
 
+    /// Shrinks this cleared frame's collections to twice the fill of
+    /// `rendered`, the frame still on screen, once the window has stopped
+    /// drawing; see [`CapacityShrink::idle_target`]. Only the retired frame
+    /// is touched: `rendered` is what event dispatch and presentation still
+    /// read.
+    pub(crate) fn shrink_idle(&mut self, rendered: &Frame) {
+        let shrink = &mut self.shrink;
+        shrink
+            .element_states
+            .shrink_map_idle(&mut self.element_states, rendered.element_states.len());
+        shrink.accessed_element_states.shrink_vec_idle(
+            &mut self.accessed_element_states,
+            rendered.accessed_element_states.len(),
+        );
+        shrink
+            .mouse_listeners
+            .shrink_vec_idle(&mut self.mouse_listeners, rendered.mouse_listeners.len());
+        shrink
+            .input_handlers
+            .shrink_vec_idle(&mut self.input_handlers, rendered.input_handlers.len());
+        shrink
+            .tooltip_requests
+            .shrink_vec_idle(&mut self.tooltip_requests, rendered.tooltip_requests.len());
+        shrink
+            .cursor_styles
+            .shrink_vec_idle(&mut self.cursor_styles, rendered.cursor_styles.len());
+        shrink
+            .hitboxes
+            .shrink_vec_idle(&mut self.hitboxes, rendered.hitboxes.len());
+        shrink.window_control_hitboxes.shrink_vec_idle(
+            &mut self.window_control_hitboxes,
+            rendered.window_control_hitboxes.len(),
+        );
+        shrink
+            .deferred_draws
+            .shrink_vec_idle(&mut self.deferred_draws, rendered.deferred_draws.len());
+        self.dispatch_tree.shrink_idle(&rendered.dispatch_tree);
+        self.scene.shrink_idle(&rendered.scene);
+    }
+
     pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
         self.cursor_styles
             .iter()
@@ -1254,6 +1296,11 @@ pub struct Window {
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
+    /// When the last draw finished, by the executor's clock, and the timer
+    /// that reclaims per-frame capacity once that is `SHRINK_AFTER_DURATION`
+    /// ago; see [`Self::reclaim_idle_capacity`].
+    last_draw_at: Instant,
+    idle_capacity_reclaim: Option<Task<()>>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -1969,6 +2016,8 @@ impl Window {
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
+            last_draw_at: cx.background_executor().now(),
+            idle_capacity_reclaim: None,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -3278,6 +3327,11 @@ impl Window {
         }
         self.needs_present.set(true);
 
+        self.last_draw_at = cx.background_executor().now();
+        if self.idle_capacity_reclaim.is_none() {
+            self.schedule_idle_capacity_reclaim(SHRINK_AFTER_DURATION, cx);
+        }
+
         #[cfg(feature = "profiler")]
         {
             let draw_duration = self
@@ -3289,6 +3343,50 @@ impl Window {
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
         arena_scope.exit(&cx.element_arena)
+    }
+
+    fn schedule_idle_capacity_reclaim(&mut self, delay: Duration, cx: &mut App) {
+        self.idle_capacity_reclaim = Some(self.spawn(cx, async move |cx| {
+            cx.background_executor.timer(delay).await;
+            cx.update(|window, cx| window.reclaim_idle_capacity(cx))
+                .log_err();
+        }));
+    }
+
+    /// Frees the per-frame capacity a window that has stopped drawing no
+    /// longer uses.
+    ///
+    /// The shrink policies behind [`CapacityShrink`], the element arena and
+    /// [`TaffyLayoutEngine`] all advance on draws, so a heavy scene followed
+    /// by a quiet or hidden window — a long transcript whose panels were then
+    /// hidden, a window moved behind another — kept the capacity of the
+    /// largest frame it ever drew for as long as it stayed quiet:
+    /// `SHRINK_AFTER_FRAMES` frames is not two seconds idle. This runs the
+    /// same shrink from a timer once no draw has finished for
+    /// `SHRINK_AFTER_DURATION`, keeping twice the on-screen frame's use so the
+    /// next draw of that scene does not regrow everything.
+    ///
+    /// It runs as a foreground task, so no draw is in flight, and it touches
+    /// only the retired frame's storage, the cleared layout tree and arena
+    /// chunks nothing points into; the rendered frame that dispatch and
+    /// presentation still read is left alone. Rather than re-arming on every
+    /// draw, the timer checks how long ago the last draw finished and, if a
+    /// draw landed since it was armed, waits out the remainder; an animating
+    /// window costs one timer per quiet period instead of one per frame. It
+    /// never draws: reclaiming is not a reason to redraw.
+    fn reclaim_idle_capacity(&mut self, cx: &mut App) {
+        self.idle_capacity_reclaim = None;
+        let now = cx.background_executor().now();
+        let quiet_for = now.saturating_duration_since(self.last_draw_at);
+        if quiet_for < SHRINK_AFTER_DURATION {
+            self.schedule_idle_capacity_reclaim(SHRINK_AFTER_DURATION - quiet_for, cx);
+            return;
+        }
+        self.next_frame.shrink_idle(&self.rendered_frame);
+        if let Some(layout_engine) = self.layout_engine.as_mut() {
+            layout_engine.reclaim_idle_capacity();
+        }
+        cx.element_arena.borrow_mut().release_idle_chunks(now);
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -7611,8 +7709,10 @@ mod tests {
         InputEvent as _, InteractiveElement as _, IntoElement, LongPressEvent, MouseButton,
         MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
+        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, rgb,
+        size, util::MIN_RETAINED_CAPACITY,
     };
+    use crate::arena::SHRINK_AFTER_DURATION;
 
     struct EmptyView;
 
@@ -7670,6 +7770,170 @@ mod tests {
         // subsequent draws of both windows work against a fresh arena.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+
+    /// A root that paints `quads` one-pixel quads. Each child is a layout
+    /// node, an arena-allocated element and a scene quad, so the count sizes
+    /// every per-frame store the idle reclaim covers; 20,000 is the order of
+    /// a dozen long chat transcripts drawn side by side.
+    struct QuadGrid {
+        quads: Rc<Cell<usize>>,
+    }
+
+    impl Render for QuadGrid {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_wrap()
+                .children((0..self.quads.get()).map(|_| div().size(px(1.)).bg(rgb(0xff0000))))
+        }
+    }
+
+    fn draw_window(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+
+    /// What the window holds for its next draw: the retired frame's quad
+    /// vector capacity and the element arena's capacity.
+    fn retained_capacity(cx: &mut TestAppContext, window: AnyWindowHandle) -> (usize, usize) {
+        cx.update_window(window, |_, window, cx| {
+            (
+                window.next_frame.scene.quads.capacity(),
+                cx.element_arena.borrow().capacity(),
+            )
+        })
+        .unwrap()
+    }
+
+    /// The draw-driven shrink policies only advance on draws, so a heavy
+    /// scene followed by a quiet window kept its high-water capacity for as
+    /// long as it stayed quiet. A window that has not drawn for the shrink
+    /// duration must give it back without being drawn.
+    #[gpui::test]
+    fn test_quiet_window_reclaims_idle_capacity(cx: &mut TestAppContext) {
+        const HEAVY: usize = 20_000;
+        let quads = Rc::new(Cell::new(HEAVY));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        // add_window drew once; a second draw puts the heavy scene through
+        // the other frame lineage too.
+        draw_window(cx, window.into());
+        let (heavy_quads, heavy_arena) = retained_capacity(cx, window.into());
+        assert!(heavy_quads >= HEAVY);
+        assert!(
+            heavy_arena > 1024 * 1024,
+            "the heavy scene must grow the arena past its first chunk"
+        );
+
+        // Far fewer small frames than the draw-driven policy needs.
+        quads.set(1);
+        draw_window(cx, window.into());
+        draw_window(cx, window.into());
+        assert_eq!(
+            retained_capacity(cx, window.into()),
+            (heavy_quads, heavy_arena)
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        let (idle_quads, idle_arena) = retained_capacity(cx, window.into());
+        assert!(
+            idle_quads <= MIN_RETAINED_CAPACITY,
+            "quad capacity {idle_quads} was not reclaimed from {heavy_quads}"
+        );
+        assert_eq!(
+            idle_arena,
+            1024 * 1024,
+            "the arena kept {heavy_arena} bytes for a one-quad scene"
+        );
+
+        // The window still draws, and regrows what the next scene needs.
+        quads.set(HEAVY);
+        draw_window(cx, window.into());
+        let rendered_quads = cx
+            .update_window(window.into(), |_, window, _| {
+                window.rendered_frame.scene.quads.len()
+            })
+            .unwrap();
+        assert!(rendered_quads >= HEAVY);
+    }
+
+    /// A window that keeps drawing is never reclaimed: a timer that fires
+    /// within the shrink duration of a draw waits out the remainder.
+    #[gpui::test]
+    fn test_idle_reclaim_waits_for_a_full_quiet_period(cx: &mut TestAppContext) {
+        let quads = Rc::new(Cell::new(20_000));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        draw_window(cx, window.into());
+        let heavy = retained_capacity(cx, window.into());
+        quads.set(1);
+        draw_window(cx, window.into());
+
+        cx.executor()
+            .advance_clock(SHRINK_AFTER_DURATION * 3 / 4);
+        draw_window(cx, window.into());
+        cx.executor()
+            .advance_clock(SHRINK_AFTER_DURATION * 3 / 4);
+        cx.run_until_parked();
+        assert_eq!(
+            retained_capacity(cx, window.into()),
+            heavy,
+            "a window drawn within the shrink duration must keep its capacity"
+        );
+
+        cx.executor()
+            .advance_clock(SHRINK_AFTER_DURATION / 2);
+        cx.run_until_parked();
+        let (quads_after, arena_after) = retained_capacity(cx, window.into());
+        assert!(quads_after < heavy.0);
+        assert!(arena_after < heavy.1);
+    }
+
+    /// Prints how long the first heavy draw after an idle reclaim takes next
+    /// to the same draw with the high-water capacity still retained, three
+    /// runs each. Run with `--release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn regrow_after_idle_reclaim_timing() {
+        const HEAVY: usize = 20_000;
+        let mut cx = TestAppContext::single();
+        let quads = Rc::new(Cell::new(HEAVY));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        let mut retained = Vec::new();
+        let mut regrown = Vec::new();
+        for _ in 0..3 {
+            quads.set(HEAVY);
+            draw_window(&mut cx, window.into());
+            quads.set(1);
+            draw_window(&mut cx, window.into());
+            quads.set(HEAVY);
+            let start = std::time::Instant::now();
+            draw_window(&mut cx, window.into());
+            retained.push(start.elapsed());
+
+            quads.set(1);
+            draw_window(&mut cx, window.into());
+            cx.executor().advance_clock(Duration::from_secs(3));
+            cx.run_until_parked();
+            let (quads_capacity, arena_capacity) = retained_capacity(&mut cx, window.into());
+            assert!(quads_capacity <= MIN_RETAINED_CAPACITY && arena_capacity == 1024 * 1024);
+            quads.set(HEAVY);
+            let start = std::time::Instant::now();
+            draw_window(&mut cx, window.into());
+            regrown.push(start.elapsed());
+        }
+        println!("first heavy draw with capacity retained: {retained:?}");
+        println!("first heavy draw after idle reclaim:     {regrown:?}");
     }
 
     /// Platforms that stop requesting frames for idle windows (currently web)

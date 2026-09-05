@@ -325,6 +325,51 @@ impl CapacityShrink {
             map.shrink_to(target);
         }
     }
+
+    /// The capacity to shrink to once the window has stopped drawing, given
+    /// the fill of the frame still on screen.
+    ///
+    /// [`Self::record`] only advances on draws, so a heavy scene followed by a
+    /// quiet or hidden window would keep its high-water capacity for as long
+    /// as it stays quiet. Here the low-use run is treated as complete now:
+    /// the target is twice the largest fill seen since the last busy frame,
+    /// `last_len` included, and `None` when the collection is not
+    /// over-provisioned against that. Either way the run is consumed, as it
+    /// is when [`Self::record`] sees a busy frame: fills recorded before a
+    /// frame that needed the capacity must not size a later quiet period.
+    pub(crate) fn idle_target(&mut self, last_len: usize, capacity: usize) -> Option<usize> {
+        let target = self
+            .max_recent_len
+            .max(last_len)
+            .saturating_mul(2)
+            .max(MIN_RETAINED_CAPACITY);
+        self.low_use_frames = 0;
+        self.max_recent_len = 0;
+        (target < capacity).then_some(target)
+    }
+
+    /// Shrinks the cleared `vec` to twice `last_len`, the fill of its
+    /// counterpart in the frame still on screen, if it holds more than that.
+    pub(crate) fn shrink_vec_idle<T>(&mut self, vec: &mut Vec<T>, last_len: usize) {
+        if let Some(target) = self.idle_target(last_len, vec.capacity()) {
+            vec.shrink_to(target);
+        }
+    }
+
+    /// Shrinks the cleared `map` to twice `last_len`, the fill of its
+    /// counterpart in the frame still on screen, if it holds more than that.
+    pub(crate) fn shrink_map_idle<K, V, S>(
+        &mut self,
+        map: &mut std::collections::HashMap<K, V, S>,
+        last_len: usize,
+    ) where
+        K: Eq + std::hash::Hash,
+        S: std::hash::BuildHasher,
+    {
+        if let Some(target) = self.idle_target(last_len, map.capacity()) {
+            map.shrink_to(target);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,5 +412,56 @@ mod capacity_shrink_tests {
             assert_eq!(shrink.record(1, 1_000), None);
         }
         assert_eq!(shrink.record(1, 1_000), Some(MIN_RETAINED_CAPACITY));
+    }
+
+    #[test]
+    fn idle_shrinks_before_the_frame_window_completes() {
+        let mut vec: Vec<u64> = Vec::with_capacity(10_000);
+        let mut shrink = CapacityShrink::default();
+        for _ in 0..5 {
+            vec.extend(0..10);
+            shrink.clear_vec(&mut vec);
+        }
+        assert_eq!(vec.capacity(), 10_000);
+        shrink.shrink_vec_idle(&mut vec, 10);
+        assert!(vec.capacity() <= MIN_RETAINED_CAPACITY.max(20));
+    }
+
+    #[test]
+    fn idle_keeps_what_the_frame_on_screen_fills() {
+        let mut shrink = CapacityShrink::default();
+        assert_eq!(shrink.record(10, 1_000), None);
+        assert_eq!(shrink.idle_target(600, 1_000), None);
+        assert_eq!(shrink.idle_target(10, 1_000), Some(MIN_RETAINED_CAPACITY));
+    }
+
+    #[test]
+    fn idle_target_covers_the_largest_recent_fill() {
+        let mut shrink = CapacityShrink::default();
+        assert_eq!(shrink.record(300, 10_000), None);
+        assert_eq!(shrink.record(10, 10_000), None);
+        assert_eq!(shrink.idle_target(10, 10_000), Some(600));
+        // The run is consumed: the next idle sizes against the frame on screen
+        // alone, where the stale 300 would have called 600 a fit.
+        assert_eq!(shrink.idle_target(10, 600), Some(MIN_RETAINED_CAPACITY));
+    }
+
+    /// A quiet period whose on-screen frame needs the capacity ends the
+    /// low-use run the same way a busy frame does in `record`: the fills
+    /// recorded before it must not size the next quiet period, and the
+    /// draw-driven window starts over.
+    #[test]
+    fn idle_target_consumes_the_run_when_nothing_can_shrink() {
+        let mut shrink = CapacityShrink::default();
+        assert_eq!(shrink.record(300, 1_000), None);
+        assert_eq!(shrink.idle_target(600, 1_000), None);
+        assert_eq!(shrink.idle_target(10, 1_000), Some(MIN_RETAINED_CAPACITY));
+
+        assert_eq!(shrink.record(300, 1_000), None);
+        assert_eq!(shrink.idle_target(600, 1_000), None);
+        for _ in 0..SHRINK_AFTER_FRAMES - 1 {
+            assert_eq!(shrink.record(10, 1_000), None);
+        }
+        assert_eq!(shrink.record(10, 1_000), Some(MIN_RETAINED_CAPACITY));
     }
 }
