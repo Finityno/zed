@@ -9,7 +9,7 @@ use std::time::Duration;
 /// drawing the count alone is reached in `SHRINK_AFTER_FRAMES / windows`
 /// frames, and a large window that sat still while a small one animated
 /// would lose its chunks and regrow them on its next draw.
-const SHRINK_AFTER_DURATION: Duration = Duration::from_secs(2);
+pub(crate) const SHRINK_AFTER_DURATION: Duration = Duration::from_secs(2);
 use std::{
     alloc::{self, handle_alloc_error},
     cell::Cell,
@@ -104,6 +104,9 @@ pub struct Arena {
     last_high_use: Instant,
     low_use_clears: u32,
     max_recent_used_chunks: usize,
+    /// Chunks the most recent draw used, busy or not; the floor an idle
+    /// release keeps so the frame still on screen redraws without regrowing.
+    last_used_chunks: usize,
 }
 
 impl Drop for Arena {
@@ -125,6 +128,7 @@ impl Arena {
             last_high_use: Instant::now(),
             low_use_clears: 0,
             max_recent_used_chunks: 0,
+            last_used_chunks: 1,
         }
     }
 
@@ -182,6 +186,7 @@ impl Arena {
         }
         let used_chunks = self.current_chunk_index + 1;
         self.current_chunk_index = 0;
+        self.last_used_chunks = used_chunks;
 
         // Same hysteresis as the per-frame collections: a run of draws that
         // all fit in fewer chunks than are allocated frees the surplus, and
@@ -208,11 +213,51 @@ impl Arena {
         }
     }
 
-    #[cfg(test)]
-    fn clear_at(&mut self, now: Instant) {
+    /// [`Self::clear`] with the clock supplied by the caller, so the shrink
+    /// policy's timing follows the executor's clock (and can be advanced by
+    /// tests) instead of the wall clock.
+    pub(crate) fn clear_at(&mut self, now: Instant) {
         if self.scope_depth == 0 {
             self.force_clear_at(now);
+        } else {
+            log::debug!(
+                "deferring arena clear; {} enclosing scope(s) still active",
+                self.scope_depth
+            );
         }
+    }
+
+    /// Frees the chunks past what the most recent draws used, for a window
+    /// that has stopped drawing. The per-clear policy above only advances on
+    /// draws, so a heavy scene followed by a quiet or hidden window kept every
+    /// chunk it grew; this applies the same shrink from a timer instead.
+    ///
+    /// Chunks past `current_chunk_index` hold no live allocation, so the
+    /// truncation is sound even mid-scope; the floor is the most any draw
+    /// since the last busy one used, so the frame still on screen redraws
+    /// without regrowing. The busy-draw guard is the per-clear policy's: a
+    /// draw that needed every chunk within `SHRINK_AFTER_DURATION` keeps them,
+    /// since the arena is shared by every window and another one may be the
+    /// heavy drawer. Returns whether any chunk was freed.
+    pub(crate) fn release_idle_chunks(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last_high_use) < SHRINK_AFTER_DURATION {
+            return false;
+        }
+        let keep = self
+            .max_recent_used_chunks
+            .max(self.last_used_chunks)
+            .max(self.current_chunk_index + 1);
+        if keep >= self.chunks.len() {
+            return false;
+        }
+        self.chunks.truncate(keep);
+        self.low_use_clears = 0;
+        self.max_recent_used_chunks = 0;
+        log::trace!(
+            "released idle element arena capacity down to {}kb",
+            self.capacity() / 1024,
+        );
+        true
     }
 
     #[inline(always)]
@@ -443,6 +488,85 @@ mod tests {
             arena.clear_at(frame_time(epoch, clear / 4));
         }
         assert_eq!(arena.capacity(), 64);
+    }
+
+    /// The idle release does what a full low-use window would have, without
+    /// waiting for `SHRINK_AFTER_FRAMES` clears that a quiet window never
+    /// produces.
+    #[test]
+    fn test_idle_release_frees_surplus_after_a_few_small_draws() {
+        let mut arena = Arena::new(64);
+        let epoch = Instant::now();
+        for _ in 0..32 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        arena.clear_at(frame_time(epoch, 0));
+        assert_eq!(arena.capacity(), 8 * 64);
+
+        for frame in 1..4 {
+            arena.alloc(|| 1u64);
+            arena.clear_at(frame_time(epoch, frame));
+        }
+        assert_eq!(arena.capacity(), 8 * 64);
+
+        // Still inside the busy-draw guard: nothing goes yet.
+        assert!(!arena.release_idle_chunks(epoch + SHRINK_AFTER_DURATION / 2));
+        assert_eq!(arena.capacity(), 8 * 64);
+
+        assert!(arena.release_idle_chunks(epoch + SHRINK_AFTER_DURATION));
+        assert_eq!(arena.capacity(), 64);
+        assert!(!arena.release_idle_chunks(epoch + SHRINK_AFTER_DURATION * 2));
+
+        for _ in 0..8 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        assert_eq!(arena.capacity(), 2 * 64);
+    }
+
+    /// A window whose last draw used every chunk keeps them: the next draw
+    /// of that same scene would only allocate them all again.
+    #[test]
+    fn test_idle_release_keeps_what_the_last_draw_used() {
+        let mut arena = Arena::new(64);
+        let epoch = Instant::now();
+        for _ in 0..32 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        arena.clear_at(frame_time(epoch, 0));
+        assert_eq!(arena.capacity(), 8 * 64);
+
+        assert!(!arena.release_idle_chunks(epoch + SHRINK_AFTER_DURATION * 2));
+        assert_eq!(arena.capacity(), 8 * 64);
+
+        // Half the chunks in the last draw: the other half is surplus.
+        for _ in 0..16 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        arena.clear_at(frame_time(epoch, 1));
+        assert!(arena.release_idle_chunks(epoch + SHRINK_AFTER_DURATION * 2));
+        assert_eq!(arena.capacity(), 4 * 64);
+    }
+
+    /// Live allocations pin their chunks: a release mid-scope only drops
+    /// chunks nothing points into.
+    #[test]
+    fn test_idle_release_never_frees_live_chunks() {
+        let mut arena = Arena::new(64);
+        let epoch = Instant::now();
+        for _ in 0..32 {
+            arena.alloc(|| [0u8; 16]);
+        }
+        arena.clear_at(frame_time(epoch, 0));
+        arena.alloc(|| 1u64);
+        arena.clear_at(frame_time(epoch, 1));
+
+        arena.begin_scope();
+        let live: Vec<_> = (0..12).map(|_| arena.alloc(|| [0u8; 16])).collect();
+        assert!(arena.release_idle_chunks(epoch + SHRINK_AFTER_DURATION * 2));
+        assert_eq!(arena.capacity(), 3 * 64);
+        assert!(live.iter().all(|value| value.iter().all(|byte| *byte == 0)));
+        drop(live);
+        arena.end_scope();
     }
 
     #[test]
