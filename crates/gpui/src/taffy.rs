@@ -98,6 +98,9 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.shrink_to(target);
         self.absolute_outer_origins.shrink_to(target);
         self.computed_layouts.shrink_to(target);
+        // Emptied by every recompute that fills it, so between draws it holds
+        // only the capacity of the largest subtree ever walked.
+        self.layout_bounds_scratch_space.shrink_to(target);
         true
     }
 
@@ -833,9 +836,16 @@ mod tests {
     #[test]
     fn idle_rebuild_sizes_the_tree_to_the_last_frame() {
         let mut engine = TaffyLayoutEngine::new();
-        request_leaves(&mut engine, 10_000);
+        let ids: Vec<LayoutId> = (0..10_000)
+            .map(|_| engine.request_layout(Style::default(), crate::px(16.), 1.0, &[]))
+            .collect();
+        // What a recompute over the whole tree leaves behind: the scratch
+        // stack has held every node and is empty again.
+        engine.layout_bounds_scratch_space.extend(ids);
+        engine.layout_bounds_scratch_space.clear();
         engine.clear();
         assert_eq!(engine.node_high_water(), 10_000);
+        assert!(engine.layout_bounds_scratch_space.capacity() >= 10_000);
 
         // A frame that still fills more than half of it keeps the tree.
         request_leaves(&mut engine, 6_000);
@@ -847,6 +857,7 @@ mod tests {
         engine.clear();
         assert!(engine.reclaim_idle_capacity());
         assert_eq!(engine.node_high_water(), 200);
+        assert!(engine.layout_bounds_scratch_space.capacity() <= 200);
         assert!(!engine.reclaim_idle_capacity());
 
         // The rebuilt tree hands out ids and grows again.

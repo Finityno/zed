@@ -163,6 +163,7 @@ impl Scene {
             opaque_quad_indices,
         ] = &mut self.shrink;
         paint_operations.shrink_vec_idle(&mut self.paint_operations, rendered.paint_operations.len());
+        self.primitive_bounds.shrink_idle(&rendered.primitive_bounds);
         layer_stack.shrink_vec_idle(&mut self.layer_stack, rendered.layer_stack.len());
         paths.shrink_vec_idle(&mut self.paths, rendered.paths.len());
         shadows.shrink_vec_idle(&mut self.shadows, rendered.shadows.len());

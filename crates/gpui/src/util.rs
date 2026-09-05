@@ -334,19 +334,18 @@ impl CapacityShrink {
     /// as it stays quiet. Here the low-use run is treated as complete now:
     /// the target is twice the largest fill seen since the last busy frame,
     /// `last_len` included, and `None` when the collection is not
-    /// over-provisioned against that.
+    /// over-provisioned against that. Either way the run is consumed, as it
+    /// is when [`Self::record`] sees a busy frame: fills recorded before a
+    /// frame that needed the capacity must not size a later quiet period.
     pub(crate) fn idle_target(&mut self, last_len: usize, capacity: usize) -> Option<usize> {
         let target = self
             .max_recent_len
             .max(last_len)
             .saturating_mul(2)
             .max(MIN_RETAINED_CAPACITY);
-        if target >= capacity {
-            return None;
-        }
         self.low_use_frames = 0;
         self.max_recent_len = 0;
-        Some(target)
+        (target < capacity).then_some(target)
     }
 
     /// Shrinks the cleared `vec` to twice `last_len`, the fill of its
@@ -445,5 +444,24 @@ mod capacity_shrink_tests {
         // The run is consumed: the next idle sizes against the frame on screen
         // alone, where the stale 300 would have called 600 a fit.
         assert_eq!(shrink.idle_target(10, 600), Some(MIN_RETAINED_CAPACITY));
+    }
+
+    /// A quiet period whose on-screen frame needs the capacity ends the
+    /// low-use run the same way a busy frame does in `record`: the fills
+    /// recorded before it must not size the next quiet period, and the
+    /// draw-driven window starts over.
+    #[test]
+    fn idle_target_consumes_the_run_when_nothing_can_shrink() {
+        let mut shrink = CapacityShrink::default();
+        assert_eq!(shrink.record(300, 1_000), None);
+        assert_eq!(shrink.idle_target(600, 1_000), None);
+        assert_eq!(shrink.idle_target(10, 1_000), Some(MIN_RETAINED_CAPACITY));
+
+        assert_eq!(shrink.record(300, 1_000), None);
+        assert_eq!(shrink.idle_target(600, 1_000), None);
+        for _ in 0..SHRINK_AFTER_FRAMES - 1 {
+            assert_eq!(shrink.record(10, 1_000), None);
+        }
+        assert_eq!(shrink.record(10, 1_000), Some(MIN_RETAINED_CAPACITY));
     }
 }
