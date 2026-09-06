@@ -1060,6 +1060,13 @@ impl App {
         self.reduce_motion
     }
 
+    /// Bytes the element arena has reserved: every chunk it holds, in use or
+    /// not. It grows to the heaviest draw and the idle release gives chunks
+    /// back, so this is what the windows' elements cost between draws.
+    pub fn element_arena_capacity(&self) -> usize {
+        self.element_arena.borrow().capacity()
+    }
+
     /// Sets whether non-essential animations (e.g. loading spinners) should be
     /// rendered in a static state instead of animating.
     pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
