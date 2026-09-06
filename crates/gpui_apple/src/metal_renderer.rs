@@ -9,7 +9,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, quad_depth, size,
+    PrimitiveBatch, RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size, point,
+    quad_depth, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -78,6 +79,9 @@ pub struct InstanceBufferPool {
     /// them wrote. Drives the shrink in [`Self::record_frame_usage`].
     window_frames: u32,
     window_peak_bytes: usize,
+    /// What the pool has reported into the process-wide render memory gauges:
+    /// the buffers waiting here, refreshed as they come and go.
+    render_memory: RenderMemoryLedger,
 }
 
 /// A pool buffer can never shrink below this; it is also the size every
@@ -97,6 +101,7 @@ impl Default for InstanceBufferPool {
             buffers: Vec::new(),
             window_frames: 0,
             window_peak_bytes: 0,
+            render_memory: RenderMemoryLedger::default(),
         }
     }
 }
@@ -110,6 +115,14 @@ impl InstanceBufferPool {
     pub(crate) fn reset(&mut self, buffer_size: usize) {
         self.buffer_size = buffer_size;
         self.buffers.clear();
+        self.publish_memory();
+    }
+
+    fn publish_memory(&mut self) {
+        self.render_memory.publish(
+            RenderMemoryGauge::InstanceBuffers,
+            (self.buffers.len() * self.buffer_size) as u64,
+        );
     }
 
     pub(crate) fn acquire(
@@ -129,6 +142,7 @@ impl InstanceBufferPool {
 
             device.new_buffer(self.buffer_size as u64, options)
         });
+        self.publish_memory();
         InstanceBuffer {
             metal_buffer: buffer,
             size: self.buffer_size,
@@ -137,7 +151,8 @@ impl InstanceBufferPool {
 
     pub(crate) fn release(&mut self, buffer: InstanceBuffer) {
         if buffer.size == self.buffer_size {
-            self.buffers.push(buffer.metal_buffer)
+            self.buffers.push(buffer.metal_buffer);
+            self.publish_memory();
         }
     }
 
@@ -238,6 +253,10 @@ pub struct MetalRenderer {
     /// memoryless on Apple GPUs and cannot survive an encoder boundary.
     fallback_depth_texture: Option<metal::Texture>,
     fallback_depth_idle_frames: u32,
+    /// What this renderer has reported into the process-wide render memory
+    /// gauges: the depth attachments it holds, refreshed by
+    /// [`Self::publish_depth_memory`].
+    render_memory: RenderMemoryLedger,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -384,14 +403,16 @@ impl MetalRenderer {
     /// that used them keeps its own references from its command buffer, so
     /// moving the handles never affects an in-flight draw.
     pub fn take_intermediates(&mut self) -> IntermediateTextures {
-        IntermediateTextures {
+        let intermediates = IntermediateTextures {
             depth: self.depth_texture.take(),
             path: self.path_intermediate_texture.take(),
             path_msaa: self.path_intermediate_msaa_texture.take(),
             path_idle_frames: self.path_intermediate_idle_frames,
             fallback_depth: self.fallback_depth_texture.take(),
             fallback_depth_idle_frames: self.fallback_depth_idle_frames,
-        }
+        };
+        self.publish_depth_memory();
+        intermediates
     }
 
     /// Installs intermediate textures taken from another renderer; see
@@ -403,6 +424,22 @@ impl MetalRenderer {
         self.path_intermediate_idle_frames = intermediates.path_idle_frames;
         self.fallback_depth_texture = intermediates.fallback_depth;
         self.fallback_depth_idle_frames = intermediates.fallback_depth_idle_frames;
+        self.publish_depth_memory();
+    }
+
+    /// Reports the depth attachments this renderer holds right now. Called
+    /// at the end of every frame and wherever the textures change hands or go
+    /// away, so a hidden window's release and a base-to-overlay hand-off are
+    /// seen without a draw. The gauge is device memory, so a memoryless
+    /// attachment (tile memory on Apple GPUs) contributes nothing.
+    fn publish_depth_memory(&mut self) {
+        let bytes = [&self.depth_texture, &self.fallback_depth_texture]
+            .into_iter()
+            .flatten()
+            .map(|texture| texture.allocated_size())
+            .sum();
+        self.render_memory
+            .publish(RenderMemoryGauge::DepthTextures, bytes);
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -617,6 +654,7 @@ impl MetalRenderer {
             shares_atlas_frame: false,
             fallback_depth_texture: None,
             fallback_depth_idle_frames: 0,
+            render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -684,6 +722,7 @@ impl MetalRenderer {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
         self.fallback_depth_texture = None;
+        self.publish_depth_memory();
     }
 
     fn update_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -1234,6 +1273,7 @@ impl MetalRenderer {
         if !self.shares_atlas_frame {
             self.sprite_atlas.on_frame_drawn(scene);
         }
+        self.publish_depth_memory();
 
         Ok(command_buffer)
     }
@@ -2665,11 +2705,45 @@ mod instance_buffer_pool_tests {
     use super::{
         INSTANCE_BUFFER_FLOOR_SIZE, INSTANCE_BUFFER_SHRINK_AFTER_FRAMES, InstanceBufferPool,
     };
+    use gpui::RenderMemoryGauge;
 
     fn pool_at(buffer_size: usize) -> InstanceBufferPool {
         let mut pool = InstanceBufferPool::default();
         pool.reset(buffer_size);
         pool
+    }
+
+    /// The pool reports the buffers waiting in it — not the ones a frame has
+    /// out — and a size change retires the old ones from the report too.
+    #[test]
+    fn pooled_buffers_are_reported_to_the_render_memory_gauges() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let unified = device.has_unified_memory();
+        let gauge = RenderMemoryGauge::InstanceBuffers;
+        let floor = INSTANCE_BUFFER_FLOOR_SIZE as u64;
+        let mut pool = pool_at(INSTANCE_BUFFER_FLOOR_SIZE);
+        assert_eq!(pool.render_memory.published(gauge), 0);
+
+        let first = pool.acquire(&device, unified);
+        let second = pool.acquire(&device, unified);
+        assert_eq!(pool.render_memory.published(gauge), 0);
+
+        pool.release(first);
+        assert_eq!(pool.render_memory.published(gauge), floor);
+        assert!(gpui::render_memory_gauges().instance_buffer_bytes >= floor);
+
+        // Growing drops the idle buffers of the old size, and one of that size
+        // coming back is dropped rather than pooled.
+        pool.reset(INSTANCE_BUFFER_FLOOR_SIZE * 2);
+        assert_eq!(pool.render_memory.published(gauge), 0);
+        pool.release(second);
+        assert_eq!(pool.render_memory.published(gauge), 0);
+
+        let third = pool.acquire(&device, unified);
+        pool.release(third);
+        assert_eq!(pool.render_memory.published(gauge), floor * 2);
     }
 
     /// One large frame inside the window — a big window drawing once while a
@@ -2702,6 +2776,70 @@ mod instance_buffer_pool_tests {
             pool.record_frame_usage(1024);
         }
         assert_eq!(pool.buffer_size, INSTANCE_BUFFER_FLOOR_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod render_memory_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{DevicePixels, RenderMemoryGauge};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn headless() -> MetalRenderer {
+        MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+    }
+
+    /// A renderer reports the depth attachments it holds, follows them as they
+    /// are released and as they are lent to an overlay renderer and back, and
+    /// the process-wide gauge carries at least what it reports.
+    #[test]
+    fn depth_attachments_are_reported_by_whichever_renderer_holds_them() {
+        let gauge = RenderMemoryGauge::DepthTextures;
+        let full_screen = gpui::size(DevicePixels(3456), DevicePixels(2168));
+        let mut base = headless();
+        assert_eq!(base.render_memory.published(gauge), 0);
+
+        base.update_drawable_size(full_screen);
+        base.ensure_fallback_depth_texture(full_screen);
+        base.publish_depth_memory();
+        let depth = base
+            .depth_texture
+            .as_ref()
+            .map_or(0, |texture| texture.allocated_size());
+        let fallback = base
+            .fallback_depth_texture
+            .as_ref()
+            .map_or(0, |texture| texture.allocated_size());
+        // The fallback is a private texture: two bytes per pixel, never tile memory.
+        assert!(
+            fallback >= 3456 * 2168 * 2,
+            "a 16-bit private depth texture at 3456x2168 holds ~15 MB, got {fallback}"
+        );
+        let held = depth + fallback;
+        println!(
+            "depth attachments at {}x{}: depth {} bytes ({:?}), fallback {} bytes",
+            full_screen.width.0,
+            full_screen.height.0,
+            depth,
+            base.depth_texture.as_ref().map(|texture| texture.storage_mode()),
+            fallback,
+        );
+        assert_eq!(base.render_memory.published(gauge), held);
+        assert!(gpui::render_memory_gauges().depth_texture_bytes >= held);
+
+        // Lent to an overlay renderer, the bytes move with the textures.
+        let mut overlay = headless();
+        overlay.lend_intermediates(base.take_intermediates());
+        assert_eq!(base.render_memory.published(gauge), 0);
+        assert_eq!(overlay.render_memory.published(gauge), held);
+        base.lend_intermediates(overlay.take_intermediates());
+        assert_eq!(base.render_memory.published(gauge), held);
+        assert_eq!(overlay.render_memory.published(gauge), 0);
+
+        // A hidden window's release is seen without a draw.
+        base.release_intermediate_textures();
+        assert_eq!(base.render_memory.published(gauge), 0);
     }
 }
 
