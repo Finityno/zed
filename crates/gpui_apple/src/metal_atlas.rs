@@ -4,7 +4,8 @@ use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use gpui::{
     ATLAS_TILE_MAX_IDLE_FRAMES, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Scene, Size, TileId,
+    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, RenderMemoryGauge,
+    RenderMemoryLedger, Scene, Size, TileId,
 };
 use metal::Device;
 use parking_lot::Mutex;
@@ -22,6 +23,7 @@ impl MetalAtlas {
             tiles_by_key: Default::default(),
             frame: 0,
             retire_cursor: 0,
+            render_memory: RenderMemoryLedger::default(),
         }))
     }
 
@@ -48,17 +50,17 @@ impl MetalAtlas {
     /// Device bytes the atlas's textures hold, as (monochrome, polychrome).
     /// Read by the renderer's GPU stats logging.
     pub(crate) fn allocated_bytes(&self) -> (u64, u64) {
-        fn total(list: &AtlasTextureList<MetalAtlasTexture>) -> u64 {
-            list.textures
-                .iter()
-                .flatten()
-                .map(|texture| texture.metal_texture.allocated_size())
-                .sum()
-        }
+        self.0.lock().allocated_bytes()
+    }
+
+    #[cfg(test)]
+    fn published_bytes(&self) -> (u64, u64) {
         let lock = self.0.lock();
         (
-            total(&lock.monochrome_textures),
-            total(&lock.polychrome_textures),
+            lock.render_memory
+                .published(RenderMemoryGauge::AtlasMonochrome),
+            lock.render_memory
+                .published(RenderMemoryGauge::AtlasPolychrome),
         )
     }
 
@@ -87,6 +89,9 @@ struct MetalAtlasState {
     /// with this atlas, which is why `Window` compares against it before replaying
     /// a retained scene.
     frame: u64,
+    /// What this atlas has reported into the process-wide render memory
+    /// gauges; refreshed whenever a page is created or freed.
+    render_memory: RenderMemoryLedger,
     /// Position in the concatenated (monochrome, polychrome) page list that the
     /// next `retire_unused` call examines.
     retire_cursor: usize,
@@ -240,6 +245,29 @@ impl MetalAtlasState {
         }
     }
 
+    /// Device bytes the pages hold, as (monochrome, polychrome).
+    fn allocated_bytes(&self) -> (u64, u64) {
+        fn total(list: &AtlasTextureList<MetalAtlasTexture>) -> u64 {
+            list.textures
+                .iter()
+                .flatten()
+                .map(|texture| texture.metal_texture.allocated_size())
+                .sum()
+        }
+        (
+            total(&self.monochrome_textures),
+            total(&self.polychrome_textures),
+        )
+    }
+
+    fn publish_memory(&mut self) {
+        let (monochrome, polychrome) = self.allocated_bytes();
+        self.render_memory
+            .publish(RenderMemoryGauge::AtlasMonochrome, monochrome);
+        self.render_memory
+            .publish(RenderMemoryGauge::AtlasPolychrome, polychrome);
+    }
+
     /// Returns a tile's space to its page and drops the page once it holds nothing.
     /// The caller removes the `tiles_by_key` entry.
     fn release_tile(&mut self, tile: AtlasTile) {
@@ -248,15 +276,20 @@ impl MetalAtlasState {
         let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
             return;
         };
+        let mut page_freed = false;
         if let Some(mut texture) = texture_slot.take() {
             if texture.tiles.remove(&tile.tile_id).is_some() {
                 texture.allocator.deallocate(tile.tile_id.into());
             }
             if texture.tiles.is_empty() {
                 textures.free_list.push(id.index as usize);
+                page_freed = true;
             } else {
                 *texture_slot = Some(texture);
             }
+        }
+        if page_freed {
+            self.publish_memory();
         }
     }
 
@@ -332,16 +365,18 @@ impl MetalAtlasState {
             tiles: FxHashMap::default(),
         };
 
-        if let Some(ix) = index {
-            texture_list.textures[ix] = Some(atlas_texture);
-            texture_list.textures.get_mut(ix)
-        } else {
-            texture_list.textures.push(Some(atlas_texture));
-            texture_list.textures.last_mut()
-        }
-        .unwrap()
-        .as_mut()
-        .unwrap()
+        let ix = match index {
+            Some(ix) => {
+                texture_list.textures[ix] = Some(atlas_texture);
+                ix
+            }
+            None => {
+                texture_list.textures.push(Some(atlas_texture));
+                texture_list.textures.len() - 1
+            }
+        };
+        self.publish_memory();
+        self.textures_mut(kind).textures[ix].as_mut().unwrap()
     }
 
     fn texture(&self, id: AtlasTextureId) -> &MetalAtlasTexture {
@@ -528,6 +563,36 @@ mod tests {
         };
         let key = make_image_key(999, 0);
         atlas.remove(&key);
+    }
+
+    #[test]
+    fn test_atlas_pages_are_reported_to_the_render_memory_gauges() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        const MIB: u64 = 1024 * 1024;
+        let key = make_image_key(1, 0);
+        let small = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+        insert_tile(&atlas, &key, small);
+
+        let (monochrome, polychrome) = atlas.allocated_bytes();
+        assert_eq!(monochrome, 0);
+        assert!(
+            polychrome >= 4 * MIB,
+            "a default 1024² BGRA8 page holds 4 MiB, got {polychrome}"
+        );
+        assert_eq!(atlas.published_bytes(), (0, polychrome));
+        // The gauge sums every live atlas in the process, so it holds at
+        // least this one's page whatever the other tests are doing.
+        assert!(gpui::render_memory_gauges().atlas_polychrome_bytes >= polychrome);
+
+        // Removing the only tile frees the page, and the report follows.
+        atlas.remove(&key);
+        assert_eq!(atlas.allocated_bytes(), (0, 0));
+        assert_eq!(atlas.published_bytes(), (0, 0));
     }
 
     fn make_glyph_key(glyph_id: u32) -> AtlasKey {
