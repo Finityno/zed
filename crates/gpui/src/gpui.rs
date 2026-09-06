@@ -46,6 +46,7 @@ pub mod profiler;
 ))]
 #[expect(missing_docs)]
 pub mod queue;
+mod render_memory;
 mod thread_park;
 mod scene;
 mod shared_uri;
@@ -149,6 +150,7 @@ pub use profiler::*;
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use thread_park::{ThreadIdleHook, set_thread_idle_hook, thread_idle};
 pub use refineable::*;
+pub use render_memory::*;
 pub use scene::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
