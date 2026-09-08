@@ -17,6 +17,7 @@ categories = ["gui"]
 workspace = true
 
 [features]
+text-allocation-validation = []
 default = ["font-kit", "wayland", "x11", "windows-manifest"]
 test-support = [
     "leak-detection",

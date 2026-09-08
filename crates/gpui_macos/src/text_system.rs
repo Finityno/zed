@@ -207,6 +207,23 @@ impl PlatformTextSystem for MacTextSystem {
         self.0.write().layout_line(text, font_size, font_runs)
     }
 
+    fn layout_line_admitted(
+        &self, source: gpui::AdmittedTextSource, font_size: Pixels, font_runs: &[FontRun],
+    ) -> std::result::Result<gpui::AdmittedLineLayout, gpui::TextAllocationError> {
+        let scratch = match source.platform_coverage() {
+            gpui::TextPlatformCoverage::StrictAdmission => Some(source.admission().native_scratch(gpui::TextShapingInput {
+                text: source.as_str(), backend: "core-text", utf8_bytes: source.as_str().len(),
+                utf16_units: source.as_str().encode_utf16().count(), font_runs, font_size,
+            })?),
+            gpui::TextPlatformCoverage::ObservedUnbounded => None,
+        };
+        #[cfg(feature = "text-allocation-validation")]
+        source.admission().construction(gpui::TextConstructionEvent::NativeEntry);
+        let result = self.0.write().layout_line_admitted(source, font_size, font_runs);
+        drop(scratch);
+        result
+    }
+
     fn recommended_rendering_mode(
         &self,
         _font_id: FontId,
@@ -625,6 +642,162 @@ impl MacTextSystemState {
             descent: max_descent.into(),
             len: text.len(),
         }
+    }
+
+    fn layout_line_admitted(
+        &mut self, source: gpui::AdmittedTextSource, font_size: Pixels, font_runs: &[FontRun],
+    ) -> std::result::Result<gpui::AdmittedLineLayout, gpui::TextAllocationError> {
+        use gpui::TextAllocationError;
+        let text = source.as_str();
+        let mut covered = 0usize;
+        for run in font_runs {
+            covered = covered.checked_add(run.len).ok_or(TextAllocationError::Overflow)?;
+            if !text.is_char_boundary(covered) || run.font_id.0 >= self.fonts.len() {
+                return Err(TextAllocationError::UnsupportedTransform);
+            }
+        }
+        if covered != text.len() { return Err(TextAllocationError::UnsupportedTransform); }
+        // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
+        let mut string = CFMutableAttributedString::new();
+        let mut max_ascent = 0.0f32;
+        let mut max_descent = 0.0f32;
+
+        {
+            let mut text = text;
+            let mut break_ligature = true;
+            for run in font_runs {
+                let text_run;
+                (text_run, text) = text.split_at(run.len);
+
+                let utf16_start = string.char_len(); // insert at end of string
+                // note: replace_str may silently ignore codepoints it dislikes (e.g., BOM at start of string)
+                string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
+                let utf16_end = string.char_len();
+
+                let length = utf16_end - utf16_start;
+                let cf_range = CFRange::init(utf16_start, length);
+                let font = &self.fonts[run.font_id.0];
+
+                let font_metrics = font.metrics();
+                let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
+                max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
+                max_descent = max_descent.max(-font_metrics.descent * font_scale);
+
+                let font_size = if break_ligature {
+                    px(f32::from(font_size).next_up())
+                } else {
+                    font_size
+                };
+                unsafe {
+                    string.set_attribute(
+                        cf_range,
+                        kCTFontAttributeName,
+                        &font.native_font().clone_with_font_size(font_size.into()),
+                    );
+                }
+                break_ligature = !break_ligature;
+            }
+        }
+        // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
+        let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
+        let glyph_runs = line.glyph_runs();
+        let run_count = glyph_runs.len() as usize;
+        let mut glyph_count = 0usize;
+        for run in glyph_runs.iter() {
+            glyph_count = glyph_count.checked_add(usize::try_from(run.glyph_count()).map_err(|_| TextAllocationError::Overflow)?)
+                .ok_or(TextAllocationError::Overflow)?;
+        }
+        let reserved = std::mem::size_of::<gpui::AdmittedLineLayout>()
+            .checked_add(std::mem::size_of::<LineLayout>())
+            .and_then(|bytes| bytes.checked_add(4 * std::mem::size_of::<usize>()))
+            .and_then(|bytes| bytes.checked_add(run_count.checked_mul(std::mem::size_of::<ShapedRun>())?))
+            .and_then(|bytes| bytes.checked_add(glyph_count.checked_mul(2)?.checked_mul(std::mem::size_of::<ShapedGlyph>())?))
+            .ok_or(TextAllocationError::Overflow)?;
+        let allocation = gpui::TextAllocationReservation::for_line(&source, reserved)?;
+        let mut runs = Vec::<ShapedRun>::new();
+        #[cfg(feature = "text-allocation-validation")]
+        source.admission().construction(gpui::TextConstructionEvent::RunBuffer);
+        runs.try_reserve_exact(run_count).map_err(|_| TextAllocationError::Denied)?;
+        #[cfg(feature = "text-allocation-validation")]
+        let output_run_capacity = runs.capacity();
+        let mut retained_bytes = std::mem::size_of::<gpui::AdmittedLineLayout>()
+            .checked_add(std::mem::size_of::<LineLayout>())
+            .and_then(|bytes| bytes.checked_add(4 * std::mem::size_of::<usize>()))
+            .and_then(|bytes| bytes.checked_add(runs.capacity().checked_mul(std::mem::size_of::<ShapedRun>())?))
+            .ok_or(TextAllocationError::Overflow)?;
+        let mut ix_converter = StringIndexConverter::new(text);
+        for run in glyph_runs.into_iter() {
+            let attributes = run.attributes().ok_or(TextAllocationError::UnsupportedTransform)?;
+            let font = unsafe {
+                attributes
+                    .get(kCTFontAttributeName)
+                    .downcast::<CTFont>()
+                    .ok_or(TextAllocationError::UnsupportedTransform)?
+            };
+            let postscript_name = font.postscript_name();
+            let font_id = match self.font_ids_by_postscript_name.get(&postscript_name) {
+                Some(font_id) => *font_id,
+                None if source.platform_coverage() == gpui::TextPlatformCoverage::ObservedUnbounded => {
+                    self.id_for_native_font(font.clone())
+                }
+                None => {
+                    #[cfg(feature = "text-allocation-validation")]
+                    source.admission().native_unavailable_font(&postscript_name);
+                    return Err(TextAllocationError::MissingNativeMeasurement);
+                }
+            };
+
+            let glyphs = match runs.last_mut() {
+                Some(run) if run.font_id == font_id => &mut run.glyphs,
+                _ => {
+                    runs.push(ShapedRun {
+                        font_id,
+                        glyphs: Vec::new(),
+                    });
+                    &mut runs.last_mut().ok_or(TextAllocationError::UnsupportedTransform)?.glyphs
+                }
+            };
+            let old_bytes = glyphs.capacity().checked_mul(std::mem::size_of::<ShapedGlyph>())
+                .ok_or(TextAllocationError::Overflow)?;
+            let other_live_bytes = retained_bytes.checked_sub(old_bytes).ok_or(TextAllocationError::Overflow)?;
+            allocation.grow_glyph_buffer(glyphs,
+                usize::try_from(run.glyph_count()).map_err(|_| TextAllocationError::Overflow)?, other_live_bytes)?;
+            retained_bytes = glyphs.capacity().checked_mul(std::mem::size_of::<ShapedGlyph>())
+                .and_then(|bytes| bytes.checked_add(other_live_bytes)).ok_or(TextAllocationError::Overflow)?;
+            for ((&glyph_id, position), &glyph_utf16_ix) in run
+                .glyphs()
+                .iter()
+                .zip(run.positions().iter())
+                .zip(run.string_indices().iter())
+            {
+                let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).map_err(|_| TextAllocationError::Overflow)?;
+                if ix_converter.utf16_ix > glyph_utf16_ix {
+                    // We cannot reuse current index converter, as it can only seek forward. Restart the search.
+                    ix_converter = StringIndexConverter::new(text);
+                }
+                ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
+                glyphs.push(ShapedGlyph {
+                    id: GlyphId(glyph_id as u32),
+                    position: point(position.x as f32, position.y as f32).map(px),
+                    index: ix_converter.utf8_ix,
+                    is_emoji: self.is_emoji(font_id),
+                });
+            }
+            #[cfg(feature = "text-allocation-validation")]
+            source.admission().native_output(&postscript_name, glyphs.len(), glyphs.capacity(), output_run_capacity);
+        }
+        let typographic_bounds = line.get_typographic_bounds();
+        let layout = LineLayout {
+            runs,
+            font_size,
+            width: typographic_bounds.width.into(),
+            ascent: max_ascent.into(),
+            descent: max_descent.into(),
+            len: text.len(),
+        };
+        drop(line);
+        drop(string);
+        gpui::AdmittedLineLayout::from_native(source, layout, allocation)
     }
 }
 

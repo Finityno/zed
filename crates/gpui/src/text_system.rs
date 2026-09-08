@@ -702,6 +702,13 @@ impl WindowTextSystem {
         self.line_layout_cache.truncate_layouts(index)
     }
 
+    pub(crate) fn shape_line_admitted(
+        &self, source: crate::AdmittedTextSource, font_size: Pixels, font_id: FontId,
+    ) -> Result<Arc<crate::AdmittedLineLayout>, crate::TextAllocationError> {
+        let run = FontRun { len: source.as_str().len(), font_id };
+        self.line_layout_cache.layout_line_admitted(source, font_size, run)
+    }
+
     /// Shape the given line, at the given font_size, for painting to the screen.
     /// Subsets of the line can be styled independently with the `runs` parameter.
     ///
