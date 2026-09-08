@@ -12,6 +12,7 @@ workspace = true
 path = "src/gpui_macos.rs"
 
 [features]
+text-allocation-validation = ["gpui/text-allocation-validation", "font-kit"]
 default = ["gpui/default"]
 bench-support = ["gpui/bench-support", "gpui_apple/bench-support"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]

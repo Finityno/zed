@@ -1,0 +1,47 @@
+[package]
+name = "admitted-text-validation"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+compile-fail = []
+native-probes = []
+
+[dependencies]
+gpui = { path = "../../crates/gpui", default-features = false, features = ["text-allocation-validation"] }
+gpui_macos = { path = "../../crates/gpui_macos", default-features = false, features = ["text-allocation-validation"] }
+
+[lib]
+path = "harness.rs"
+
+[[bin]]
+name = "ownership"
+path = "ownership.rs"
+
+[[bin]]
+name = "native-calibration"
+path = "native_calibration.rs"
+required-features = ["native-probes"]
+
+[[bin]]
+name = "positive-control"
+path = "positive_control.rs"
+required-features = ["compile-fail"]
+
+[[bin]]
+name = "reservation_clone"
+path = "reservation_clone.rs"
+required-features = ["compile-fail"]
+
+[[bin]]
+name = "reservation_after_publish"
+path = "reservation_after_publish.rs"
+required-features = ["compile-fail"]
+
+[[bin]]
+name = "published_raw_escape"
+path = "published_raw_escape.rs"
+required-features = ["compile-fail"]
