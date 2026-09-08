@@ -1,0 +1,34 @@
+use std::sync::{Arc, atomic::Ordering};
+fn main() {
+    gpui::validate_admitted_text_ownership();
+    let policy = Arc::new(admitted_text_validation::Policy { deny_source: true, ..Default::default() });
+    assert!(matches!(gpui::AdmittedTextSource::new("source must not allocate", policy.clone()), Err(gpui::TextAllocationError::Denied)));
+    assert_eq!(policy.source_constructions.load(Ordering::SeqCst), 0);
+    assert_eq!(policy.live.load(Ordering::SeqCst), 0);
+    let policy = Arc::new(admitted_text_validation::Policy::default());
+    let source = gpui::AdmittedTextSource::new("glyphs", policy.clone()).expect("source");
+    let bytes_per_glyph = std::mem::size_of::<gpui::ShapedGlyph>();
+    let mut reservation = gpui::TextAllocationReservation::for_line(&source, 4 * bytes_per_glyph).expect("initial admission");
+    let mut glyphs = Vec::new();
+    reservation.grow_glyph_buffer(&mut glyphs, 4, 0).expect("initial growth");
+    glyphs.push(gpui::ShapedGlyph { id: gpui::GlyphId(0), position: gpui::point(gpui::px(0.), gpui::px(0.)), index: 0, is_emoji: false });
+    let pointer = glyphs.as_ptr();
+    let capacity = glyphs.capacity();
+    let charged = policy.live.load(Ordering::SeqCst);
+    let constructions = policy.glyph_constructions.load(Ordering::SeqCst);
+    assert!(matches!(reservation.grow_glyph_buffer(&mut glyphs, 4, 0), Err(gpui::TextAllocationError::Denied)));
+    assert!(matches!(reservation.grow_glyph_buffer(&mut glyphs, usize::MAX, 0), Err(gpui::TextAllocationError::Overflow)));
+    assert_eq!(glyphs.as_ptr(), pointer);
+    assert_eq!(glyphs.capacity(), capacity);
+    assert_eq!(glyphs.len(), 1);
+    assert_eq!(policy.live.load(Ordering::SeqCst), charged);
+    assert_eq!(policy.glyph_constructions.load(Ordering::SeqCst), constructions);
+    reservation.reconcile(16 * bytes_per_glyph).expect("admit growth peak");
+    reservation.grow_glyph_buffer(&mut glyphs, 4, 0).expect("admitted retry");
+    assert_eq!(policy.glyph_constructions.load(Ordering::SeqCst), constructions + 1);
+    drop(glyphs);
+    drop(reservation);
+    drop(source);
+    assert_eq!(policy.live.load(Ordering::SeqCst), 0);
+    println!("ownership: passed; native calibration: not exercised");
+}
