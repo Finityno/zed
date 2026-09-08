@@ -139,3 +139,11 @@ unsafe impl objc::Encode for NSRange {
 unsafe fn ns_string(string: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(string).autorelease() }
 }
+
+
+/// Construct the actual text backend without opening a window, for the isolated
+/// allocation validation executable only.
+#[cfg(feature = "text-allocation-validation")]
+pub fn admitted_text_validation_backend() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
+    std::sync::Arc::new(MacTextSystem::new())
+}
