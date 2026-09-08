@@ -397,10 +397,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self)
+        text_layout.prepaint(bounds, self, window.text_style().text_align)
     }
 
     fn paint(
@@ -471,10 +471,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref())
+        text_layout.prepaint(bounds, self.as_ref(), window.text_style().text_align)
     }
 
     fn paint(
@@ -697,10 +697,10 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text)
+        self.layout.prepaint(bounds, &self.text, window.text_style().text_align)
     }
 
     fn paint(
@@ -869,10 +869,10 @@ impl Element for ShimmerText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text);
+        self.layout.prepaint(bounds, &self.text, window.text_style().text_align);
     }
 
     fn paint(
@@ -907,6 +907,7 @@ impl IntoElement for ShimmerText {
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
 struct TextLayoutInner {
+    text_align: TextAlign,
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
@@ -1067,6 +1068,7 @@ impl TextLayout {
                 else {
                     if !preserve_cached_layout {
                         element_state.0.borrow_mut().replace(TextLayoutInner {
+                            text_align: text_style.text_align,
                             lines: Default::default(),
                             len: 0,
                             line_height,
@@ -1088,6 +1090,7 @@ impl TextLayout {
 
                 if !preserve_cached_layout {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
+                        text_align: text_style.text_align,
                         lines,
                         len,
                         line_height,
@@ -1103,13 +1106,14 @@ impl TextLayout {
         })
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, text_align: TextAlign) {
         let mut element_state = self.0.borrow_mut();
         let element_state = element_state
             .as_mut()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
         element_state.bounds = Some(bounds);
+        element_state.text_align = text_align;
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
@@ -1302,7 +1306,13 @@ impl TextLayout {
                 line_origin.y = line_bottom;
                 line_start_ix += line.len() + 1;
             } else {
-                let position_within_line = position - line_origin;
+                let mut position_within_line = position - line_origin;
+                let row_index = (position_within_line.y / line_height) as usize;
+                position_within_line.x -= line.alignment_offset(
+                    row_index,
+                    element_state.text_align,
+                    bounds.size.width,
+                );
                 match line.index_for_position(position_within_line, line_height) {
                     Ok(index_within_line) => return Ok(line_start_ix + index_within_line),
                     Err(index_within_line) => return Err(line_start_ix + index_within_line),
@@ -1337,7 +1347,13 @@ impl TextLayout {
                 continue;
             } else {
                 let ix_within_line = index - line_start_ix;
-                return Some(line_origin + line.position_for_index(ix_within_line, line_height)?);
+                let mut position = line.position_for_index(ix_within_line, line_height)?;
+                position.x += line.alignment_offset(
+                    (position.y / line_height) as usize,
+                    element_state.text_align,
+                    bounds.size.width,
+                );
+                return Some(line_origin + position);
             }
         }
 
@@ -1377,6 +1393,11 @@ impl TextLayout {
             .iter()
             .map(|line| line.layout.clone())
             .collect()
+    }
+
+    /// The alignment used to paint the laid-out text.
+    pub fn text_align(&self) -> TextAlign {
+        self.0.borrow().as_ref().expect("prepaint has not been performed").text_align
     }
 
     /// The bounds of this layout.
@@ -1736,6 +1757,60 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_text_positions_follow_each_visual_row() {
+        use crate::{FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, WrapBoundary, point, size};
+
+        for (align, first_left, second_left) in [
+            (TextAlign::Left, 10.0, 10.0),
+            (TextAlign::Center, 50.0, 45.0),
+            (TextAlign::Right, 90.0, 80.0),
+        ] {
+            let line = WrappedLine {
+                text: "aβcde".into(),
+                layout: Arc::new(WrappedLineLayout {
+                    unwrapped_layout: Arc::new(LineLayout {
+                        width: px(50.0),
+                        len: 6,
+                        runs: vec![ShapedRun {
+                            font_id: FontId(0),
+                            glyphs: [0, 1, 3, 4, 5].into_iter().enumerate().map(|(index, byte)| {
+                                ShapedGlyph {
+                                    id: GlyphId(index as u32),
+                                    position: point(px(index as f32 * 10.0), px(0.0)),
+                                    index: byte,
+                                    is_emoji: false,
+                                }
+                            }).collect(),
+                        }],
+                        ..Default::default()
+                    }),
+                    wrap_boundaries: smallvec::smallvec![WrapBoundary { run_ix: 0, glyph_ix: 2 }],
+                    wrap_width: Some(px(100.0)),
+                }),
+                ..Default::default()
+            };
+            let layout = TextLayout(Rc::new(RefCell::new(Some(TextLayoutInner {
+                text_align: TextAlign::Left,
+                len: 6,
+                lines: smallvec::smallvec![line],
+                line_height: px(20.0),
+                wrap_width: Some(px(100.0)),
+                truncate_width: None,
+                size: None,
+                bounds: None,
+            }))));
+            layout.prepaint(Bounds::new(point(px(10.0), px(30.0)), size(px(100.0), px(40.0))), "aβcde", align);
+            assert_eq!(layout.text_align(), align);
+            assert_eq!(layout.position_for_index(0), Some(point(px(first_left), px(30.0))));
+            assert_eq!(layout.position_for_index(4), Some(point(px(second_left + 10.0), px(50.0))));
+            assert_eq!(layout.index_for_position(point(px(first_left + 11.0), px(31.0))), Ok(1));
+            assert_eq!(layout.index_for_position(point(px(second_left + 11.0), px(51.0))), Ok(4));
+            assert_eq!(layout.index_for_position(point(px(second_left - 1.0), px(51.0))), Err(3));
+            assert_eq!(layout.index_for_position(point(px(second_left + 31.0), px(51.0))), Err(6));
+        }
+    }
 
     #[test]
     fn test_into_element_for() {
