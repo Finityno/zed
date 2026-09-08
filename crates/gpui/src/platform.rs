@@ -1287,6 +1287,13 @@ pub trait PlatformTextSystem: Send + Sync {
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     /// Layout a line of text with the given font runs.
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+    /// Optional admitted shaping; unsupported backends never fall through to
+    /// the unaccounted legacy shaper.
+    fn layout_line_admitted(
+        &self, _source: crate::AdmittedTextSource, _font_size: Pixels, _runs: &[FontRun],
+    ) -> std::result::Result<crate::AdmittedLineLayout, crate::TextAllocationError> {
+        Err(crate::TextAllocationError::UnsupportedBackend)
+    }
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;

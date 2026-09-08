@@ -33,6 +33,15 @@ impl SharedString {
         SharedString(SmolStr::new(str))
     }
 
+    /// Bytes in the shared heap backing, excluding allocator bookkeeping.
+    pub fn heap_allocation_bytes(&self) -> usize {
+        if self.0.is_heap_allocated() {
+            self.len().saturating_add(2 * std::mem::size_of::<usize>())
+        } else {
+            0
+        }
+    }
+
     /// Get a &str from the underlying string.
     pub fn as_str(&self) -> &str {
         &self.0
