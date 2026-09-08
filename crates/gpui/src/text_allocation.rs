@@ -286,6 +286,42 @@ pub(crate) mod tests {
     }
 
     #[cfg_attr(test, test)]
+    pub(crate) fn admitted_single_line_alignment_preserves_utf8_geometry() {
+        use crate::{point, px, size, Bounds, FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, TextAlign};
+        for width in [20.0, 80.0] {
+            for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+                let admission = Arc::new(Counter::default());
+                let source = AdmittedTextSource::new("aβc", admission.clone()).expect("source");
+                let allocation = TextAllocationReservation::for_line(&source, 1024).expect("glyph reservation");
+                let raw = LineLayout {
+                    width: px(30.0), len: 4,
+                    runs: vec![ShapedRun { font_id: FontId(0), glyphs: [0, 1, 3].into_iter().enumerate().map(|(index, byte)| ShapedGlyph {
+                        id: GlyphId(index as u32), position: point(px(index as f32 * 10.0), px(0.0)), index: byte, is_emoji: false,
+                    }).collect() }], ..Default::default()
+                };
+                let line = Arc::new(AdmittedLineLayout::from_native(source, raw, allocation).expect("line"));
+                let element = TextAllocationReservation::reserve(line.source().admission(), TextAllocationClass::Element,
+                    std::mem::size_of::<AdmittedTextLayoutInner>() + 2 * std::mem::size_of::<usize>()).expect("geometry reservation");
+                let bounds = Bounds::new(point(px(10.0), px(30.0)), size(px(width), px(20.0)));
+                let layout = AdmittedTextLayout(std::rc::Rc::new(AdmittedTextLayoutInner {
+                    text_align: align, line, bounds: std::cell::Cell::new(Some(bounds)), _allocation: element.publish(),
+                }));
+                let offset = match align { TextAlign::Left => 0.0, TextAlign::Center => (width - 30.0) / 2.0, TextAlign::Right => width - 30.0 };
+                let expected_origin = point(px(10.0 + offset), px(30.0));
+                assert_eq!(admitted_line_origin(bounds, px(30.0), align), expected_origin);
+                for (byte, x) in [(0, 0.0), (1, 10.0), (3, 20.0), (4, 30.0)] {
+                    let point = point(expected_origin.x + px(x), expected_origin.y);
+                    assert_eq!(layout.position_for_index(byte), Some(point));
+                    assert_eq!(layout.closest_index_for_position(point), Some(byte));
+                }
+                assert_eq!(layout.position_for_index(2), None);
+                drop(layout);
+                assert_eq!(admission.0.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[cfg_attr(test, test)]
     pub(crate) fn admitted_text_source_clones_share_backing_and_charge() {
         let admission = Arc::new(Counter::default());
         let source = AdmittedTextSource::new(&"x".repeat(4096), admission.clone()).expect("source admission");
@@ -391,7 +427,7 @@ impl AdmittedLineLayout {
     pub(crate) fn source(&self) -> &AdmittedTextSource { &self.source }
 
     pub(crate) fn paint(
-        &self, origin: crate::Point<crate::Pixels>, line_height: crate::Pixels,
+        &self, bounds: crate::Bounds<crate::Pixels>, line_height: crate::Pixels,
         style: &AdmittedTextStyle, window: &mut crate::Window, cx: &mut crate::App,
     ) -> crate::Result<()> {
         let len = u32::try_from(self.len()).map_err(|_| TextAllocationError::Overflow)?;
@@ -402,8 +438,9 @@ impl AdmittedLineLayout {
                 underline: style.underline, strikethrough: style.strikethrough,
             }],
         };
-        line.paint_background(origin, line_height, style.text_align, None, window, cx)?;
-        line.paint(origin, line_height, style.text_align, None, window, cx)
+        let origin = admitted_line_origin(bounds, self.width(), style.text_align);
+        line.paint_background(origin, line_height, crate::TextAlign::Left, None, window, cx)?;
+        line.paint(origin, line_height, crate::TextAlign::Left, None, window, cx)
     }
 
     /// Copying a subrange requires its own admitted source and glyph buffers.
@@ -442,9 +479,19 @@ pub struct AdmittedTextLayout(std::rc::Rc<AdmittedTextLayoutInner>);
 
 #[derive(Debug)]
 struct AdmittedTextLayoutInner {
+    text_align: crate::TextAlign,
     line: Arc<AdmittedLineLayout>,
     bounds: std::cell::Cell<Option<crate::Bounds<crate::Pixels>>>,
     _allocation: TextAllocationLease,
+}
+
+fn admitted_line_origin(bounds: crate::Bounds<crate::Pixels>, line_width: crate::Pixels, align: crate::TextAlign) -> crate::Point<crate::Pixels> {
+    let offset = match align {
+        crate::TextAlign::Left => crate::Pixels::ZERO,
+        crate::TextAlign::Center => (bounds.size.width - line_width) / 2.0,
+        crate::TextAlign::Right => bounds.size.width - line_width,
+    };
+    crate::point(bounds.origin.x + offset, bounds.origin.y)
 }
 
 impl AdmittedTextLayout {
@@ -456,13 +503,19 @@ impl AdmittedTextLayout {
 
     /// Closest source byte boundary at a point in window coordinates.
     pub fn closest_index_for_position(&self, position: crate::Point<crate::Pixels>) -> Option<usize> {
-        self.bounds().map(|bounds| self.0.line.closest_index_for_x(position.x - bounds.origin.x))
+        self.bounds().map(|bounds| {
+            let origin = admitted_line_origin(bounds, self.0.line.width(), self.0.text_align);
+            self.0.line.closest_index_for_x(position.x - origin.x)
+        })
     }
 
     /// Window position for an existing UTF-8 boundary.
     pub fn position_for_index(&self, index: usize) -> Option<crate::Point<crate::Pixels>> {
         if !self.0.line.source().as_str().is_char_boundary(index) { return None; }
-        self.bounds().map(|bounds| crate::point(bounds.origin.x + self.0.line.x_for_index(index), bounds.origin.y))
+        self.bounds().map(|bounds| {
+            let origin = admitted_line_origin(bounds, self.0.line.width(), self.0.text_align);
+            crate::point(origin.x + self.0.line.x_for_index(index), origin.y)
+        })
     }
 }
 
@@ -496,7 +549,7 @@ impl crate::StyledText {
         let allocation = TextAllocationReservation::reserve(source.admission(), TextAllocationClass::Element, bytes)?;
         let line = window.text_system().shape_line_admitted(source, style.font_size, style.font_id)?;
         let layout = AdmittedTextLayout(std::rc::Rc::new(AdmittedTextLayoutInner {
-            line, bounds: std::cell::Cell::new(None), _allocation: allocation.publish(),
+            text_align: style.text_align, line, bounds: std::cell::Cell::new(None), _allocation: allocation.publish(),
         }));
         Ok(AdmittedStyledText { layout, style })
     }
@@ -544,7 +597,7 @@ impl crate::Element for AdmittedStyledText {
         window: &mut crate::Window, cx: &mut crate::App,
     ) {
         use gpui_util::ResultExt;
-        self.layout.0.line.paint(bounds.origin, self.style.line_height, &self.style, window, cx).log_err();
+        self.layout.0.line.paint(bounds, self.style.line_height, &self.style, window, cx).log_err();
     }
 }
 
@@ -557,5 +610,6 @@ pub fn validate_admitted_text_ownership() {
     tests::admitted_text_source_rejects_multiline_before_allocation();
     tests::admitted_line_rejects_another_source_under_the_same_policy();
     tests::admitted_line_published_owner_has_no_builder_alias();
+    tests::admitted_single_line_alignment_preserves_utf8_geometry();
     crate::text_system::validate_admitted_cache_ownership();
 }
