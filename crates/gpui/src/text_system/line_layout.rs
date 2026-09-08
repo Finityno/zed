@@ -1,4 +1,4 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, TextAlign, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -337,6 +337,23 @@ impl WrappedLineLayout {
     /// The runs in this layout, sans wrapping
     pub fn runs(&self) -> &[ShapedRun] {
         &self.unwrapped_layout.runs
+    }
+
+    /// The horizontal offset used when painting a visual row with text alignment.
+    pub fn alignment_offset(&self, row_index: usize, align: TextAlign, width: Pixels) -> Pixels {
+        let boundary_x = |boundary: &WrapBoundary| {
+            self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x
+        };
+        let start = row_index.checked_sub(1)
+            .and_then(|index| self.wrap_boundaries.get(index))
+            .map_or(Pixels::ZERO, boundary_x);
+        let end = self.wrap_boundaries.get(row_index)
+            .map_or(self.unwrapped_layout.width, boundary_x);
+        match align {
+            TextAlign::Left => Pixels::ZERO,
+            TextAlign::Center => (width - (end - start)) / 2.0,
+            TextAlign::Right => width - (end - start),
+        }
     }
 
     /// The index corresponding to a given position in this layout for the given line height.
