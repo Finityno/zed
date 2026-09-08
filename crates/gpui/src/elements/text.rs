@@ -1757,7 +1757,7 @@ mod tests {
 
     #[test]
     fn aligned_text_positions_follow_each_visual_row() {
-        use crate::{FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, WrapBoundary};
+        use crate::{FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, WrapBoundary, point, size};
 
         for (align, first_left, second_left) in [
             (TextAlign::Left, 10.0, 10.0),
