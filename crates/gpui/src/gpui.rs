@@ -59,6 +59,7 @@ mod tab_stop;
 mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
+mod text_allocation;
 mod text_system;
 mod util;
 mod view;
@@ -163,6 +164,7 @@ use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
+pub use text_allocation::*;
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;

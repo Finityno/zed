@@ -462,6 +462,76 @@ pub(crate) struct LineLayoutCache {
     font_generation: Arc<AtomicUsize>,
     /// Records the generation represented by both frame caches.
     cached_font_generation: AtomicUsize,
+    admitted: Mutex<Option<Box<AdmittedFrameCache>>>,
+}
+
+
+struct AdmittedCacheEntry {
+    layout: Arc<crate::AdmittedLineLayout>,
+    font_size: Pixels,
+    run: FontRun,
+    age: u8,
+}
+
+struct AdmittedFrameCache {
+    entries: [Option<AdmittedCacheEntry>; 128],
+    _allocation: crate::text_allocation::TextAllocationLease,
+}
+
+impl AdmittedFrameCache {
+    fn new(admission: &Arc<dyn crate::TextAllocationAdmission>) -> Result<Box<Self>, crate::TextAllocationError> {
+        let allocation = crate::TextAllocationReservation::reserve(
+            admission, crate::TextAllocationClass::Layout, std::mem::size_of::<Self>(),
+        )?;
+        Ok(Box::new(Self { entries: std::array::from_fn(|_| None), _allocation: allocation.publish() }))
+    }
+
+    fn layout(
+        cache: &mut Option<Box<Self>>, source: crate::AdmittedTextSource, font_size: Pixels, run: FontRun,
+        shape: impl FnOnce(crate::AdmittedTextSource, Pixels, FontRun) -> Result<crate::AdmittedLineLayout, crate::TextAllocationError>,
+    ) -> Result<Arc<crate::AdmittedLineLayout>, crate::TextAllocationError> {
+        if run.len != source.as_str().len() {
+            return Err(crate::TextAllocationError::UnsupportedTransform);
+        }
+        if let Some(cache) = cache.as_mut() {
+            for entry in cache.entries.iter_mut().flatten() {
+                if Arc::ptr_eq(entry.layout.source().admission(), source.admission())
+                    && entry.layout.source().platform_coverage() == source.platform_coverage()
+                    && entry.font_size == font_size && entry.run == run
+                    && entry.layout.source().as_str() == source.as_str()
+                {
+                    entry.age = 0;
+                    return Ok(Arc::clone(&entry.layout));
+                }
+            }
+        }
+        let layout = shape(source.clone(), font_size, run)?;
+        if !layout.source().same_allocation(&source)
+            || !Arc::ptr_eq(layout.source().admission(), source.admission())
+        {
+            return Err(crate::TextAllocationError::MismatchedSource);
+        }
+        let layout = Arc::new(layout);
+        if cache.is_none() {
+            *cache = Some(AdmittedFrameCache::new(layout.source().admission())?);
+        }
+        if let Some(slot) = cache.as_mut().and_then(|cache| cache.entries.iter_mut().find(|entry| entry.is_none())) {
+            *slot = Some(AdmittedCacheEntry { layout: Arc::clone(&layout), font_size, run, age: 0 });
+        }
+        Ok(layout)
+    }
+
+    fn finish_frame(&mut self) -> bool {
+        let mut occupied = false;
+        for entry in &mut self.entries {
+            if let Some(value) = entry {
+                value.age += 1;
+                if value.age >= 2 { *entry = None; }
+                else { occupied = true; }
+            }
+        }
+        occupied
+    }
 }
 
 #[derive(Default)]
@@ -504,6 +574,7 @@ impl LineLayoutCache {
             platform_text_system,
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
+            admitted: Mutex::new(None),
         }
     }
 
@@ -584,6 +655,12 @@ impl LineLayoutCache {
 
     pub fn finish_frame(&self) {
         let _font_generation = self.clear_if_font_generation_changed();
+        {
+            let mut admitted = self.admitted.lock();
+            if admitted.as_mut().is_some_and(|cache| !cache.finish_frame()) {
+                *admitted = None;
+            }
+        }
         let mut curr_frame = self.current_frame.write();
         let mut prev_frame = self.previous_frame.lock();
         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
@@ -662,6 +739,18 @@ impl LineLayoutCache {
 
             layout
         }
+    }
+
+    pub(crate) fn layout_line_admitted(
+        &self, source: crate::AdmittedTextSource, font_size: Pixels, run: FontRun,
+    ) -> Result<Arc<crate::AdmittedLineLayout>, crate::TextAllocationError> {
+        if run.len != source.as_str().len() {
+            return Err(crate::TextAllocationError::UnsupportedTransform);
+        }
+        let mut cache = self.admitted.lock();
+        AdmittedFrameCache::layout(&mut cache, source, font_size, run, |source, font_size, run| {
+            self.platform_text_system.layout_line_admitted(source, font_size, std::slice::from_ref(&run))
+        })
     }
 
     pub fn layout_line<Text>(
@@ -1070,6 +1159,11 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_cache_retirement_preserves_frame_owner_charge() {
+        super::validate_admitted_cache_ownership();
+    }
+
     use super::*;
     use crate::GlyphId;
 
@@ -1187,3 +1281,126 @@ mod tests {
         assert_eq!(positions, vec![0.5, 0.5]);
     }
 }
+
+#[cfg(any(test, feature = "text-allocation-validation"))]
+pub(crate) fn validate_admitted_cache_ownership() {
+        use crate::{AdmittedLineLayout, AdmittedTextSource, TextAllocationReservation};
+        use crate::text_allocation::tests::Counter;
+        use std::sync::atomic::Ordering;
+        let admission = Arc::new(Counter::default());
+        let source = AdmittedTextSource::new(&"x".repeat(4096), admission.clone()).expect("source");
+        let raw = LineLayout { len: 4096, ..LineLayout::default() };
+        let allocation = TextAllocationReservation::for_line(&source,
+            AdmittedLineLayout::allocation_bytes(&raw).expect("layout size")).expect("layout admission");
+        let layout = Arc::new(AdmittedLineLayout::from_native(source, raw, allocation).expect("layout"));
+        let mut cache = AdmittedFrameCache::new(layout.source().admission()).expect("cache admission");
+        cache.entries[0] = Some(AdmittedCacheEntry {
+            layout: Arc::clone(&layout), font_size: px(12.), run: FontRun { len: 4096, font_id: FontId(0) }, age: 0,
+        });
+        let charged = admission.0.load(Ordering::Relaxed);
+        let frame_alias = Arc::clone(&layout);
+        assert_eq!(admission.0.load(Ordering::Relaxed), charged);
+        drop(layout);
+        assert!(cache.finish_frame());
+        assert_eq!(admission.0.load(Ordering::Relaxed), charged);
+        assert!(!cache.finish_frame());
+        drop(cache);
+        assert!(admission.0.load(Ordering::Relaxed) > 0);
+        assert_eq!(frame_alias.len(), 4096);
+        assert!(matches!(frame_alias.try_split_at(1), Err(crate::TextAllocationError::UnsupportedTransform)));
+        drop(frame_alias);
+        assert_eq!(admission.0.load(Ordering::Relaxed), 0);
+        let mut cache = None;
+        let shaped = std::cell::Cell::new(0usize);
+        let shape = |source: crate::AdmittedTextSource, _: Pixels, _: FontRun| {
+            shaped.set(shaped.get() + 1);
+            let raw = LineLayout { len: source.as_str().len(), ..Default::default() };
+            let reservation = TextAllocationReservation::for_line(&source,
+                AdmittedLineLayout::allocation_bytes(&raw)?)?;
+            AdmittedLineLayout::from_native(source, raw, reservation)
+        };
+        let source = AdmittedTextSource::new("cached", admission.clone()).expect("source");
+        let run = FontRun { len: 6, font_id: FontId(0) };
+        let first = AdmittedFrameCache::layout(&mut cache, source.clone(), px(12.), run, &shape).expect("first");
+        let second = AdmittedFrameCache::layout(&mut cache, source, px(12.), run, &shape).expect("hit");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(shaped.get(), 1);
+        let tracked_source = AdmittedTextSource::new_tracked_platform("cached", admission.clone()).expect("tracked source");
+        let tracked = AdmittedFrameCache::layout(&mut cache, tracked_source, px(12.), run, &shape).expect("tracked layout");
+        assert!(!Arc::ptr_eq(&first, &tracked));
+        assert_eq!(tracked.source().platform_coverage(), crate::TextPlatformCoverage::ObservedUnbounded);
+        assert_eq!(first.source().platform_coverage(), crate::TextPlatformCoverage::StrictAdmission);
+        assert_eq!(shaped.get(), 2);
+        drop(tracked);
+        let another_policy = Arc::new(Counter::default());
+        let source = AdmittedTextSource::new("cached", another_policy.clone()).expect("other policy source");
+        let other = AdmittedFrameCache::layout(&mut cache, source, px(12.), run, &shape).expect("separate policy");
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(shaped.get(), 3);
+        let geometry = first.clone();
+        let measure_callback = { let first = first.clone(); move || first.len() };
+        drop(first);
+        drop(second);
+        drop(other);
+        drop(cache);
+        assert_eq!(another_policy.0.load(Ordering::Relaxed), 0);
+        assert!(admission.0.load(Ordering::Relaxed) > 0);
+        drop(geometry);
+        assert_eq!(measure_callback(), 6);
+        assert!(admission.0.load(Ordering::Relaxed) > 0);
+        drop(measure_callback);
+        assert_eq!(admission.0.load(Ordering::Relaxed), 0);
+
+        let mut cache = None;
+        for index in 0..128 {
+            let text = format!("entry-{index}");
+            let source = AdmittedTextSource::new(&text, admission.clone()).expect("cache source");
+            let run = FontRun { len: text.len(), font_id: FontId(0) };
+            drop(AdmittedFrameCache::layout(&mut cache, source, px(12.), run, &shape).expect("cache fill"));
+        }
+        assert_eq!(cache.as_ref().expect("full cache").entries.iter().flatten().count(), 128);
+        let baseline = admission.0.load(Ordering::Relaxed);
+        let source = AdmittedTextSource::new("overflow", admission.clone()).expect("overflow source");
+        let run = FontRun { len: 8, font_id: FontId(0) };
+        let first = AdmittedFrameCache::layout(&mut cache, source.clone(), px(12.), run, &shape).expect("uncached first");
+        let second = AdmittedFrameCache::layout(&mut cache, source, px(12.), run, &shape).expect("uncached second");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(admission.0.load(Ordering::Relaxed) > baseline);
+        assert_eq!(cache.as_ref().expect("still full").entries.iter().flatten().count(), 128);
+        drop(first);
+        drop(second);
+        assert_eq!(admission.0.load(Ordering::Relaxed), baseline);
+        drop(cache);
+        assert_eq!(admission.0.load(Ordering::Relaxed), 0);
+
+        let mut cache = None;
+        let source = AdmittedTextSource::new("line-a", admission.clone()).expect("line a");
+        let run = FontRun { len: 6, font_id: FontId(0) };
+        let first = AdmittedFrameCache::layout(&mut cache, source, px(12.), run, &shape).expect("line a layout");
+        let first_weak = Arc::downgrade(&first);
+        let source = AdmittedTextSource::new("line-b", admission.clone()).expect("line b");
+        let second = AdmittedFrameCache::layout(&mut cache, source, px(12.), run, &shape).expect("line b layout");
+        drop(first);
+        assert!(cache.as_mut().expect("cache").finish_frame());
+        drop(AdmittedFrameCache::layout(&mut cache, second.source().clone(), px(12.), run, &shape).expect("line b hit"));
+        assert!(cache.as_mut().expect("cache").finish_frame());
+        assert!(first_weak.upgrade().is_none());
+        assert_eq!(cache.as_ref().expect("one retained line").entries.iter().flatten().count(), 1);
+        drop(cache);
+        assert_eq!(second.len(), 6);
+        assert!(admission.0.load(Ordering::Relaxed) > 0);
+        drop(second);
+        drop(first_weak);
+        assert_eq!(admission.0.load(Ordering::Relaxed), 0);
+
+        let mut cache = None;
+        let source = AdmittedTextSource::new("wanted", admission.clone()).expect("requested source");
+        let mismatch = AdmittedFrameCache::layout(&mut cache, source, px(12.), run, |_, size, run| {
+            let wrong = AdmittedTextSource::new("wrong!", admission.clone())?;
+            shape(wrong, size, run)
+        });
+        assert!(matches!(mismatch, Err(crate::TextAllocationError::MismatchedSource)));
+        assert!(cache.is_none());
+        assert_eq!(admission.0.load(Ordering::Relaxed), 0);
+
+    }
