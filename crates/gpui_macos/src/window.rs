@@ -1594,6 +1594,16 @@ impl Drop for MacWindow {
             this.native_window.setDelegate_(nil);
         }
         this.input_handler.take();
+        // The accessibility adapter retains the window's content view, whose
+        // GPUIView subview holds a raw `Arc` back to this state, so leaving
+        // the adapter in place keeps the state — and with it the renderer,
+        // its layer, drawables and atlas — alive after the window is gone.
+        // Take it out here and release it once the window has closed. The
+        // last mouse-down event and context menu are dropped the same way so
+        // no other AppKit object retained by the state can close that loop.
+        let accesskit_adapter = this.accesskit_adapter.take();
+        let last_left_mouse_down_event = this.last_left_mouse_down_event.take();
+        let active_context_menu = this.active_context_menu.take();
         this.foreground_executor
             .spawn(async move {
                 unsafe {
@@ -1601,6 +1611,9 @@ impl Drop for MacWindow {
                         let _: () = msg_send![parent, endSheet: window];
                     }
                     window.close();
+                    drop(accesskit_adapter);
+                    drop(last_left_mouse_down_event);
+                    drop(active_context_menu);
                     window.autorelease();
                 }
             })
