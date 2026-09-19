@@ -63,6 +63,38 @@ struct FontKey {
     font_fallbacks: Option<FontFallbacks>,
 }
 
+struct LineFontCache {
+    entries: [Option<(FontId, Pixels, CTFont)>; 16],
+    next_entry: usize,
+}
+
+impl LineFontCache {
+    fn new() -> Self {
+        Self { entries: std::array::from_fn(|_| None), next_entry: 0 }
+    }
+
+    fn with_font<Output>(
+        &mut self,
+        font_id: FontId,
+        font: &FontKitFont,
+        font_size: Pixels,
+        use_font: impl FnOnce(&CTFont) -> Output,
+    ) -> Output {
+        if let Some((_, _, native_font)) = self.entries.iter().flatten()
+            .find(|(cached_id, cached_size, _)| *cached_id == font_id && *cached_size == font_size) {
+            return use_font(native_font);
+        }
+        // CoreText initializes variable-font advance caches on each distinct
+        // resized font. Repeated styled runs should share those objects. Keep
+        // this line-local and bounded, including on the admitted shaping path.
+        let native_font = font.native_font().clone_with_font_size(font_size.into());
+        let output = use_font(&native_font);
+        self.entries[self.next_entry] = Some((font_id, font_size, native_font));
+        self.next_entry = (self.next_entry + 1) % self.entries.len();
+        output
+    }
+}
+
 struct MacTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
@@ -551,6 +583,7 @@ impl MacTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        let mut fonts = LineFontCache::new();
 
         {
             let mut text = text;
@@ -578,13 +611,9 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
-                unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
-                }
+                fonts.with_font(run.font_id, font, font_size, |native_font| unsafe {
+                    string.set_attribute(cf_range, kCTFontAttributeName, native_font);
+                });
                 break_ligature = !break_ligature;
             }
         }
@@ -661,6 +690,7 @@ impl MacTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        let mut fonts = LineFontCache::new();
 
         {
             let mut text = text;
@@ -688,13 +718,9 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
-                unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
-                }
+                fonts.with_font(run.font_id, font, font_size, |native_font| unsafe {
+                    string.set_attribute(cf_range, kCTFontAttributeName, native_font);
+                });
                 break_ligature = !break_ligature;
             }
         }
@@ -941,6 +967,52 @@ mod lenient_font_attributes {
 mod tests {
     use crate::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+
+    #[test]
+    fn line_font_cache_reuses_fonts_without_merging_ligature_sizes() -> anyhow::Result<()> {
+        use core_foundation::base::TCFType;
+
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica"))?;
+        let other_id = fonts.font_id(&font("Times"))?;
+        let state = fonts.0.read();
+        let mut cache = super::LineFontCache::new();
+        let normal = cache.with_font(font_id, &state.fonts[font_id.0], px(16.0), |font| font.clone());
+        let separated_size = px(16.0f32.next_up());
+        let separated = cache.with_font(font_id, &state.fonts[font_id.0], separated_size, |font| font.clone());
+        assert_eq!(normal.pt_size(), 16.0);
+        assert_eq!(separated.pt_size(), f64::from(f32::from(separated_size)));
+        assert_ne!(normal.as_concrete_TypeRef(), separated.as_concrete_TypeRef());
+        cache.with_font(other_id, &state.fonts[other_id.0], px(16.0), |other| {
+            assert_ne!(normal.postscript_name(), other.postscript_name());
+        });
+        for _ in 0..20 {
+            cache.with_font(font_id, &state.fonts[font_id.0], px(16.0), |font| {
+                assert_eq!(normal.as_concrete_TypeRef(), font.as_concrete_TypeRef());
+            });
+            cache.with_font(font_id, &state.fonts[font_id.0], separated_size, |font| {
+                assert_eq!(separated.as_concrete_TypeRef(), font.as_concrete_TypeRef());
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn line_font_cache_eviction_preserves_requested_font_and_size() -> anyhow::Result<()> {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica"))?;
+        let state = fonts.0.read();
+        let font = &state.fonts[font_id.0];
+        let expected_name = font.native_font().postscript_name();
+        let mut cache = super::LineFontCache::new();
+        for size in (10..50).chain(10..50) {
+            cache.with_font(font_id, font, px(size as f32), |native| {
+                assert_eq!(native.pt_size(), f64::from(size));
+                assert_eq!(native.postscript_name(), expected_name);
+            });
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_layout_line_bom_char() {
