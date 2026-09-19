@@ -773,6 +773,9 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    if !decoration_runs.iter().any(|run| run.background_color.is_some()) {
+        return Ok(());
+    }
     let line_bounds = Bounds::new(
         origin,
         size(
