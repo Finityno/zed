@@ -496,6 +496,7 @@ fn paint_line(
         ),
     );
     window.paint_layer(line_bounds, |window| {
+        let content_mask = window.content_mask();
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let mut decoration_runs = decoration_runs.iter();
@@ -524,7 +525,9 @@ fn paint_line(
             // expressed relative to the BASELINE with y pointing up, so it has to be flipped
             // and positioned on the baseline to say where ink can actually land on screen.
             let max_glyph_box = text_system.bounding_box(run.font_id, layout.font_size);
+            let descent = text_system.descent(run.font_id, layout.font_size).abs();
             max_glyph_size = max_glyph_box.size;
+            let mut vertical_cull: Option<((u32, u32), Pixels, Pixels, bool)> = None;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -683,31 +686,45 @@ fn paint_line(
                 // included. Union with the line row so the box is never smaller than the row,
                 // and allow a glyph box of horizontal overhang for negative side bearings.
                 let vertical_offset = point(px(0.0), glyph.position.y);
-                let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
-                let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
-                // A backend whose box has a zero origin (advance metrics rather
-                // than outline extents, as the cosmic-text one reports) has
-                // left the descent out of it, so take that from the font.
-                let descent = text_system.descent(run.font_id, layout.font_size).abs();
-                let ink_bottom = (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
-                // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
-                // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
-                // texture bounds include the antialiasing skirt, and some fonts report a box
-                // their own glyphs then exceed. Berkeley Mono Variable -- fincode's code font --
-                // rasterizes its descenders 0.55px below the box it reports, at every weight and
-                // at every leading from 1.0x to 1.6x, so without this pad the cheap box is not a
-                // superset of the exact one and a descender at a clip edge is dropped while
-                // visible. The pre-cull only exists to avoid rasterizing obviously offscreen
-                // glyphs, so erring large costs a few edge rasterizations and nothing else.
-                const RASTER_SKIRT: Pixels = px(2.0);
-                let cull_top = ink_top.min(glyph_origin.y) - RASTER_SKIRT;
-                let cull_bottom = ink_bottom.max(glyph_origin.y + line_height) + RASTER_SKIRT;
+                let vertical_key = (glyph_origin.y.0.to_bits(), glyph.position.y.0.to_bits());
+                let (cull_top, cull_height, vertically_visible) = match vertical_cull {
+                    Some((key, top, height, visible)) if key == vertical_key => (top, height, visible),
+                    _ => {
+                        let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
+                        let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
+                        // A backend whose box has a zero origin (advance metrics rather
+                        // than outline extents, as the cosmic-text one reports) has
+                        // left the descent out of it, so take that from the font.
+                        let ink_bottom = (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
+                        // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
+                        // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
+                        // texture bounds include the antialiasing skirt, and some fonts report a box
+                        // their own glyphs then exceed. Berkeley Mono Variable -- fincode's code font --
+                        // rasterizes its descenders 0.55px below the box it reports, at every weight and
+                        // at every leading from 1.0x to 1.6x, so without this pad the cheap box is not a
+                        // superset of the exact one and a descender at a clip edge is dropped while
+                        // visible. The pre-cull only exists to avoid rasterizing obviously offscreen
+                        // glyphs, so erring large costs a few edge rasterizations and nothing else.
+                        const RASTER_SKIRT: Pixels = px(2.0);
+                        let cull_top = ink_top.min(glyph_origin.y) - RASTER_SKIRT;
+                        let cull_bottom = ink_bottom.max(glyph_origin.y + line_height) + RASTER_SKIRT;
+                        let cull_height = cull_bottom - cull_top;
+                        // Match Bounds::intersects, including its reconstructed lower edge
+                        // and Pixels total ordering at nonfinite coordinates.
+                        let visible = cull_top < content_mask.bounds.bottom()
+                            && cull_top + cull_height > content_mask.bounds.top();
+                        vertical_cull = Some((vertical_key, cull_top, cull_height, visible));
+                        (cull_top, cull_height, visible)
+                    }
+                };
+                if !vertically_visible {
+                    continue;
+                }
                 let max_glyph_bounds = Bounds {
                     origin: point(glyph_origin.x - max_glyph_size.width, cull_top),
-                    size: size(max_glyph_size.width * 3., cull_bottom - cull_top),
+                    size: size(max_glyph_size.width * 3., cull_height),
                 };
 
-                let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     if glyph.is_emoji {
                         window.paint_emoji(
@@ -773,6 +790,9 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    if !decoration_runs.iter().any(|run| run.background_color.is_some()) {
+        return Ok(());
+    }
     let line_bounds = Bounds::new(
         origin,
         size(
@@ -1467,6 +1487,7 @@ mod tests {
 /// `insert_primitive` -> scene) and counts the glyph sprites that actually reached the scene.
 #[cfg(test)]
 mod pre_cull_regression_tests {
+    use super::{DecorationRun, paint_line};
     use crate::{
         AppContext as _, Bounds, ContentMask, Context, DevicePixels, Font, FontId,
         FontMetrics, FontRun,
@@ -1474,7 +1495,8 @@ mod pre_cull_regression_tests {
         ParentElement as _, Render, RenderGlyphParams, Size, Styled as _, TestAppContext,
         TestDispatcher,
         TextAlign,
-        TextRenderingMode, TextRun, Window, black, canvas, div, font, point, px, size,
+        ShapedRun, StrikethroughStyle, TextRenderingMode, TextRun, UnderlineStyle, Window,
+        WrapBoundary, black, canvas, div, font, point, px, size, white,
     };
     use anyhow::Result;
     use std::{borrow::Cow, cell::Cell, cell::RefCell, rc::Rc, sync::Arc};
@@ -1839,6 +1861,115 @@ mod pre_cull_regression_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    struct PositionedCullView {
+        wrapped: bool,
+    }
+
+    impl Render for PositionedCullView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let wrapped = self.wrapped;
+            div().child(canvas(
+                |_, _, _| (),
+                move |_bounds, _, window, cx| {
+                    let mut layout = NoopTextSystem.layout_line("abcdef", FONT_SIZE, &[]);
+                    for (index, glyph) in layout.runs[0].glyphs.iter_mut().enumerate() {
+                        glyph.position.x = px(index as f32 * 10.);
+                        if !wrapped {
+                            glyph.position.y = px([0., 0., 128., 128., 0., 128.][index]);
+                        }
+                    }
+                    layout.width = px(60.);
+                    let mut wraps = Vec::new();
+                    if wrapped {
+                        let glyphs = layout.runs[0].glyphs.split_off(3);
+                        layout.runs.push(ShapedRun {
+                            font_id: FontId(1),
+                            glyphs,
+                        });
+                        wraps.extend([
+                            WrapBoundary { run_ix: 0, glyph_ix: 2 },
+                            WrapBoundary { run_ix: 1, glyph_ix: 1 },
+                        ]);
+                    }
+                    let decorations = [
+                        DecorationRun {
+                            len: 1,
+                            color: black(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        },
+                        DecorationRun {
+                            len: 5,
+                            color: white(),
+                            background_color: None,
+                            underline: Some(UnderlineStyle {
+                                thickness: px(1.),
+                                color: None,
+                                wavy: false,
+                            }),
+                            strikethrough: Some(StrikethroughStyle {
+                                thickness: px(1.),
+                                color: None,
+                            }),
+                        },
+                    ];
+                    let mask = Bounds::new(point(px(-10.), px(0.)), size(px(1000.), LINE_HEIGHT));
+                    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+                        paint_line(
+                            point(px(0.), px(-128.)),
+                            &layout,
+                            LINE_HEIGHT,
+                            TextAlign::Left,
+                            None,
+                            &decorations,
+                            &wraps,
+                            window,
+                            cx,
+                        )
+                        .expect("positioned glyph fixture should paint");
+                    });
+                },
+            ))
+        }
+    }
+
+    fn paint_positioned_cull_sequence(wrapped: bool) -> (Vec<(f32, Hsla)>, usize) {
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(InkedTextSystem(NoopTextSystem)),
+        );
+        let window = cx.add_window(move |_, _| PositionedCullView { wrapped });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let scale_factor = window.scale_factor();
+            let scene = &window.rendered_frame.scene;
+            let mut sprites = scene.monochrome_sprites.iter()
+                .map(|sprite| (sprite.bounds.origin.x.0 / scale_factor, sprite.color))
+                .chain(scene.subpixel_sprites.iter()
+                    .map(|sprite| (sprite.bounds.origin.x.0 / scale_factor, sprite.color)))
+                .collect::<Vec<_>>();
+            sprites.sort_by(|left, right| left.0.total_cmp(&right.0));
+            (sprites, scene.underlines.len())
+        })
+        .expect("positioned glyph window should draw")
+    }
+
+    #[test]
+    fn vertical_cull_tracks_changing_glyph_offsets_without_losing_style_or_advances() {
+        let (sprites, decorations) = paint_positioned_cull_sequence(false);
+        assert_eq!(sprites, vec![(20., white()), (30., white()), (50., white())]);
+        assert_eq!(decorations, 0, "glyph offsets must not move row decorations");
+    }
+
+    #[test]
+    fn vertical_cull_tracks_hidden_to_visible_wraps_across_decorated_runs() {
+        let (sprites, decorations) = paint_positioned_cull_sequence(true);
+        assert_eq!(sprites, vec![(0., white()), (10., white())]);
+        assert_eq!(decorations, 2, "the visible row must retain underline and strike");
     }
 
     /// Drawing the same unchanged view repeatedly takes the cached-paint reuse path from the
