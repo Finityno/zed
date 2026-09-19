@@ -524,6 +524,7 @@ fn paint_line(
             // expressed relative to the BASELINE with y pointing up, so it has to be flipped
             // and positioned on the baseline to say where ink can actually land on screen.
             let max_glyph_box = text_system.bounding_box(run.font_id, layout.font_size);
+            let descent = text_system.descent(run.font_id, layout.font_size).abs();
             max_glyph_size = max_glyph_box.size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
@@ -688,7 +689,6 @@ fn paint_line(
                 // A backend whose box has a zero origin (advance metrics rather
                 // than outline extents, as the cosmic-text one reports) has
                 // left the descent out of it, so take that from the font.
-                let descent = text_system.descent(run.font_id, layout.font_size).abs();
                 let ink_bottom = (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
                 // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
                 // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
