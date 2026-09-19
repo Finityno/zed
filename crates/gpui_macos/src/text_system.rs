@@ -998,6 +998,49 @@ mod tests {
     }
 
     #[test]
+    fn line_font_cache_preserves_coretext_shaping_across_styled_runs() -> anyhow::Result<()> {
+        use super::{CFMutableAttributedString, CFRange, CFString, CTLine, LineFontCache,
+            TCFType, kCTFontAttributeName};
+
+        let fonts = MacTextSystem::new();
+        let regular = fonts.font_id(&font("Helvetica"))?;
+        let italic = fonts.font_id(&font("Times-Italic"))?;
+        let state = fonts.0.read();
+        let fragments = [("office ffi ", regular), ("affinity ", italic),
+            ("مرحبا ", regular), ("😀 e\u{301} ", regular)];
+        let shape = |reuse_fonts| {
+            let mut string = CFMutableAttributedString::new();
+            let mut cache = LineFontCache::new();
+            for (index, (text, font_id)) in fragments.iter().cycle().take(64).enumerate() {
+                let start = string.char_len();
+                string.replace_str(&CFString::new(text), CFRange::init(start, 0));
+                let range = CFRange::init(start, string.char_len() - start);
+                let font = &state.fonts[font_id.0];
+                let size = px(if index % 2 == 0 { 16.0f32.next_up() } else { 16.0 });
+                if reuse_fonts {
+                    cache.with_font(*font_id, font, size, |native| unsafe {
+                        string.set_attribute(range, kCTFontAttributeName, native);
+                    });
+                } else {
+                    unsafe {
+                        string.set_attribute(range, kCTFontAttributeName,
+                            &font.native_font().clone_with_font_size(size.into()));
+                    }
+                }
+            }
+            let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
+            let glyphs = line.glyph_runs().into_iter().map(|run| (
+                run.glyphs().to_vec(),
+                run.positions().iter().map(|position| (position.x, position.y)).collect::<Vec<_>>(),
+                run.string_indices().to_vec(),
+            )).collect::<Vec<_>>();
+            (line.get_typographic_bounds().width, glyphs)
+        };
+        assert_eq!(shape(true), shape(false));
+        Ok(())
+    }
+
+    #[test]
     fn line_font_cache_eviction_preserves_requested_font_and_size() -> anyhow::Result<()> {
         let fonts = MacTextSystem::new();
         let font_id = fonts.font_id(&font("Helvetica"))?;
