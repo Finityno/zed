@@ -1004,7 +1004,7 @@ mod tests {
 
         let fonts = MacTextSystem::new();
         let regular = fonts.font_id(&font("Helvetica"))?;
-        let italic = fonts.font_id(&font("Times-Italic"))?;
+        let italic = fonts.font_id(&font("Times").italic())?;
         let state = fonts.0.read();
         let fragments = [("office ffi ", regular), ("affinity ", italic),
             ("مرحبا ", regular), ("😀 e\u{301} ", regular)];
