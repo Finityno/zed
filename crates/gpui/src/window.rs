@@ -1838,21 +1838,28 @@ impl Window {
                 let force_render =
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
-                let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
-                    .log_err();
-
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                //
+                // An unfocused window's own redraws count as demand too: an
+                // app that paces its animations with timers and notifies per
+                // streamed chunk has no next-frame callbacks for the cap to
+                // see, and redrew at the display's rate in the background.
+                // Input-driven redraws stay exempt through the rate tracker.
+                let has_demand = request_frame_options.force_render
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || (!active.get() && invalidator.is_dirty());
                 let min_frame_interval = if request_frame_options.require_presentation
-                    || (!request_frame_options.force_render
-                        && next_frame_callbacks.borrow().is_empty())
+                    || !has_demand
                 {
                     None
                 } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
                     inactive_frame_interval
-                } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
+                } else if let Some(ThermalState::Critical | ThermalState::Serious) = handle
+                    .update(&mut cx, |_, _, cx| cx.thermal_state())
+                    .log_err()
+                {
                     Some(Duration::from_micros(16667))
                 } else {
                     None
@@ -8716,6 +8723,62 @@ mod tests {
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    struct CountsRenders(Rc<Cell<usize>>);
+
+    impl Render for CountsRenders {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div()
+        }
+    }
+
+    /// An unfocused window that is dirty only because a view notified, with
+    /// no next-frame callback pending, is held to the inactive frame interval
+    /// like an animating one, and the deferred redraw is not lost.
+    #[gpui::test]
+    fn test_inactive_window_throttles_notify_driven_redraws(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    inactive_frame_interval: Some(Duration::from_secs(3600)),
+                    ..Default::default()
+                },
+                {
+                    let renders = renders.clone();
+                    move |_, cx| cx.new(|_| CountsRenders(renders))
+                },
+            )
+            .unwrap()
+        });
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        // Dirtied from outside an update: in tests an effect flush draws
+        // every dirty window itself, and the frame request would find a
+        // clean one.
+        let invalidator = window
+            .update(cx, |_, window, _| window.invalidator.clone())
+            .unwrap();
+        invalidator.set_dirty(true);
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        // Only the deferral re-arms the frame source. The render count cannot
+        // tell the two apart here: deferring schedules a frame through an
+        // update, and the test harness draws on that flush.
+        assert!(
+            test_window.frame_wake_count() > baseline,
+            "the redraw waits out the inactive interval and re-arms the frame source"
+        );
+
+        test_window.simulate_active_status_change(true);
+        let drawn = renders.get();
+        invalidator.set_dirty(true);
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(renders.get() > drawn, "an active window redraws at once");
+        assert_eq!(test_window.frame_wake_count(), baseline, "and defers nothing");
     }
 
     #[gpui::test]
