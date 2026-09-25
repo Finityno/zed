@@ -108,6 +108,15 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub blended_quad_indices: Vec<u32>,
     pub opaque_quad_indices: Vec<u32>,
+    /// Sweeps referenced by `SpriteEffect::animation`.
+    shimmer_animations: Vec<ShimmerAnimation>,
+    /// Indices of the sprites whose effect animates, gathered by `finish`
+    /// (sorting moves sprites, so they cannot be recorded on insertion).
+    animated_monochrome_sprites: Vec<u32>,
+    animated_subpixel_sprites: Vec<u32>,
+    /// Opacity cycles referenced by `Background::time_animation`.
+    quad_animations: Vec<QuadOpacityAnimation>,
+    animated_quads: Vec<u32>,
     /// One tracker per vector above, in the order `clear` destructures them.
     shrink: [CapacityShrink; 12],
 }
@@ -142,6 +151,11 @@ impl Scene {
         surfaces.clear_vec(&mut self.surfaces);
         blended_quad_indices.clear_vec(&mut self.blended_quad_indices);
         opaque_quad_indices.clear_vec(&mut self.opaque_quad_indices);
+        self.shimmer_animations.clear();
+        self.animated_monochrome_sprites.clear();
+        self.animated_subpixel_sprites.clear();
+        self.quad_animations.clear();
+        self.animated_quads.clear();
     }
 
     /// Shrinks this cleared scene's vectors to twice the fill of `rendered`,
@@ -299,10 +313,51 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Registers an opacity cycle for one quad, returning the value its
+    /// background's time animation should carry.
+    pub(crate) fn push_quad_animation(&mut self, animation: QuadOpacityAnimation) -> u32 {
+        self.quad_animations.push(animation);
+        self.quad_animations.len() as u32
+    }
+
+    /// Registers a sweep for sprites painted after this call, returning the
+    /// value their [`SpriteEffect::animation`] should carry.
+    pub(crate) fn push_shimmer_animation(&mut self, animation: ShimmerAnimation) -> u32 {
+        self.shimmer_animations.push(animation);
+        self.shimmer_animations.len() as u32
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        // Every glyph of one shimmering label names the same sweep, so the
+        // label's glyphs share one remapped entry rather than one each.
+        let mut remapped_animation = (0, 0);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive(primitive) => {
+                    let mut primitive = primitive.clone();
+                    if let Primitive::Quad(quad) = &mut primitive
+                        && quad.background.time_animation() != 0
+                    {
+                        let animation = self.push_quad_animation(
+                            prev_scene.quad_animations
+                                [quad.background.time_animation() as usize - 1],
+                        );
+                        quad.background = quad.background.with_time_animation(animation);
+                    }
+                    if let Primitive::MonochromeSprite(MonochromeSprite { effect, .. })
+                    | Primitive::SubpixelSprite(SubpixelSprite { effect, .. }) = &mut primitive
+                        && effect.animation != 0
+                    {
+                        if remapped_animation.0 != effect.animation {
+                            let animation =
+                                prev_scene.shimmer_animations[effect.animation as usize - 1];
+                            remapped_animation =
+                                (effect.animation, self.push_shimmer_animation(animation));
+                        }
+                        effect.animation = remapped_animation.1;
+                    }
+                    self.insert_primitive(primitive)
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -322,6 +377,65 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.partition_quads();
+        self.animated_monochrome_sprites.clear();
+        self.animated_monochrome_sprites.extend(
+            (0..self.monochrome_sprites.len() as u32)
+                .filter(|&index| self.monochrome_sprites[index as usize].effect.animation != 0),
+        );
+        self.animated_subpixel_sprites.clear();
+        self.animated_subpixel_sprites.extend(
+            (0..self.subpixel_sprites.len() as u32)
+                .filter(|&index| self.subpixel_sprites[index as usize].effect.animation != 0),
+        );
+        self.animated_quads.clear();
+        self.animated_quads.extend(
+            (0..self.quads.len() as u32)
+                .filter(|&index| self.quads[index as usize].background.time_animation() != 0),
+        );
+    }
+
+    /// Whether anything in this finished scene moves with time on its own, so
+    /// presenting it again later shows something new.
+    pub fn has_time_animations(&self) -> bool {
+        !self.animated_monochrome_sprites.is_empty()
+            || !self.animated_subpixel_sprites.is_empty()
+            || !self.animated_quads.is_empty()
+    }
+
+    /// Moves every time-driven primitive of this finished scene to where it is
+    /// now. Called before each present, so a frame replayed from a cached view
+    /// shows the current phase rather than the one it was painted at.
+    pub(crate) fn advance_time_animations(&mut self) {
+        if !self.has_time_animations() {
+            return;
+        }
+        let animations = &self.shimmer_animations;
+        let mut current = (0, 0.0);
+        let mut band_origin = |animation: u32| {
+            if current.0 != animation {
+                current = (animation, animations[animation as usize - 1].band_origin());
+            }
+            current.1
+        };
+        for &index in &self.animated_monochrome_sprites {
+            let effect = &mut self.monochrome_sprites[index as usize].effect;
+            effect.band_origin = band_origin(effect.animation);
+        }
+        for &index in &self.animated_subpixel_sprites {
+            let effect = &mut self.subpixel_sprites[index as usize].effect;
+            effect.band_origin = band_origin(effect.animation);
+        }
+        for &index in &self.animated_quads {
+            let quad = &mut self.quads[index as usize];
+            let animation_id = quad.background.time_animation();
+            let animation = &self.quad_animations[animation_id as usize - 1];
+            let opacity = animation.cycle.current_opacity();
+            quad.background = animation
+                .background
+                .opacity(opacity)
+                .with_time_animation(animation_id);
+            quad.border_color = animation.border_color.opacity(opacity);
+        }
     }
 
     fn partition_quads(&mut self) {
@@ -330,7 +444,12 @@ impl Scene {
         let partitioning_enabled =
             opaque_quad_partitioning_enabled() && self.quads.len() <= MAX_DEPTH_PARTITIONED_QUADS;
         for (quad_id, quad) in self.quads.iter().enumerate() {
-            let has_opaque_core = partitioning_enabled && quad.has_opaque_core();
+            // A quad whose opacity animates may be solid in this frame and
+            // translucent in the next without the scene being rebuilt, so it
+            // always takes the blended pass.
+            let has_opaque_core = partitioning_enabled
+                && quad.background.time_animation() == 0
+                && quad.has_opaque_core();
             if has_opaque_core {
                 self.opaque_quad_indices.push(quad_id as u32);
             }
@@ -604,6 +723,149 @@ mod tests {
         replayed.replay(0..source.len(), &source);
 
         assert!(replayed.is_empty());
+    }
+
+    fn unit_bounds() -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: ScaledPixels::from(10.),
+                height: ScaledPixels::from(10.),
+            },
+        }
+    }
+
+    fn opaque_quad() -> Quad {
+        Quad {
+            bounds: unit_bounds(),
+            content_mask: ContentMask {
+                bounds: unit_bounds(),
+            },
+            background: Background::from(Hsla::black()),
+            ..Default::default()
+        }
+    }
+
+    fn shimmering_glyph(animation: u32) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: unit_bounds(),
+            content_mask: ContentMask {
+                bounds: unit_bounds(),
+            },
+            color: crate::white(),
+            effect: SpriteEffect {
+                kind: SpriteEffect::SHIMMER_KIND,
+                animation,
+                ..SpriteEffect::default()
+            },
+            tile: AtlasTile {
+                texture_id: crate::AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Monochrome,
+                },
+                tile_id: crate::TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    /// A shimmer's band is moved by the scene before each present; a view
+    /// cached around it replays its glyphs into the next frame, and they must
+    /// still name a sweep there, or the band freezes at the phase it was
+    /// painted with.
+    #[test]
+    fn replayed_shimmer_glyphs_keep_their_sweep() {
+        let mut source = Scene::default();
+        let animation = source.push_shimmer_animation(ShimmerAnimation {
+            band_start: -40.0,
+            travel: 1000.0,
+            period: std::time::Duration::from_millis(1000),
+            hold: 0.0,
+        });
+        source.insert_primitive(shimmering_glyph(animation));
+        source.insert_primitive(shimmering_glyph(animation));
+        source.insert_primitive(shimmering_glyph(0));
+        source.finish();
+        assert!(source.has_time_animations());
+
+        let mut replayed = Scene::default();
+        // An unrelated sweep first, so the replayed index has to be remapped.
+        replayed.push_shimmer_animation(ShimmerAnimation {
+            band_start: 0.0,
+            travel: 0.0,
+            period: std::time::Duration::from_millis(1),
+            hold: 0.0,
+        });
+        replayed.replay(0..source.len(), &source);
+        replayed.finish();
+        assert!(replayed.has_time_animations());
+        assert_eq!(replayed.shimmer_animations.len(), 2, "one entry per label");
+
+        replayed.advance_time_animations();
+        let animated: Vec<_> = replayed
+            .monochrome_sprites
+            .iter()
+            .filter(|sprite| sprite.effect.animation != 0)
+            .collect();
+        assert_eq!(animated.len(), 2);
+        for sprite in animated {
+            assert_eq!(sprite.effect.animation, 2);
+            assert!((-40.0..=960.0).contains(&sprite.effect.band_origin));
+        }
+    }
+
+    #[test]
+    fn a_scene_without_moving_parts_does_not_animate() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(shimmering_glyph(0));
+        scene.insert_primitive(opaque_quad());
+        scene.finish();
+        assert!(!scene.has_time_animations());
+    }
+
+    #[test]
+    fn opacity_cycle_interpolates_between_keyframes_and_wraps() {
+        let cycle = OpacityCycle::new(
+            std::time::Duration::from_millis(750),
+            [(0.0, 1.0), (0.5, 0.2), (0.75, 0.2), (1.0, 1.0)],
+        );
+        assert!((cycle.opacity_at(0.0) - 1.0).abs() < 1e-6);
+        assert!((cycle.opacity_at(0.25) - 0.6).abs() < 1e-6);
+        assert!((cycle.opacity_at(0.6) - 0.2).abs() < 1e-6);
+        assert!((cycle.opacity_at(0.875) - 0.6).abs() < 1e-6);
+        assert!((cycle.opacity_at(1.25) - 0.6).abs() < 1e-6);
+    }
+
+    /// An animated quad may be solid now and translucent at the next present,
+    /// which the opaque depth pass would paint as solid.
+    #[test]
+    fn opacity_cycled_quads_take_the_blended_pass() {
+        let mut scene = Scene::default();
+        let quad = opaque_quad();
+        let animation = scene.push_quad_animation(QuadOpacityAnimation {
+            cycle: OpacityCycle::new(
+                std::time::Duration::from_millis(750),
+                [(0.0, 0.5), (0.5, 0.5), (0.75, 0.5), (1.0, 0.5)],
+            ),
+            background: quad.background,
+            border_color: quad.border_color,
+        });
+        scene.insert_primitive(Quad {
+            background: quad.background.with_time_animation(animation),
+            ..quad
+        });
+        scene.finish();
+        assert!(scene.opaque_quad_indices.is_empty());
+        assert_eq!(scene.blended_quad_indices, vec![0]);
+
+        scene.advance_time_animations();
+        let background = scene.quads[0].background;
+        assert_eq!(background.time_animation(), animation);
+        assert!((background.solid.a - quad.background.solid.a * 0.5).abs() < 1e-6);
     }
 }
 
@@ -1193,8 +1455,12 @@ pub struct SpriteEffect {
     pub origin: Point<ScaledPixels>,
     /// Half-width of the core, as a fraction of `band_width`.
     pub core_spread: f32,
-    /// Padding to keep the struct at 64 bytes across all four shader backends.
-    pub pad: u32,
+    /// One more than the index of the [`ShimmerAnimation`] in the owning
+    /// scene that moves `band_origin` with time, or `0` for a still band. The
+    /// shaders never read it (they see it as padding); the scene rewrites
+    /// `band_origin` from it before every present, so a sweeping shimmer
+    /// animates without its view drawing again.
+    pub animation: u32,
     /// Color the band blends towards at full intensity.
     pub highlight_color: Hsla,
     /// Trailing edge of the highlight band, measured along `direction` from
@@ -1212,6 +1478,103 @@ impl SpriteEffect {
     pub(crate) const SHIMMER_KIND: u32 = 1;
 }
 
+/// How a sweeping shimmer band moves with time, kept beside the scene rather
+/// than in [`SpriteEffect`] so every glyph in the window does not pay for it.
+///
+/// The band's trailing edge is `band_start + travel * sweep(t)`, where the
+/// sweep runs from 0 to 1 over `period`, then holds past the end for the
+/// `hold` fraction of the cycle.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct ShimmerAnimation {
+    /// Trailing edge at the start of a sweep, in device pixels along the
+    /// effect's `direction`.
+    pub band_start: f32,
+    /// Distance the trailing edge covers in one sweep, in device pixels.
+    pub travel: f32,
+    pub period: std::time::Duration,
+    pub hold: f32,
+}
+
+/// A repeating opacity curve for quads, evaluated by the scene before every
+/// present so the quads animate without their view drawing again.
+///
+/// `keyframes` are `(phase, opacity)` points over one cycle, in increasing
+/// phase from `0.0` to `1.0`; opacity is interpolated linearly between them.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct OpacityCycle {
+    period: std::time::Duration,
+    phase: f32,
+    keyframes: [(f32, f32); 4],
+}
+
+impl OpacityCycle {
+    /// A cycle of `period` through four `(phase, opacity)` keyframes.
+    pub fn new(period: std::time::Duration, keyframes: [(f32, f32); 4]) -> Self {
+        Self {
+            period,
+            phase: 0.0,
+            keyframes,
+        }
+    }
+
+    /// Offsets this cycle by a fraction of its period, so several quads can
+    /// run the same curve out of step.
+    pub fn phase(mut self, phase: f32) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// Opacity at `phase` through the cycle (wrapped into `0..1`).
+    pub fn opacity_at(&self, phase: f32) -> f32 {
+        let phase = phase.rem_euclid(1.0);
+        for pair in self.keyframes.windows(2) {
+            let ((start, from), (end, to)) = (pair[0], pair[1]);
+            if phase <= end {
+                let progress = if end > start {
+                    ((phase - start) / (end - start)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                return from + (to - from) * progress;
+            }
+        }
+        self.keyframes[3].1
+    }
+
+    /// Opacity now, on the clock every time-animated primitive shares.
+    pub fn current_opacity(&self) -> f32 {
+        self.opacity_at(time_animation_phase(self.period) + self.phase)
+    }
+}
+
+static TIME_ANIMATION_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// How far through a cycle of `period` the shared animation clock is, in
+/// `0..1`. Computed in `f64` so the phase does not step after long uptimes.
+fn time_animation_phase(period: std::time::Duration) -> f32 {
+    let period = period.as_secs_f64();
+    if period <= 0.0 {
+        return 0.0;
+    }
+    (TIME_ANIMATION_EPOCH.elapsed().as_secs_f64() / period).rem_euclid(1.0) as f32
+}
+
+/// A quad whose background and border fade with an [`OpacityCycle`]; the
+/// colors are the ones it was painted with at full cycle opacity.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct QuadOpacityAnimation {
+    pub cycle: OpacityCycle,
+    pub background: Background,
+    pub border_color: Hsla,
+}
+
+impl ShimmerAnimation {
+    fn band_origin(&self) -> f32 {
+        self.band_start + self.travel * crate::elements::shimmer_delta(self.period, self.hold)
+    }
+}
+
 // Every glyph in the window carries one of these, and the four shader backends
 // mirror the layout by hand, so growing it is a decision rather than an
 // accident. `pad` exists to keep this assertion true.
@@ -1226,7 +1589,7 @@ impl Default for SpriteEffect {
             core_gain: 0.0,
             origin: Point::default(),
             core_spread: 0.5,
-            pad: 0,
+            animation: 0,
             highlight_color: Hsla::default(),
             band_origin: 0.0,
             band_width: 0.0,

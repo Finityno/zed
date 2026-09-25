@@ -974,6 +974,18 @@ impl Background {
         self.pad & Self::GLASS_CONTENT != 0
     }
 
+    /// One more than the index of the scene's opacity animation driving this
+    /// background, or `0`. Kept in `pad` above the glass bit; no shader reads
+    /// it.
+    pub(crate) fn time_animation(&self) -> u32 {
+        self.pad >> 1
+    }
+
+    pub(crate) fn with_time_animation(mut self, animation: u32) -> Self {
+        self.pad = (self.pad & Self::GLASS_CONTENT) | (animation << 1);
+        self
+    }
+
     /// Use specified color space for color interpolation.
     ///
     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>

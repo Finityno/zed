@@ -31,7 +31,7 @@ pub const DEFAULT_SHIMMER_ANGLE: f32 = 120.0;
 /// Progress of the band across its travel, in `0..=1`. `hold` reserves a
 /// fraction of the cycle for the band to sit off the end of the text, which
 /// reads as a pause between sweeps.
-fn shimmer_delta(period: Duration, hold: f32) -> f32 {
+pub(crate) fn shimmer_delta(period: Duration, hold: f32) -> f32 {
     let period = period.as_secs_f64();
     if period <= 0.0 {
         return 0.0;
@@ -1213,8 +1213,7 @@ impl TextLayout {
         let axis_min = projected_width.min(0.0) + projected_height.min(0.0);
         let axis_max = projected_width.max(0.0) + projected_height.max(0.0);
         let travel = px(axis_max - axis_min) + band_width * 2.0;
-        let band_origin =
-            px(axis_min) - band_width + travel * shimmer_delta(style.period, style.hold);
+        let band_start = px(axis_min) - band_width;
         let mut highlight_color = highlight_color;
         // The highlight is painted as a separate overlay from the glyphs, so an
         // ancestor's opacity has to be applied here or the text fades while
@@ -1233,20 +1232,24 @@ impl TextLayout {
         };
         let shimmer_origin = crate::point(bounds.origin.x + align_offset, bounds.origin.y);
 
-        // The band's position is a function of time, so an otherwise idle
-        // window has to keep drawing for it to move at all.
-        if highlight_color.a > 0.0
-            && !style.period.is_zero()
-            && !crate::window::text_shimmer_disabled()
-        {
-            window.request_animation_frame();
-        }
+        // The band's position is a function of time. Rather than drawing the
+        // view again for every step, the scene carries the sweep and moves the
+        // band itself before each present (see `Scene::advance_time_animations`),
+        // so an otherwise idle window only re-presents its last frame.
+        let sweep = (highlight_color.a > 0.0 && !style.period.is_zero()).then_some(
+            crate::window::TextShimmerSweep {
+                band_start,
+                travel,
+                period: style.period,
+                hold: style.hold,
+            },
+        );
 
         window.with_text_shimmer(
             crate::window::TextShimmerStyle {
                 origin: shimmer_origin,
                 highlight_color,
-                band_origin,
+                band_origin: band_start + travel * shimmer_delta(style.period, style.hold),
                 band_width,
                 direction,
                 // `pow(0.0, 0.0)` is undefined in the shading languages, and a
@@ -1256,7 +1259,9 @@ impl TextLayout {
                 falloff: style.falloff.max(0.05),
                 core_gain: style.core_gain.clamp(0.0, 1.0),
                 core_spread: style.core_spread.clamp(0.01, 1.0),
+                animation: 0,
             },
+            sweep,
             |window| {
                 for line in &element_state.lines {
                     line.paint_background(

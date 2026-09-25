@@ -18,7 +18,7 @@ use crate::{
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState,
@@ -1275,6 +1275,7 @@ pub struct Window {
     pub(crate) glass_content: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
+    opacity_cycle_stack: Vec<OpacityCycle>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -1312,6 +1313,11 @@ pub struct Window {
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Whether the rendered scene moves with time on its own, so the window
+    /// keeps presenting it while nothing redraws it.
+    scene_animates: Rc<Cell<bool>>,
+    /// When the rendered scene was last presented.
+    last_present_at: Rc<Cell<Option<Instant>>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1693,6 +1699,8 @@ impl Window {
         profiler::journal::record_window_visibility(handle.window_id(), visibility);
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let scene_animates = Rc::new(Cell::new(false));
+        let last_present_at = Rc::new(Cell::new(None));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
@@ -1806,6 +1814,8 @@ impl Window {
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
+            let scene_animates = scene_animates.clone();
+            let last_present_at = last_present_at.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
@@ -1902,9 +1912,29 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
+                //
+                // A scene that animates on its own (a sweeping text shimmer)
+                // is presented again at the time-animation rate, with nothing
+                // rendered, laid out or painted: `present` moves it to now.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || input_rate_tracker.borrow_mut().is_high_rate()
+                    || (scene_animates.get()
+                        && last_present_at.get().is_none_or(|last_present| {
+                            let interval = if active.get() {
+                                time_animation_frame_interval()
+                            } else {
+                                time_animation_frame_interval()
+                                    .max(inactive_frame_interval.unwrap_or_default())
+                            };
+                            // Frame requests arrive on vsync, so an interval
+                            // that is a whole number of refreshes lands a hair
+                            // early or late; without the slack, 30 fps on a
+                            // 120 Hz display would present every fifth vsync.
+                            now.duration_since(last_present)
+                                + TIME_ANIMATION_FRAME_SLACK
+                                >= interval
+                        }));
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -1943,6 +1973,7 @@ impl Window {
                     .update(&mut cx, |_, window, _| {
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || window.scene_animates.get()
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -1951,10 +1982,13 @@ impl Window {
 
                 // Platforms that stop requesting frames for idle windows only
                 // deliver another request after a wakeup. If demand remains
-                // after this frame (the window was re-invalidated mid-draw, or
-                // animations scheduled next-frame callbacks), re-arm the frame
-                // source explicitly.
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
+                // after this frame (the window was re-invalidated mid-draw,
+                // animations scheduled next-frame callbacks, or the scene
+                // animates on its own), re-arm the frame source explicitly.
+                if invalidator.is_dirty()
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || scene_animates.get()
+                {
                     invalidator.wake_platform();
                 }
             }
@@ -2164,6 +2198,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             text_shimmer_stack: Vec::new(),
+            opacity_cycle_stack: Vec::new(),
             element_opacity: 1.0,
             glass_content: false,
             requested_autoscroll: None,
@@ -2195,6 +2230,8 @@ impl Window {
             visibility_observers: SubscriberSet::new(),
             hovered,
             needs_present,
+            scene_animates,
+            last_present_at,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -2284,6 +2321,19 @@ pub(crate) struct TextShimmerStyle {
     pub falloff: f32,
     pub core_gain: f32,
     pub core_spread: f32,
+    /// The scene's [`SpriteEffect::animation`] for this band; set by
+    /// [`Window::with_text_shimmer`] when the band sweeps.
+    pub animation: u32,
+}
+
+/// How a [`TextShimmerStyle`]'s band moves with time, in logical pixels along
+/// its direction. See [`crate::scene::ShimmerAnimation`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextShimmerSweep {
+    pub band_start: Pixels,
+    pub travel: Pixels,
+    pub period: Duration,
+    pub hold: f32,
 }
 
 impl TextShimmerStyle {
@@ -2298,13 +2348,40 @@ impl TextShimmerStyle {
             core_gain: self.core_gain,
             origin: self.origin.scale(factor),
             core_spread: self.core_spread,
-            pad: 0,
+            animation: self.animation,
             highlight_color: self.highlight_color,
             band_origin: self.band_origin.0 * factor,
             band_width: self.band_width.0 * factor,
             direction: self.direction,
         }
     }
+}
+
+/// How early a time-animation frame may be presented, so an interval that is
+/// a whole number of display refreshes is not pushed to the next one by vsync
+/// jitter.
+const TIME_ANIMATION_FRAME_SLACK: Duration = Duration::from_millis(2);
+
+static TIME_ANIMATION_FRAME_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(33_333_333);
+
+/// Sets how often a window whose scene animates on its own (a sweeping text
+/// shimmer) presents that scene again while nothing redraws it. Defaults to
+/// 30 fps. An inactive window never goes faster than its
+/// [`WindowOptions::inactive_frame_interval`].
+///
+/// These frames render, lay out and paint nothing, but each one still encodes
+/// and rasterizes the whole scene on the GPU, so an app in the background may
+/// want to slow them down.
+pub fn set_time_animation_frame_interval(interval: Duration) {
+    TIME_ANIMATION_FRAME_NANOS.store(
+        u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn time_animation_frame_interval() -> Duration {
+    Duration::from_nanos(TIME_ANIMATION_FRAME_NANOS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// `GPUI_DISABLE_TEXT_SHIMMER=1` paints shimmered text as plain text without
@@ -3659,6 +3736,8 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.scene_animates
+            .set(self.rendered_frame.scene.has_time_animations());
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3801,6 +3880,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         let atlas_frame_before_draw = self.sprite_atlas.frame_index();
+        self.rendered_frame.scene.advance_time_animations();
+        self.last_present_at.set(Some(Instant::now()));
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
@@ -4421,13 +4502,48 @@ impl Window {
 
     pub(crate) fn with_text_shimmer<R>(
         &mut self,
-        shimmer: TextShimmerStyle,
+        mut shimmer: TextShimmerStyle,
+        sweep: Option<TextShimmerSweep>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
+        if let Some(sweep) = sweep
+            && !text_shimmer_disabled()
+        {
+            let scale_factor = self.scale_factor();
+            shimmer.animation =
+                self.next_frame
+                    .scene
+                    .push_shimmer_animation(crate::scene::ShimmerAnimation {
+                        band_start: sweep.band_start.0 * scale_factor,
+                        travel: sweep.travel.0 * scale_factor,
+                        period: sweep.period,
+                        hold: sweep.hold,
+                    });
+        }
         self.text_shimmer_stack.push(shimmer);
         let result = f(self);
         self.text_shimmer_stack.pop();
+        result
+    }
+
+    /// Fades every quad painted inside `f` with `cycle`, driven by the window
+    /// rather than by drawing again: the scene sets each quad's opacity before
+    /// every present, and keeps presenting while such a quad is on screen.
+    /// For a looping decorative animation (a pulsing loader) that would
+    /// otherwise redraw its whole window at its frame rate.
+    ///
+    /// The painted colors are the ones at full cycle opacity. Nested cycles do
+    /// not compose; the innermost applies.
+    pub fn with_opacity_cycle<R>(
+        &mut self,
+        cycle: OpacityCycle,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        self.opacity_cycle_stack.push(cycle);
+        let result = f(self);
+        self.opacity_cycle_stack.pop();
         result
     }
 
@@ -5008,6 +5124,27 @@ impl Window {
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
         };
+
+        if let Some(cycle) = self.opacity_cycle_stack.last().copied() {
+            let animation =
+                self.next_frame
+                    .scene
+                    .push_quad_animation(crate::scene::QuadOpacityAnimation {
+                        cycle,
+                        background: quad.background,
+                        border_color: quad.border_color,
+                    });
+            let opacity = cycle.current_opacity();
+            self.next_frame.scene.insert_primitive(Quad {
+                background: quad
+                    .background
+                    .opacity(opacity)
+                    .with_time_animation(animation),
+                border_color: quad.border_color.opacity(opacity),
+                ..quad
+            });
+            return;
+        }
 
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);
