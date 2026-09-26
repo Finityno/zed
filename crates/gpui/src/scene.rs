@@ -117,6 +117,19 @@ pub struct Scene {
     /// Opacity cycles referenced by `Background::time_animation`.
     quad_animations: Vec<QuadOpacityAnimation>,
     animated_quads: Vec<u32>,
+    /// Moves referenced by each primitive's transition id (`pad`, or the
+    /// background's transition bits for quads).
+    transitions: Vec<SceneTransition>,
+    /// The transition primitives inserted now are stamped with, set by
+    /// [`crate::Window::with_time_transition`].
+    current_transition: u32,
+    /// Gathered by `finish`, like the animated sprite indices.
+    transitioned: Vec<TransitionedPrimitive>,
+    /// When the last transition this scene carries lands.
+    transitions_end_at: Option<std::time::Instant>,
+    /// Each transition's composed offset and opacity for the present being
+    /// prepared, reused across presents.
+    transition_states: Vec<(Point<ScaledPixels>, f32)>,
     /// One tracker per vector above, in the order `clear` destructures them.
     shrink: [CapacityShrink; 12],
 }
@@ -156,6 +169,10 @@ impl Scene {
         self.animated_subpixel_sprites.clear();
         self.quad_animations.clear();
         self.animated_quads.clear();
+        self.transitions.clear();
+        self.current_transition = 0;
+        self.transitioned.clear();
+        self.transitions_end_at = None;
     }
 
     /// Shrinks this cleared scene's vectors to twice the fill of `rendered`,
@@ -269,6 +286,25 @@ impl Scene {
             return;
         }
 
+        if self.current_transition != 0 {
+            let transition = self.current_transition;
+            match &mut primitive {
+                Primitive::MonochromeSprite(MonochromeSprite { pad, .. })
+                | Primitive::SubpixelSprite(SubpixelSprite { pad, .. })
+                | Primitive::PolychromeSprite(PolychromeSprite { pad, .. })
+                | Primitive::Underline(Underline { pad, .. })
+                | Primitive::Shadow(Shadow { pad, .. })
+                    if *pad == 0 =>
+                {
+                    *pad = transition;
+                }
+                Primitive::Quad(quad) if quad.background.time_transition() == 0 => {
+                    quad.background = quad.background.with_time_transition(transition);
+                }
+                _ => {}
+            }
+        }
+
         let order = self
             .layer_stack
             .last()
@@ -327,14 +363,65 @@ impl Scene {
         self.shimmer_animations.len() as u32
     }
 
+    /// Registers a transition for primitives inserted until the next
+    /// [`Self::set_current_transition`], returning its id, or `None` once the
+    /// scene holds more than a quad's background can name.
+    pub(crate) fn push_transition(&mut self, transition: SceneTransition) -> Option<u32> {
+        let id = u32::try_from(self.transitions.len() + 1).ok()?;
+        if id > Background::MAX_TIME_TRANSITION {
+            return None;
+        }
+        self.transitions.push(transition);
+        Some(id)
+    }
+
+    /// Copies `transition` and the transitions it was pushed inside from
+    /// `prev_scene`, parents first, so a replayed id always names a later
+    /// entry than its parent's. `0` when the scene has run out of ids.
+    fn remap_transition(
+        &mut self,
+        prev_scene: &Scene,
+        transition: u32,
+        remapped: &mut Vec<(u32, u32)>,
+    ) -> u32 {
+        if let Some(&(_, id)) = remapped.iter().find(|(source, _)| *source == transition) {
+            return id;
+        }
+        let mut entry = prev_scene.transitions[transition as usize - 1];
+        if entry.parent != 0 {
+            entry.parent = self.remap_transition(prev_scene, entry.parent, remapped);
+        }
+        let id = self.push_transition(entry).unwrap_or(0);
+        remapped.push((transition, id));
+        id
+    }
+
+    /// The transition primitives are being stamped with, `0` for none.
+    pub(crate) fn current_transition(&self) -> u32 {
+        self.current_transition
+    }
+
+    /// Stamps primitives inserted from now on with `transition` (`0` for
+    /// none), returning the one that was current.
+    pub(crate) fn set_current_transition(&mut self, transition: u32) -> u32 {
+        std::mem::replace(&mut self.current_transition, transition)
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
         let mut remapped_animation = (0, 0);
+        let mut remapped_transitions: Vec<(u32, u32)> = Vec::new();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
+                    let transition = primitive_transition(&primitive);
+                    if transition != 0 {
+                        let remapped =
+                            self.remap_transition(prev_scene, transition, &mut remapped_transitions);
+                        set_primitive_transition(&mut primitive, remapped);
+                    }
                     if let Primitive::Quad(quad) = &mut primitive
                         && quad.background.time_animation() != 0
                     {
@@ -392,6 +479,80 @@ impl Scene {
             (0..self.quads.len() as u32)
                 .filter(|&index| self.quads[index as usize].background.time_animation() != 0),
         );
+        self.gather_transitioned();
+    }
+
+    fn gather_transitioned(&mut self) {
+        self.transitioned.clear();
+        self.transitions_end_at = None;
+        if self.transitions.is_empty() {
+            return;
+        }
+        let transitioned = &mut self.transitioned;
+        let mut push = |transition: u32, target: TransitionTarget| {
+            if transition != 0 {
+                transitioned.push(TransitionedPrimitive { transition, target });
+            }
+        };
+        for (index, sprite) in self.monochrome_sprites.iter().enumerate() {
+            push(sprite.pad, TransitionTarget::MonochromeSprite {
+                index: index as u32,
+                origin: sprite.bounds.origin,
+                alpha: sprite.color.a,
+            });
+        }
+        for (index, sprite) in self.subpixel_sprites.iter().enumerate() {
+            push(sprite.pad, TransitionTarget::SubpixelSprite {
+                index: index as u32,
+                origin: sprite.bounds.origin,
+                alpha: sprite.color.a,
+            });
+        }
+        for (index, sprite) in self.polychrome_sprites.iter().enumerate() {
+            push(sprite.pad, TransitionTarget::PolychromeSprite {
+                index: index as u32,
+                origin: sprite.bounds.origin,
+                opacity: sprite.opacity,
+            });
+        }
+        for (index, underline) in self.underlines.iter().enumerate() {
+            push(underline.pad, TransitionTarget::Underline {
+                index: index as u32,
+                origin: underline.bounds.origin,
+                alpha: underline.color.a,
+            });
+        }
+        for (index, shadow) in self.shadows.iter().enumerate() {
+            push(shadow.pad, TransitionTarget::Shadow {
+                index: index as u32,
+                origin: shadow.bounds.origin,
+                element_origin: shadow.element_bounds.origin,
+                alpha: shadow.color.a,
+            });
+        }
+        for (index, quad) in self.quads.iter().enumerate() {
+            push(quad.background.time_transition(), TransitionTarget::Quad {
+                index: index as u32,
+                origin: quad.bounds.origin,
+                background: quad.background,
+                border_color: quad.border_color,
+            });
+        }
+        self.transitions_end_at = self
+            .transitions
+            .iter()
+            .map(|transition| transition.transition.ends_at())
+            .max();
+    }
+
+    /// Whether a transition this scene carries has yet to land, so presenting
+    /// it again shows something new every frame rather than at the slower
+    /// time-animation rate.
+    pub fn transitions_in_flight(&self) -> bool {
+        !self.transitioned.is_empty()
+            && self
+                .transitions_end_at
+                .is_some_and(|end| std::time::Instant::now() < end)
     }
 
     /// Whether anything in this finished scene moves with time on its own, so
@@ -400,13 +561,14 @@ impl Scene {
         !self.animated_monochrome_sprites.is_empty()
             || !self.animated_subpixel_sprites.is_empty()
             || !self.animated_quads.is_empty()
+            || self.transitions_in_flight()
     }
 
     /// Moves every time-driven primitive of this finished scene to where it is
     /// now. Called before each present, so a frame replayed from a cached view
     /// shows the current phase rather than the one it was painted at.
     pub(crate) fn advance_time_animations(&mut self) {
-        if !self.has_time_animations() {
+        if !self.has_time_animations() && self.transitioned.is_empty() {
             return;
         }
         let animations = &self.shimmer_animations;
@@ -436,6 +598,74 @@ impl Scene {
                 .with_time_animation(animation_id);
             quad.border_color = animation.border_color.opacity(opacity);
         }
+        self.advance_transitions(std::time::Instant::now());
+    }
+
+    fn advance_transitions(&mut self, now: std::time::Instant) {
+        if self.transitioned.is_empty() {
+            return;
+        }
+        // Parents are always pushed before the transitions inside them, so
+        // one pass in order composes every chain.
+        self.transition_states.clear();
+        for transition in &self.transitions {
+            let own = (transition.offset_at(now), transition.transition.opacity_at(now));
+            let composed = match transition.parent {
+                0 => own,
+                parent => {
+                    let (offset, opacity) = self.transition_states[parent as usize - 1];
+                    (own.0 + offset, own.1 * opacity)
+                }
+            };
+            self.transition_states.push(composed);
+        }
+        for primitive in &self.transitioned {
+            let (offset, opacity) = self.transition_states[primitive.transition as usize - 1];
+            match primitive.target {
+                TransitionTarget::MonochromeSprite { index, origin, alpha } => {
+                    let sprite = &mut self.monochrome_sprites[index as usize];
+                    sprite.bounds.origin = origin + offset;
+                    sprite.color.a = alpha * opacity;
+                }
+                TransitionTarget::SubpixelSprite { index, origin, alpha } => {
+                    let sprite = &mut self.subpixel_sprites[index as usize];
+                    sprite.bounds.origin = origin + offset;
+                    sprite.color.a = alpha * opacity;
+                }
+                TransitionTarget::PolychromeSprite { index, origin, opacity: painted } => {
+                    let sprite = &mut self.polychrome_sprites[index as usize];
+                    sprite.bounds.origin = origin + offset;
+                    sprite.opacity = painted * opacity;
+                }
+                TransitionTarget::Underline { index, origin, alpha } => {
+                    let underline = &mut self.underlines[index as usize];
+                    underline.bounds.origin = origin + offset;
+                    underline.color.a = alpha * opacity;
+                }
+                TransitionTarget::Shadow { index, origin, element_origin, alpha } => {
+                    let shadow = &mut self.shadows[index as usize];
+                    shadow.bounds.origin = origin + offset;
+                    shadow.element_bounds.origin = element_origin + offset;
+                    shadow.color.a = alpha * opacity;
+                }
+                TransitionTarget::Quad { index, origin, background, border_color } => {
+                    let quad = &mut self.quads[index as usize];
+                    quad.bounds.origin = origin + offset;
+                    // An opacity cycle has just reset this quad's colors from
+                    // its own rest state; anything else starts from the colors
+                    // it was painted with, so neither compounds per present.
+                    let (base_background, base_border) = if quad.background.time_animation() != 0 {
+                        (quad.background, quad.border_color)
+                    } else {
+                        (background, border_color)
+                    };
+                    quad.background = base_background
+                        .opacity(opacity)
+                        .with_time_transition(primitive.transition);
+                    quad.border_color = base_border.opacity(opacity);
+                }
+            }
+        }
     }
 
     fn partition_quads(&mut self) {
@@ -446,9 +676,11 @@ impl Scene {
         for (quad_id, quad) in self.quads.iter().enumerate() {
             // A quad whose opacity animates may be solid in this frame and
             // translucent in the next without the scene being rebuilt, so it
-            // always takes the blended pass.
+            // always takes the blended pass; so does one a transition moves
+            // or fades.
             let has_opaque_core = partitioning_enabled
                 && quad.background.time_animation() == 0
+                && quad.background.time_transition() == 0
                 && quad.has_opaque_core();
             if has_opaque_core {
                 self.opaque_quad_indices.push(quad_id as u32);
@@ -534,6 +766,7 @@ fn opaque_quad_partitioning_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::px;
     use crate::util::{MIN_RETAINED_CAPACITY, SHRINK_AFTER_FRAMES};
 
     /// `quad_depth` is mirrored in every backend's shader by hand, and upstream
@@ -816,6 +1049,194 @@ mod tests {
             assert_eq!(sprite.effect.animation, 2);
             assert!((-40.0..=960.0).contains(&sprite.effect.band_origin));
         }
+    }
+
+    fn rolling_in(started_at: std::time::Instant) -> SceneTransition {
+        SceneTransition {
+            transition: TimeTransition::new(started_at, std::time::Duration::from_millis(100))
+                .offset(point(px(0.), px(10.)), Point::default())
+                .opacity(0.0, 1.0),
+            scale_factor: 2.0,
+            parent: 0,
+        }
+    }
+
+    /// A slide along x with no fade, pushed inside `parent`.
+    fn sliding(started_at: std::time::Instant, parent: u32) -> SceneTransition {
+        SceneTransition {
+            transition: TimeTransition::new(started_at, std::time::Duration::from_millis(100))
+                .offset(point(px(-6.), px(0.)), Point::default()),
+            scale_factor: 2.0,
+            parent,
+        }
+    }
+
+    #[test]
+    fn a_nested_transition_moves_with_the_one_around_it() {
+        let started_at = std::time::Instant::now();
+        let mut scene = Scene::default();
+        let Some(outer) = scene.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition always fits");
+        };
+        let Some(inner) = scene.push_transition(sliding(started_at, outer)) else {
+            panic!("a second transition always fits");
+        };
+        scene.set_current_transition(inner);
+        scene.insert_primitive(shimmering_glyph(0));
+        scene.set_current_transition(0);
+        scene.finish();
+
+        scene.advance_transitions(started_at + std::time::Duration::from_millis(50));
+        let sprite = &scene.monochrome_sprites[0];
+        // Halfway through both: the outer's 5 logical pixels down, the
+        // inner's 3 left, at scale factor 2; only the outer fades.
+        assert_eq!(sprite.bounds.origin.y, ScaledPixels::from(10.));
+        assert_eq!(sprite.bounds.origin.x, ScaledPixels::from(-6.));
+        assert!((sprite.color.a - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn replaying_a_nested_transition_brings_its_parent_along() {
+        let started_at = std::time::Instant::now();
+        let mut source = Scene::default();
+        let Some(outer) = source.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition always fits");
+        };
+        let Some(inner) = source.push_transition(sliding(started_at, outer)) else {
+            panic!("a second transition always fits");
+        };
+        source.set_current_transition(inner);
+        source.insert_primitive(shimmering_glyph(0));
+        source.set_current_transition(0);
+        source.finish();
+
+        let mut replayed = Scene::default();
+        replayed.push_transition(rolling_in(started_at - std::time::Duration::from_secs(5)));
+        replayed.replay(0..source.len(), &source);
+        replayed.finish();
+        assert_eq!(replayed.transitions.len(), 3);
+        let stamped = replayed.monochrome_sprites[0].pad;
+        let parent = replayed.transitions[stamped as usize - 1].parent;
+        assert!(parent != 0 && parent < stamped, "the parent is copied first");
+        replayed.advance_transitions(started_at + std::time::Duration::from_millis(50));
+        assert_eq!(replayed.monochrome_sprites[0].bounds.origin.x, ScaledPixels::from(-6.));
+        assert_eq!(replayed.monochrome_sprites[0].bounds.origin.y, ScaledPixels::from(10.));
+    }
+
+    #[test]
+    fn a_transition_moves_and_fades_what_it_covers_from_rest() {
+        let started_at = std::time::Instant::now();
+        let mut scene = Scene::default();
+        let transition = scene.push_transition(rolling_in(started_at));
+        let Some(transition) = transition else {
+            panic!("a first transition always fits");
+        };
+        scene.set_current_transition(transition);
+        scene.insert_primitive(shimmering_glyph(0));
+        scene.insert_primitive(opaque_quad());
+        scene.set_current_transition(0);
+        scene.insert_primitive(shimmering_glyph(0));
+        scene.finish();
+        assert!(scene.transitions_in_flight());
+        assert!(scene.has_time_animations());
+        assert_eq!(scene.transitioned.len(), 2, "only what was painted inside it");
+        // Moved content never takes the opaque depth pass.
+        assert!(scene.opaque_quad_indices.is_empty());
+
+        scene.advance_transitions(started_at + std::time::Duration::from_millis(50));
+        let moved: Vec<_> = scene.monochrome_sprites.iter().filter(|sprite| sprite.pad != 0).collect();
+        assert_eq!(moved.len(), 1);
+        // Halfway, linear: half of 10 logical pixels at scale factor 2.
+        assert_eq!(moved[0].bounds.origin.y, ScaledPixels::from(10.));
+        assert!((moved[0].color.a - 0.5).abs() < 1e-6);
+        let still = scene.monochrome_sprites.iter().find(|sprite| sprite.pad == 0);
+        assert!(still.is_some_and(|sprite| sprite.bounds.origin.y == ScaledPixels::from(0.)
+            && sprite.color.a == 1.0));
+        assert_eq!(scene.quads[0].bounds.origin.y, ScaledPixels::from(10.));
+        assert!(scene.quads[0].background.as_solid().is_some_and(|color| (color.a - 0.5).abs() < 1e-6));
+        assert_eq!(scene.quads[0].background.time_transition(), transition);
+
+        // Every present starts from rest, so advancing twice lands the same.
+        for _ in 0..2 {
+            scene.advance_transitions(started_at + std::time::Duration::from_millis(100));
+        }
+        assert_eq!(moved_origin(&scene), ScaledPixels::from(0.));
+        assert!(scene.quads[0].background.as_solid().is_some_and(|color| color.a == 1.0));
+    }
+
+    fn moved_origin(scene: &Scene) -> ScaledPixels {
+        scene
+            .monochrome_sprites
+            .iter()
+            .find(|sprite| sprite.pad != 0)
+            .map_or(ScaledPixels::from(-1.), |sprite| sprite.bounds.origin.y)
+    }
+
+    #[test]
+    fn a_landed_transition_stops_asking_for_frames() {
+        let started_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut scene = Scene::default();
+        let Some(transition) = scene.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition always fits");
+        };
+        scene.set_current_transition(transition);
+        scene.insert_primitive(shimmering_glyph(0));
+        scene.finish();
+        assert!(!scene.transitions_in_flight());
+        assert!(!scene.has_time_animations());
+        scene.advance_time_animations();
+        assert_eq!(moved_origin(&scene), ScaledPixels::from(0.), "painted where it landed");
+    }
+
+    #[test]
+    fn replayed_transitions_are_remapped_into_the_new_scene() {
+        let started_at = std::time::Instant::now();
+        let mut source = Scene::default();
+        let Some(transition) = source.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition always fits");
+        };
+        source.set_current_transition(transition);
+        source.insert_primitive(shimmering_glyph(0));
+        source.insert_primitive(shimmering_glyph(0));
+        source.set_current_transition(0);
+        source.finish();
+
+        let mut replayed = Scene::default();
+        // An unrelated transition first, so the replayed id has to be remapped.
+        replayed.push_transition(rolling_in(started_at - std::time::Duration::from_secs(5)));
+        replayed.replay(0..source.len(), &source);
+        replayed.finish();
+        assert_eq!(replayed.transitions.len(), 2, "one entry per transition, not per glyph");
+        assert!(replayed.monochrome_sprites.iter().all(|sprite| sprite.pad == 2));
+        assert!(replayed.transitions_in_flight());
+    }
+
+    #[test]
+    fn a_background_keeps_glass_animation_and_transition_apart() {
+        let background = Background::from(Hsla::black())
+            .glass_content()
+            .with_time_animation(0x1234)
+            .with_time_transition(0x456);
+        assert!(background.is_glass_content());
+        assert_eq!(background.time_animation(), 0x1234);
+        assert_eq!(background.time_transition(), 0x456);
+        let background = background.with_time_animation(7);
+        assert_eq!(background.time_transition(), 0x456);
+        let background = background.with_time_transition(Background::MAX_TIME_TRANSITION + 1);
+        assert_eq!(background.time_transition(), 0x456, "an id that does not fit is not stored");
+        assert_eq!(background.with_time_transition(0).time_animation(), 7);
+    }
+
+    #[test]
+    fn a_fade_can_run_over_part_of_the_transition() {
+        let started_at = std::time::Instant::now();
+        let transition = TimeTransition::new(started_at, std::time::Duration::from_millis(100))
+            .opacity(0.0, 1.0)
+            .opacity_span(0.5, 1.0);
+        let at = |millis| started_at + std::time::Duration::from_millis(millis);
+        assert_eq!(transition.opacity_at(at(25)), 0.0);
+        assert!((transition.opacity_at(at(75)) - 0.5).abs() < 1e-6);
+        assert_eq!(transition.opacity_at(at(100)), 1.0);
     }
 
     #[test]
@@ -1558,6 +1979,181 @@ fn time_animation_phase(period: std::time::Duration) -> f32 {
         return 0.0;
     }
     (TIME_ANIMATION_EPOCH.elapsed().as_secs_f64() / period).rem_euclid(1.0) as f32
+}
+
+/// A one-shot move and fade, evaluated by the scene before every present so
+/// what it applies to animates without its view drawing again.
+///
+/// Everything painted inside [`crate::Window::with_time_transition`] is laid
+/// out and painted at rest; the transition offsets it from there by
+/// `from_offset` → `to_offset` and scales its opacity `from_opacity` →
+/// `to_opacity`, both along `easing` over `duration` from `started_at`. The
+/// fade can run over a sub-span of that progress (see
+/// [`Self::opacity_span`]). Clipping stays where the element was painted,
+/// so content can travel into or out of a clipped slot.
+#[derive(Copy, Clone, Debug)]
+pub struct TimeTransition {
+    started_at: std::time::Instant,
+    duration: std::time::Duration,
+    from_offset: Point<Pixels>,
+    to_offset: Point<Pixels>,
+    from_opacity: f32,
+    to_opacity: f32,
+    opacity_span: (f32, f32),
+    easing: fn(f32) -> f32,
+}
+
+impl TimeTransition {
+    /// A transition of `duration` from `started_at` that, until configured,
+    /// neither moves nor fades anything.
+    pub fn new(started_at: std::time::Instant, duration: std::time::Duration) -> Self {
+        Self {
+            started_at,
+            duration,
+            from_offset: Point::default(),
+            to_offset: Point::default(),
+            from_opacity: 1.0,
+            to_opacity: 1.0,
+            opacity_span: (0.0, 1.0),
+            easing: |progress| progress,
+        }
+    }
+
+    /// Travel from `from` to `to`, relative to where the content was painted.
+    pub fn offset(mut self, from: Point<Pixels>, to: Point<Pixels>) -> Self {
+        self.from_offset = from;
+        self.to_offset = to;
+        self
+    }
+
+    /// Fade from `from` to `to`, multiplied into the painted opacity.
+    pub fn opacity(mut self, from: f32, to: f32) -> Self {
+        self.from_opacity = from;
+        self.to_opacity = to;
+        self
+    }
+
+    /// Run the fade over this fraction of the transition's progress rather
+    /// than all of it, so an outgoing copy can be gone before an incoming one
+    /// arrives.
+    pub fn opacity_span(mut self, start: f32, end: f32) -> Self {
+        self.opacity_span = (start, end);
+        self
+    }
+
+    /// The curve both the offset and the fade follow, from linear progress in
+    /// `0..=1` to eased progress.
+    pub fn easing(mut self, easing: fn(f32) -> f32) -> Self {
+        self.easing = easing;
+        self
+    }
+
+    /// When the transition lands.
+    pub fn ends_at(&self) -> std::time::Instant {
+        self.started_at + self.duration
+    }
+
+    /// Linear progress at `now`, in `0..=1`.
+    pub fn progress_at(&self, now: std::time::Instant) -> f32 {
+        let duration = self.duration.as_secs_f32();
+        if duration <= 0.0 {
+            return 1.0;
+        }
+        (now.saturating_duration_since(self.started_at).as_secs_f32() / duration).clamp(0.0, 1.0)
+    }
+
+    /// Offset from the painted position at `now`.
+    pub fn offset_at(&self, now: std::time::Instant) -> Point<Pixels> {
+        let eased = (self.easing)(self.progress_at(now));
+        self.from_offset + (self.to_offset - self.from_offset) * eased
+    }
+
+    /// Opacity factor at `now`.
+    pub fn opacity_at(&self, now: std::time::Instant) -> f32 {
+        let (start, end) = self.opacity_span;
+        let progress = self.progress_at(now);
+        let span_progress = if end > start {
+            ((progress - start) / (end - start)).clamp(0.0, 1.0)
+        } else if progress >= end {
+            1.0
+        } else {
+            0.0
+        };
+        let eased = (self.easing)(span_progress);
+        self.from_opacity + (self.to_opacity - self.from_opacity) * eased
+    }
+}
+
+/// A [`TimeTransition`] as the scene applies it: offsets in device pixels.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SceneTransition {
+    pub transition: TimeTransition,
+    pub scale_factor: f32,
+    /// The transition this one was pushed inside, or `0`. Its offset adds to
+    /// this one's and its opacity multiplies in, so a label rolling inside a
+    /// row that slides moves with both.
+    pub parent: u32,
+}
+
+impl SceneTransition {
+    fn offset_at(&self, now: std::time::Instant) -> Point<ScaledPixels> {
+        self.transition.offset_at(now).scale(self.scale_factor)
+    }
+}
+
+/// The transition id a primitive carries, or `0`.
+fn primitive_transition(primitive: &Primitive) -> u32 {
+    match primitive {
+        Primitive::MonochromeSprite(MonochromeSprite { pad, .. })
+        | Primitive::SubpixelSprite(SubpixelSprite { pad, .. })
+        | Primitive::PolychromeSprite(PolychromeSprite { pad, .. })
+        | Primitive::Underline(Underline { pad, .. })
+        | Primitive::Shadow(Shadow { pad, .. }) => *pad,
+        Primitive::Quad(quad) => quad.background.time_transition(),
+        Primitive::Path(_) | Primitive::Surface(_) => 0,
+    }
+}
+
+fn set_primitive_transition(primitive: &mut Primitive, transition: u32) {
+    match primitive {
+        Primitive::MonochromeSprite(MonochromeSprite { pad, .. })
+        | Primitive::SubpixelSprite(SubpixelSprite { pad, .. })
+        | Primitive::PolychromeSprite(PolychromeSprite { pad, .. })
+        | Primitive::Underline(Underline { pad, .. })
+        | Primitive::Shadow(Shadow { pad, .. }) => *pad = transition,
+        Primitive::Quad(quad) => {
+            quad.background = quad.background.with_time_transition(transition);
+        }
+        Primitive::Path(_) | Primitive::Surface(_) => {}
+    }
+}
+
+/// A primitive moved by a transition, with what it was painted as so every
+/// present computes its state from rest rather than from the last present.
+#[derive(Copy, Clone, Debug)]
+struct TransitionedPrimitive {
+    transition: u32,
+    target: TransitionTarget,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum TransitionTarget {
+    MonochromeSprite { index: u32, origin: Point<ScaledPixels>, alpha: f32 },
+    SubpixelSprite { index: u32, origin: Point<ScaledPixels>, alpha: f32 },
+    PolychromeSprite { index: u32, origin: Point<ScaledPixels>, opacity: f32 },
+    Underline { index: u32, origin: Point<ScaledPixels>, alpha: f32 },
+    Shadow {
+        index: u32,
+        origin: Point<ScaledPixels>,
+        element_origin: Point<ScaledPixels>,
+        alpha: f32,
+    },
+    Quad {
+        index: u32,
+        origin: Point<ScaledPixels>,
+        background: Background,
+        border_color: Hsla,
+    },
 }
 
 /// A quad whose background and border fade with an [`OpacityCycle`]; the

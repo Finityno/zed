@@ -974,15 +974,42 @@ impl Background {
         self.pad & Self::GLASS_CONTENT != 0
     }
 
+    /// Bits of `pad` holding the opacity animation, above the glass bit.
+    const TIME_ANIMATION_BITS: u32 = 19;
+    const TIME_ANIMATION_MASK: u32 = ((1 << Self::TIME_ANIMATION_BITS) - 1) << 1;
+    /// Bits of `pad` holding the time transition, above the animation.
+    const TIME_TRANSITION_SHIFT: u32 = 1 + Self::TIME_ANIMATION_BITS;
+    /// The largest transition id a background can carry.
+    pub(crate) const MAX_TIME_TRANSITION: u32 = u32::MAX >> Self::TIME_TRANSITION_SHIFT;
+
     /// One more than the index of the scene's opacity animation driving this
     /// background, or `0`. Kept in `pad` above the glass bit; no shader reads
     /// it.
     pub(crate) fn time_animation(&self) -> u32 {
-        self.pad >> 1
+        (self.pad & Self::TIME_ANIMATION_MASK) >> 1
     }
 
     pub(crate) fn with_time_animation(mut self, animation: u32) -> Self {
-        self.pad = (self.pad & Self::GLASS_CONTENT) | (animation << 1);
+        self.pad = (self.pad & !Self::TIME_ANIMATION_MASK)
+            | ((animation << 1) & Self::TIME_ANIMATION_MASK);
+        self
+    }
+
+    /// One more than the index of the scene's time transition moving this
+    /// background, or `0`. Kept in `pad` above the opacity animation.
+    pub(crate) fn time_transition(&self) -> u32 {
+        self.pad >> Self::TIME_TRANSITION_SHIFT
+    }
+
+    /// Leaves the background unchanged when `transition` does not fit, so an
+    /// overflowing scene paints the quad at rest rather than under another
+    /// transition's id.
+    pub(crate) fn with_time_transition(mut self, transition: u32) -> Self {
+        if transition > Self::MAX_TIME_TRANSITION {
+            return self;
+        }
+        self.pad = (self.pad & !(Self::MAX_TIME_TRANSITION << Self::TIME_TRANSITION_SHIFT))
+            | (transition << Self::TIME_TRANSITION_SHIFT);
         self
     }
 

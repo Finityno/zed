@@ -19,6 +19,7 @@ use crate::{
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    TimeTransition,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState,
@@ -1316,6 +1317,10 @@ pub struct Window {
     /// Whether the rendered scene moves with time on its own, so the window
     /// keeps presenting it while nothing redraws it.
     scene_animates: Rc<Cell<bool>>,
+    /// Whether a transition in the rendered scene has yet to land, so the
+    /// window presents it on every frame rather than at the time-animation
+    /// rate.
+    scene_transitioning: Rc<Cell<bool>>,
     /// When the rendered scene was last presented.
     last_present_at: Rc<Cell<Option<Instant>>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -1700,6 +1705,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let scene_animates = Rc::new(Cell::new(false));
+        let scene_transitioning = Rc::new(Cell::new(false));
         let last_present_at = Rc::new(Cell::new(None));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
@@ -1815,6 +1821,7 @@ impl Window {
             let active = active.clone();
             let needs_present = needs_present.clone();
             let scene_animates = scene_animates.clone();
+            let scene_transitioning = scene_transitioning.clone();
             let last_present_at = last_present_at.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
@@ -1916,9 +1923,18 @@ impl Window {
                 // A scene that animates on its own (a sweeping text shimmer)
                 // is presented again at the time-animation rate, with nothing
                 // rendered, laid out or painted: `present` moves it to now.
+                // A transition is a short one-shot move the reader is
+                // watching, so it presents at the faster transition rate.
+                let presented_within = |interval: Duration| {
+                    last_present_at.get().is_none_or(|last_present| {
+                        now.duration_since(last_present) + TIME_ANIMATION_FRAME_SLACK >= interval
+                    })
+                };
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
                     || input_rate_tracker.borrow_mut().is_high_rate()
+                    || (scene_transitioning.get()
+                        && presented_within(time_transition_frame_interval()))
                     || (scene_animates.get()
                         && last_present_at.get().is_none_or(|last_present| {
                             let interval = if active.get() {
@@ -2231,6 +2247,7 @@ impl Window {
             hovered,
             needs_present,
             scene_animates,
+            scene_transitioning,
             last_present_at,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
@@ -2382,6 +2399,24 @@ pub fn set_time_animation_frame_interval(interval: Duration) {
 
 fn time_animation_frame_interval() -> Duration {
     Duration::from_nanos(TIME_ANIMATION_FRAME_NANOS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Sets how often a window presents while a [`TimeTransition`] in its scene
+/// has yet to land. Defaults to 60 fps: a transition is a short move the
+/// reader is watching, but presenting on every refresh of a 120 Hz display
+/// doubles its cost for a step nobody sees.
+pub fn set_time_transition_frame_interval(interval: Duration) {
+    TIME_TRANSITION_FRAME_NANOS.store(
+        u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+static TIME_TRANSITION_FRAME_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(16_666_667);
+
+fn time_transition_frame_interval() -> Duration {
+    Duration::from_nanos(TIME_TRANSITION_FRAME_NANOS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// `GPUI_DISABLE_TEXT_SHIMMER=1` paints shimmered text as plain text without
@@ -3738,6 +3773,8 @@ impl Window {
         self.next_frame.clear();
         self.scene_animates
             .set(self.rendered_frame.scene.has_time_animations());
+        self.scene_transitioning
+            .set(self.rendered_frame.scene.transitions_in_flight());
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3881,6 +3918,12 @@ impl Window {
         let present_start = Instant::now();
         let atlas_frame_before_draw = self.sprite_atlas.frame_index();
         self.rendered_frame.scene.advance_time_animations();
+        // A transition that has landed stops asking for frames here, since
+        // nothing draws the scene again to say so.
+        self.scene_transitioning
+            .set(self.rendered_frame.scene.transitions_in_flight());
+        self.scene_animates
+            .set(self.rendered_frame.scene.has_time_animations());
         self.last_present_at.set(Some(Instant::now()));
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
@@ -4544,6 +4587,37 @@ impl Window {
         self.opacity_cycle_stack.push(cycle);
         let result = f(self);
         self.opacity_cycle_stack.pop();
+        result
+    }
+
+    /// Moves and fades everything painted inside `f` with `transition`,
+    /// driven by the window rather than by drawing again: the scene sets each
+    /// primitive's position and opacity before every present, and the window
+    /// presents on every frame until the transition lands. For a short
+    /// one-shot swap (a line rolling out of a slot as its successor rolls in)
+    /// that would otherwise redraw its whole window for every frame of it.
+    ///
+    /// Paint the content at rest; the transition's offsets are relative to
+    /// it, and clipping stays where it was painted. Hitboxes do not move.
+    /// Paths and surfaces are not moved. A transition nested inside another
+    /// composes with it: the offsets add and the opacities multiply.
+    pub fn with_time_transition<R>(
+        &mut self,
+        transition: TimeTransition,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let parent = self.next_frame.scene.current_transition();
+        let Some(id) = self.next_frame.scene.push_transition(crate::scene::SceneTransition {
+            transition,
+            scale_factor: self.scale_factor(),
+            parent,
+        }) else {
+            return f(self);
+        };
+        let previous = self.next_frame.scene.set_current_transition(id);
+        let result = f(self);
+        self.next_frame.scene.set_current_transition(previous);
         result
     }
 
