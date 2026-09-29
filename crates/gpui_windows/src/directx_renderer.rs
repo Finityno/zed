@@ -1729,6 +1729,14 @@ impl DirectXRenderer {
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
     }
+
+    /// Whether draws are being skipped while a lost device is recovered.
+    /// `draw` and `draw_layered` return `Ok` without presenting then, both
+    /// when the renderer was already parked and when the device went away
+    /// mid-frame, so after a successful draw this says nothing was shown.
+    pub(crate) fn skipping_draws(&self) -> bool {
+        self.skip_draws
+    }
 }
 
 impl DirectXResources {

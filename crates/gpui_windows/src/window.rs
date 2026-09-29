@@ -1186,13 +1186,14 @@ impl PlatformWindow for WindowsWindow {
 
     fn draw_layered(&self, scene: &Scene, overlay_start: usize) -> PresentReport {
         let clear_color = self.effective_clear_color();
-        let outcome = match self
-            .state
-            .renderer
-            .borrow_mut()
+        let mut renderer = self.state.renderer.borrow_mut();
+        let outcome = match renderer
             .draw_layered(scene, overlay_start, clear_color)
             .log_err()
         {
+            // A renderer recovering a lost device skips the frame and still
+            // reports success; the recovery forces a render of its own.
+            Some(()) if renderer.skipping_draws() => PresentOutcome::Dropped,
             Some(()) => PresentOutcome::Presented,
             None => PresentOutcome::Dropped,
         };
