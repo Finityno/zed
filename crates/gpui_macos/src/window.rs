@@ -4086,6 +4086,13 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        // The frame presents inside the Core Animation transaction that
+        // resizes the window, so it lands in step with the new window frame.
+        // A present deferred here would be retried on the next display
+        // refresh, outside the transaction, and show stretched until then.
+        // That cannot happen while the layer's `nextDrawable` waits for a
+        // drawable, where a nil drops the frame instead; an acquire that can
+        // give up without one has to keep this present in the transaction.
         lock.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
