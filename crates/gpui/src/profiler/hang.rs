@@ -19,7 +19,9 @@ use serde::Serialize;
 ///
 /// 3: a present the platform deferred is foreground work, not a presentation:
 /// it no longer seals an interval, clears a pending frame, or ends the input
-/// latency and dirty-to-present spans of the frame it failed to show.
+/// latency and dirty-to-present spans of the frame it failed to show, and its
+/// window stays pending until a present lands, even when nothing was
+/// invalidated.
 pub const MEASUREMENT_VERSION: u32 = 3;
 
 use super::SerializedLocation;
