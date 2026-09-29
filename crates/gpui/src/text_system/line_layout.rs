@@ -8,8 +8,9 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use super::LineWrapper;
@@ -481,6 +482,11 @@ pub(crate) struct LineLayoutCache {
     /// Records the generation represented by both frame caches.
     cached_font_generation: AtomicUsize,
     admitted: Mutex<Option<Box<AdmittedFrameCache>>>,
+    /// Lines handed to the platform to shape, and the nanoseconds that took
+    /// while `shaping_timed`; see [`crate::FrameWorkStats::lines_shaped`].
+    lines_shaped: AtomicU64,
+    shape_nanos: AtomicU64,
+    shaping_timed: AtomicBool,
 }
 
 
@@ -593,7 +599,38 @@ impl LineLayoutCache {
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
             admitted: Mutex::new(None),
+            lines_shaped: AtomicU64::new(0),
+            shape_nanos: AtomicU64::new(0),
+            shaping_timed: AtomicBool::new(false),
         }
+    }
+
+    /// Runs `shape`, a call into the platform to shape one line, counting it.
+    fn shape<R>(&self, shape: impl FnOnce() -> R) -> R {
+        self.lines_shaped.fetch_add(1, Ordering::Relaxed);
+        if !self.shaping_timed.load(Ordering::Relaxed) {
+            return shape();
+        }
+        let started_at = Instant::now();
+        let shaped = shape();
+        let nanos = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.shape_nanos.fetch_add(nanos, Ordering::Relaxed);
+        shaped
+    }
+
+    /// The lines shaped since the last [`Self::reset_shaping_stats`], and the
+    /// time that took if it was being kept.
+    pub(crate) fn shaping_stats(&self) -> (u64, Duration) {
+        (
+            self.lines_shaped.load(Ordering::Relaxed),
+            Duration::from_nanos(self.shape_nanos.load(Ordering::Relaxed)),
+        )
+    }
+
+    pub(crate) fn reset_shaping_stats(&self, timed: bool) {
+        self.lines_shaped.store(0, Ordering::Relaxed);
+        self.shape_nanos.store(0, Ordering::Relaxed);
+        self.shaping_timed.store(timed, Ordering::Relaxed);
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
@@ -767,7 +804,13 @@ impl LineLayoutCache {
         }
         let mut cache = self.admitted.lock();
         AdmittedFrameCache::layout(&mut cache, source, font_size, run, |source, font_size, run| {
-            self.platform_text_system.layout_line_admitted(source, font_size, std::slice::from_ref(&run))
+            self.shape(|| {
+                self.platform_text_system.layout_line_admitted(
+                    source,
+                    font_size,
+                    std::slice::from_ref(&run),
+                )
+            })
         })
     }
 
@@ -803,9 +846,8 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
+            let mut layout =
+                self.shape(|| self.platform_text_system.layout_line(&text, font_size, runs));
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -954,9 +996,8 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
+        let mut layout =
+            self.shape(|| self.platform_text_system.layout_line(&text, font_size, runs));
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);

@@ -376,6 +376,7 @@ impl<E: Element> Drawable<E> {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
+                window.frame_work.stats.elements += 1;
                 let global_id = self
                     .element
                     .id()

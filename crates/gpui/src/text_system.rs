@@ -704,6 +704,16 @@ impl WindowTextSystem {
         self.line_layout_cache.layout_index()
     }
 
+    /// The lines this window shaped since [`Self::reset_shaping_stats`], and
+    /// the time that took if it was being kept.
+    pub(crate) fn shaping_stats(&self) -> (u64, std::time::Duration) {
+        self.line_layout_cache.shaping_stats()
+    }
+
+    pub(crate) fn reset_shaping_stats(&self, timed: bool) {
+        self.line_layout_cache.reset_shaping_stats(timed)
+    }
+
     pub(crate) fn reuse_layouts(&self, index: Range<LineLayoutIndex>) {
         self.line_layout_cache.reuse_layouts(index)
     }

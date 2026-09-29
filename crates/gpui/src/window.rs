@@ -70,10 +70,13 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 #[cfg(feature = "profiler")]
 mod draw_profile;
+mod frame_work;
 mod glyph_painting;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
+pub use frame_work::FrameWorkStats;
+pub(crate) use frame_work::add_elapsed;
 pub(crate) use glyph_painting::LineGlyphPainter;
 
 use self::a11y::A11y;
@@ -1289,6 +1292,7 @@ pub struct Window {
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
     glyph_raster_cache: glyph_painting::GlyphRasterCache,
+    pub(crate) frame_work: frame_work::FrameWorkCounters,
     opacity_cycle_stack: Vec<OpacityCycle>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2253,6 +2257,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             text_shimmer_stack: Vec::new(),
             glyph_raster_cache: glyph_painting::GlyphRasterCache::default(),
+            frame_work: frame_work::FrameWorkCounters::default(),
             opacity_cycle_stack: Vec::new(),
             element_opacity: 1.0,
             glass_content: false,
@@ -3763,6 +3768,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            self.frame_work.stats.frames += 1;
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
             {
@@ -4115,12 +4121,15 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        let build_started_at = self.frame_work.clock();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::RequestLayout);
         let root_layout_id = root_element.request_layout(self, cx);
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Prepaint);
+        frame_work::add_elapsed(&mut self.frame_work.stats.build_time, build_started_at);
+        let prepaint_started_at = self.frame_work.clock();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -4156,10 +4165,12 @@ impl Window {
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        frame_work::add_elapsed(&mut self.frame_work.stats.prepaint_time, prepaint_started_at);
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Paint);
+        let paint_started_at = self.frame_work.clock();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -4184,6 +4195,7 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+        frame_work::add_elapsed(&mut self.frame_work.stats.paint_time, paint_started_at);
 
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Finish);
@@ -5734,6 +5746,7 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        self.frame_work.stats.layout_nodes += 1;
 
         self.layout_engine.as_mut().unwrap().request_layout(
             style,
@@ -5760,6 +5773,7 @@ impl Window {
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        self.frame_work.stats.layout_nodes += 1;
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -5781,9 +5795,12 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         let layout_started_at = self.draw_clock.begin_layout();
+        let started_at = self.frame_work.clock();
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
+        self.frame_work.stats.compute_layout_calls += 1;
+        frame_work::add_elapsed(&mut self.frame_work.stats.compute_layout_time, started_at);
         #[cfg(feature = "profiler")]
         self.end_draw_layout(layout_started_at);
     }

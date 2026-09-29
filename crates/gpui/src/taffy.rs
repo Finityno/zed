@@ -309,8 +309,14 @@ impl TaffyLayoutEngine {
                         untransform(available_space.height),
                     );
 
+                    let started_at = window.frame_work.clock();
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
+                    window.frame_work.stats.measure_calls += 1;
+                    crate::window::add_elapsed(
+                        &mut window.frame_work.stats.measure_time,
+                        started_at,
+                    );
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
             )

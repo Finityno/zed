@@ -490,6 +490,7 @@ fn request_layout_view(
             _ => {
                 #[cfg(feature = "profiler")]
                 window.record_view_render(entity_id, view_name);
+                window.frame_work.stats.views_rendered += 1;
                 let mut element = render(window, cx);
                 let layout_id = element.request_layout(window, cx);
                 (layout_id, Some(element))
@@ -545,6 +546,7 @@ fn prepaint_view(
                 {
                     #[cfg(feature = "profiler")]
                     window.draw_clock.count_reuse();
+                    window.frame_work.stats.views_reused += 1;
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
                     cx.entities
@@ -557,6 +559,7 @@ fn prepaint_view(
 
                 #[cfg(feature = "profiler")]
                 window.record_view_render(entity_id, view_name);
+                window.frame_work.stats.views_rendered += 1;
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
