@@ -2666,6 +2666,13 @@ impl PlatformWindow for MacWindow {
         this.renderer.note_scene_tiles(&this.overlay_scene);
         let split_duration = split_start.elapsed();
         let mut report = this.renderer.draw(&this.base_scene);
+        report.breakdown.encode += split_duration;
+        if report.outcome == PresentOutcome::Deferred {
+            // Presenting the overlay over a base that did not land would put
+            // the two planes on different frames; the retry presents both.
+            this.release_intermediates_if_occluded();
+            return report;
+        }
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
@@ -2679,7 +2686,6 @@ impl PlatformWindow for MacWindow {
         this.renderer.lend_intermediates(intermediates);
         this.release_intermediates_if_occluded();
 
-        report.breakdown.encode += split_duration;
         report.breakdown.accumulate(overlay_report.breakdown);
         if overlay_report.outcome != PresentOutcome::Presented {
             report.outcome = overlay_report.outcome;

@@ -15,7 +15,8 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeMenuItem, Path, Pixels,
     PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    PresentOutcome, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
@@ -1985,25 +1986,37 @@ impl Window {
                         .log_err();
                 }
 
-                handle
+                // `needs_present` is still set after the present above only
+                // when the platform deferred it (see `PresentOutcome`):
+                // presented and dropped frames both clear it. That is what
+                // keeps this from looping: a platform that reported a
+                // repeating error as deferred would be asked for a frame on
+                // every request, so errors must stay `Dropped`.
+                let present_owed = handle
                     .update(&mut cx, |_, window, _| {
+                        let present_owed = window.needs_present.get();
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                             || window.scene_animates.get()
+                            || present_owed
                         {
                             window.platform_window.schedule_frame();
                         }
+                        present_owed
                     })
-                    .log_err();
+                    .log_err()
+                    .unwrap_or(false);
 
                 // Platforms that stop requesting frames for idle windows only
                 // deliver another request after a wakeup. If demand remains
                 // after this frame (the window was re-invalidated mid-draw,
-                // animations scheduled next-frame callbacks, or the scene
-                // animates on its own), re-arm the frame source explicitly.
+                // animations scheduled next-frame callbacks, the scene
+                // animates on its own, or the present was deferred), re-arm
+                // the frame source explicitly.
                 if invalidator.is_dirty()
                     || !next_frame_callbacks.borrow().is_empty()
                     || scene_animates.get()
+                    || present_owed
                 {
                     invalidator.wake_platform();
                 }
@@ -3924,16 +3937,33 @@ impl Window {
             .set(self.rendered_frame.scene.transitions_in_flight());
         self.scene_animates
             .set(self.rendered_frame.scene.has_time_animations());
-        self.last_present_at.set(Some(Instant::now()));
+        let previous_present_at = self.last_present_at.replace(Some(Instant::now()));
         let report = self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
         );
         // A draw that bailed before rendering (no drawable, a render error)
         // marked nothing, so the scene's tiles are no newer than they were.
+        // This holds whatever the outcome: a deferred overlay present whose
+        // base layer rendered still marked the scene's tiles in use.
         let atlas_frame_after_draw = self.sprite_atlas.frame_index();
         if atlas_frame_after_draw > atlas_frame_before_draw {
             self.atlas_frame_at_last_present = atlas_frame_after_draw;
+        }
+        if report.outcome == PresentOutcome::Deferred {
+            // Nothing reached the screen, so the frame stays owed, even when
+            // this present was asked for without a new draw (a required
+            // presentation, a time animation's tick): `needs_present` makes
+            // the frame loop re-arm and the next request present again
+            // (without drawing, unless the window was invalidated meanwhile),
+            // and the time-animation cadence still measures from the last
+            // present that landed.
+            self.needs_present.set(true);
+            self.last_present_at.set(previous_present_at);
+            #[cfg(feature = "profiler")]
+            self.window_profiler
+                .record_deferred_present(present_start, Instant::now(), report);
+            return;
         }
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3943,8 +3973,6 @@ impl Window {
             !self.next_frame_callbacks.borrow().is_empty(),
             report,
         );
-        #[cfg(not(feature = "profiler"))]
-        let _ = report;
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
@@ -8459,9 +8487,10 @@ mod tests {
         DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
         FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent,
         Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
+        Pixels, PlatformInput, Point, PresentOutcome, Render, RequestFrameOptions, ScaledPixels,
+        StatefulInteractiveElement as _, Styled, TestAppContext, TestWindow, TouchDragEvent,
+        TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
+        WindowHandle, WindowOptions,
         canvas, div, hsla, point, px, rgb, size, util::MIN_RETAINED_CAPACITY,
     };
     use crate::arena::SHRINK_AFTER_DURATION;
@@ -9083,6 +9112,116 @@ mod tests {
             test_window.frame_scheduled(),
             "a rendered scene awaiting presentation must wake the render loop"
         );
+    }
+
+    fn open_render_counting_window(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<CountsRenders>, TestWindow, Rc<Cell<usize>>) {
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), {
+                let renders = renders.clone();
+                move |_, cx| cx.new(|_| CountsRenders(renders))
+            })
+            .unwrap()
+        });
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_active_status_change(true);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        (window, test_window, renders)
+    }
+
+    const PRESENT_ONLY: RequestFrameOptions = RequestFrameOptions {
+        require_presentation: true,
+        force_render: false,
+    };
+
+    /// A present the platform deferred (no surface to render into) keeps its
+    /// frame owed: the window stays marked for presentation, the frame
+    /// source is re-armed, the last present is not moved, and the next
+    /// request presents the retained scene without rendering it again.
+    #[gpui::test]
+    fn a_deferred_present_keeps_the_frame_owed(cx: &mut TestAppContext) {
+        let (window, test_window, renders) = open_render_counting_window(cx);
+        let presented_at = window
+            .update(cx, |_, window, _| {
+                assert!(!window.needs_present.get(), "the first frame presented");
+                window.last_present_at.get()
+            })
+            .unwrap();
+        assert!(presented_at.is_some());
+
+        test_window.queue_present_outcomes([PresentOutcome::Deferred]);
+        let drawn = renders.get();
+        let wakes = test_window.frame_wake_count();
+        test_window.simulate_frame_request(PRESENT_ONLY);
+        window
+            .update(cx, |_, window, _| {
+                assert!(
+                    window.needs_present.get(),
+                    "a deferred present leaves the frame owed"
+                );
+                assert_eq!(
+                    window.last_present_at.get(),
+                    presented_at,
+                    "and does not count as a present"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            test_window.frame_wake_count(),
+            wakes + 1,
+            "the frame source is re-armed once for the retry"
+        );
+
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        window
+            .update(cx, |_, window, _| {
+                assert!(
+                    !window.needs_present.get(),
+                    "the retry presented the owed frame"
+                );
+                assert_ne!(window.last_present_at.get(), presented_at);
+            })
+            .unwrap();
+        assert_eq!(
+            renders.get(),
+            drawn,
+            "the retry re-presents the retained scene without rendering it"
+        );
+        assert_eq!(
+            test_window.frame_wake_count(),
+            wakes + 1,
+            "and once it lands nothing re-arms the frame source"
+        );
+    }
+
+    /// The frame loop re-arms while a present is owed, which is only safe
+    /// because presented and dropped frames both clear it: a platform whose
+    /// every present failed would otherwise be asked for a frame on every
+    /// request. Errors must stay `Dropped`, never `Deferred`.
+    #[gpui::test]
+    fn presented_and_dropped_frames_do_not_re_arm_the_frame_source(cx: &mut TestAppContext) {
+        let (window, test_window, _renders) = open_render_counting_window(cx);
+
+        for outcome in [PresentOutcome::Presented, PresentOutcome::Dropped] {
+            test_window.queue_present_outcomes([outcome]);
+            let wakes = test_window.frame_wake_count();
+            test_window.simulate_frame_request(PRESENT_ONLY);
+            window
+                .update(cx, |_, window, _| {
+                    assert!(
+                        !window.needs_present.get(),
+                        "a {outcome:?} present clears the owed frame"
+                    );
+                })
+                .unwrap();
+            assert_eq!(
+                test_window.frame_wake_count(),
+                wakes,
+                "a {outcome:?} present does not re-arm the frame source"
+            );
+        }
     }
 
     #[gpui::test]

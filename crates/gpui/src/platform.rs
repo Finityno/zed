@@ -828,6 +828,14 @@ pub enum PresentOutcome {
     /// The frame was submitted for display.
     #[default]
     Presented,
+    /// The platform had no surface to render into (on macOS, `nextDrawable`
+    /// returned none) and submitted nothing. The frame is still owed: the
+    /// window keeps it pending and re-arms its frame source, and the next
+    /// frame request presents it. Retries run at the rate the platform
+    /// delivers frame requests (macOS: once per display refresh), so an
+    /// error that repeats every frame must be reported as
+    /// [`Self::Dropped`], never as this.
+    Deferred,
     /// The frame was lost to an error and is not retried.
     Dropped,
 }
@@ -837,6 +845,7 @@ impl PresentOutcome {
     pub fn name(self) -> &'static str {
         match self {
             Self::Presented => "presented",
+            Self::Deferred => "deferred",
             Self::Dropped => "dropped",
         }
     }

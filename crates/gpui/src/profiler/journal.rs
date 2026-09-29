@@ -579,7 +579,11 @@ impl ForegroundJournalWriter {
     }
 
     fn record_present(&mut self, timing: PresentTiming, frame: Option<FrameTiming>) {
-        if let Some(window) = self.windows.get_mut(&timing.window_id) {
+        // A deferred present left the frame pending, so the window's
+        // outstanding invalidation still is too.
+        if timing.report.outcome != crate::PresentOutcome::Deferred
+            && let Some(window) = self.windows.get_mut(&timing.window_id)
+        {
             window.dirty_at = None;
         }
         if self.power_interrupted_since(timing.present_start) {
@@ -1549,6 +1553,32 @@ mod tests {
             )
         }));
         assert!(has_boundary_at(&entries, presented_at));
+    }
+
+    /// A deferred present is recorded as work, but the frame it failed to
+    /// show is still pending, so the turn does not end the interval idle.
+    #[test]
+    fn a_deferred_present_keeps_the_window_pending() {
+        let start = Instant::now();
+        let deferred_at = start + Duration::from_millis(1);
+        let window_id = WindowId::from(0xD17C);
+        let (mut journal, mut collector) = test_journal(ForegroundRunnableCounter::new());
+        journal.record_frame_pending(window_id, start);
+        journal.begin_turn();
+        let mut deferred = presentation_timing(window_id, deferred_at);
+        deferred.report.outcome = crate::PresentOutcome::Deferred;
+        journal.record_present(deferred, None);
+        journal.end_turn(deferred_at);
+
+        let entries = collector.collect_unseen().entries;
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                entry,
+                ForegroundJournalEntry::Event(ForegroundEvent::Present(timing))
+                    if timing.window_id == window_id
+            )
+        }));
+        assert!(!has_boundary_at(&entries, deferred_at));
     }
 
     /// A frame that outlives [`FRAME_DEADLINE`] no longer seals an interval

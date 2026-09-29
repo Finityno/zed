@@ -244,6 +244,9 @@ pub struct MetalRenderer {
     /// not showing the window. Shared with the handlers, which run on a
     /// Metal thread.
     drawables_in_flight: Arc<AtomicU32>,
+    /// Presents deferred in a row because `nextDrawable` returned none; used
+    /// to log a run of them once instead of once per display refresh.
+    consecutive_deferred_presents: u32,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     /// Set by [`Self::release_intermediate_textures`] while the window is
@@ -674,6 +677,7 @@ impl MetalRenderer {
             render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
             drawables_in_flight: Arc::new(AtomicU32::new(0)),
+            consecutive_deferred_presents: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -1135,6 +1139,12 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        // An empty layer has no drawable to give, and waiting for one would
+        // retry every refresh for nothing. Resizing it to a real size redraws
+        // the window anyway, so the frame is not owed.
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            return dropped(breakdown);
+        }
         breakdown.drawables_in_flight = self
             .drawables_in_flight
             .load(Ordering::Relaxed)
@@ -1143,12 +1153,30 @@ impl MetalRenderer {
         let drawable = layer.next_drawable();
         breakdown.acquire = acquire_start.elapsed();
         let Some(drawable) = drawable else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return dropped(breakdown);
+            // The pool had nothing to give. The frame stays owed and the
+            // display link's next tick presents it, so this repeats at most
+            // once per refresh until a drawable comes back; log the run once.
+            if self.consecutive_deferred_presents == 0 {
+                log::warn!(
+                    "no drawable available (drawable size {viewport_size:?}, \
+                     {} in flight); deferring the present",
+                    breakdown.drawables_in_flight
+                );
+            }
+            self.consecutive_deferred_presents =
+                self.consecutive_deferred_presents.saturating_add(1);
+            return PresentReport {
+                outcome: PresentOutcome::Deferred,
+                breakdown,
+            };
         };
+        if self.consecutive_deferred_presents > 0 {
+            log::info!(
+                "drawable available again after {} deferred presents",
+                self.consecutive_deferred_presents
+            );
+            self.consecutive_deferred_presents = 0;
+        }
 
         let encode_start = Instant::now();
         let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size);

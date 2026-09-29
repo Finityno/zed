@@ -16,7 +16,11 @@ use scheduler::Instant;
 use serde::Serialize;
 
 /// Version of the power/visibility-aware measurement rules.
-pub const MEASUREMENT_VERSION: u32 = 2;
+///
+/// 3: a present the platform deferred is foreground work, not a presentation:
+/// it no longer seals an interval, clears a pending frame, or ends the input
+/// latency and dirty-to-present spans of the frame it failed to show.
+pub const MEASUREMENT_VERSION: u32 = 3;
 
 use super::SerializedLocation;
 use super::journal::{
@@ -234,7 +238,9 @@ pub enum SerializedHangContributor {
         start_ms: f64,
         /// How long platform submission took, in milliseconds.
         duration_ms: f64,
-        /// What became of the frame: `"presented"` or `"dropped"`.
+        /// What became of the frame: `"presented"`, `"deferred"` (no surface
+        /// to render into; the frame was presented again later) or
+        /// `"dropped"`.
         outcome: &'static str,
         /// Of `duration_ms`, the wait for a surface to render into (macOS:
         /// `nextDrawable`).

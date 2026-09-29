@@ -1,7 +1,8 @@
 use crate::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, HeadlessAtlas, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size, TestPlatform,
+    PlatformWindow, Point, PresentOutcome, PresentReport, PromptButton, RequestFrameOptions, Scene,
+    Size, TestPlatform,
     TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
@@ -12,6 +13,7 @@ use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
     cell::Cell,
+    collections::VecDeque,
     path::PathBuf,
     rc::{Rc, Weak},
     sync::{self, Arc},
@@ -62,6 +64,7 @@ pub(crate) struct TestWindowState {
     frame_wake_count: Rc<Cell<usize>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
+    queued_present_outcomes: VecDeque<PresentOutcome>,
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
@@ -144,6 +147,7 @@ impl TestWindow {
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
             frame_callback_pending: false,
+            queued_present_outcomes: VecDeque::new(),
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
@@ -176,6 +180,14 @@ impl TestWindow {
 
     pub fn frame_scheduled(&self) -> bool {
         self.0.lock().frame_scheduled
+    }
+
+    /// Makes the next presents report these outcomes, in order, as a
+    /// platform would when it has no surface to render into (`Deferred`) or
+    /// fails to render (`Dropped`). A deferred or dropped present draws
+    /// nothing; once the queue is empty, presents draw and succeed again.
+    pub fn queue_present_outcomes(&self, outcomes: impl IntoIterator<Item = PresentOutcome>) {
+        self.0.lock().queued_present_outcomes.extend(outcomes);
     }
 
     pub fn simulate_visibility_change(&self, visibility: WindowVisibility) {
@@ -560,6 +572,22 @@ impl PlatformWindow for TestWindow {
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
+        }
+    }
+
+    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) -> PresentReport {
+        let outcome = self
+            .0
+            .lock()
+            .queued_present_outcomes
+            .pop_front()
+            .unwrap_or_default();
+        if outcome == PresentOutcome::Presented {
+            self.draw(scene);
+        }
+        PresentReport {
+            outcome,
+            ..PresentReport::default()
         }
     }
 
