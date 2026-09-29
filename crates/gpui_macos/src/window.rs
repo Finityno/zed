@@ -30,7 +30,8 @@ use gpui::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NativeMenuItem, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
+    PresentOutcome, PresentReport, PromptButton, PromptLevel, RequestFrameOptions, Rgba,
+    SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle,
     WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
@@ -79,7 +80,7 @@ use std::{
         Arc, Once, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
@@ -868,6 +869,11 @@ struct MacWindowState {
     select_next_tab_callback: Option<Box<dyn FnMut()>>,
     select_previous_tab_callback: Option<Box<dyn FnMut()>>,
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
+    /// Whether this window was given a tabbing identifier, and so may be a
+    /// native tab. Kept per window because `allowsAutomaticWindowTabbing` is
+    /// class-wide: configuring any window overwrites it, so it does not say
+    /// whether this one can be a tab.
+    native_tabbing: bool,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
@@ -1410,6 +1416,9 @@ impl MacWindow {
                 select_next_tab_callback: None,
                 select_previous_tab_callback: None,
                 toggle_tab_bar_callback: None,
+                // Only these kinds are given the identifier below.
+                native_tabbing: allows_automatic_window_tabbing
+                    && matches!(kind, WindowKind::Normal | WindowKind::Floating),
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
@@ -1788,7 +1797,11 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
-        let native_window = self.0.lock().native_window;
+        let native_window = {
+            let mut lock = self.0.lock();
+            lock.native_tabbing = tabbing_identifier.is_some();
+            lock.native_window
+        };
         unsafe {
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
@@ -2634,19 +2647,20 @@ impl PlatformWindow for MacWindow {
         this.release_intermediates_if_occluded();
     }
 
-    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) {
+    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) -> PresentReport {
         let mut this = self.0.lock();
         if this.overlay_renderer.is_none() {
             // Every present comes through here (gpui core never calls `draw`),
             // so the occluded-window release has to happen on this branch too
             // or a window without an overlay keeps the intermediates a stray
             // draw rebuilt while it was hidden.
-            this.renderer.draw(scene);
+            let report = this.renderer.draw(scene);
             this.release_intermediates_if_occluded();
-            return;
+            return report;
         }
 
         let this = &mut *this;
+        let split_start = Instant::now();
         let split = overlay_start.min(scene.len());
         // The two halves are kept across presents so their vectors hold
         // their capacity, instead of being allocated and freed per frame for
@@ -2659,10 +2673,21 @@ impl PlatformWindow for MacWindow {
         this.overlay_scene.replay(split..scene.len(), scene);
         this.overlay_scene.finish();
 
+        this.renderer.note_scene_tiles(&this.overlay_scene);
+        let split_duration = split_start.elapsed();
+        let mut report = this.renderer.draw(&this.base_scene);
+        report.breakdown.encode += split_duration;
+        if report.outcome != PresentOutcome::Presented {
+            // Presenting the overlay over a base that did not land would put
+            // the two planes on different frames. A deferred base is retried
+            // and the retry presents both; a dropped one leaves both on the
+            // frame before, as a window without an overlay is left. Input
+            // keeps following the overlay that is still on screen.
+            this.release_intermediates_if_occluded();
+            return report;
+        }
         this.overlay_input_active
             .store(!this.overlay_scene.is_empty(), Ordering::Release);
-        this.renderer.note_scene_tiles(&this.overlay_scene);
-        this.renderer.draw(&this.base_scene);
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
@@ -2671,10 +2696,22 @@ impl PlatformWindow for MacWindow {
             .as_mut()
             .expect("overlay renderer checked above");
         overlay_renderer.lend_intermediates(intermediates);
-        overlay_renderer.draw(&this.overlay_scene);
+        let overlay_report = overlay_renderer.draw(&this.overlay_scene);
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
         this.release_intermediates_if_occluded();
+
+        report.breakdown.accumulate(overlay_report.breakdown);
+        // The base layer holds the window's content, so the present's
+        // outcome is the base's. An overlay layer whose drawable size is
+        // still zero drops every frame, and reporting that as the frame's
+        // outcome would count every frame as lost while the content was
+        // reaching the screen. An overlay that defers after the base landed
+        // is not retried: its plane keeps the previous frame until the window
+        // next presents. It cannot defer while its layer waits for drawables
+        // rather than timing out.
+        report.breakdown.overlay_outcome = Some(overlay_report.outcome);
+        report
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
@@ -3691,10 +3728,14 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             lock.stop_display_link();
             // Nothing paints an occluded window, so its drawable-sized
             // intermediate textures can go; the first draw after it becomes
-            // visible again recreates them.
+            // visible again recreates them. Its in-flight drawable counts
+            // start afresh too, so one raised by a lost presented handler
+            // does not outlive the stretch of presenting it happened in.
             lock.renderer.release_intermediate_textures();
+            lock.renderer.forget_drawables_in_flight();
             if let Some(renderer) = lock.overlay_renderer.as_mut() {
                 renderer.release_intermediate_textures();
+                renderer.forget_drawables_in_flight();
             }
         }
     }
@@ -3878,6 +3919,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     }
 
     let executor = lock.foreground_executor.clone();
+    let native_window = lock.native_window;
     drop(lock);
 
     let a11y_events = {
@@ -3896,12 +3938,40 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // This is only done on subsequent activations (not the first) to ensure the initial focus
     // path is properly established. Without this guard, the focus state would remain unset until
     // the first mouse click, causing keybindings to be non-functional.
+    //
+    // It is also only done for a window that shares a native tab group with another, or that can
+    // be a native tab and was hidden. The frame presents inside a Core Animation transaction,
+    // on the main thread, while AppKit's activation is still in progress, so a wait for a
+    // drawable there (a compositor still holding the window's drawables from before it was
+    // deactivated) stalls the activation for every app, not just this one. A visible window with
+    // no sibling tab has no tab switch to hide, and its display link, which runs whenever the
+    // window is visible, presents on the next refresh. A hidden window's display link is stopped,
+    // so without this frame it would show its content from before it was hidden until the
+    // occlusion change restarts the link and a refresh passes: this is the tab left in front
+    // after closing the one above it, which AppKit may already have taken out of the group. A
+    // window given no tabbing identifier is never a tab, so a hidden one (behind another app's
+    // window and brought forward with Cmd-Tab) is left to its display link.
     if selector == sel!(windowDidBecomeKey:) && is_active {
+        // Asked before the window-state lock is taken, so nothing AppKit does in answering can
+        // find it held.
+        let shares_a_tab_group = unsafe {
+            let tabbed_windows: id = msg_send![native_window, tabbedWindows];
+            !tabbed_windows.is_null() && {
+                let count: NSUInteger = msg_send![tabbed_windows, count];
+                count > 1
+            }
+        };
         let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
 
         if lock.activated_least_once {
-            if let Some(mut callback) = lock.request_frame_callback.take() {
+            let display_link_running = lock
+                .frame_source
+                .as_ref()
+                .is_some_and(WindowFrameSource::is_running);
+            if (shares_a_tab_group || (lock.native_tabbing && !display_link_running))
+                && let Some(mut callback) = lock.request_frame_callback.take()
+            {
                 lock.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
@@ -4026,6 +4096,13 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        // The frame presents inside the Core Animation transaction that
+        // resizes the window, so it lands in step with the new window frame.
+        // A present deferred here would be retried on the next display
+        // refresh, outside the transaction, and show stretched until then.
+        // That cannot happen while the layer's `nextDrawable` waits for a
+        // drawable, where a nil drops the frame instead; an acquire that can
+        // give up without one has to keep this present in the transaction.
         lock.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);

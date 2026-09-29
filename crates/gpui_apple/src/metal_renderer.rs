@@ -9,8 +9,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size, point,
-    quad_depth, size,
+    PresentBreakdown, PresentOutcome, PresentReport, PrimitiveBatch, RenderMemoryGauge,
+    RenderMemoryLedger, ScaledPixels, Scene, Size, point, quad_depth, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -29,7 +29,23 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Instant,
+};
+
+/// How many presents in a row may defer for want of a drawable before the
+/// frame is dropped instead: about a second of display refreshes.
+const MAX_CONSECUTIVE_DEFERRED_PRESENTS: u32 = 120;
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -227,6 +243,25 @@ pub struct MetalRenderer {
     stale_texture_heals: u32,
     /// When GPU memory stats were last logged, while `FINCODE_GPU_STATS=1`.
     gpu_stats_last_log: Option<std::time::Instant>,
+    /// Drawables handed to `present` whose presented handler has not run
+    /// yet: queued behind the one on screen, or held by a compositor that is
+    /// not showing the window. Shared with the handlers, which run on a
+    /// Metal thread. A handler that never runs leaves it raised, so it is
+    /// clamped when read ([`Self::read_drawables_in_flight`]) and starts
+    /// afresh when the window is hidden ([`Self::forget_drawables_in_flight`])
+    /// and with every new layer, since a layer is only ever made along with
+    /// its renderer.
+    drawables_in_flight: Arc<AtomicU32>,
+    /// Set once `drawables_in_flight` has read above the layer's maximum,
+    /// which only presented handlers that never ran can cause. Clamping
+    /// removes only the excess over the maximum, so the count may go on
+    /// overstating what is in flight; this stays set, and every report says
+    /// so, until the count starts afresh.
+    drawables_in_flight_overstated: bool,
+    /// Presents deferred in a row because `nextDrawable` returned none; used
+    /// to log a run of them once instead of once per display refresh, and to
+    /// end a run that goes on too long (see `missing_drawable_outcome`).
+    consecutive_deferred_presents: u32,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     /// Set by [`Self::release_intermediate_textures`] while the window is
@@ -656,6 +691,9 @@ impl MetalRenderer {
             fallback_depth_idle_frames: 0,
             render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
+            drawables_in_flight: Arc::new(AtomicU32::new(0)),
+            drawables_in_flight_overstated: false,
+            consecutive_deferred_presents: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -1073,14 +1111,43 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, scene: &Scene) -> PresentReport {
+        // `nextDrawable` hands back an autoreleased drawable, and the command
+        // buffer and pass descriptors are autoreleased too. Without a pool of
+        // its own the frame's drawable stays retained until the main run
+        // loop's pool drains, which a main thread busy for several frames in
+        // a row puts off; Core Animation cannot reuse a drawable that is still
+        // retained, so the layer's three-drawable pool empties faster and the
+        // next `nextDrawable` waits. `present_drawable` retains the drawable
+        // for as long as the command buffer needs it, and `render_frame`
+        // returns an owned command buffer, so nothing used after the pool
+        // outlives it.
+        objc2::rc::autoreleasepool(|_| self.draw_in_pool(scene))
+    }
+
+    /// Presents `scene` to the layer and reports where the time went:
+    /// `acquire` is `nextDrawable`, `encode` is `render_frame`, and `commit`
+    /// is the hand-off to the GPU and compositor, including the
+    /// in-transaction path's wait for the command buffer to be scheduled.
+    /// They are split because a slow present has different causes in each:
+    /// a compositor holding the layer's drawables, main-thread CPU (or page
+    /// faults) while encoding, or a GPU backlog.
+    fn draw_in_pool(&mut self, scene: &Scene) -> PresentReport {
+        let mut breakdown = PresentBreakdown {
+            layers: 1,
+            ..PresentBreakdown::default()
+        };
+        let dropped = |breakdown| PresentReport {
+            outcome: PresentOutcome::Dropped,
+            breakdown,
+        };
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return dropped(PresentBreakdown::default());
             }
         };
         let viewport_size = layer.drawable_size();
@@ -1088,24 +1155,66 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return;
+        // An empty layer has no drawable to give, and waiting for one would
+        // retry every refresh for nothing. Resizing it to a real size redraws
+        // the window anyway, so the frame is not owed.
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            // A dropped frame ends any run of deferrals, as it does when the
+            // run is cut off, so the next missing drawable starts a new run.
+            self.consecutive_deferred_presents = 0;
+            return dropped(breakdown);
+        }
+        let (drawables_in_flight, drawables_in_flight_clamped) =
+            self.read_drawables_in_flight(&layer);
+        breakdown.drawables_in_flight = drawables_in_flight;
+        breakdown.drawables_in_flight_clamped = drawables_in_flight_clamped;
+        let acquire_start = Instant::now();
+        let drawable = layer.next_drawable();
+        breakdown.acquire = acquire_start.elapsed();
+        let Some(drawable) = drawable else {
+            let allows_timeout: cocoa::base::BOOL =
+                unsafe { msg_send![&*layer, allowsNextDrawableTimeout] };
+            let outcome = self.missing_drawable_outcome(allows_timeout == YES);
+            match outcome {
+                PresentOutcome::Deferred if self.consecutive_deferred_presents == 1 => {
+                    log::warn!(
+                        "no drawable available (drawable size {viewport_size:?}, \
+                         {} in flight); deferring the present",
+                        breakdown.drawables_in_flight
+                    );
+                }
+                PresentOutcome::Dropped => {
+                    log::error!(
+                        "no drawable available (drawable size {viewport_size:?}, \
+                         {} in flight); dropping the frame",
+                        breakdown.drawables_in_flight
+                    );
+                }
+                _ => {}
+            }
+            return PresentReport { outcome, breakdown };
         };
+        if self.consecutive_deferred_presents > 0 {
+            log::info!(
+                "drawable available again after {} deferred presents",
+                self.consecutive_deferred_presents
+            );
+            self.consecutive_deferred_presents = 0;
+        }
 
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
+        let encode_start = Instant::now();
+        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size);
+        breakdown.encode = encode_start.elapsed();
+        let command_buffer = match command_buffer {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
-                return;
+                return dropped(breakdown);
             }
         };
 
+        let commit_start = Instant::now();
+        self.note_drawable_in_flight(drawable);
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -1114,7 +1223,81 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        breakdown.commit = commit_start.elapsed();
         self.maybe_log_gpu_stats();
+        PresentReport {
+            outcome: PresentOutcome::Presented,
+            breakdown,
+        }
+    }
+
+    /// What a present that got no drawable reports. The frame stays owed
+    /// (`Deferred`) only while a nil drawable can mean the pool was merely
+    /// empty: with `allowsNextDrawableTimeout` off, `nextDrawable` waits for
+    /// a drawable instead, so a nil there is a fault (a lost device, a layer
+    /// with no usable configuration) that would be retried every display
+    /// refresh for as long as it lasts. A run of deferrals is also cut off
+    /// after [`MAX_CONSECUTIVE_DEFERRED_PRESENTS`], so a pool that never
+    /// refills costs one dropped frame per invalidation rather than a
+    /// present attempt per refresh.
+    fn missing_drawable_outcome(&mut self, layer_allows_timeout: bool) -> PresentOutcome {
+        if layer_allows_timeout
+            && self.consecutive_deferred_presents < MAX_CONSECUTIVE_DEFERRED_PRESENTS
+        {
+            self.consecutive_deferred_presents += 1;
+            PresentOutcome::Deferred
+        } else {
+            self.consecutive_deferred_presents = 0;
+            PresentOutcome::Dropped
+        }
+    }
+
+    /// How many drawables are in flight, for a present's report, and whether
+    /// the count is known to overstate them. More than the layer's maximum
+    /// drawable count can only mean presented handlers that never ran (a
+    /// command buffer that failed after commit, say); the count is lowered to
+    /// the maximum, which still bounds the drawables really in flight from
+    /// above, so lost handlers cannot keep it climbing. That removes only the
+    /// excess, so the bias below the maximum stays, and so does the flag,
+    /// until [`Self::forget_drawables_in_flight`].
+    fn read_drawables_in_flight(&mut self, layer: &metal::MetalLayerRef) -> (u8, bool) {
+        let maximum = layer.maximum_drawable_count().min(u8::MAX as NSUInteger) as u32;
+        let count = self
+            .drawables_in_flight
+            .fetch_min(maximum, Ordering::Relaxed);
+        self.drawables_in_flight_overstated |= count > maximum;
+        (count.min(maximum) as u8, self.drawables_in_flight_overstated)
+    }
+
+    /// Starts the in-flight count afresh, for a window that has just been
+    /// hidden, so a count left raised by a presented handler that never ran
+    /// does not read as a held pool for the rest of the window's life.
+    /// Handlers of drawables presented before this still decrement the count
+    /// they were registered with, not the new one; drawables the compositor
+    /// holds from before the window was hidden therefore go uncounted once it
+    /// is visible again, until it has presented past them.
+    pub fn forget_drawables_in_flight(&mut self) {
+        self.drawables_in_flight = Arc::new(AtomicU32::new(0));
+        self.drawables_in_flight_overstated = false;
+    }
+
+    /// Counts `drawable` as in flight until Core Animation displays or
+    /// discards it; the presented handler runs in both cases. Must be called
+    /// before the drawable is presented, which is when handlers are fixed.
+    fn note_drawable_in_flight(&self, drawable: &metal::MetalDrawableRef) {
+        let drawables_in_flight = self.drawables_in_flight.clone();
+        drawables_in_flight.fetch_add(1, Ordering::Relaxed);
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+            drawables_in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    count.checked_sub(1)
+                })
+                .ok();
+        });
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+        unsafe {
+            drawable.add_presented_handler(&*RcBlock::as_ptr(&block).cast());
+        }
     }
 
     fn gpu_stats_enabled() -> bool {
@@ -2931,7 +3114,7 @@ mod stale_texture_healing_tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
 
-    fn solid_quad_scene(extent: f32) -> Scene {
+    pub(super) fn solid_quad_scene(extent: f32) -> Scene {
         let mut scene = Scene::default();
         let bounds = Bounds {
             origin: Point {
@@ -3372,5 +3555,185 @@ mod stale_texture_healing_tests {
             .render_scene_to_image(&triangle_path_scene(32.), size)
             .expect("path render succeeds after retirement");
         assert!(renderer.path_intermediate_texture.is_some());
+    }
+}
+
+/// A layer-backed draw, the path every window present takes, reports where
+/// its time went. The layer is in no window, so nothing reaches the screen,
+/// but `nextDrawable`, encoding and commit all run for real.
+#[cfg(test)]
+mod present_report_tests {
+    use super::{InstanceBufferPool, MetalRenderer, stale_texture_healing_tests::solid_quad_scene};
+    use gpui::{DevicePixels, PresentOutcome};
+    use parking_lot::Mutex;
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
+
+    #[test]
+    fn a_layer_backed_draw_reports_acquire_encode_and_commit_separately() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        assert_eq!(report.outcome, PresentOutcome::Presented);
+        let breakdown = report.breakdown;
+        assert_eq!(breakdown.layers, 1);
+        assert!(
+            breakdown.encode > Duration::ZERO,
+            "encoding a quad takes measurable time: {breakdown:?}"
+        );
+        assert_eq!(
+            breakdown.drawables_in_flight, 0,
+            "nothing was presented before the first draw"
+        );
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+        assert_eq!(report.outcome, PresentOutcome::Presented);
+        assert!(
+            report.breakdown.drawables_in_flight <= 1,
+            "only the first draw's drawable can still be in flight: {:?}",
+            report.breakdown
+        );
+    }
+
+    /// Noting a drawable counts it before it is presented, so before its
+    /// presented handler can run: the count rises by one then, whatever the
+    /// handler later does.
+    #[test]
+    fn noting_a_drawable_counts_it_in_flight_before_its_handler_can_run() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        let layer = renderer.layer.clone().expect("a window renderer has a layer");
+
+        objc2::rc::autoreleasepool(|_| {
+            let drawable = layer
+                .next_drawable()
+                .expect("a layer in no window always has a drawable to give");
+            assert_eq!(renderer.drawables_in_flight.load(Ordering::Relaxed), 0);
+            renderer.note_drawable_in_flight(drawable);
+            assert_eq!(
+                renderer.drawables_in_flight.load(Ordering::Relaxed),
+                1,
+                "the drawable was counted and nothing has presented it yet"
+            );
+        });
+    }
+
+    /// A layer with no size has no drawable to give, and asking for one would
+    /// only fail again on every refresh, so the present is dropped without
+    /// asking; resizing the layer redraws the window anyway.
+    #[test]
+    fn a_zero_size_layer_drops_the_present_without_asking_for_a_drawable() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let drawable_size = renderer
+            .layer()
+            .expect("a window renderer has a layer")
+            .drawable_size();
+        assert_eq!(
+            (drawable_size.width, drawable_size.height),
+            (0., 0.),
+            "a layer that was never sized has an empty drawable"
+        );
+        renderer.consecutive_deferred_presents = 5;
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        assert_eq!(report.outcome, PresentOutcome::Dropped);
+        assert_eq!(report.breakdown.layers, 1, "the layer exists, only empty");
+        assert_eq!(
+            report.breakdown.acquire,
+            Duration::ZERO,
+            "nextDrawable was never asked"
+        );
+        assert_eq!(
+            renderer.consecutive_deferred_presents, 0,
+            "a dropped present ends the run of deferrals before it"
+        );
+    }
+
+    #[test]
+    fn a_headless_renderer_reports_a_dropped_present() {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        assert_eq!(report.outcome, PresentOutcome::Dropped);
+        assert_eq!(report.breakdown.layers, 0);
+    }
+
+    /// A missing drawable defers the frame only while the layer can time out
+    /// waiting for one, and only for a bounded run: anything else is a fault
+    /// that would otherwise be retried every display refresh.
+    #[test]
+    fn a_missing_drawable_defers_only_a_bounded_run_on_a_layer_that_can_time_out() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+
+        assert_eq!(
+            renderer.missing_drawable_outcome(false),
+            PresentOutcome::Dropped,
+            "a layer that waits for drawables returns none only on a fault"
+        );
+        assert_eq!(renderer.consecutive_deferred_presents, 0);
+
+        for _ in 0..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
+            assert_eq!(
+                renderer.missing_drawable_outcome(true),
+                PresentOutcome::Deferred
+            );
+        }
+        assert_eq!(
+            renderer.missing_drawable_outcome(true),
+            PresentOutcome::Dropped,
+            "a run that outlasts the bound drops the frame"
+        );
+        assert_eq!(
+            renderer.missing_drawable_outcome(true),
+            PresentOutcome::Deferred,
+            "and the next present starts a fresh run"
+        );
+    }
+
+    /// A layer never has more drawables out than its maximum, so a count
+    /// above it can only come from presented handlers that never ran. It
+    /// reads as the maximum, flagged, and is lowered so it stops climbing.
+    /// Lowering it removes only the excess, so it stays flagged, however low
+    /// it later reads, until hiding the window starts it afresh.
+    #[test]
+    fn an_in_flight_count_above_the_layer_maximum_is_clamped_flagged_and_forgotten() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let layer = renderer.layer.clone().expect("a window renderer has a layer");
+        let maximum = layer.maximum_drawable_count() as u8;
+        assert_eq!(renderer.read_drawables_in_flight(&layer), (0, false));
+        renderer.drawables_in_flight.store(7, Ordering::Relaxed);
+
+        assert_eq!(renderer.read_drawables_in_flight(&layer), (maximum, true));
+        assert_eq!(
+            renderer.drawables_in_flight.load(Ordering::Relaxed),
+            u32::from(maximum),
+            "the count is lowered to the maximum"
+        );
+        assert_eq!(
+            renderer.read_drawables_in_flight(&layer),
+            (maximum, true),
+            "the lost handlers' bias below the maximum is still in the count"
+        );
+        renderer.drawables_in_flight.store(1, Ordering::Relaxed);
+        assert_eq!(
+            renderer.read_drawables_in_flight(&layer),
+            (1, true),
+            "and still may be as it falls"
+        );
+
+        renderer.forget_drawables_in_flight();
+        assert_eq!(renderer.read_drawables_in_flight(&layer), (0, false));
     }
 }

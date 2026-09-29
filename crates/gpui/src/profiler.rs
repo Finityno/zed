@@ -827,6 +827,9 @@ pub struct PresentTiming {
     /// The interval since the previous newly drawn frame was submitted, when
     /// both frames belong to an active animation.
     pub animation_interval: Option<Duration>,
+    /// What the platform reported for the submission: whether the frame
+    /// landed, and where its time went when the platform measures that.
+    pub report: crate::PresentReport,
 }
 
 #[cfg(feature = "profiler")]
@@ -859,6 +862,9 @@ pub struct FrameDurationSnapshot {
     /// Histogram of intervals between consecutively presented frames while the
     /// window was animating, in nanoseconds.
     pub present_interval_histogram: Histogram<u64>,
+    /// Presents the platform deferred because it had no surface to render
+    /// into; each one's frame was presented again later.
+    pub deferred_presents: u64,
 }
 
 /// A point-in-time snapshot of the input-latency histograms for a window,
@@ -907,6 +913,7 @@ pub struct WindowProfiler {
     last_present_at: Option<Instant>,
     animating_at_last_present: bool,
     pending_frame: Option<FrameTiming>,
+    deferred_presents: u64,
 }
 
 #[cfg(feature = "profiler")]
@@ -938,6 +945,7 @@ impl WindowProfiler {
             last_present_at: None,
             animating_at_last_present: false,
             pending_frame: None,
+            deferred_presents: 0,
         };
         journal::record_frame_pending(window_id, Instant::now());
         Ok(profiler)
@@ -1068,12 +1076,14 @@ impl WindowProfiler {
         present_end: Instant,
         window_active: bool,
         next_frame_scheduled: bool,
+        report: crate::PresentReport,
     ) {
-        self.record_present_at(
+        self.record_present_report_at(
             present_start,
             present_end,
             window_active,
             next_frame_scheduled,
+            report,
         );
     }
 
@@ -1092,15 +1102,62 @@ impl WindowProfiler {
             dirty_to_present_histogram: self.dirty_to_present_histogram.clone(),
             draw_duration_histogram: self.draw_duration_histogram.clone(),
             present_interval_histogram: self.present_interval_histogram.clone(),
+            deferred_presents: self.deferred_presents,
         }
     }
 
+    /// Records a present the platform deferred (see
+    /// [`crate::PresentOutcome::Deferred`]).
+    ///
+    /// The attempt goes into the journal as foreground work, so a slow one
+    /// still shows up in a hang report, but nothing reached the screen: the
+    /// pending frame, the first unpresented input and the last present are
+    /// left alone, so the present that eventually lands measures input
+    /// latency and dirty-to-present across the deferral, which is what the
+    /// user waited through.
+    pub fn record_deferred_present(
+        &mut self,
+        present_start: Instant,
+        present_end: Instant,
+        report: crate::PresentReport,
+    ) {
+        self.deferred_presents += 1;
+        journal::record_present(
+            PresentTiming {
+                window_id: self.window_id,
+                present_start,
+                present_end,
+                animation_interval: None,
+                report,
+            },
+            None,
+        );
+    }
+
+    #[cfg(test)]
     fn record_present_at(
         &mut self,
         present_start: Instant,
         present_end: Instant,
         window_active: bool,
         next_frame_scheduled: bool,
+    ) {
+        self.record_present_report_at(
+            present_start,
+            present_end,
+            window_active,
+            next_frame_scheduled,
+            crate::PresentReport::default(),
+        );
+    }
+
+    fn record_present_report_at(
+        &mut self,
+        present_start: Instant,
+        present_end: Instant,
+        window_active: bool,
+        next_frame_scheduled: bool,
+        report: crate::PresentReport,
     ) {
         if let Some(first_input_at) = self.first_input_at.take()
             && journal::frame_sample_is_valid(self.window_id, first_input_at)
@@ -1138,6 +1195,7 @@ impl WindowProfiler {
             present_start,
             present_end,
             animation_interval,
+            report,
         };
         journal::record_present(present_timing, frame);
 
@@ -1499,6 +1557,37 @@ mod tests {
         let histogram = snapshot.dirty_to_present_histogram;
         assert_eq!(histogram.len(), 1);
         assert!(histogram.max() >= Duration::from_millis(10).as_nanos() as u64);
+    }
+
+    /// A deferred present showed nothing, so the frame's dirty-to-present
+    /// span runs on to the present that lands and includes the deferral.
+    #[test]
+    fn a_deferred_present_leaves_the_frame_to_the_present_that_lands() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(9)).expect("window profiler should initialize");
+        let draw_end = Instant::now();
+        record_test_draw(&mut window_profiler, draw_end);
+
+        let deferred_end = draw_end + Duration::from_secs(1);
+        window_profiler.record_deferred_present(
+            deferred_end,
+            deferred_end,
+            crate::PresentReport {
+                outcome: crate::PresentOutcome::Deferred,
+                ..Default::default()
+            },
+        );
+        let snapshot = window_profiler.frame_duration_snapshot();
+        assert_eq!(snapshot.dirty_to_present_histogram.len(), 0);
+        assert_eq!(snapshot.deferred_presents, 1);
+
+        let present_end = deferred_end + Duration::from_millis(6);
+        window_profiler.record_present_at(present_end, present_end, true, false);
+        let snapshot = window_profiler.frame_duration_snapshot();
+        let histogram = snapshot.dirty_to_present_histogram;
+        assert_eq!(histogram.len(), 1);
+        assert!(histogram.max() >= Duration::from_millis(1010).as_nanos() as u64);
+        assert_eq!(snapshot.deferred_presents, 1);
     }
 
     #[cfg(feature = "profiler")]

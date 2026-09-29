@@ -822,6 +822,92 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// What became of a frame handed to [`PlatformWindow::draw_layered`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub enum PresentOutcome {
+    /// The frame was submitted for display.
+    #[default]
+    Presented,
+    /// The platform had no surface to render into (on macOS, `nextDrawable`
+    /// returned none) and submitted nothing. The frame is still owed: the
+    /// window keeps it pending and re-arms its frame source, and the next
+    /// frame request presents it. Retries run at the rate the platform
+    /// delivers frame requests (macOS: once per display refresh), so an
+    /// error that repeats every frame must be reported as
+    /// [`Self::Dropped`], never as this.
+    Deferred,
+    /// The frame was lost to an error and is not retried.
+    Dropped,
+}
+
+impl PresentOutcome {
+    /// A stable lowercase name for logs and telemetry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Presented => "presented",
+            Self::Deferred => "deferred",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// Where the time of one present went, for platforms that measure it.
+///
+/// A platform that reports no breakdown leaves every field zero, so
+/// `layers == 0` means "not measured" rather than "free". With an overlay
+/// surface the durations are summed across both layers.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub struct PresentBreakdown {
+    /// Waiting for a surface to render into (macOS: `nextDrawable`).
+    pub acquire: Duration,
+    /// Encoding the scene's GPU work, including splitting it across layers.
+    pub encode: Duration,
+    /// Handing the encoded work and the surface to the GPU and compositor,
+    /// including any wait the synchronous (in-transaction) path makes.
+    pub commit: Duration,
+    /// How many surfaces the present covered.
+    pub layers: u8,
+    /// The most surfaces any one layer had submitted but not yet seen
+    /// displayed or discarded when it asked for the next one; a count near
+    /// the layer's maximum means the compositor is holding them.
+    pub drawables_in_flight: u8,
+    /// A layer's in-flight count has read above the most surfaces it can
+    /// have since the count last started afresh, which happens only when the
+    /// notice that one was displayed or discarded never came.
+    /// `drawables_in_flight` is clamped to that maximum, and since clamping
+    /// removes only the excess, it may overstate what the compositor holds
+    /// for as long as this is set.
+    pub drawables_in_flight_clamped: bool,
+    /// What became of the overlay surface's half of the frame, for a window
+    /// that splits its scene across a base and an overlay surface and drew
+    /// the overlay. The present's own outcome is the base surface's, which
+    /// holds the window's content, so an overlay that failed is reported
+    /// here rather than counting a frame whose base landed as lost.
+    pub overlay_outcome: Option<PresentOutcome>,
+}
+
+impl PresentBreakdown {
+    /// Adds another layer's present to this one.
+    pub fn accumulate(&mut self, other: PresentBreakdown) {
+        self.acquire += other.acquire;
+        self.encode += other.encode;
+        self.commit += other.commit;
+        self.layers = self.layers.saturating_add(other.layers);
+        self.drawables_in_flight = self.drawables_in_flight.max(other.drawables_in_flight);
+        self.drawables_in_flight_clamped |= other.drawables_in_flight_clamped;
+        self.overlay_outcome = self.overlay_outcome.or(other.overlay_outcome);
+    }
+}
+
+/// The result of one [`PlatformWindow::draw_layered`] call.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub struct PresentReport {
+    /// What became of the frame.
+    pub outcome: PresentOutcome,
+    /// Where the present's time went, when the platform measures it.
+    pub breakdown: PresentBreakdown,
+}
+
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
 ///
 /// `Inactive` means visible but not receiving input (a system dialog on
@@ -996,8 +1082,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ///
     /// Platforms without layered scene support fall back to drawing the complete
     /// scene on their primary surface.
-    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) {
+    ///
+    /// Every present goes through here, so this is where a platform reports
+    /// what became of the frame and, when it measures it, where the time
+    /// went. The fallback reports a presented frame with no breakdown.
+    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) -> PresentReport {
         self.draw(scene);
+        PresentReport::default()
     }
     /// Enables a transparent GPUI surface above native child views.
     ///
