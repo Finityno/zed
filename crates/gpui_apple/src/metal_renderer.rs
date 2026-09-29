@@ -3586,6 +3586,62 @@ mod present_report_tests {
         );
     }
 
+    /// Noting a drawable counts it before it is presented, so before its
+    /// presented handler can run: the count rises by one then, whatever the
+    /// handler later does.
+    #[test]
+    fn noting_a_drawable_counts_it_in_flight_before_its_handler_can_run() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        let layer = renderer.layer.clone().expect("a window renderer has a layer");
+
+        objc2::rc::autoreleasepool(|_| {
+            let drawable = layer
+                .next_drawable()
+                .expect("a layer in no window always has a drawable to give");
+            assert_eq!(renderer.drawables_in_flight.load(Ordering::Relaxed), 0);
+            renderer.note_drawable_in_flight(drawable);
+            assert_eq!(
+                renderer.drawables_in_flight.load(Ordering::Relaxed),
+                1,
+                "the drawable was counted and nothing has presented it yet"
+            );
+        });
+    }
+
+    /// A layer with no size has no drawable to give, and asking for one would
+    /// only fail again on every refresh, so the present is dropped without
+    /// asking; resizing the layer redraws the window anyway.
+    #[test]
+    fn a_zero_size_layer_drops_the_present_without_asking_for_a_drawable() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let drawable_size = renderer
+            .layer()
+            .expect("a window renderer has a layer")
+            .drawable_size();
+        assert_eq!(
+            (drawable_size.width, drawable_size.height),
+            (0., 0.),
+            "a layer that was never sized has an empty drawable"
+        );
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        assert_eq!(report.outcome, PresentOutcome::Dropped);
+        assert_eq!(report.breakdown.layers, 1, "the layer exists, only empty");
+        assert_eq!(
+            report.breakdown.acquire,
+            Duration::ZERO,
+            "nextDrawable was never asked"
+        );
+        assert_eq!(
+            renderer.consecutive_deferred_presents, 0,
+            "a dropped present starts no run of deferrals"
+        );
+    }
+
     #[test]
     fn a_headless_renderer_reports_a_dropped_present() {
         let mut renderer =
