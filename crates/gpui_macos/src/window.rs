@@ -3912,12 +3912,28 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // This is only done on subsequent activations (not the first) to ensure the initial focus
     // path is properly established. Without this guard, the focus state would remain unset until
     // the first mouse click, causing keybindings to be non-functional.
+    //
+    // It is also only done for a window that shares a native tab group with another. The frame
+    // presents inside a Core Animation transaction, on the main thread, while AppKit's activation
+    // is still in progress, so a wait for a drawable there (a compositor still holding the
+    // window's drawables from before it was deactivated) stalls the activation for every app,
+    // not just this one. A window with no sibling tab has no tab switch to hide, and its display
+    // link, which runs whenever the window is visible, presents on the next refresh.
     if selector == sel!(windowDidBecomeKey:) && is_active {
         let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
 
         if lock.activated_least_once {
-            if let Some(mut callback) = lock.request_frame_callback.take() {
+            let shares_a_tab_group = unsafe {
+                let tabbed_windows: id = msg_send![lock.native_window, tabbedWindows];
+                !tabbed_windows.is_null() && {
+                    let count: NSUInteger = msg_send![tabbed_windows, count];
+                    count > 1
+                }
+            };
+            if shares_a_tab_group
+                && let Some(mut callback) = lock.request_frame_callback.take()
+            {
                 lock.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
