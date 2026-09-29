@@ -75,6 +75,8 @@ mod glyph_painting;
 mod layout_keys;
 #[cfg(test)]
 mod layout_retention_tests;
+#[cfg(test)]
+mod replay_tests;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -1067,6 +1069,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    window_control_hitboxes_index: usize,
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
     mouse_listeners_index: usize,
@@ -4525,6 +4528,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_records.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
@@ -4548,6 +4552,15 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        // Window controls (the caption, drag strips, minimize, maximize and
+        // close buttons) are hit-tested against the rendered frame's list, so
+        // a view reused without painting would otherwise lose them.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
