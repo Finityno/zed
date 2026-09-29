@@ -3956,8 +3956,9 @@ impl Window {
         );
         // A draw that bailed before rendering (no drawable, a render error)
         // marked nothing, so the scene's tiles are no newer than they were.
-        // This holds whatever the outcome: a deferred overlay present whose
-        // base layer rendered still marked the scene's tiles in use.
+        // The atlas frame decides this rather than the outcome: a present
+        // that rendered part of the scene before reporting a failure still
+        // marked those tiles in use.
         let atlas_frame_after_draw = self.sprite_atlas.frame_index();
         if atlas_frame_after_draw > atlas_frame_before_draw {
             self.atlas_frame_at_last_present = atlas_frame_after_draw;
