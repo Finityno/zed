@@ -1159,6 +1159,9 @@ impl MetalRenderer {
         // retry every refresh for nothing. Resizing it to a real size redraws
         // the window anyway, so the frame is not owed.
         if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            // A dropped frame ends any run of deferrals, as it does when the
+            // run is cut off, so the next missing drawable starts a new run.
+            self.consecutive_deferred_presents = 0;
             return dropped(breakdown);
         }
         let (drawables_in_flight, drawables_in_flight_clamped) =
@@ -3637,6 +3640,7 @@ mod present_report_tests {
             (0., 0.),
             "a layer that was never sized has an empty drawable"
         );
+        renderer.consecutive_deferred_presents = 5;
 
         let report = renderer.draw(&solid_quad_scene(32.));
 
@@ -3649,7 +3653,7 @@ mod present_report_tests {
         );
         assert_eq!(
             renderer.consecutive_deferred_presents, 0,
-            "a dropped present starts no run of deferrals"
+            "a dropped present ends the run of deferrals before it"
         );
     }
 
