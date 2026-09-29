@@ -396,6 +396,11 @@ impl ForegroundRunnableCounter {
 struct WindowFrameState {
     visibility: WindowVisibility,
     dirty_at: Option<Instant>,
+    /// When the frame a deferred present failed to show was first owed: its
+    /// invalidation, or the first deferral when nothing was invalidated.
+    /// Unlike `dirty_at` it outlives the pending state's expiry, so retries
+    /// measure the owed frame's deadline from here instead of renewing it.
+    owed_since: Option<Instant>,
     visibility_changed_at: Option<Instant>,
 }
 
@@ -404,6 +409,7 @@ impl WindowFrameState {
         Self {
             visibility,
             dirty_at: None,
+            owed_since: None,
             visibility_changed_at: None,
         }
     }
@@ -494,6 +500,7 @@ impl ForegroundJournalWriter {
         self.power_changed_at = Some(at);
         for window in self.windows.values_mut() {
             window.dirty_at = None;
+            window.owed_since = None;
         }
     }
 
@@ -512,6 +519,7 @@ impl ForegroundJournalWriter {
             window.visibility = visibility;
             window.visibility_changed_at = Some(at);
             window.dirty_at = None;
+            window.owed_since = None;
         }
     }
 
@@ -585,10 +593,23 @@ impl ForegroundJournalWriter {
             // turn does not seal the interval in between. An invalidated
             // frame keeps its invalidation's pending state; a presentation
             // asked for without a new draw (a required presentation, a time
-            // animation's tick) has none, and becomes pending here.
-            self.record_frame_pending(timing.window_id, timing.present_start);
+            // animation's tick) has none, and becomes pending here. Retries
+            // hold the window pending from when the frame was first owed, not
+            // from themselves, so a run of deferrals expires at the deadline
+            // any pending frame has rather than renewing it on every retry.
+            let window = self
+                .windows
+                .entry(timing.window_id)
+                .or_insert_with(|| WindowFrameState::new(WindowVisibility::Visible));
+            let owed_since = *window
+                .owed_since
+                .get_or_insert(window.dirty_at.unwrap_or(timing.present_start));
+            if timing.present_start.saturating_duration_since(owed_since) < FRAME_DEADLINE {
+                self.record_frame_pending(timing.window_id, owed_since);
+            }
         } else if let Some(window) = self.windows.get_mut(&timing.window_id) {
             window.dirty_at = None;
+            window.owed_since = None;
         }
         if self.power_interrupted_since(timing.present_start) {
             return;
@@ -1621,6 +1642,46 @@ mod tests {
             &collector.collect_unseen().entries,
             presented_at
         ));
+    }
+
+    /// Retries of a deferred present hold the window pending from when its
+    /// frame was first owed, so a run of deferrals that outlasts
+    /// [`FRAME_DEADLINE`] lets the interval end idle, as any expired pending
+    /// frame does, instead of each retry renewing the deadline.
+    #[test]
+    fn retries_of_a_deferred_present_do_not_renew_its_deadline() {
+        let start = Instant::now();
+        let window_id = WindowId::from(0xD17E);
+        let (mut journal, mut collector) = test_journal(ForegroundRunnableCounter::new());
+        let defer_at = |journal: &mut ForegroundJournalWriter, at: Instant| {
+            journal.begin_turn();
+            let mut deferred = presentation_timing(window_id, at);
+            deferred.report.outcome = crate::PresentOutcome::Deferred;
+            journal.record_present(deferred, None);
+            journal.end_turn(at);
+        };
+        let early_retry = start + FRAME_DEADLINE - Duration::from_millis(8);
+        let late_retry = start + FRAME_DEADLINE + Duration::from_millis(8);
+        defer_at(&mut journal, start);
+        defer_at(&mut journal, early_retry);
+        defer_at(&mut journal, late_retry);
+
+        let entries = collector.collect_unseen().entries;
+        let pending_marks = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    ForegroundJournalEntry::FrameState(FrameStateChange::Pending { .. })
+                )
+            })
+            .count();
+        assert_eq!(pending_marks, 1, "only the first deferral marks the window");
+        assert!(!has_boundary_at(&entries, early_retry));
+        assert!(
+            has_boundary_at(&entries, late_retry),
+            "the turn past the deadline ends the interval idle"
+        );
     }
 
     /// A frame that outlives [`FRAME_DEADLINE`] no longer seals an interval
