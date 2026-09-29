@@ -42,6 +42,15 @@ pub struct FrameWorkStats {
     /// Kept self-measuring nodes given a new measurement and dirtied, so that
     /// the layout engine measures them again.
     pub measured_nodes_dirtied: u64,
+    /// Text nodes whose element took last frame's measurement over, because
+    /// it would shape its text the same way, leaving the node clean.
+    pub measurements_carried: u64,
+    /// Text nodes whose text changed but measured to every size the layout
+    /// engine had taken of them, leaving the node clean.
+    pub measurements_replayed: u64,
+    /// Measurements taken to find those out, outside the layout engine, and
+    /// not counted in [`Self::measure_calls`].
+    pub replay_measure_calls: u64,
     /// Layout computations: the root's, and every one an element asked for
     /// on its own, such as a cached view or a list item.
     pub compute_layout_calls: u64,
@@ -112,6 +121,9 @@ impl Window {
             layout_style_writes: retention.style_writes,
             layout_children_writes: retention.children_writes,
             measured_nodes_dirtied: retention.measured_nodes_dirtied,
+            measurements_carried: retention.measurements_carried,
+            measurements_replayed: retention.measurements_replayed,
+            replay_measure_calls: retention.replay_measure_calls,
             ..self.frame_work.stats
         }
     }
@@ -184,7 +196,11 @@ mod tests {
         assert!(first.elements >= 13, "{first:?}");
         assert!(first.views_rendered >= 1, "{first:?}");
         assert!(first.layout_nodes >= 13, "{first:?}");
-        assert!(first.measure_calls >= 6, "{first:?}");
+        assert!(first.measure_calls >= 1, "the new label is measured: {first:?}");
+        assert!(
+            first.measure_calls + first.measurements_carried >= 6,
+            "every label is measured or carries its measurement: {first:?}"
+        );
         assert!(first.compute_layout_calls >= 1, "{first:?}");
         assert_eq!(first.lines_shaped, 1, "only the new label is shaped: {first:?}");
         assert_eq!(first.build_time, Duration::ZERO);

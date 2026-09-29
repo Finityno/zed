@@ -2,8 +2,7 @@ use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextAlign,
-    TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
+    TextRun, TextStyle, TooltipId, Window, WrappedLine,
     WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
@@ -20,6 +19,8 @@ use std::{
     sync::LazyLock,
     time::{Duration, Instant},
 };
+
+mod measurement;
 
 static SHIMMER_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -923,196 +924,9 @@ impl TextLayout {
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> LayoutId {
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
-
-        let runs = if let Some(runs) = runs {
-            runs
-        } else {
-            vec![text_style.to_run(text.len())]
-        };
-        window.request_measured_layout(Default::default(), {
-            let element_state = self.clone();
-
-            move |known_dimensions, available_space, window, cx| {
-                let wrap_width = if text_style.white_space == WhiteSpace::Normal {
-                    known_dimensions.width.or(match available_space.width {
-                        crate::AvailableSpace::Definite(x) => Some(x),
-                        _ => None,
-                    })
-                } else {
-                    None
-                };
-
-                let truncate_width = text_style.text_overflow.as_ref().and_then(|_| {
-                    known_dimensions.width.or(match available_space.width {
-                        crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                            Some(max_lines) => Some(x * max_lines),
-                            None => Some(x),
-                        },
-                        _ => None,
-                    })
-                });
-
-                // Only use cached layout if:
-                // 1. We have a cached size
-                // 2. wrap_width matches EXACTLY (including None == None), or the
-                //    cached layout was shaped unwrapped and already fits the
-                //    width now offered (see below)
-                // 3. truncate_width matches (a layout computed without truncation
-                //    cannot answer for one with it, nor the other way round)
-                //
-                // FINCODE FORK: upstream's check here is
-                // `wrap_width.is_none() || wrap_width == text_layout.wrap_width`,
-                // which answers intrinsic-sizing probes (Taffy min-/max-content,
-                // wrap_width == None) with a size shaped at whatever definite
-                // width happened to be cached. That poisons flex sizing: if one
-                // transient frame shaped this text at a collapsed width (the
-                // cached size is then ~one glyph wide and very tall), the next
-                // probe is answered with that collapsed size, the parent flex
-                // node is sized around it, and the definite width handed back
-                // re-creates the collapsed shape — a self-perpetuating fixpoint
-                // that paints transcript text one character per line until some
-                // unrelated change rebuilds the element. Probes must therefore
-                // only reuse a layout produced under the same wrap_width.
-                //
-                // The other direction is exact: Taffy probes a wrapping leaf
-                // unconstrained before laying it out at a definite width, and
-                // text whose unwrapped shape is no wider than that width wraps
-                // nowhere, so the unwrapped lines are the wrapped lines. Only
-                // text the width actually bites is shaped a second time.
-                if let Some(text_layout) = element_state.0.borrow().as_ref()
-                    && let Some(size) = text_layout.size
-                    && truncate_width == text_layout.truncate_width
-                    && (wrap_width == text_layout.wrap_width
-                        || (text_layout.wrap_width.is_none()
-                            && truncate_width.is_none()
-                            && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width)))
-                {
-                    return size;
-                }
-
-                // FINCODE FORK: when an intrinsic probe (wrap_width == None)
-                // misses the cache above, it shapes unwrapped below — the
-                // correct intrinsic answer. But it must NOT overwrite a cached
-                // definite-width layout: paint() draws whatever lines are
-                // stored here into the assigned bounds without re-wrapping, so
-                // clobbering the wrapped lines with an unwrapped probe shape
-                // would paint the text as one long unwrapped line. Probes
-                // compute their answer and leave the stored layout untouched.
-                let preserve_cached_layout = wrap_width.is_none()
-                    && element_state.0.borrow().as_ref().is_some_and(|cached| {
-                        cached.wrap_width.is_some() && cached.size.is_some()
-                    });
-
-                // Only truncation needs a line wrapper and an affix: taking the
-                // wrapper resolves the font and locks the wrapper pool.
-                let (text, runs) = if let Some(truncate_width) = truncate_width
-                    && let Some(text_overflow) = text_style.text_overflow.as_ref()
-                {
-                    let (truncation_affix, truncate_from) = match text_overflow {
-                        TextOverflow::Truncate(affix) => (affix, TruncateFrom::End),
-                        TextOverflow::TruncateStart(affix) => (affix, TruncateFrom::Start),
-                        TextOverflow::TruncateMiddle(affix) => (affix, TruncateFrom::Middle),
-                    };
-                    let mut line_wrapper =
-                        cx.text_system().line_wrapper(text_style.font(), font_size);
-                    if let Some(max_lines) = text_style.line_clamp
-                        && let Some(wrap_width) = wrap_width
-                    {
-                        line_wrapper.truncate_wrapped_line(
-                            text.clone(),
-                            wrap_width,
-                            max_lines,
-                            truncation_affix,
-                            &runs,
-                            truncate_from,
-                        )
-                    } else if let Some(unclipped) = window
-                        .text_system()
-                        .shape_text(text.clone(), font_size, &runs, None, None)
-                        .log_err()
-                        && unclipped
-                            .iter()
-                            .all(|line| line.size(line_height).width <= truncate_width)
-                    {
-                        // The truncation decision below sums per-character advances,
-                        // which overestimates the shaped width (no kerning), truncating
-                        // text that fits exactly in its measured width. Skip truncation
-                        // whenever the honestly-shaped text fits; the shaping result
-                        // comes from the line layout cache when the same text was
-                        // already measured untruncated this frame.
-                        (text.clone(), Cow::Borrowed(&*runs))
-                    } else {
-                        line_wrapper.truncate_line(
-                            text.clone(),
-                            truncate_width,
-                            truncation_affix,
-                            &runs,
-                            truncate_from,
-                        )
-                    }
-                } else {
-                    (text.clone(), Cow::Borrowed(&*runs))
-                };
-                let len = text.len();
-
-                let Some(lines) = window
-                    .text_system()
-                    .shape_text(
-                        text,
-                        font_size,
-                        &runs,
-                        wrap_width,            // Wrap if we know the width.
-                        text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                    )
-                    .log_err()
-                else {
-                    if !preserve_cached_layout {
-                        element_state.0.borrow_mut().replace(TextLayoutInner {
-                            text_align: text_style.text_align,
-                            lines: Default::default(),
-                            len: 0,
-                            line_height,
-                            wrap_width,
-                            truncate_width,
-                            size: Some(Size::default()),
-                            bounds: None,
-                        });
-                    }
-                    return Size::default();
-                };
-
-                let mut size: Size<Pixels> = Size::default();
-                for line in &lines {
-                    let line_size = line.size(line_height);
-                    size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
-                }
-
-                if !preserve_cached_layout {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        text_align: text_style.text_align,
-                        lines,
-                        len,
-                        line_height,
-                        wrap_width,
-                        truncate_width,
-                        size: Some(size),
-                        bounds: None,
-                    });
-                }
-
-                size
-            }
-        })
+        measurement::layout_text(self, text, runs, window, cx)
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, text_align: TextAlign) {

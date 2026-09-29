@@ -574,7 +574,7 @@ impl Element for Segments {
 }
 
 /// The no-op text system, except that every glyph rasterizes to a small box,
-/// so text paints a sprite per glyph and where each glyph went is compared.
+/// so text paints a sprite per glyph and what went where is compared.
 struct GlyphBoxTextSystem(NoopTextSystem);
 
 impl PlatformTextSystem for GlyphBoxTextSystem {
@@ -606,10 +606,12 @@ impl PlatformTextSystem for GlyphBoxTextSystem {
         self.0.glyph_for_char(font_id, ch)
     }
 
-    fn glyph_raster_bounds(&self, _params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+    /// Each glyph's box is as wide as its id says, so which glyph was painted
+    /// shows as well as where.
+    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         Ok(Bounds {
             origin: point(DevicePixels(0), DevicePixels(-8)),
-            size: size(DevicePixels(5), DevicePixels(9)),
+            size: size(DevicePixels(2 + (params.glyph_id.0 % 7) as i32), DevicePixels(9)),
         })
     }
 
@@ -622,8 +624,16 @@ impl PlatformTextSystem for GlyphBoxTextSystem {
         Ok((raster_bounds.size, vec![u8::MAX; area.max(0) as usize]))
     }
 
+    /// The no-op layout, with each glyph named after its character, so that
+    /// glyphs of different characters paint differently.
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        self.0.layout_line(text, font_size, runs)
+        let mut layout = self.0.layout_line(text, font_size, runs);
+        for glyph in layout.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+            if let Some(character) = text[glyph.index..].chars().next() {
+                glyph.id = GlyphId(character as u32 + 16);
+            }
+        }
+        layout
     }
 
     fn recommended_rendering_mode(&self, font_id: FontId, font_size: Pixels) -> TextRenderingMode {
@@ -1004,13 +1014,17 @@ fn dashboard_frame_work() {
             |duration: std::time::Duration| duration.as_secs_f64() * 1000. / work.frames as f64;
         eprintln!(
             "retained layout {retained}: per frame {:.0} nodes, {:.0} reused, {:.0} created, \
-             {:.0} measured nodes dirtied, {:.0} measure calls, {:.1} lines shaped; \
+             {:.0} measured nodes dirtied, {:.0} carried, {:.0} replayed, {:.0} measure calls, \
+             {:.0} replay measure calls, {:.1} lines shaped; \
              build {:.2} ms, prepaint {:.2} ms (layout {:.2} ms, measuring {:.2} ms), paint {:.2} ms",
             per_frame(work.layout_nodes),
             per_frame(work.layout_nodes_reused),
             per_frame(work.layout_nodes_created),
             per_frame(work.measured_nodes_dirtied),
+            per_frame(work.measurements_carried),
+            per_frame(work.measurements_replayed),
             per_frame(work.measure_calls),
+            per_frame(work.replay_measure_calls),
             per_frame(work.lines_shaped),
             per_frame_ms(work.build_time),
             per_frame_ms(work.prepaint_time),
@@ -1019,4 +1033,70 @@ fn dashboard_frame_work() {
             per_frame_ms(work.paint_time),
         );
     }
+}
+
+/// Text in a narrow box, above a probe that lands below it.
+struct WrappedText {
+    text: SharedString,
+    color: Hsla,
+}
+
+impl Render for WrappedText {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(200.))
+            .child(
+                div()
+                    .w(px(120.))
+                    .text_color(self.color)
+                    .child(self.text.clone()),
+            )
+            .child(div().w(px(20.)).h(px(10.)).bg(PALETTE[2]))
+    }
+}
+
+fn wrapped_text(text: &'static str) -> impl FnOnce(&mut Context<WrappedText>) -> WrappedText {
+    move |_| WrappedText {
+        text: text.into(),
+        color: PALETTE[0],
+    }
+}
+
+/// Text drawn again as it was takes last frame's measurement over, and
+/// recolored text does too, repainted with its new colour: neither is
+/// measured again nor dirties the nodes above it.
+#[test]
+fn text_measured_the_same_way_keeps_its_measurement() {
+    let unchanged = work_after(wrapped_text("a label that wraps in the box"), |_, _| {});
+    assert_eq!(unchanged.measured_nodes_dirtied, 0, "{unchanged:?}");
+    assert_eq!(unchanged.measure_calls, 0, "{unchanged:?}");
+    assert!(unchanged.measurements_carried >= 1, "{unchanged:?}");
+
+    let recolored = work_after(wrapped_text("a label that wraps in the box"), |view, _| {
+        view.color = PALETTE[3]
+    });
+    assert_eq!(recolored.measured_nodes_dirtied, 0, "{recolored:?}");
+    assert_eq!(recolored.measure_calls, 0, "{recolored:?}");
+    assert!(recolored.measurements_carried >= 1, "{recolored:?}");
+}
+
+/// Changed text that measures what it measured before, under every
+/// constraint it was measured under, leaves its node and the nodes above it
+/// clean; text that wraps differently is measured again.
+#[test]
+fn changed_text_is_measured_again_only_when_its_size_changes() {
+    let same_size = work_after(wrapped_text("value 42"), |view, _| {
+        view.text = "value 17".into()
+    });
+    assert_eq!(same_size.measured_nodes_dirtied, 0, "{same_size:?}");
+    assert_eq!(same_size.measure_calls, 0, "{same_size:?}");
+    assert_eq!(same_size.measurements_replayed, 1, "{same_size:?}");
+
+    let longer = work_after(wrapped_text("value 42"), |view, _| {
+        view.text = "a value long enough to wrap onto a second line".into()
+    });
+    assert_eq!(longer.measured_nodes_dirtied, 1, "{longer:?}");
+    assert!(longer.measure_calls > 0, "{longer:?}");
 }

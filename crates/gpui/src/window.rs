@@ -5792,6 +5792,44 @@ impl Window {
         )
     }
 
+    /// Adds a self-measuring leaf in the default style, as
+    /// [`Self::request_measured_layout`] does, whose measurement can be carried
+    /// over from the element that measured the same node last frame.
+    ///
+    /// `adopt` is given `state` and what that element left, and takes its
+    /// measurement over when it still stands; the node then stays clean, and
+    /// Taffy keeps what it cached for it and the nodes above it. Otherwise
+    /// `measure` may run here, under the constraints Taffy measured the node
+    /// under, to tell whether it still measures the same.
+    pub(crate) fn request_carried_measured_layout<S: 'static>(
+        &mut self,
+        state: S,
+        adopt: impl FnOnce(&S, &dyn std::any::Any) -> crate::taffy::Adopted,
+        measure: impl Fn(&S, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+        + 'static,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.invalidator.debug_assert_prepaint();
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.frame_work.stats.layout_nodes += 1;
+        let key = self.layout_keys.current();
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        let id = layout_engine.request_carried_measured_layout(
+            key,
+            None,
+            rem_size,
+            scale_factor,
+            state,
+            adopt,
+            measure,
+            self,
+            cx,
+        );
+        self.layout_engine = Some(layout_engine);
+        id
+    }
+
     /// Compute the layout for the given id within the given available space.
     /// This method is called for its side effect, typically by the framework prior to painting.
     /// After calling it, you can request the bounds of the given layout node id or any descendant.
