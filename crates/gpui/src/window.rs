@@ -967,6 +967,17 @@ impl TooltipId {
     }
 }
 
+/// A measurement closure with the key [`Window::request_measured_layout_with_key`]
+/// was given, and the type of the closure, which the key is only compared
+/// within.
+struct KeyedMeasurement {
+    key: u64,
+    closure: std::any::TypeId,
+    measure: Box<
+        dyn Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>,
+    >,
+}
+
 pub(crate) struct TooltipBounds {
     id: TooltipId,
     bounds: Bounds<Pixels>,
@@ -5801,7 +5812,68 @@ impl Window {
         )
     }
 
-    /// Adds a self-measuring leaf in the default style, as
+    /// Adds a self-measuring leaf, as [`Self::request_measured_layout`] does,
+    /// with a `key` saying what the measurement depends on, so that layout
+    /// kept from the last frame can be kept on this one.
+    ///
+    /// A layout node kept across frames that is given a new measurement
+    /// closure has to be measured again, and everything above it laid out
+    /// again, unless something says the new closure measures what the old one
+    /// did. `key` says so: when the element that took this node last frame
+    /// asked for it with the same key (and a closure of the same type), the
+    /// node is left clean, and the layout engine keeps what it computed for
+    /// it and for the nodes above it. The new closure is still the one called
+    /// if the engine measures the node under constraints it has not seen.
+    ///
+    /// When the key changed, the new closure is called here, under every
+    /// constraint the engine measured the node under since it was last
+    /// dirtied; if it gives every size it gave then, the node is still left
+    /// clean. Only a change in size lays out the nodes above it again.
+    ///
+    /// The key has to cover everything the closure's result depends on: a
+    /// closure returning a fixed extent can use a hash of that extent. Two
+    /// closures given the same key that would measure differently leave the
+    /// layout wrong; when in doubt, use [`Self::request_measured_layout`],
+    /// which measures every frame.
+    ///
+    /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    pub fn request_measured_layout_with_key<F>(
+        &mut self,
+        style: Style,
+        key: u64,
+        measure: F,
+        cx: &mut App,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        self.request_carried_measured_layout(
+            Some(&style),
+            KeyedMeasurement {
+                key,
+                closure: std::any::TypeId::of::<F>(),
+                measure: Box::new(measure),
+            },
+            |measurement, previous| {
+                match previous.downcast_ref::<KeyedMeasurement>() {
+                    Some(previous)
+                        if previous.key == measurement.key
+                            && previous.closure == measurement.closure =>
+                    {
+                        crate::taffy::Adopted::Measurement
+                    }
+                    _ => crate::taffy::Adopted::No,
+                }
+            },
+            |measurement, known, available, window, cx| {
+                (measurement.measure)(known, available, window, cx)
+            },
+            cx,
+        )
+    }
+
+    /// Adds a self-measuring leaf in `style`, the default one if `None`, as
     /// [`Self::request_measured_layout`] does, whose measurement can be carried
     /// over from the element that measured the same node last frame.
     ///
@@ -5812,6 +5884,7 @@ impl Window {
     /// under, to tell whether it still measures the same.
     pub(crate) fn request_carried_measured_layout<S: 'static>(
         &mut self,
+        style: Option<&Style>,
         state: S,
         adopt: impl FnOnce(&S, &dyn std::any::Any) -> crate::taffy::Adopted,
         measure: impl Fn(&S, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
@@ -5826,7 +5899,7 @@ impl Window {
         let mut layout_engine = self.layout_engine.take().unwrap();
         let id = layout_engine.request_carried_measured_layout(
             key,
-            None,
+            style,
             rem_size,
             scale_factor,
             state,

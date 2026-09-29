@@ -42,11 +42,13 @@ pub struct FrameWorkStats {
     /// Kept self-measuring nodes given a new measurement and dirtied, so that
     /// the layout engine measures them again.
     pub measured_nodes_dirtied: u64,
-    /// Text nodes whose element took last frame's measurement over, because
-    /// it would shape its text the same way, leaving the node clean.
+    /// Measured nodes whose element took last frame's measurement over,
+    /// leaving the node clean: text that would shape the same way, and
+    /// measurements asked for with the key they had
+    /// ([`Window::request_measured_layout_with_key`]).
     pub measurements_carried: u64,
-    /// Text nodes whose text changed but measured to every size the layout
-    /// engine had taken of them, leaving the node clean.
+    /// Measured nodes whose text or key changed but that measured to every
+    /// size the layout engine had taken of them, leaving the node clean.
     pub measurements_replayed: u64,
     /// Measurements taken to find those out, outside the layout engine, and
     /// not counted in [`Self::measure_calls`].

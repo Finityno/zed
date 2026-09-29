@@ -179,7 +179,7 @@ pub(super) fn layout_text(
     cx: &mut App,
 ) -> LayoutId {
     let inputs = TextMeasureInputs::new(text, runs, layout, window);
-    window.request_carried_measured_layout(inputs, adopt_measurement, measure_text, cx)
+    window.request_carried_measured_layout(None, inputs, adopt_measurement, measure_text, cx)
 }
 
 /// Takes over the measurement `previous` left, if it stands for `inputs`.

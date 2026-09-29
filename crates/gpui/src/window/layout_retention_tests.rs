@@ -92,6 +92,7 @@ enum Change {
     Segment { at: usize, word: usize },
     SegmentCount { count: usize },
     SegmentWidth { width: f32 },
+    SegmentKeying,
     Tint,
     Select { row: usize },
     Resize { width: f32, height: f32 },
@@ -157,9 +158,10 @@ impl Change {
             78..80 => Change::SegmentCount {
                 count: rng.random_range(0..8),
             },
-            80..83 => Change::SegmentWidth {
+            80..82 => Change::SegmentWidth {
                 width: rng.random_range(40.0..300.0),
             },
+            82..83 => Change::SegmentKeying,
             83..85 => Change::Tint,
             85..87 => Change::Select {
                 row: rng.random_range(0..64),
@@ -188,6 +190,8 @@ struct OracleView {
     column: bool,
     segments: Vec<usize>,
     segment_width: Pixels,
+    /// Whether the segments' extent is measured with a key.
+    keyed_segments: bool,
     tint: usize,
     /// The row that asks the list to scroll it into view when it is shown.
     selected: Option<u64>,
@@ -219,6 +223,7 @@ impl OracleView {
             column: false,
             segments: vec![0, 5, 8],
             segment_width: px(160.),
+            keyed_segments: true,
             tint: 0,
             selected: None,
             badge: cx.new(|_| Badge { count: 0 }),
@@ -290,6 +295,7 @@ impl OracleView {
                 self.segments.resize(count, 1);
             }
             Change::SegmentWidth { width } => self.segment_width = px(width),
+            Change::SegmentKeying => self.keyed_segments = !self.keyed_segments,
             Change::Tint => {
                 self.tint += 1;
                 self.badge.update(cx, |badge, cx| {
@@ -475,6 +481,7 @@ impl Render for OracleView {
                 words: self.segments.clone(),
                 width: self.segment_width,
                 tint,
+                keyed: self.keyed_segments,
             })
             .child(uniform_rows)
             .child(list_rows)
@@ -510,6 +517,9 @@ struct Segments {
     words: Vec<usize>,
     width: Pixels,
     tint: usize,
+    /// Measures with a key naming the extent, as an element that knows what
+    /// its measurement depends on does.
+    keyed: bool,
 }
 
 impl IntoElement for Segments {
@@ -537,13 +547,18 @@ impl Element for Segments {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, ()) {
         let extent = size(self.width, px(SEGMENT_HEIGHT * self.words.len() as f32));
-        (
-            window.request_measured_layout(Style::default(), move |_, _, _, _| extent),
-            (),
-        )
+        let measure = move |_, _, _: &mut Window, _: &mut App| extent;
+        let layout_id = if self.keyed {
+            let key = u64::from(extent.width.0.to_bits()) << 32
+                | u64::from(extent.height.0.to_bits());
+            window.request_measured_layout_with_key(Style::default(), key, measure, cx)
+        } else {
+            window.request_measured_layout(Style::default(), measure)
+        };
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -1280,4 +1295,120 @@ fn text_moving_to_another_node_is_not_shaped_again() {
         "rows landed on their neighbours' nodes: {work:?}"
     );
     assert_eq!(work.lines_shaped, 1, "only the inserted row is new: {work:?}");
+}
+
+/// A box whose measurement is keyed by what it measures to.
+struct KeyedBox {
+    extent: Size<Pixels>,
+    /// The key the measurement is given, which callers keep in step with
+    /// what it depends on.
+    key: u64,
+}
+
+impl Render for KeyedBox {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().flex().flex_col().child(div().h(px(4.)).bg(PALETTE[1])).child(KeyedLeaf {
+            extent: self.extent,
+            key: self.key,
+        })
+    }
+}
+
+struct KeyedLeaf {
+    extent: Size<Pixels>,
+    key: u64,
+}
+
+impl IntoElement for KeyedLeaf {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for KeyedLeaf {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let extent = self.extent;
+        (
+            window.request_measured_layout_with_key(
+                Style::default(),
+                self.key,
+                move |_, _, _, _| extent,
+                cx,
+            ),
+            (),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        window.paint_quad(crate::fill(bounds, PALETTE[2]));
+    }
+}
+
+fn keyed_box(extent: Size<Pixels>, key: u64) -> impl FnOnce(&mut Context<KeyedBox>) -> KeyedBox {
+    move |_| KeyedBox { extent, key }
+}
+
+/// A measurement asked for with the key it had last frame leaves its node
+/// clean; with another key it is measured again, and dirties the nodes
+/// above it only when it measures to another size.
+#[test]
+fn a_keyed_measurement_is_taken_again_only_when_its_key_changes() {
+    let extent = size(px(40.), px(30.));
+    let same_key = work_after(keyed_box(extent, 1), |_, _| {});
+    assert_eq!(same_key.measured_nodes_dirtied, 0, "{same_key:?}");
+    assert_eq!(same_key.measure_calls, 0, "{same_key:?}");
+    assert!(same_key.measurements_carried >= 1, "{same_key:?}");
+
+    let new_key_same_size = work_after(keyed_box(extent, 1), |view, _| view.key = 2);
+    assert_eq!(
+        new_key_same_size.measured_nodes_dirtied, 0,
+        "{new_key_same_size:?}"
+    );
+    assert_eq!(new_key_same_size.measurements_replayed, 1, "{new_key_same_size:?}");
+
+    let new_size = work_after(keyed_box(extent, 1), |view, _| {
+        view.key = 2;
+        view.extent = size(px(40.), px(60.));
+    });
+    assert_eq!(new_size.measured_nodes_dirtied, 1, "{new_size:?}");
+    assert!(new_size.measure_calls > 0, "{new_size:?}");
 }
