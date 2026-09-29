@@ -30,7 +30,8 @@ use gpui::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NativeMenuItem, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
+    PresentOutcome, PresentReport, PromptButton, PromptLevel, RequestFrameOptions, Rgba,
+    SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle,
     WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
@@ -79,7 +80,7 @@ use std::{
         Arc, Once, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
@@ -2634,19 +2635,20 @@ impl PlatformWindow for MacWindow {
         this.release_intermediates_if_occluded();
     }
 
-    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) {
+    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) -> PresentReport {
         let mut this = self.0.lock();
         if this.overlay_renderer.is_none() {
             // Every present comes through here (gpui core never calls `draw`),
             // so the occluded-window release has to happen on this branch too
             // or a window without an overlay keeps the intermediates a stray
             // draw rebuilt while it was hidden.
-            this.renderer.draw(scene);
+            let report = this.renderer.draw(scene);
             this.release_intermediates_if_occluded();
-            return;
+            return report;
         }
 
         let this = &mut *this;
+        let split_start = Instant::now();
         let split = overlay_start.min(scene.len());
         // The two halves are kept across presents so their vectors hold
         // their capacity, instead of being allocated and freed per frame for
@@ -2662,7 +2664,8 @@ impl PlatformWindow for MacWindow {
         this.overlay_input_active
             .store(!this.overlay_scene.is_empty(), Ordering::Release);
         this.renderer.note_scene_tiles(&this.overlay_scene);
-        this.renderer.draw(&this.base_scene);
+        let split_duration = split_start.elapsed();
+        let mut report = this.renderer.draw(&this.base_scene);
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
@@ -2671,10 +2674,17 @@ impl PlatformWindow for MacWindow {
             .as_mut()
             .expect("overlay renderer checked above");
         overlay_renderer.lend_intermediates(intermediates);
-        overlay_renderer.draw(&this.overlay_scene);
+        let overlay_report = overlay_renderer.draw(&this.overlay_scene);
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
         this.release_intermediates_if_occluded();
+
+        report.breakdown.encode += split_duration;
+        report.breakdown.accumulate(overlay_report.breakdown);
+        if overlay_report.outcome != PresentOutcome::Presented {
+            report.outcome = overlay_report.outcome;
+        }
+        report
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {

@@ -827,6 +827,9 @@ pub struct PresentTiming {
     /// The interval since the previous newly drawn frame was submitted, when
     /// both frames belong to an active animation.
     pub animation_interval: Option<Duration>,
+    /// What the platform reported for the submission: whether the frame
+    /// landed, and where its time went when the platform measures that.
+    pub report: crate::PresentReport,
 }
 
 #[cfg(feature = "profiler")]
@@ -1068,12 +1071,14 @@ impl WindowProfiler {
         present_end: Instant,
         window_active: bool,
         next_frame_scheduled: bool,
+        report: crate::PresentReport,
     ) {
-        self.record_present_at(
+        self.record_present_report_at(
             present_start,
             present_end,
             window_active,
             next_frame_scheduled,
+            report,
         );
     }
 
@@ -1095,12 +1100,30 @@ impl WindowProfiler {
         }
     }
 
+    #[cfg(test)]
     fn record_present_at(
         &mut self,
         present_start: Instant,
         present_end: Instant,
         window_active: bool,
         next_frame_scheduled: bool,
+    ) {
+        self.record_present_report_at(
+            present_start,
+            present_end,
+            window_active,
+            next_frame_scheduled,
+            crate::PresentReport::default(),
+        );
+    }
+
+    fn record_present_report_at(
+        &mut self,
+        present_start: Instant,
+        present_end: Instant,
+        window_active: bool,
+        next_frame_scheduled: bool,
+        report: crate::PresentReport,
     ) {
         if let Some(first_input_at) = self.first_input_at.take()
             && journal::frame_sample_is_valid(self.window_id, first_input_at)
@@ -1138,6 +1161,7 @@ impl WindowProfiler {
             present_start,
             present_end,
             animation_interval,
+            report,
         };
         journal::record_present(present_timing, frame);
 

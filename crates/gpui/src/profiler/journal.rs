@@ -1347,6 +1347,7 @@ mod tests {
             present_start: start + Duration::from_millis(5),
             present_end: start + Duration::from_millis(6),
             animation_interval: None,
+            report: Default::default(),
         };
         let mut sealer = IntervalSealer::new(start);
 
@@ -2976,6 +2977,7 @@ mod tests {
             present_start: present_end,
             present_end,
             animation_interval: None,
+            report: Default::default(),
         }
     }
 

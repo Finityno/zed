@@ -234,6 +234,21 @@ pub enum SerializedHangContributor {
         start_ms: f64,
         /// How long platform submission took, in milliseconds.
         duration_ms: f64,
+        /// What became of the frame: `"presented"` or `"dropped"`.
+        outcome: &'static str,
+        /// Of `duration_ms`, the wait for a surface to render into (macOS:
+        /// `nextDrawable`).
+        acquire_ms: f64,
+        /// Of `duration_ms`, encoding the scene's GPU work.
+        encode_ms: f64,
+        /// Of `duration_ms`, handing the work to the GPU and compositor.
+        commit_ms: f64,
+        /// Surfaces the present covered; 0 when the platform does not
+        /// measure the breakdown, and the three splits are then 0 too.
+        layers: u8,
+        /// The most surfaces any layer had submitted but not yet seen
+        /// displayed when it asked for the next one.
+        drawables_in_flight: u8,
         /// How many other events in the interval contain this one.
         depth: usize,
     },
@@ -369,12 +384,21 @@ impl SerializedHangContributor {
                 invalidations: timing.invalidations,
                 depth,
             },
-            ForegroundEvent::Present(timing) => Self::Present {
-                window_id: timing.window_id.as_u64(),
-                start_ms: since_startup(timing.present_start),
-                duration_ms,
-                depth,
-            },
+            ForegroundEvent::Present(timing) => {
+                let breakdown = timing.report.breakdown;
+                Self::Present {
+                    window_id: timing.window_id.as_u64(),
+                    start_ms: since_startup(timing.present_start),
+                    duration_ms,
+                    outcome: timing.report.outcome.name(),
+                    acquire_ms: as_millis(breakdown.acquire),
+                    encode_ms: as_millis(breakdown.encode),
+                    commit_ms: as_millis(breakdown.commit),
+                    layers: breakdown.layers,
+                    drawables_in_flight: breakdown.drawables_in_flight,
+                    depth,
+                }
+            }
             ForegroundEvent::SmallPolls(flush) => {
                 // The sealer folds these out of snapshot events; a contributor
                 // can therefore never be one, but serialize defensively as an
@@ -525,6 +549,7 @@ mod tests {
                         present_start: presented_at - Duration::from_millis(1),
                         present_end: presented_at,
                         animation_interval: None,
+                        report: Default::default(),
                     },
                 }),
             )]);
@@ -554,6 +579,7 @@ mod tests {
             present_start: at(380),
             present_end: at(400),
             animation_interval: None,
+            report: Default::default(),
         };
         let frame = FrameTiming {
             window_id,
@@ -653,6 +679,64 @@ mod tests {
         assert_eq!(serialized.active_ms, 60.0);
         assert_eq!(serialized.stall_ms, 60.0);
         assert_eq!(serialized.busy_fraction, 1.0);
+    }
+
+    /// A slow present names which part of it was slow, so a report can tell
+    /// a starved drawable pool from slow encoding or a GPU backlog.
+    #[test]
+    fn serialized_present_carries_its_breakdown() {
+        let startup = scheduler::Instant::now();
+        let at = |ms: u64| startup + Duration::from_millis(ms);
+        let presentation = PresentTiming {
+            window_id: WindowId::from(0xB4EA),
+            present_start: at(1000),
+            present_end: at(2000),
+            animation_interval: None,
+            report: crate::PresentReport {
+                outcome: crate::PresentOutcome::Presented,
+                breakdown: crate::PresentBreakdown {
+                    acquire: Duration::from_micros(990_250),
+                    encode: Duration::from_millis(8),
+                    commit: Duration::from_millis(1),
+                    layers: 2,
+                    drawables_in_flight: 2,
+                },
+            },
+        };
+        let snapshot = FrameSnapshot {
+            interval_start: at(1000),
+            boundary: IntervalBoundary::Idle { ended_at: at(2000) },
+            events: vec![ForegroundEvent::Present(presentation)],
+            small_polls: Vec::new(),
+            dropped_events: 0,
+            journal_discontinuous: false,
+        };
+        let incident =
+            HangIncident::detect(snapshot, HANG_THRESHOLD, FRAME_BUDGET).expect("has contributors");
+        let serialized = SerializedHangIncident::convert(startup, &incident, 8, None);
+
+        let [
+            SerializedHangContributor::Present {
+                duration_ms,
+                outcome,
+                acquire_ms,
+                encode_ms,
+                commit_ms,
+                layers,
+                drawables_in_flight,
+                ..
+            },
+        ] = serialized.contributors.as_slice()
+        else {
+            panic!("expected one present contributor, got {serialized:?}");
+        };
+        assert_eq!(*duration_ms, 1000.0);
+        assert_eq!(*outcome, "presented");
+        assert_eq!(*acquire_ms, 990.25);
+        assert_eq!(*encode_ms, 8.0);
+        assert_eq!(*commit_ms, 1.0);
+        assert_eq!(*layers, 2);
+        assert_eq!(*drawables_in_flight, 2);
     }
 
     #[test]
@@ -775,6 +859,7 @@ mod tests {
                     present_start: at(145),
                     present_end: at(150),
                     animation_interval: None,
+                    report: Default::default(),
                 },
             }),
             events: vec![
@@ -861,6 +946,7 @@ mod tests {
                     present_start: at(149),
                     present_end: at(150),
                     animation_interval: None,
+                    report: Default::default(),
                 },
             }),
             events: vec![task_poll_event(at(0), at(5))],
@@ -975,6 +1061,7 @@ mod tests {
                     present_start: at(149),
                     present_end: at(150),
                     animation_interval: None,
+                    report: Default::default(),
                 },
             }),
             events: Vec::new(),
@@ -1289,6 +1376,7 @@ mod tests {
             present_start: present_end - Duration::from_millis(1),
             present_end,
             animation_interval: None,
+            report: Default::default(),
         }
     }
 

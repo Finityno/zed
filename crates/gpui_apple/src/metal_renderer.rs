@@ -9,8 +9,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size, point,
-    quad_depth, size,
+    PresentBreakdown, PresentOutcome, PresentReport, PrimitiveBatch, RenderMemoryGauge,
+    RenderMemoryLedger, ScaledPixels, Scene, Size, point, quad_depth, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -29,7 +29,19 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Instant,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -227,6 +239,11 @@ pub struct MetalRenderer {
     stale_texture_heals: u32,
     /// When GPU memory stats were last logged, while `FINCODE_GPU_STATS=1`.
     gpu_stats_last_log: Option<std::time::Instant>,
+    /// Drawables handed to `present` whose presented handler has not run
+    /// yet: queued behind the one on screen, or held by a compositor that is
+    /// not showing the window. Shared with the handlers, which run on a
+    /// Metal thread.
+    drawables_in_flight: Arc<AtomicU32>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     /// Set by [`Self::release_intermediate_textures`] while the window is
@@ -656,6 +673,7 @@ impl MetalRenderer {
             fallback_depth_idle_frames: 0,
             render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
+            drawables_in_flight: Arc::new(AtomicU32::new(0)),
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -1073,7 +1091,7 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, scene: &Scene) -> PresentReport {
         // `nextDrawable` hands back an autoreleased drawable, and the command
         // buffer and pass descriptors are autoreleased too. Without a pool of
         // its own the frame's drawable stays retained until the main run
@@ -1087,14 +1105,29 @@ impl MetalRenderer {
         objc2::rc::autoreleasepool(|_| self.draw_in_pool(scene))
     }
 
-    fn draw_in_pool(&mut self, scene: &Scene) {
+    /// Presents `scene` to the layer and reports where the time went:
+    /// `acquire` is `nextDrawable`, `encode` is `render_frame`, and `commit`
+    /// is the hand-off to the GPU and compositor, including the
+    /// in-transaction path's wait for the command buffer to be scheduled.
+    /// They are split because a slow present has different causes in each:
+    /// a compositor holding the layer's drawables, main-thread CPU (or page
+    /// faults) while encoding, or a GPU backlog.
+    fn draw_in_pool(&mut self, scene: &Scene) -> PresentReport {
+        let mut breakdown = PresentBreakdown {
+            layers: 1,
+            ..PresentBreakdown::default()
+        };
+        let dropped = |breakdown| PresentReport {
+            outcome: PresentOutcome::Dropped,
+            breakdown,
+        };
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return dropped(PresentBreakdown::default());
             }
         };
         let viewport_size = layer.drawable_size();
@@ -1102,24 +1135,34 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
+        breakdown.drawables_in_flight = self
+            .drawables_in_flight
+            .load(Ordering::Relaxed)
+            .min(u8::MAX as u32) as u8;
+        let acquire_start = Instant::now();
+        let drawable = layer.next_drawable();
+        breakdown.acquire = acquire_start.elapsed();
+        let Some(drawable) = drawable else {
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return dropped(breakdown);
         };
 
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
+        let encode_start = Instant::now();
+        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size);
+        breakdown.encode = encode_start.elapsed();
+        let command_buffer = match command_buffer {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
-                return;
+                return dropped(breakdown);
             }
         };
 
+        let commit_start = Instant::now();
+        self.note_drawable_in_flight(drawable);
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -1128,7 +1171,31 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        breakdown.commit = commit_start.elapsed();
         self.maybe_log_gpu_stats();
+        PresentReport {
+            outcome: PresentOutcome::Presented,
+            breakdown,
+        }
+    }
+
+    /// Counts `drawable` as in flight until Core Animation displays or
+    /// discards it; the presented handler runs in both cases. Must be called
+    /// before the drawable is presented, which is when handlers are fixed.
+    fn note_drawable_in_flight(&self, drawable: &metal::MetalDrawableRef) {
+        let drawables_in_flight = self.drawables_in_flight.clone();
+        drawables_in_flight.fetch_add(1, Ordering::Relaxed);
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+            drawables_in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    count.checked_sub(1)
+                })
+                .ok();
+        });
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+        unsafe {
+            drawable.add_presented_handler(&*RcBlock::as_ptr(&block).cast());
+        }
     }
 
     fn gpu_stats_enabled() -> bool {
@@ -2945,7 +3012,7 @@ mod stale_texture_healing_tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
 
-    fn solid_quad_scene(extent: f32) -> Scene {
+    pub(super) fn solid_quad_scene(extent: f32) -> Scene {
         let mut scene = Scene::default();
         let bounds = Bounds {
             origin: Point {
@@ -3386,5 +3453,56 @@ mod stale_texture_healing_tests {
             .render_scene_to_image(&triangle_path_scene(32.), size)
             .expect("path render succeeds after retirement");
         assert!(renderer.path_intermediate_texture.is_some());
+    }
+}
+
+/// A layer-backed draw, the path every window present takes, reports where
+/// its time went. The layer is in no window, so nothing reaches the screen,
+/// but `nextDrawable`, encoding and commit all run for real.
+#[cfg(test)]
+mod present_report_tests {
+    use super::{InstanceBufferPool, MetalRenderer, stale_texture_healing_tests::solid_quad_scene};
+    use gpui::{DevicePixels, PresentOutcome};
+    use parking_lot::Mutex;
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn a_layer_backed_draw_reports_acquire_encode_and_commit_separately() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        assert_eq!(report.outcome, PresentOutcome::Presented);
+        let breakdown = report.breakdown;
+        assert_eq!(breakdown.layers, 1);
+        assert!(
+            breakdown.encode > Duration::ZERO,
+            "encoding a quad takes measurable time: {breakdown:?}"
+        );
+        assert_eq!(
+            breakdown.drawables_in_flight, 0,
+            "nothing was presented before the first draw"
+        );
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+        assert_eq!(report.outcome, PresentOutcome::Presented);
+        assert!(
+            report.breakdown.drawables_in_flight <= 1,
+            "only the first draw's drawable can still be in flight: {:?}",
+            report.breakdown
+        );
+    }
+
+    #[test]
+    fn a_headless_renderer_reports_a_dropped_present() {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        assert_eq!(report.outcome, PresentOutcome::Dropped);
+        assert_eq!(report.breakdown.layers, 0);
     }
 }

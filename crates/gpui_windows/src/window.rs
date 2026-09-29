@@ -1184,13 +1184,22 @@ impl PlatformWindow for WindowsWindow {
             .render_to_image(scene, self.effective_clear_color())
     }
 
-    fn draw_layered(&self, scene: &Scene, overlay_start: usize) {
+    fn draw_layered(&self, scene: &Scene, overlay_start: usize) -> PresentReport {
         let clear_color = self.effective_clear_color();
-        self.state
+        let outcome = match self
+            .state
             .renderer
             .borrow_mut()
             .draw_layered(scene, overlay_start, clear_color)
-            .log_err();
+            .log_err()
+        {
+            Some(()) => PresentOutcome::Presented,
+            None => PresentOutcome::Dropped,
+        };
+        PresentReport {
+            outcome,
+            breakdown: PresentBreakdown::default(),
+        }
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {

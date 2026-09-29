@@ -3925,7 +3925,7 @@ impl Window {
         self.scene_animates
             .set(self.rendered_frame.scene.has_time_animations());
         self.last_present_at.set(Some(Instant::now()));
-        self.platform_window.draw_layered(
+        let report = self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
         );
@@ -3941,7 +3941,10 @@ impl Window {
             Instant::now(),
             self.active.get(),
             !self.next_frame_callbacks.borrow().is_empty(),
+            report,
         );
+        #[cfg(not(feature = "profiler"))]
+        let _ = report;
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
