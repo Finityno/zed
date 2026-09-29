@@ -951,33 +951,23 @@ impl TextLayout {
                     None
                 };
 
-                let (truncate_width, truncation_affix, truncate_from) =
-                    if let Some(text_overflow) = text_style.text_overflow.clone() {
-                        let width = known_dimensions.width.or(match available_space.width {
-                            crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                                Some(max_lines) => Some(x * max_lines),
-                                None => Some(x),
-                            },
-                            _ => None,
-                        });
-
-                        match text_overflow {
-                            TextOverflow::Truncate(s) => (width, s, TruncateFrom::End),
-                            TextOverflow::TruncateStart(s) => (width, s, TruncateFrom::Start),
-                            TextOverflow::TruncateMiddle(s) => (width, s, TruncateFrom::Middle),
-                        }
-                    } else {
-                        (None, "".into(), TruncateFrom::End)
-                    };
+                let truncate_width = text_style.text_overflow.as_ref().and_then(|_| {
+                    known_dimensions.width.or(match available_space.width {
+                        crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
+                            Some(max_lines) => Some(x * max_lines),
+                            None => Some(x),
+                        },
+                        _ => None,
+                    })
+                });
 
                 // Only use cached layout if:
                 // 1. We have a cached size
-                // 2. wrap_width matches EXACTLY (including None == None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                //    because the previous layout may have been computed without truncation)
-                // 4. the cached layout was not truncated (a truncated layout answers an
-                //    unconstrained probe with the truncated size, which poisons intrinsic
-                //    sizing with whatever width some earlier measure pass happened to use)
+                // 2. wrap_width matches EXACTLY (including None == None), or the
+                //    cached layout was shaped unwrapped and already fits the
+                //    width now offered (see below)
+                // 3. truncate_width matches (a layout computed without truncation
+                //    cannot answer for one with it, nor the other way round)
                 //
                 // FINCODE FORK: upstream's check here is
                 // `wrap_width.is_none() || wrap_width == text_layout.wrap_width`,
@@ -992,10 +982,19 @@ impl TextLayout {
                 // that paints transcript text one character per line until some
                 // unrelated change rebuilds the element. Probes must therefore
                 // only reuse a layout produced under the same wrap_width.
+                //
+                // The other direction is exact: Taffy probes a wrapping leaf
+                // unconstrained before laying it out at a definite width, and
+                // text whose unwrapped shape is no wider than that width wraps
+                // nowhere, so the unwrapped lines are the wrapped lines. Only
+                // text the width actually bites is shaped a second time.
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && wrap_width == text_layout.wrap_width
                     && truncate_width == text_layout.truncate_width
+                    && (wrap_width == text_layout.wrap_width
+                        || (text_layout.wrap_width.is_none()
+                            && truncate_width.is_none()
+                            && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width)))
                 {
                     return size;
                 }
@@ -1013,8 +1012,18 @@ impl TextLayout {
                         cached.wrap_width.is_some() && cached.size.is_some()
                     });
 
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let (text, runs) = if let Some(truncate_width) = truncate_width {
+                // Only truncation needs a line wrapper and an affix: taking the
+                // wrapper resolves the font and locks the wrapper pool.
+                let (text, runs) = if let Some(truncate_width) = truncate_width
+                    && let Some(text_overflow) = text_style.text_overflow.as_ref()
+                {
+                    let (truncation_affix, truncate_from) = match text_overflow {
+                        TextOverflow::Truncate(affix) => (affix, TruncateFrom::End),
+                        TextOverflow::TruncateStart(affix) => (affix, TruncateFrom::Start),
+                        TextOverflow::TruncateMiddle(affix) => (affix, TruncateFrom::Middle),
+                    };
+                    let mut line_wrapper =
+                        cx.text_system().line_wrapper(text_style.font(), font_size);
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
@@ -1022,7 +1031,7 @@ impl TextLayout {
                             text.clone(),
                             wrap_width,
                             max_lines,
-                            &truncation_affix,
+                            truncation_affix,
                             &runs,
                             truncate_from,
                         )
@@ -1045,7 +1054,7 @@ impl TextLayout {
                         line_wrapper.truncate_line(
                             text.clone(),
                             truncate_width,
-                            &truncation_affix,
+                            truncation_affix,
                             &runs,
                             truncate_from,
                         )
@@ -1815,6 +1824,75 @@ mod tests {
             assert_eq!(layout.index_for_position(point(px(second_left - 1.0), px(51.0))), Err(3));
             assert_eq!(layout.index_for_position(point(px(second_left + 31.0), px(51.0))), Err(6));
         }
+    }
+
+    struct ProbedText {
+        text: SharedString,
+        width: Pixels,
+        layout: Rc<RefCell<Option<TextLayout>>>,
+    }
+
+    impl crate::Render for ProbedText {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl IntoElement {
+            use crate::{ParentElement as _, Styled as _, div};
+            let text = StyledText::new(self.text.clone());
+            *self.layout.borrow_mut() = Some(text.layout().clone());
+            div()
+                .flex()
+                .flex_row()
+                .w(self.width)
+                .child(div().min_w_0().child(text))
+        }
+    }
+
+    /// Draws `text` in a shrinkable flex item of a row `width` wide, which
+    /// Taffy sizes by probing it unconstrained before laying it out at a
+    /// definite width, and returns the wrap width its kept layout was shaped
+    /// at and how many times it wrapped.
+    fn probed_text_layout(text: &'static str, width: Pixels) -> (Option<Pixels>, usize) {
+        use crate::AppContext as _;
+        let mut cx = crate::TestAppContext::single();
+        let layout = Rc::new(RefCell::new(None));
+        let window = cx.add_window({
+            let layout = layout.clone();
+            move |_, _| ProbedText {
+                text: text.into(),
+                width,
+                layout,
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let layout = layout.borrow();
+        let layout = layout.as_ref().unwrap().0.borrow();
+        let layout = layout.as_ref().unwrap();
+        let wraps = layout
+            .lines
+            .iter()
+            .map(|line| line.wrap_boundaries().len())
+            .sum();
+        (layout.wrap_width, wraps)
+    }
+
+    /// Text narrower than the width it is laid out at is answered from its
+    /// unconstrained shape rather than shaped again, and text the width bites
+    /// is still shaped, and wrapped, at that width.
+    #[test]
+    fn text_that_fits_its_width_is_not_shaped_again() {
+        let (wrap_width, wraps) = probed_text_layout("short", px(400.));
+        assert_eq!(wrap_width, None, "fitting text keeps its unconstrained shape");
+        assert_eq!(wraps, 0);
+
+        let (wrap_width, wraps) = probed_text_layout(
+            "a line long enough that forty pixels cannot hold it without wrapping",
+            px(40.),
+        );
+        assert_eq!(wrap_width, Some(px(40.)), "text that does not fit is shaped at its width");
+        assert!(wraps > 0);
     }
 
     #[test]
