@@ -345,6 +345,10 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// The layout nodes the view's content claimed when it was last laid
+    /// out, kept while the view is reused so that laying it out again finds
+    /// them.
+    layout_keys: Vec<u64>,
 }
 
 struct ViewElementCacheKey {
@@ -547,6 +551,7 @@ fn prepaint_view(
                     #[cfg(feature = "profiler")]
                     window.draw_clock.count_reuse();
                     window.frame_work.stats.views_reused += 1;
+                    window.keep_layout_keys(&element_state.layout_keys);
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
                     cx.entities
@@ -562,12 +567,14 @@ fn prepaint_view(
                 window.frame_work.stats.views_rendered += 1;
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
+                let layout_keys = window.record_claimed_layout_keys();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
                     element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
                     element.prepaint_at(bounds.origin, window, cx);
                     element
                 });
+                let layout_keys = window.finish_recording_claimed_layout_keys(layout_keys);
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
@@ -576,6 +583,7 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        layout_keys,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {

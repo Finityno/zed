@@ -5899,8 +5899,8 @@ impl Window {
         &mut self,
         style: Option<&Style>,
         state: S,
-        adopt: impl FnOnce(&S, &dyn std::any::Any) -> crate::taffy::Adopted,
-        measure: impl Fn(&S, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+        adopt: impl FnOnce(&Rc<S>, &Rc<dyn std::any::Any>) -> crate::taffy::Adopted,
+        measure: impl Fn(&Rc<S>, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
         + 'static,
         cx: &mut App,
     ) -> LayoutId {
@@ -5923,6 +5923,32 @@ impl Window {
         );
         self.layout_engine = Some(layout_engine);
         id
+    }
+
+    /// Starts recording the layout nodes claimed from here on, for a view to
+    /// keep them on frames it is drawn from the last one without being laid
+    /// out. Returns where the recording begins; recordings nest.
+    pub(crate) fn record_claimed_layout_keys(&mut self) -> usize {
+        self.layout_engine
+            .as_mut()
+            .map_or(0, |engine| engine.record_claimed_keys())
+    }
+
+    /// Ends the recording begun at `start`, returning the keys of the layout
+    /// nodes claimed while it was open.
+    pub(crate) fn finish_recording_claimed_layout_keys(&mut self, start: usize) -> Vec<u64> {
+        self.layout_engine
+            .as_mut()
+            .map(|engine| engine.finish_recording_claimed_keys(start))
+            .unwrap_or_default()
+    }
+
+    /// Keeps the layout nodes under `keys` through this frame without laying
+    /// them out, for the frame that lays them out again.
+    pub(crate) fn keep_layout_keys(&mut self, keys: &[u64]) {
+        if let Some(engine) = self.layout_engine.as_mut() {
+            engine.keep_retained(keys);
+        }
     }
 
     /// Compute the layout for the given id within the given available space.

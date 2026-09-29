@@ -28,6 +28,10 @@ pub struct FrameWorkStats {
     pub layout_nodes: u64,
     /// Layout nodes kept from an earlier frame and handed out again.
     pub layout_nodes_reused: u64,
+    /// Layout nodes kept through a frame without being asked for: those of
+    /// cached views drawn from the last frame, kept for the frame that lays
+    /// them out again.
+    pub layout_nodes_kept: u64,
     /// Layout nodes made anew, because no node was kept for the element or
     /// layout retention is off (`GPUI_RETAINED_LAYOUT=0`).
     pub layout_nodes_created: u64,
@@ -118,6 +122,7 @@ impl Window {
             lines_shaped,
             shape_time,
             layout_nodes_reused: retention.nodes_reused,
+            layout_nodes_kept: retention.nodes_kept,
             layout_nodes_created: retention.nodes_created,
             layout_nodes_released: retention.nodes_released,
             layout_style_writes: retention.style_writes,

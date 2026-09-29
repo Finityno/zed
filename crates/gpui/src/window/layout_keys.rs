@@ -135,13 +135,22 @@ impl LayoutKeys {
         self.push_step(step)
     }
 
-    fn push_step(&mut self, step: u64) -> u64 {
-        let parent = self
-            .stack
+    /// The key [`Self::push`] would give an element identified by `id` here,
+    /// if keys are handed out.
+    fn key_of_identified(&self, id: &ElementId) -> Option<u64> {
+        self.enabled
+            .then(|| mix(self.parent_key(), mix(FxBuildHasher.hash_one(id), IDENTIFIED_STEP)))
+    }
+
+    fn parent_key(&self) -> u64 {
+        self.stack
             .last()
             .map(|parent| parent.key)
-            .unwrap_or_else(|| mix(self.prepaint_scope, PREPAINT_SALT));
-        let key = mix(parent, step);
+            .unwrap_or_else(|| mix(self.prepaint_scope, PREPAINT_SALT))
+    }
+
+    fn push_step(&mut self, step: u64) -> u64 {
+        let key = mix(self.parent_key(), step);
         self.stack.push(LayoutKeyFrame {
             key,
             next_unidentified_child: 0,
@@ -190,7 +199,9 @@ impl Window {
     /// one row would hand every item its neighbour's nodes. Keyed by its
     /// index, an item keeps its nodes while it stays in view. An item with an
     /// id keeps being matched by that, so one identified by its data keeps
-    /// its nodes when items are inserted ahead of it. Only the layout is
+    /// its nodes when items are inserted ahead of it, unless an item laid
+    /// out before it this frame already took that key (items sharing one
+    /// id), in which case it is keyed by its index too. Only the layout is
     /// keyed; the element id stack and element state are untouched.
     pub(crate) fn layout_as_list_item(
         &mut self,
@@ -199,8 +210,15 @@ impl Window {
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) -> Size<Pixels> {
-        if element.element_id().is_some() {
-            return element.layout_as_root(available_space, self, cx);
+        if let Some(id) = element.element_id() {
+            let taken = self.layout_keys.key_of_identified(&id).is_some_and(|key| {
+                self.layout_engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.claimed_this_frame(key))
+            });
+            if !taken {
+                return element.layout_as_root(available_space, self, cx);
+            }
         }
         self.layout_keys
             .push_step(mix(index as u64, LIST_ITEM_STEP));

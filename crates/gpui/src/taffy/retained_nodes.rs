@@ -14,8 +14,8 @@
 
 use super::{EXPECT_MESSAGE, LayoutId, MeasureFn, NodeContext, TaffyLayoutEngine, ToTaffy as _};
 use crate::{
-    AbsoluteLength, App, AvailableSpace, DefiniteLength, Edges, GridTemplate, Length, Pixels,
-    Size, Style, Window, util::round_to_device_pixel,
+    AbsoluteLength, AlignItems, App, AvailableSpace, DefiniteLength, Edges, GridTemplate, Length,
+    Pixels, Size, Style, Window, util::round_to_device_pixel,
 };
 use collections::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
@@ -38,9 +38,10 @@ pub(crate) struct LayoutRetention {
     transient: Vec<LayoutId>,
     /// The styles elements asked for, for the nodes whose style Taffy holds
     /// stretched to fill the window instead (see
-    /// [`TaffyLayoutEngine::stretch_auto_size_to_fill`]). Compared against
-    /// the stretched style, every request would differ and dirty the root.
-    unstretched_styles: FxHashMap<LayoutId, taffy::style::Style>,
+    /// [`TaffyLayoutEngine::stretch_auto_size_to_fill`]), with the frame it
+    /// was last stretched in. Compared against the stretched style, every
+    /// request would differ and dirty the root.
+    unstretched_styles: FxHashMap<LayoutId, (taffy::style::Style, u64)>,
     frame: u64,
     /// Retained nodes claimed this frame. When every retained node was, the
     /// end of the frame has nothing to sweep.
@@ -50,6 +51,11 @@ pub(crate) struct LayoutRetention {
     /// [`TaffyLayoutEngine::begin_transaction`].
     transaction_claims: Vec<u64>,
     open_transactions: usize,
+    /// Keys claimed while a recording is open, for a view to claim again on
+    /// a frame it is drawn without being laid out. See
+    /// [`TaffyLayoutEngine::record_claimed_keys`].
+    claimed_keys: Vec<u64>,
+    open_key_recordings: usize,
     /// The fingerprint of the default style, which every text leaf asks for,
     /// under the rem size and scale factor it was taken at.
     default_fingerprint: Option<(Pixels, f32, u64)>,
@@ -60,6 +66,7 @@ pub(crate) struct LayoutRetention {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetentionCounts {
     pub(crate) nodes_reused: u64,
+    pub(crate) nodes_kept: u64,
     pub(crate) nodes_created: u64,
     pub(crate) nodes_released: u64,
     pub(crate) style_writes: u64,
@@ -115,6 +122,19 @@ fn dirty_ancestors(taffy: &mut TaffyTree<NodeContext>, id: LayoutId) {
         taffy.mark_dirty(ancestor).expect(EXPECT_MESSAGE);
         node = taffy.parent(ancestor);
     }
+}
+
+/// Whether Taffy lays out the children of the node, or of its parent, in full
+/// while only sizing it.
+///
+/// A flex container aligning by baseline has to place its children to find
+/// their baselines, so a probe of its size leaves them laid out for the
+/// probe's constraints. A tree built every frame lays the container out
+/// again afterwards; a kept one may answer that from the container's cache
+/// and leave the children where the probe put them. Such a node is laid out
+/// every frame, as if it were new.
+fn aligns_by_baseline(style: &Style) -> bool {
+    style.align_items == Some(AlignItems::Baseline) || style.align_self == Some(AlignItems::Baseline)
 }
 
 /// The measurements Taffy took of one node since it was last dirtied: the
@@ -232,11 +252,25 @@ fn boxed_measure(
 }
 
 impl LayoutRetention {
+    fn note_claim(&mut self, key: u64) {
+        if self.open_transactions > 0 {
+            self.transaction_claims.push(key);
+        }
+        if self.open_key_recordings > 0 {
+            self.claimed_keys.push(key);
+        }
+    }
+
     /// Drops every retained node's record, for a tree being replaced.
+    ///
+    /// The collections are replaced rather than cleared: this runs to give
+    /// back what the largest frame made them hold.
     pub(crate) fn forget_all(&mut self) {
-        self.retained.clear();
-        self.transient.clear();
-        self.unstretched_styles.clear();
+        self.retained = FxHashMap::default();
+        self.transient = Vec::new();
+        self.unstretched_styles = FxHashMap::default();
+        self.transaction_claims = Vec::new();
+        self.claimed_keys = Vec::new();
         self.claimed_this_frame = 0;
     }
 }
@@ -257,12 +291,62 @@ impl TaffyLayoutEngine {
             return Claim::Unkeyed;
         }
         node.claimed_in_frame = frame;
+        let id = node.id;
         retention.claimed_this_frame += 1;
         retention.counts.nodes_reused += 1;
-        if retention.open_transactions > 0 {
-            retention.transaction_claims.push(key);
+        retention.note_claim(key);
+        Claim::Reused(key, id)
+    }
+
+    /// Whether the node kept under `key` was claimed this frame.
+    pub(crate) fn claimed_this_frame(&self, key: u64) -> bool {
+        self.retention
+            .retained
+            .get(&key)
+            .is_some_and(|node| node.claimed_in_frame == self.retention.frame)
+    }
+
+    /// Starts recording the keys claimed from here on, returning where the
+    /// recording begins. Recordings nest.
+    pub(crate) fn record_claimed_keys(&mut self) -> usize {
+        let retention = &mut self.retention;
+        retention.open_key_recordings += 1;
+        retention.claimed_keys.len()
+    }
+
+    /// Ends the recording begun at `start`, returning the keys claimed while
+    /// it was open.
+    pub(crate) fn finish_recording_claimed_keys(&mut self, start: usize) -> Vec<u64> {
+        let retention = &mut self.retention;
+        let mut keys = retention.claimed_keys[start..].to_vec();
+        retention.open_key_recordings -= 1;
+        if retention.open_key_recordings == 0 {
+            retention.claimed_keys.clear();
         }
-        Claim::Reused(key, node.id)
+        // A transaction rolled back hands its claims back, and the requests
+        // made again claim the same keys a second time.
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// Claims the nodes kept under `keys` that are still kept and not yet
+    /// claimed this frame, without asking anything of them: the nodes of a
+    /// view drawn again from the last frame, which does not lay them out,
+    /// kept for the frame that builds it again.
+    pub(crate) fn keep_retained(&mut self, keys: &[u64]) {
+        let retention = &mut self.retention;
+        let frame = retention.frame;
+        for &key in keys {
+            if let Some(node) = retention.retained.get_mut(&key)
+                && node.claimed_in_frame != frame
+            {
+                node.claimed_in_frame = frame;
+                retention.claimed_this_frame += 1;
+                retention.counts.nodes_kept += 1;
+                retention.note_claim(key);
+            }
+        }
     }
 
     /// Begins a stretch of layout requests that may be rolled back, as
@@ -310,9 +394,7 @@ impl TaffyLayoutEngine {
             retention.transient.push(id);
             return;
         };
-        if retention.open_transactions > 0 {
-            retention.transaction_claims.push(key);
-        }
+        retention.note_claim(key);
         retention.retained.insert(
             key,
             RetainedNode {
@@ -355,6 +437,7 @@ impl TaffyLayoutEngine {
                 self.retention
                     .unstretched_styles
                     .get(&id)
+                    .map(|(requested, _)| requested)
                     .unwrap_or_else(|| self.taffy.style(id.into()).expect(EXPECT_MESSAGE))
                     == &style.to_taffy(rem_size, scale_factor),
                 "layout_fingerprint matched a style that converts differently"
@@ -367,6 +450,7 @@ impl TaffyLayoutEngine {
         let previous = retention
             .unstretched_styles
             .get(&id)
+            .map(|(requested, _)| requested)
             .unwrap_or_else(|| self.taffy.style(id.into()).expect(EXPECT_MESSAGE));
         if previous == &style {
             return;
@@ -426,6 +510,10 @@ impl TaffyLayoutEngine {
                 let fingerprint = layout_fingerprint(style, rem_size, scale_factor);
                 self.apply_requested_style(key, id, style, fingerprint, rem_size, scale_factor);
                 self.apply_children(key, id, children);
+                if aligns_by_baseline(style) {
+                    self.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
+                    dirty_ancestors(&mut self.taffy, id);
+                }
                 let node = self.retained_node(key);
                 if node.measured {
                     node.measured = false;
@@ -556,12 +644,13 @@ impl TaffyLayoutEngine {
         rem_size: Pixels,
         scale_factor: f32,
         state: S,
-        adopt: impl FnOnce(&S, &dyn Any) -> Adopted,
-        measure: impl Fn(&S, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+        adopt: impl FnOnce(&Rc<S>, &Rc<dyn Any>) -> Adopted,
+        measure: impl Fn(&Rc<S>, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
         + 'static,
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutId {
+        let state = Rc::new(state);
         let fingerprint = self.style_fingerprint(style, rem_size, scale_factor);
         let frame = self.retention.frame;
         let reusable = key
@@ -570,11 +659,12 @@ impl TaffyLayoutEngine {
                 node.claimed_in_frame != frame
                     && node.measured
                     && node.style_fingerprint == fingerprint
+                    && !style.is_some_and(aligns_by_baseline)
             })
             .map(|node| (node.measurement.clone(), node.measure_log.clone()));
 
         if let Some((previous, log)) = reusable {
-            let adopted = previous.map_or(Adopted::No, |previous| adopt(&state, &*previous));
+            let adopted = previous.map_or(Adopted::No, |previous| adopt(&state, &previous));
             let kept = if adopted != Adopted::No {
                 self.retention.counts.measurements_carried += 1;
                 true
@@ -600,7 +690,6 @@ impl TaffyLayoutEngine {
                 // A measured node always has a context; one without is
                 // measured afresh below rather than left without one.
                 if self.taffy.get_node_context(id.into()).is_some() {
-                    let state = Rc::new(state);
                     let measurement: Rc<dyn Any> = state.clone();
                     let log = log.unwrap_or_default();
                     let measure = boxed_measure(MeasureLog::logged(
@@ -621,7 +710,6 @@ impl TaffyLayoutEngine {
             }
         }
 
-        let state = Rc::new(state);
         let measurement: Rc<dyn Any> = state.clone();
         let log = Rc::<MeasureLog>::default();
         let measure = MeasureLog::logged(&log, move |known, available, window, cx| {
@@ -681,6 +769,24 @@ impl TaffyLayoutEngine {
                     false
                 });
             }
+            // A node stretched on an earlier frame and not on this one (no
+            // longer a window's root, say) still holds the stretched style in
+            // Taffy, which no element asked for: it gets back the style that
+            // was asked for.
+            let frame = retention.frame;
+            let taffy = &mut self.taffy;
+            retention
+                .unstretched_styles
+                .retain(|&id, (requested, stretched_in)| {
+                    if *stretched_in == frame {
+                        return true;
+                    }
+                    taffy
+                        .set_style(id.into(), requested.clone())
+                        .expect(EXPECT_MESSAGE);
+                    dirty_ancestors(taffy, id);
+                    false
+                });
         }
         retention.claimed_this_frame = 0;
         retention.frame += 1;
@@ -698,7 +804,7 @@ impl TaffyLayoutEngine {
     ) {
         let retention = &mut self.retention;
         let requested = match retention.unstretched_styles.get(&id) {
-            Some(requested) => requested,
+            Some((requested, _)) => requested,
             None => self.taffy.style(id.into()).expect(EXPECT_MESSAGE),
         };
         let stretch_width = requested.size.width.is_auto();
@@ -723,7 +829,7 @@ impl TaffyLayoutEngine {
                 .expect(EXPECT_MESSAGE);
             dirty_ancestors(&mut self.taffy, id);
         }
-        retention.unstretched_styles.insert(id, requested);
+        retention.unstretched_styles.insert(id, (requested, retention.frame));
     }
 }
 

@@ -96,13 +96,24 @@ enum Change {
     Tint,
     Select { row: usize },
     Resize { width: f32, height: f32 },
+    ResizeHeight { height: f32 },
+    ScaleFactor { scale: f32 },
+    RemSize { rem: f32 },
+    TextSize { size: Option<f32> },
+    LineHeight { height: Option<f32> },
+    Column { max_width: Option<f32>, items_start: bool },
+    ColumnWords { first: usize, second: usize },
+    Highlight { start: usize, len: usize, color: usize },
+    LineClamp { lines: Option<usize> },
+    WhiteSpace,
+    Baseline,
     Redraw,
 }
 
 impl Change {
     fn random(rng: &mut StdRng) -> Self {
         let cell = rng.random_range(0..CELLS);
-        match rng.random_range(0..100) {
+        match rng.random_range(0..125) {
             0..16 => Change::Word {
                 cell,
                 word: rng.random_range(0..WORDS.len()),
@@ -170,6 +181,39 @@ impl Change {
                 width: rng.random_range(300.0..1000.0),
                 height: rng.random_range(240.0..800.0),
             },
+            100..103 => Change::ResizeHeight {
+                height: rng.random_range(240.0..800.0),
+            },
+            103..104 => Change::ScaleFactor {
+                scale: [1.0, 1.5, 2.0][rng.random_range(0..3)],
+            },
+            104..105 => Change::RemSize {
+                rem: [14.0, 16.0, 18.0][rng.random_range(0..3)],
+            },
+            105..107 => Change::TextSize {
+                size: [None, Some(12.0), Some(20.0)][rng.random_range(0..3)],
+            },
+            107..109 => Change::LineHeight {
+                height: [None, Some(14.0), Some(26.0)][rng.random_range(0..3)],
+            },
+            109..113 => Change::Column {
+                max_width: [None, Some(75.0), Some(123.0), Some(260.0)][rng.random_range(0..4)],
+                items_start: rng.random_bool(0.5),
+            },
+            113..115 => Change::ColumnWords {
+                first: rng.random_range(0..8),
+                second: rng.random_range(0..8),
+            },
+            115..119 => Change::Highlight {
+                start: rng.random_range(0..40),
+                len: rng.random_range(0..30),
+                color: rng.random_range(0..PALETTE.len()),
+            },
+            119..121 => Change::LineClamp {
+                lines: [None, Some(1), Some(2)][rng.random_range(0..3)],
+            },
+            121..123 => Change::WhiteSpace,
+            123..124 => Change::Baseline,
             _ => Change::Redraw,
         }
     }
@@ -198,6 +242,15 @@ struct OracleView {
     badge: crate::Entity<Badge>,
     uniform_scroll: UniformListScrollHandle,
     list_state: ListState,
+    text_size: Option<f32>,
+    line_height: Option<f32>,
+    column_max_width: Option<f32>,
+    column_items_start: bool,
+    column_words: (usize, usize),
+    highlight: (usize, usize, usize),
+    line_clamp: Option<usize>,
+    nowrap: bool,
+    baseline: bool,
 }
 
 impl OracleView {
@@ -229,10 +282,19 @@ impl OracleView {
             badge: cx.new(|_| Badge { count: 0 }),
             uniform_scroll: UniformListScrollHandle::new(),
             list_state: ListState::new(INITIAL_ROWS as usize, ListAlignment::Top, px(40.)),
+            text_size: None,
+            line_height: None,
+            column_max_width: Some(75.),
+            column_items_start: true,
+            column_words: (3, 5),
+            highlight: (4, 9, 1),
+            line_clamp: None,
+            nowrap: false,
+            baseline: true,
         }
     }
 
-    fn apply(&mut self, change: &Change, cx: &mut Context<Self>) {
+    fn apply(&mut self, change: &Change, window: &mut Window, cx: &mut Context<Self>) {
         match *change {
             Change::Word { cell, word } => self.cells[cell].word = word,
             Change::Color { cell, color } => self.cells[cell].color = color,
@@ -306,7 +368,25 @@ impl OracleView {
             Change::Select { row } => {
                 self.selected = (!self.rows.is_empty()).then(|| self.rows[row % self.rows.len()]);
             }
-            Change::Resize { .. } | Change::Redraw => return,
+            Change::RemSize { rem } => window.set_rem_size(px(rem)),
+            Change::TextSize { size } => self.text_size = size,
+            Change::LineHeight { height } => self.line_height = height,
+            Change::Column {
+                max_width,
+                items_start,
+            } => {
+                self.column_max_width = max_width;
+                self.column_items_start = items_start;
+            }
+            Change::ColumnWords { first, second } => self.column_words = (first, second),
+            Change::Highlight { start, len, color } => self.highlight = (start, len, color),
+            Change::LineClamp { lines } => self.line_clamp = lines,
+            Change::WhiteSpace => self.nowrap = !self.nowrap,
+            Change::Baseline => self.baseline = !self.baseline,
+            Change::Resize { .. }
+            | Change::ResizeHeight { .. }
+            | Change::ScaleFactor { .. }
+            | Change::Redraw => return,
         }
         cx.notify();
     }
@@ -327,6 +407,14 @@ fn render_cell(cell: CellState, tint: usize) -> AnyElement {
         .when(cell.hidden, |this| this.hidden())
         .child(WORDS[cell.word])
         .into_any_element()
+}
+
+/// `count` words, starting at `first`, as one string.
+fn words(first: usize, count: usize) -> String {
+    (first..first + count)
+        .map(|ix| WORDS[ix % WORDS.len()])
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn render_row(row: u64, identity: RowIdentity, selected: bool) -> AnyElement {
@@ -433,12 +521,73 @@ impl Render for OracleView {
         .h(px(120.));
 
         let tint = self.tint;
+        let (first_words, second_words) = self.column_words;
+        let styled_paragraph: SharedString = words(2, self.paragraph_words / 2 + 3).into();
+        let (highlight_start, highlight_len, highlight_color) = self.highlight;
+        let highlight_start = highlight_start.min(styled_paragraph.len());
+        let highlight_end = (highlight_start + highlight_len).min(styled_paragraph.len());
+        let highlights = [(
+            highlight_start..highlight_end,
+            crate::HighlightStyle {
+                color: Some(PALETTE[highlight_color]),
+                ..Default::default()
+            },
+        )];
         div()
             .size_full()
             .flex()
             .flex_wrap()
             .gap_2()
             .when(self.column, |this| this.flex_col())
+            .child(
+                // Items sized to their content inside a capped column: Taffy
+                // probes their text at one width and lays it out at another.
+                div().flex().flex_col().flex_grow(1.).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .when(self.column_items_start, |this| this.items_start())
+                        .when_some(self.column_max_width, |this, width| this.max_w(px(width)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(SharedString::from(words(0, first_words + 1)))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .child(SharedString::from(words(5, second_words + 2))),
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                // A block holding a capped block holding text.
+                div().child(
+                    div()
+                        .when_some(self.column_max_width, |this, width| this.max_w(px(width)))
+                        .child(SharedString::from(words(3, first_words + 2))),
+                ),
+            )
+            .child(
+                // Styled runs, recoloured, clamped, unwrapped and resized.
+                div()
+                    .w(self.paragraph_width)
+                    .when_some(self.text_size, |this, size| this.text_size(px(size)))
+                    .when_some(self.line_height, |this, height| this.line_height(px(height)))
+                    .when_some(self.line_clamp, |this, lines| this.line_clamp(lines))
+                    .when(self.nowrap, |this| this.whitespace_nowrap())
+                    .child(crate::StyledText::new(styled_paragraph).with_highlights(highlights)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .when(self.baseline, |this| this.items_baseline())
+                    .child(div().text_size(px(22.)).child("tall"))
+                    .child(div().w(px(90.)).child(SharedString::from(words(1, first_words + 2))))
+                    .child(div().flex().flex_col().child("a").child("b")),
+            )
             .child(
                 div()
                     .flex()
@@ -739,8 +888,18 @@ fn apply(cx: &mut TestAppContext, window: WindowHandle<OracleView>, change: &Cha
         Change::Resize { width, height } => {
             cx.simulate_window_resize(window.into(), size(px(width), px(height)));
         }
+        Change::ResizeHeight { height } => {
+            let width = window
+                .update(cx, |_, window, _| window.viewport_size().width)
+                .unwrap();
+            cx.simulate_window_resize(window.into(), size(width, px(height)));
+        }
+        Change::ScaleFactor { scale } => {
+            cx.test_window(window.into())
+                .simulate_scale_factor_change(scale);
+        }
         _ => window
-            .update(cx, |view, _, cx| view.apply(change, cx))
+            .update(cx, |view, window, cx| view.apply(change, window, cx))
             .unwrap(),
     }
 }
@@ -960,9 +1119,10 @@ fn keeping_layout_nodes_does_not_grow_the_tree() {
             })
             .unwrap();
         assert!(
-            held as u64 <= work.layout_nodes,
-            "{held} nodes held after a frame that asked for {}",
-            work.layout_nodes
+            held as u64 <= work.layout_nodes + work.layout_nodes_kept,
+            "{held} nodes held after a frame that asked for {} and kept {}",
+            work.layout_nodes,
+            work.layout_nodes_kept
         );
     }
 }
@@ -1411,4 +1571,172 @@ fn a_keyed_measurement_is_taken_again_only_when_its_key_changes() {
     });
     assert_eq!(new_size.measured_nodes_dirtied, 1, "{new_size:?}");
     assert!(new_size.measure_calls > 0, "{new_size:?}");
+}
+
+/// Text in a box narrower than the text, which Taffy probes at one width and
+/// lays out at another; kept nodes may answer the layout from a probe's
+/// cached size.
+#[derive(Clone, Copy)]
+enum CappedText {
+    /// A block holding a block capped at 123px holding text about 185px wide.
+    Block,
+    /// A growing column holding a column of items sized to their content,
+    /// capped at 75px, holding a column of two texts.
+    Column,
+    /// A capped row holding a wrapping row aligning its items by baseline.
+    BaselineWrap,
+    /// A capped column holding a row aligning its items by baseline, whose
+    /// first item holds a wrapping row.
+    BaselineColumn,
+}
+
+impl Render for CappedText {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let root = div().size_full().flex().flex_col();
+        match self {
+            CappedText::Block => {
+                root.child(div().child(div().max_w(px(123.)).child("aaaa bbbb cccc dddd")))
+            }
+            CappedText::Column => root.child(
+                div().flex().flex_col().flex_grow(1.).child(
+                    div().flex().flex_col().items_start().max_w(px(75.)).child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child("aaaa bbbb cccc ddd")
+                            .child(div().flex().child("aaaa bbbb cccc dddd eeee fff")),
+                    ),
+                ),
+            ),
+            CappedText::BaselineWrap => root.child(
+                div().flex().flex_row().items_start().max_w(px(103.)).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_baseline()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_grow(1.)
+                                .child("aaaa bbbb cccc dddd eeee ffff"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .child("aa bbbb")
+                                .child("aaaa bbbb cccc dddd eee"),
+                        ),
+                ),
+            ),
+            CappedText::BaselineColumn => root.child(
+                div().flex().flex_col().max_w(px(49.)).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .child("aaaa bbbb c")
+                                        .child("aaaa bbbb cc"),
+                                )
+                                .child("aa bb"),
+                        )
+                        .child(div().flex().flex_row()),
+                ),
+            ),
+        }
+    }
+}
+
+/// Draws `view` in a window keeping its layout nodes and in one laying out
+/// from scratch, at each of `sizes` in turn, and asserts the two frames match
+/// at every size.
+fn assert_kept_layout_matches_scratch(view: CappedText, sizes: &[(f32, f32)]) {
+    let mut cx = text_system_context(0);
+    let retaining = cx.add_window(move |_, _| view);
+    let from_scratch = cx.add_window(move |_, _| view);
+    cx.update_window(from_scratch.into(), |_, window, _| {
+        window.layout_keys.set_enabled(false)
+    })
+    .unwrap();
+    for (step, &(width, height)) in sizes.iter().enumerate() {
+        let describe = |cx: &mut TestAppContext, window: WindowHandle<CappedText>| {
+            cx.simulate_window_resize(window.into(), size(px(width), px(height)));
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                describe_rendered_frame(window)
+            })
+            .unwrap()
+        };
+        let expected = describe(&mut cx, from_scratch);
+        let actual = describe(&mut cx, retaining);
+        assert_eq!(actual, expected, "step {step}, {width}x{height}");
+    }
+}
+
+/// Text probed wide and laid out narrow paints the lines of its box's width,
+/// not of the probe's.
+#[test]
+fn text_paints_the_lines_of_the_width_it_was_laid_out_at() {
+    assert_kept_layout_matches_scratch(CappedText::Block, &[(300., 400.), (224., 400.)]);
+    assert_kept_layout_matches_scratch(
+        CappedText::Column,
+        &[(300., 400.), (300., 436.), (300., 400.), (224., 436.)],
+    );
+}
+
+/// A row aligning by baseline lays its items out in full while it is only
+/// sized, which a kept row must not answer from its cache afterwards.
+#[test]
+fn rows_aligned_by_baseline_are_laid_out_again() {
+    let sizes = [(300., 400.), (368., 400.), (188., 400.), (300., 300.), (520., 400.)];
+    assert_kept_layout_matches_scratch(CappedText::BaselineWrap, &sizes);
+    assert_kept_layout_matches_scratch(CappedText::BaselineColumn, &sizes);
+}
+
+/// A cached view drawn from the last frame keeps the layout nodes of its
+/// content, so the frame that lays it out again makes none.
+#[test]
+fn a_reused_cached_view_keeps_its_layout_nodes() {
+    let mut cx = text_system_context(0);
+    let window = cx.add_window(|_, cx| OracleView::new(cx));
+    // Notifying a view can draw a frame of its own, so the counters start
+    // before the change and the explicit draw only runs if none did.
+    let work_after = |cx: &mut TestAppContext, change: &dyn Fn(&mut TestAppContext)| {
+        cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false))
+            .unwrap();
+        change(cx);
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            window.frame_work_stats()
+        })
+        .unwrap()
+    };
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+        .unwrap();
+    // The view is notified, and the cached badge drawn from the last frame.
+    let reused = work_after(&mut cx, &|cx| {
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+    });
+    assert!(reused.views_reused >= 1, "{reused:?}");
+    assert!(reused.layout_nodes_kept >= 1, "{reused:?}");
+    // The badge is laid out again, at the nodes it kept.
+    let rebuilt = work_after(&mut cx, &|cx| {
+        let badge = window.update(cx, |view, _, _| view.badge.clone()).unwrap();
+        badge.update(cx, |_, cx| cx.notify());
+    });
+    assert!(rebuilt.views_rendered >= 2, "{rebuilt:?}");
+    assert_eq!(rebuilt.layout_nodes_created, 0, "{rebuilt:?}");
 }

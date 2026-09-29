@@ -18,6 +18,11 @@ use crate::{
 use gpui_util::ResultExt as _;
 use std::{any::Any, borrow::Cow, cell::RefCell, cmp, rc::Rc};
 
+/// A weak handle on the inputs that measured a text layout, for its element
+/// to shape the text again at the width it was laid out at; see
+/// [`fit_to_width`].
+pub(super) type MeasuredBy = std::rc::Weak<TextMeasureInputs>;
+
 /// Everything a text element's measurement is taken from, and the layout the
 /// measurement is kept in.
 pub(super) struct TextMeasureInputs {
@@ -189,8 +194,8 @@ pub(super) fn layout_text(
 /// when Taffy measures it under other constraints. Otherwise the node keeps
 /// last frame's inputs, which measure it the same way, and only its layout is
 /// pointed at this element's, where the measurement is kept from now on.
-fn adopt_measurement(inputs: &TextMeasureInputs, previous: &dyn Any) -> Adopted {
-    let Some(previous) = previous.downcast_ref::<TextMeasureInputs>() else {
+fn adopt_measurement(inputs: &Rc<TextMeasureInputs>, previous: &Rc<dyn Any>) -> Adopted {
+    let Ok(previous) = previous.clone().downcast::<TextMeasureInputs>() else {
         return Adopted::No;
     };
     if !previous.shapes_as(inputs) {
@@ -206,9 +211,11 @@ fn adopt_measurement(inputs: &TextMeasureInputs, previous: &dyn Any) -> Adopted 
     let layout = inputs.layout.borrow();
     if recolored {
         update_decoration_runs(&mut inner.lines, &inputs.runs());
+        inner.measured_by = Rc::downgrade(inputs);
         *layout.0.borrow_mut() = Some(inner);
         Adopted::Measurement
     } else {
+        inner.measured_by = Rc::downgrade(&previous);
         *layout.0.borrow_mut() = Some(inner);
         *previous.layout.borrow_mut() = layout.clone();
         Adopted::Node
@@ -247,6 +254,7 @@ fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
             size: inner.size,
             bounds: None,
             carried: true,
+            measured_by: inner.measured_by.clone(),
         })
     }
 }
@@ -301,7 +309,7 @@ fn update_decoration_runs(lines: &mut [WrappedLine], runs: &[TextRun]) {
 /// Measures text under the constraints Taffy offers, keeping the result in
 /// its layout.
 fn measure_text(
-    inputs: &TextMeasureInputs,
+    inputs: &Rc<TextMeasureInputs>,
     known_dimensions: Size<Option<Pixels>>,
     available_space: Size<AvailableSpace>,
     window: &mut Window,
@@ -314,7 +322,7 @@ fn measure_text(
         line_height,
         layout,
         ..
-    } = inputs;
+    } = &**inputs;
     let element_state = &*layout.borrow();
     let (font_size, line_height) = (*font_size, *line_height);
     let wrap_width = if text_style.white_space == WhiteSpace::Normal {
@@ -458,6 +466,7 @@ fn measure_text(
                 size: Some(Size::default()),
                 bounds: None,
                 carried: false,
+                measured_by: Rc::downgrade(inputs),
             });
         }
         return Size::default();
@@ -481,8 +490,77 @@ fn measure_text(
             size: Some(size),
             bounds: None,
             carried: false,
+            measured_by: Rc::downgrade(inputs),
         });
     }
 
     size
+}
+
+/// Shapes the text again at the width its box was laid out at, when the lines
+/// kept are not the ones it would be shaped into there.
+///
+/// The lines kept are those of the last measurement Taffy asked for. Taffy
+/// may lay a node out at a size it cached from an earlier measurement,
+/// taken by one of this frame's probes or, with the node kept, on an earlier
+/// frame, so the last measurement asked for need not be the one the box was
+/// laid out from. Shaping again is a lookup in the line layout cache when the
+/// text was shaped at that width before.
+pub(super) fn fit_to_width(layout: &TextLayout, width: Pixels, window: &mut Window, cx: &mut App) {
+    let inputs = {
+        let inner = layout.0.borrow();
+        let Some(inner) = inner.as_ref() else {
+            return;
+        };
+        let Some(inputs) = inner.measured_by.upgrade() else {
+            return;
+        };
+        if !Rc::ptr_eq(&inputs.layout.borrow().0, &layout.0)
+            || shaped_for_width(inner, &inputs.text_style, width)
+        {
+            return;
+        }
+        inputs
+    };
+    measure_text(
+        &inputs,
+        Size {
+            width: Some(width),
+            height: None,
+        },
+        Size {
+            width: AvailableSpace::Definite(width),
+            height: AvailableSpace::MaxContent,
+        },
+        window,
+        cx,
+    );
+}
+
+/// Whether `inner`'s lines are the ones the text is shaped into at `width`.
+///
+/// Lines shaped at `width` are. So are lines shaped at a greater width (or
+/// none) that all fit in `width`: breaking greedily at the narrower width
+/// breaks in the same places, since a word that did not fit on a line at the
+/// greater width does not fit at the narrower one either. Truncation is
+/// greedy in the same way.
+fn shaped_for_width(inner: &TextLayoutInner, style: &TextStyle, width: Pixels) -> bool {
+    let Some(size) = inner.size else {
+        return true;
+    };
+    let fits = size.width <= width;
+    let shaped_at = |at: Option<Pixels>| at == Some(width) || (fits && at.is_none_or(|at| at >= width));
+    let wrapped = style.white_space != WhiteSpace::Normal
+        || shaped_at(inner.wrap_width)
+        || (fits
+            && inner
+                .lines
+                .iter()
+                .all(|line| line.wrap_boundaries.is_empty()));
+    let truncated = style.text_overflow.is_none()
+        || shaped_at(inner.truncate_width)
+        || style
+            .line_clamp
+            .is_some_and(|lines| inner.truncate_width == Some(width * lines as f32));
+    wrapped && truncated
 }

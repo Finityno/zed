@@ -399,8 +399,9 @@ impl Element for &'static str {
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
+        measurement::fit_to_width(text_layout, bounds.size.width, window, cx);
         text_layout.prepaint(bounds, self, window.text_style().text_align);
         text_layout.hold_carried_lines(window);
     }
@@ -474,8 +475,9 @@ impl Element for SharedString {
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
+        measurement::fit_to_width(text_layout, bounds.size.width, window, cx);
         text_layout.prepaint(bounds, self.as_ref(), window.text_style().text_align);
         text_layout.hold_carried_lines(window);
     }
@@ -701,8 +703,9 @@ impl Element for StyledText {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
+        measurement::fit_to_width(&self.layout, bounds.size.width, window, cx);
         self.layout
             .prepaint(bounds, &self.text, window.text_style().text_align);
         self.layout.hold_carried_lines(window);
@@ -875,8 +878,9 @@ impl Element for ShimmerText {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
+        measurement::fit_to_width(&self.layout, bounds.size.width, window, cx);
         self.layout
             .prepaint(bounds, &self.text, window.text_style().text_align);
         self.layout.hold_carried_lines(window);
@@ -925,6 +929,7 @@ struct TextLayoutInner {
     /// Whether the lines were carried over from last frame's element rather
     /// than asked of the line layout cache this frame.
     carried: bool,
+    measured_by: measurement::MeasuredBy,
 }
 
 impl TextLayout {
@@ -1648,6 +1653,7 @@ mod tests {
                 size: None,
                 bounds: None,
                 carried: false,
+                measured_by: Default::default(),
             }))));
             layout.prepaint(Bounds::new(point(px(10.0), px(30.0)), size(px(100.0), px(40.0))), "aβcde", align);
             assert_eq!(layout.text_align(), align);
