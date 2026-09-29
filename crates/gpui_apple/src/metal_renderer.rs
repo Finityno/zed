@@ -43,6 +43,10 @@ use std::{
     time::Instant,
 };
 
+/// How many presents in a row may defer for want of a drawable before the
+/// frame is dropped instead: about a second of display refreshes.
+const MAX_CONSECUTIVE_DEFERRED_PRESENTS: u32 = 120;
+
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
 
@@ -245,7 +249,8 @@ pub struct MetalRenderer {
     /// Metal thread.
     drawables_in_flight: Arc<AtomicU32>,
     /// Presents deferred in a row because `nextDrawable` returned none; used
-    /// to log a run of them once instead of once per display refresh.
+    /// to log a run of them once instead of once per display refresh, and to
+    /// end a run that goes on too long (see `missing_drawable_outcome`).
     consecutive_deferred_presents: u32,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
@@ -1153,22 +1158,27 @@ impl MetalRenderer {
         let drawable = layer.next_drawable();
         breakdown.acquire = acquire_start.elapsed();
         let Some(drawable) = drawable else {
-            // The pool had nothing to give. The frame stays owed and the
-            // display link's next tick presents it, so this repeats at most
-            // once per refresh until a drawable comes back; log the run once.
-            if self.consecutive_deferred_presents == 0 {
-                log::warn!(
-                    "no drawable available (drawable size {viewport_size:?}, \
-                     {} in flight); deferring the present",
-                    breakdown.drawables_in_flight
-                );
+            let allows_timeout: cocoa::base::BOOL =
+                unsafe { msg_send![&*layer, allowsNextDrawableTimeout] };
+            let outcome = self.missing_drawable_outcome(allows_timeout == YES);
+            match outcome {
+                PresentOutcome::Deferred if self.consecutive_deferred_presents == 1 => {
+                    log::warn!(
+                        "no drawable available (drawable size {viewport_size:?}, \
+                         {} in flight); deferring the present",
+                        breakdown.drawables_in_flight
+                    );
+                }
+                PresentOutcome::Dropped => {
+                    log::error!(
+                        "no drawable available (drawable size {viewport_size:?}, \
+                         {} in flight); dropping the frame",
+                        breakdown.drawables_in_flight
+                    );
+                }
+                _ => {}
             }
-            self.consecutive_deferred_presents =
-                self.consecutive_deferred_presents.saturating_add(1);
-            return PresentReport {
-                outcome: PresentOutcome::Deferred,
-                breakdown,
-            };
+            return PresentReport { outcome, breakdown };
         };
         if self.consecutive_deferred_presents > 0 {
             log::info!(
@@ -1204,6 +1214,27 @@ impl MetalRenderer {
         PresentReport {
             outcome: PresentOutcome::Presented,
             breakdown,
+        }
+    }
+
+    /// What a present that got no drawable reports. The frame stays owed
+    /// (`Deferred`) only while a nil drawable can mean the pool was merely
+    /// empty: with `allowsNextDrawableTimeout` off, `nextDrawable` waits for
+    /// a drawable instead, so a nil there is a fault (a lost device, a layer
+    /// with no usable configuration) that would be retried every display
+    /// refresh for as long as it lasts. A run of deferrals is also cut off
+    /// after [`MAX_CONSECUTIVE_DEFERRED_PRESENTS`], so a pool that never
+    /// refills costs one dropped frame per invalidation rather than a
+    /// present attempt per refresh.
+    fn missing_drawable_outcome(&mut self, layer_allows_timeout: bool) -> PresentOutcome {
+        if layer_allows_timeout
+            && self.consecutive_deferred_presents < MAX_CONSECUTIVE_DEFERRED_PRESENTS
+        {
+            self.consecutive_deferred_presents += 1;
+            PresentOutcome::Deferred
+        } else {
+            self.consecutive_deferred_presents = 0;
+            PresentOutcome::Dropped
         }
     }
 
@@ -3532,5 +3563,38 @@ mod present_report_tests {
 
         assert_eq!(report.outcome, PresentOutcome::Dropped);
         assert_eq!(report.breakdown.layers, 0);
+    }
+
+    /// A missing drawable defers the frame only while the layer can time out
+    /// waiting for one, and only for a bounded run: anything else is a fault
+    /// that would otherwise be retried every display refresh.
+    #[test]
+    fn a_missing_drawable_defers_only_a_bounded_run_on_a_layer_that_can_time_out() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+
+        assert_eq!(
+            renderer.missing_drawable_outcome(false),
+            PresentOutcome::Dropped,
+            "a layer that waits for drawables returns none only on a fault"
+        );
+        assert_eq!(renderer.consecutive_deferred_presents, 0);
+
+        for _ in 0..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
+            assert_eq!(
+                renderer.missing_drawable_outcome(true),
+                PresentOutcome::Deferred
+            );
+        }
+        assert_eq!(
+            renderer.missing_drawable_outcome(true),
+            PresentOutcome::Dropped,
+            "a run that outlasts the bound drops the frame"
+        );
+        assert_eq!(
+            renderer.missing_drawable_outcome(true),
+            PresentOutcome::Deferred,
+            "and the next present starts a fresh run"
+        );
     }
 }
