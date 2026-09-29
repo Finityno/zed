@@ -475,7 +475,10 @@ impl Scene {
         scratch.sort(&mut self.surfaces, |surface| surface.order);
         // A batch draws from one atlas texture, and tile ids restart at zero
         // in every texture, so sprites of one order group by texture first.
-        // Sprites sharing an order never overlap, so this is not paint order.
+        // Sprites of one order were already drawn in tile order rather than
+        // the order they were painted in (a layer, such as a line of text,
+        // gives everything in it one order), so grouping by texture does not
+        // reorder anything that was in paint order before.
         scratch.sort_sprites(&mut self.monochrome_sprites, |sprite| {
             (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
         });

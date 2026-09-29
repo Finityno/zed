@@ -85,6 +85,10 @@ where
     /// not a number. They may still meet others, as `intersects` defines it,
     /// but have no cells.
     degenerate: Vec<(Bounds<U>, u32)>,
+    /// Whether anything was filed since the grid was last emptied. A fill
+    /// replayed from start to end never builds the grid, and emptying its
+    /// cells again, up to 65,536 of them, would be for nothing.
+    filled: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -277,9 +281,12 @@ where
         + Into<f64>,
 {
     fn clear(&mut self) {
-        self.cells.fill(Cell::EMPTY);
+        if self.filled {
+            self.cells.fill(Cell::EMPTY);
+            self.degenerate.clear();
+            self.filled = false;
+        }
         self.entries_shrink.clear_vec(&mut self.entries);
-        self.degenerate.clear();
     }
 
     /// Whether `bounds` has a positive width and height and an origin that is
@@ -327,9 +334,11 @@ where
         self.cells.resize(columns * rows, Cell::EMPTY);
         self.entries.clear();
         self.degenerate.clear();
+        self.filled = false;
     }
 
     fn add(&mut self, bounds: &Bounds<U>, order: u32) {
+        self.filled = true;
         if !Self::has_area(bounds) {
             self.degenerate.push((bounds.clone(), order));
             return;
@@ -447,9 +456,12 @@ where
     /// the tree still on screen, once the window has stopped drawing; see
     /// [`CapacityShrink::idle_target`].
     pub fn shrink_idle(&mut self, rendered: &Self) {
+        // A fill replayed to its end filed nothing in its grid, so what it
+        // recorded stands for what a built grid would have held.
+        let rendered_entries = rendered.grid.entries.len().max(rendered.recorded.len());
         self.grid
             .entries_shrink
-            .shrink_vec_idle(&mut self.grid.entries, rendered.grid.entries.len());
+            .shrink_vec_idle(&mut self.grid.entries, rendered_entries);
         if let Some(capacity) = self
             .recorded_shrink
             .idle_target(rendered.recorded.len(), self.recorded.capacity())
@@ -603,6 +615,7 @@ where
                 entries: Vec::new(),
                 entries_shrink: CapacityShrink::default(),
                 degenerate: Vec::new(),
+                filled: false,
             },
             max: None,
             recorded: Vec::new(),
@@ -900,6 +913,27 @@ mod tests {
                 fill(&mut tree, &frame);
             }
         }
+    }
+
+    /// A fill replayed from start to end files nothing in the grid, and the
+    /// clear after it leaves the grid's cells alone; one that diverges builds
+    /// the grid and the clear after it empties it.
+    #[test]
+    fn only_a_built_grid_is_emptied() {
+        // Enough bounds that ordering them without the grid runs out of
+        // budget, when they are not the ones replayed.
+        let frame: Vec<_> = (0..400).map(unit_bounds).collect();
+        let mut tree = BoundsTree::default();
+        fill(&mut tree, &frame);
+        assert!(tree.grid.filled);
+        fill(&mut tree, &frame);
+        assert!(!tree.grid.filled, "a replayed fill never builds the grid");
+        let shifted: Vec<_> = (1000..1400).map(unit_bounds).collect();
+        fill(&mut tree, &shifted);
+        assert!(tree.grid.filled);
+        tree.clear();
+        assert!(!tree.grid.filled);
+        assert!(tree.grid.cells.iter().all(|cell| cell.head == NO_ENTRY));
     }
 
     fn unit_bounds(index: usize) -> Bounds<f32> {

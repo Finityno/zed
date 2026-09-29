@@ -305,9 +305,11 @@ impl Display for GlobalElementId {
 
 impl GlobalElementId {
     pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
-        use std::hash::{Hash, Hasher};
+        // The id's own hash is a 64-bit FxHash of the path, which is fine for
+        // finding element state, where a collision is told apart by comparing
+        // paths, but accessibility nodes are named by the hash alone.
         let mut hasher = std::hash::DefaultHasher::default();
-        self.hash(&mut hasher);
+        self.0.hash(&mut hasher);
         accesskit::NodeId(hasher.finish())
     }
 }

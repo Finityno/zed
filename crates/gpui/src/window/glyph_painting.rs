@@ -168,12 +168,18 @@ impl Window {
     /// find them, where a window paints in a handful of fonts and sizes.
     pub(crate) fn font_extents(&mut self, font_id: FontId, font_size: Pixels) -> FontExtents {
         let kept = &mut self.glyph_raster_cache.font_extents;
-        if let Some((_, _, extents)) = kept
+        if let Some(position) = kept
             .iter()
-            .rev()
-            .find(|(id, size, _)| *id == font_id && *size == font_size)
+            .rposition(|(id, size, _)| *id == font_id && *size == font_size)
         {
-            return *extents;
+            let extents = kept[position].2;
+            // Most recently used last, so the one pushed out is the one used
+            // least recently.
+            if position + 1 != kept.len() {
+                let entry = kept.remove(position);
+                kept.push(entry);
+            }
+            return extents;
         }
         let text_system = self.text_system();
         let extents = FontExtents {
