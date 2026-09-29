@@ -2677,11 +2677,12 @@ impl PlatformWindow for MacWindow {
         let split_duration = split_start.elapsed();
         let mut report = this.renderer.draw(&this.base_scene);
         report.breakdown.encode += split_duration;
-        if report.outcome == PresentOutcome::Deferred {
+        if report.outcome != PresentOutcome::Presented {
             // Presenting the overlay over a base that did not land would put
-            // the two planes on different frames; the retry presents both.
-            // Input keeps following the overlay that is still on screen
-            // until then.
+            // the two planes on different frames. A deferred base is retried
+            // and the retry presents both; a dropped one leaves both on the
+            // frame before, as a window without an overlay is left. Input
+            // keeps following the overlay that is still on screen.
             this.release_intermediates_if_occluded();
             return report;
         }
