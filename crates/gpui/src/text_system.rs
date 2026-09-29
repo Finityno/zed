@@ -710,6 +710,17 @@ impl WindowTextSystem {
         self.line_layout_cache.layout_index()
     }
 
+    /// Keeps `lines`, held across frames by a text element that did not ask
+    /// for them this frame, in the line layout cache. See
+    /// [`LineLayoutCache::hold_wrapped_lines`].
+    pub(crate) fn hold_lines<'a>(&self, lines: impl IntoIterator<Item = &'a WrappedLine>) {
+        self.line_layout_cache.hold_wrapped_lines(
+            lines
+                .into_iter()
+                .filter_map(|line| Some((line.cache_key.as_ref()?, &line.layout))),
+        )
+    }
+
     /// The lines this window shaped since [`Self::reset_shaping_stats`], and
     /// the time that took if it was being kept.
     pub(crate) fn shaping_stats(&self) -> (u64, std::time::Duration) {
@@ -923,7 +934,7 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
-            let layout = self.line_layout_cache.layout_wrapped_line(
+            let (layout, cache_key) = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
                 &font_runs,
@@ -936,6 +947,7 @@ impl WindowTextSystem {
                 layout,
                 decoration_runs,
                 text: line_text,
+                cache_key: Some(cache_key),
             });
 
             // Skip `\n` character.

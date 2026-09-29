@@ -737,7 +737,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
-    ) -> Arc<WrappedLineLayout>
+    ) -> (Arc<WrappedLineLayout>, Arc<CacheKey>)
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
@@ -752,8 +752,8 @@ impl LineLayoutCache {
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
-        if let Some(layout) = current_frame.wrapped_lines.get(key) {
-            return layout.clone();
+        if let Some((key, layout)) = current_frame.wrapped_lines.get_key_value(key) {
+            return (layout.clone(), key.clone());
         }
 
         let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
@@ -762,8 +762,8 @@ impl LineLayoutCache {
             current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
-            layout
+            current_frame.used_wrapped_lines.push(key.clone());
+            (layout, key)
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
@@ -790,9 +790,30 @@ impl LineLayoutCache {
             current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
+            current_frame.used_wrapped_lines.push(key.clone());
 
-            layout
+            (layout, key)
+        }
+    }
+
+    /// Tells the cache these lines, shaped on an earlier frame and still held
+    /// by a text element that did not ask for them again, are in use on this
+    /// one, so that it keeps them for whichever element asks next: a line
+    /// nobody asks for is dropped a frame later, and a text element whose
+    /// text lands on another layout node would have it shaped again.
+    pub(crate) fn hold_wrapped_lines<'a>(
+        &self,
+        lines: impl IntoIterator<Item = (&'a Arc<CacheKey>, &'a Arc<WrappedLineLayout>)>,
+    ) {
+        let _font_generation = self.clear_if_font_generation_changed();
+        let mut current_frame = self.current_frame.write();
+        for (key, layout) in lines {
+            if !current_frame.wrapped_lines.contains_key(key) {
+                current_frame
+                    .wrapped_lines
+                    .insert(key.clone(), layout.clone());
+                current_frame.used_wrapped_lines.push(key.clone());
+            }
         }
     }
 
@@ -1080,8 +1101,9 @@ trait AsCacheKeyRef {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_>;
 }
 
+/// What the cache finds a shaped line by.
 #[derive(Clone, Debug, Eq)]
-struct CacheKey {
+pub(crate) struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,

@@ -1100,3 +1100,58 @@ fn changed_text_is_measured_again_only_when_its_size_changes() {
     assert_eq!(longer.measured_nodes_dirtied, 1, "{longer:?}");
     assert!(longer.measure_calls > 0, "{longer:?}");
 }
+
+/// Rows without ids, whose text lands on a neighbour's node when a row is
+/// inserted ahead of them.
+struct ShiftingRows {
+    rows: Vec<u64>,
+}
+
+impl Render for ShiftingRows {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().flex().flex_col().children(
+            self.rows
+                .iter()
+                .map(|row| div().child(SharedString::from(format!("row number {row}")))),
+        )
+    }
+}
+
+/// Text a node carries over from frame to frame never asks the line layout
+/// cache for its lines, which the cache would then drop; the element hands
+/// them back, so text shifting onto another node is not shaped again.
+#[test]
+fn text_moving_to_another_node_is_not_shaped_again() {
+    let mut cx = text_system_context(0);
+    let window = cx.add_window(|_, _| ShiftingRows {
+        rows: (0..8).collect(),
+    });
+    for _ in 0..4 {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    cx.update_window(window.into(), |_, window, _| {
+        window.reset_frame_work_stats(false)
+    })
+    .unwrap();
+    window
+        .update(&mut cx, |view, _, cx| {
+            view.rows.insert(0, 100);
+            cx.notify();
+        })
+        .unwrap();
+    let work = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.frame_work_stats()
+        })
+        .unwrap();
+    assert!(
+        work.measurements_replayed >= 7,
+        "rows landed on their neighbours' nodes: {work:?}"
+    );
+    assert_eq!(work.lines_shaped, 1, "only the inserted row is new: {work:?}");
+}

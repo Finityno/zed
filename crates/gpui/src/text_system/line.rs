@@ -431,6 +431,9 @@ pub struct WrappedLine {
     /// The text that was shaped for this line.
     pub text: SharedString,
     pub(crate) decoration_runs: Vec<DecorationRun>,
+    /// What the line layout cache keeps the layout under, for a text element
+    /// that holds the line across frames to keep it there.
+    pub(crate) cache_key: Option<Arc<crate::text_system::CacheKey>>,
 }
 
 impl WrappedLine {
@@ -1302,6 +1305,7 @@ mod tests {
                     }),
                     text: line.text,
                     decoration_runs: line.decoration_runs.into_vec(),
+                    cache_key: None,
                 };
                 window.next_frame.scene.clear();
                 wrapped

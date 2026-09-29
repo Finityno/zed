@@ -401,7 +401,8 @@ impl Element for &'static str {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self, window.text_style().text_align)
+        text_layout.prepaint(bounds, self, window.text_style().text_align);
+        text_layout.hold_carried_lines(window);
     }
 
     fn paint(
@@ -475,7 +476,8 @@ impl Element for SharedString {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref(), window.text_style().text_align)
+        text_layout.prepaint(bounds, self.as_ref(), window.text_style().text_align);
+        text_layout.hold_carried_lines(window);
     }
 
     fn paint(
@@ -701,7 +703,9 @@ impl Element for StyledText {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text, window.text_style().text_align)
+        self.layout
+            .prepaint(bounds, &self.text, window.text_style().text_align);
+        self.layout.hold_carried_lines(window);
     }
 
     fn paint(
@@ -873,7 +877,9 @@ impl Element for ShimmerText {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text, window.text_style().text_align);
+        self.layout
+            .prepaint(bounds, &self.text, window.text_style().text_align);
+        self.layout.hold_carried_lines(window);
     }
 
     fn paint(
@@ -916,6 +922,9 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+    /// Whether the lines were carried over from last frame's element rather
+    /// than asked of the line layout cache this frame.
+    carried: bool,
 }
 
 impl TextLayout {
@@ -927,6 +936,16 @@ impl TextLayout {
         cx: &mut App,
     ) -> LayoutId {
         measurement::layout_text(self, text, runs, window, cx)
+    }
+
+    /// Keeps lines carried over from last frame's element in the line layout
+    /// cache, since this frame never asked the cache for them.
+    fn hold_carried_lines(&self, window: &Window) {
+        if let Some(inner) = self.0.borrow_mut().as_mut()
+            && mem::take(&mut inner.carried)
+        {
+            window.text_system().hold_lines(&inner.lines);
+        }
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, text_align: TextAlign) {
@@ -1628,6 +1647,7 @@ mod tests {
                 truncate_width: None,
                 size: None,
                 bounds: None,
+                carried: false,
             }))));
             layout.prepaint(Bounds::new(point(px(10.0), px(30.0)), size(px(100.0), px(40.0))), "aβcde", align);
             assert_eq!(layout.text_align(), align);

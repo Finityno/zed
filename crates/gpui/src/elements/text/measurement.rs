@@ -225,6 +225,7 @@ fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
     if Rc::strong_count(&layout.0) == 1 {
         let mut inner = layout.0.borrow_mut().take()?;
         inner.bounds = None;
+        inner.carried = true;
         Some(inner)
     } else {
         layout.0.borrow().as_ref().map(|inner| TextLayoutInner {
@@ -237,6 +238,7 @@ fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
                     layout: line.layout.clone(),
                     text: line.text.clone(),
                     decoration_runs: line.decoration_runs.clone(),
+                    cache_key: line.cache_key.clone(),
                 })
                 .collect(),
             line_height: inner.line_height,
@@ -244,6 +246,7 @@ fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
             truncate_width: inner.truncate_width,
             size: inner.size,
             bounds: None,
+            carried: true,
         })
     }
 }
@@ -454,6 +457,7 @@ fn measure_text(
                 truncate_width,
                 size: Some(Size::default()),
                 bounds: None,
+                carried: false,
             });
         }
         return Size::default();
@@ -476,6 +480,7 @@ fn measure_text(
             truncate_width,
             size: Some(size),
             bounds: None,
+            carried: false,
         });
     }
 
