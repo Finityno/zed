@@ -1258,6 +1258,12 @@ pub struct Window {
     /// retained scene's tiles were all marked used at that frame, so while it is
     /// recent they cannot have been retired; see `rendered_scene_may_reference_retired_tiles`.
     atlas_frame_at_last_present: u64,
+    /// Set when the frame loop rebuilds the scene because its tiles may have
+    /// been retired, and cleared by the next present that is not deferred. A
+    /// deferral does not move `atlas_frame_at_last_present`, so without this
+    /// every retry of the owed frame would rebuild the scene again, once per
+    /// display refresh.
+    retired_tile_redraw_deferred: bool,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1971,10 +1977,15 @@ impl Window {
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, cx| {
-                            if window.rendered_scene_may_reference_retired_tiles() {
+                            if window.rendered_scene_may_reference_retired_tiles()
+                                && !window.retired_tile_redraw_deferred
+                            {
                                 // The retained scene is old enough that the atlas may
                                 // have reclaimed tiles it names. Rebuild it without
                                 // cached-view replay so every tile is fetched afresh.
+                                // Once per run of deferred presents: the retries
+                                // present this rebuild.
+                                window.retired_tile_redraw_deferred = true;
                                 window.refresh();
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
@@ -2214,6 +2225,7 @@ impl Window {
             is_minimizable,
             sprite_atlas,
             atlas_frame_at_last_present: 0,
+            retired_tile_redraw_deferred: false,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3965,6 +3977,7 @@ impl Window {
                 .record_deferred_present(present_start, Instant::now(), report);
             return;
         }
+        self.retired_tile_redraw_deferred = false;
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -9193,6 +9206,74 @@ mod tests {
             test_window.frame_wake_count(),
             wakes + 1,
             "and once it lands nothing re-arms the frame source"
+        );
+    }
+
+    /// An atlas that has run far enough ahead of every window's last present
+    /// that each retained scene may name retired tiles.
+    struct AgedAtlas(crate::HeadlessAtlas);
+
+    impl crate::PlatformAtlas for AgedAtlas {
+        fn get_or_insert_with<'a>(
+            &self,
+            key: crate::AtlasKey,
+            build: &mut dyn FnMut() -> anyhow::Result<
+                Option<(crate::Size<crate::DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
+            >,
+        ) -> anyhow::Result<Option<crate::AtlasTile>> {
+            self.0.get_or_insert_with(key, build)
+        }
+
+        fn remove(&self, key: &crate::AtlasKey) {
+            self.0.remove(key);
+        }
+
+        fn frame_index(&self) -> u64 {
+            crate::ATLAS_TILE_MAX_IDLE_FRAMES
+        }
+    }
+
+    /// A deferral does not advance the window's last-presented atlas frame,
+    /// so a stale scene's owed frame still looks stale on every retry. The
+    /// scene is rebuilt once for the run of deferrals, not once per retry,
+    /// and the next stale present after one lands rebuilds it again.
+    #[gpui::test]
+    fn retries_of_a_deferred_present_rebuild_a_stale_scene_once(cx: &mut TestAppContext) {
+        let (window, test_window, renders) = open_render_counting_window(cx);
+        window
+            .update(cx, |_, window, _| {
+                window.sprite_atlas =
+                    std::sync::Arc::new(AgedAtlas(crate::HeadlessAtlas::default()));
+                assert!(window.rendered_scene_may_reference_retired_tiles());
+            })
+            .unwrap();
+
+        test_window.queue_present_outcomes([
+            PresentOutcome::Deferred,
+            PresentOutcome::Deferred,
+            PresentOutcome::Deferred,
+        ]);
+        let drawn = renders.get();
+        for _ in 0..3 {
+            test_window.simulate_frame_request(PRESENT_ONLY);
+        }
+        assert_eq!(
+            renders.get(),
+            drawn + 1,
+            "the first retry rebuilds the stale scene and the rest present it"
+        );
+
+        test_window.simulate_frame_request(PRESENT_ONLY);
+        assert_eq!(renders.get(), drawn + 1, "the landing present draws nothing");
+        window
+            .update(cx, |_, window, _| assert!(!window.needs_present.get()))
+            .unwrap();
+
+        test_window.simulate_frame_request(PRESENT_ONLY);
+        assert_eq!(
+            renders.get(),
+            drawn + 2,
+            "a stale present after one landed rebuilds the scene again"
         );
     }
 
