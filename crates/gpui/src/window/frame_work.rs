@@ -26,6 +26,22 @@ pub struct FrameWorkStats {
     pub views_reused: u64,
     /// Layout nodes requested from the layout engine.
     pub layout_nodes: u64,
+    /// Layout nodes kept from an earlier frame and handed out again.
+    pub layout_nodes_reused: u64,
+    /// Layout nodes made anew, because no node was kept for the element or
+    /// layout retention is off (`GPUI_RETAINED_LAYOUT=0`).
+    pub layout_nodes_created: u64,
+    /// Layout nodes released at the end of a frame: the ones made without a
+    /// key, and the kept ones no element asked for.
+    pub layout_nodes_released: u64,
+    /// Styles written to kept layout nodes because they changed. Each write
+    /// dirties the node and its ancestors.
+    pub layout_style_writes: u64,
+    /// Child lists written to kept layout nodes because they changed.
+    pub layout_children_writes: u64,
+    /// Kept self-measuring nodes given a new measurement and dirtied, so that
+    /// the layout engine measures them again.
+    pub measured_nodes_dirtied: u64,
     /// Layout computations: the root's, and every one an element asked for
     /// on its own, such as a cached view or a list item.
     pub compute_layout_calls: u64,
@@ -82,9 +98,20 @@ impl Window {
     /// [`Self::reset_frame_work_stats`].
     pub fn frame_work_stats(&self) -> FrameWorkStats {
         let (lines_shaped, shape_time) = self.text_system().shaping_stats();
+        let retention = self
+            .layout_engine
+            .as_ref()
+            .map(|engine| engine.retention_counts())
+            .unwrap_or_default();
         FrameWorkStats {
             lines_shaped,
             shape_time,
+            layout_nodes_reused: retention.nodes_reused,
+            layout_nodes_created: retention.nodes_created,
+            layout_nodes_released: retention.nodes_released,
+            layout_style_writes: retention.style_writes,
+            layout_children_writes: retention.children_writes,
+            measured_nodes_dirtied: retention.measured_nodes_dirtied,
             ..self.frame_work.stats
         }
     }
@@ -97,6 +124,9 @@ impl Window {
             timed,
         };
         self.text_system().reset_shaping_stats(timed);
+        if let Some(engine) = self.layout_engine.as_mut() {
+            engine.reset_retention_counts();
+        }
     }
 }
 

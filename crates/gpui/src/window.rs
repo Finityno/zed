@@ -72,6 +72,9 @@ pub(crate) mod a11y;
 mod draw_profile;
 mod frame_work;
 mod glyph_painting;
+mod layout_keys;
+#[cfg(test)]
+mod layout_retention_tests;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -1281,6 +1284,7 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) layout_keys: layout_keys::LayoutKeys,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) global_element_ids: crate::element::GlobalElementIdCache,
@@ -2248,6 +2252,7 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_keys: layout_keys::LayoutKeys::default(),
             root: None,
             element_id_stack: SmallVec::default(),
             global_element_ids: crate::element::GlobalElementIdCache::default(),
@@ -3818,6 +3823,7 @@ impl Window {
         }
 
         self.layout_engine.as_mut().unwrap().clear();
+        self.layout_keys.end_frame();
         self.text_system().finish_frame();
         self.glyph_raster_cache.finish_draw();
         self.global_element_ids.finish_frame();
@@ -5748,8 +5754,10 @@ impl Window {
         let scale_factor = self.scale_factor();
         self.frame_work.stats.layout_nodes += 1;
 
-        self.layout_engine.as_mut().unwrap().request_layout(
-            style,
+        let key = self.layout_keys.current();
+        self.layout_engine.as_mut().unwrap().request_keyed_layout(
+            key,
+            &style,
             rem_size,
             scale_factor,
             &cx.layout_id_buffer,
@@ -5774,10 +5782,14 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
         self.frame_work.stats.layout_nodes += 1;
-        self.layout_engine
-            .as_mut()
-            .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+        let key = self.layout_keys.current();
+        self.layout_engine.as_mut().unwrap().request_keyed_measured_layout(
+            key,
+            Some(&style),
+            rem_size,
+            scale_factor,
+            Box::new(measure),
+        )
     }
 
     /// Compute the layout for the given id within the given available space.
