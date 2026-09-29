@@ -2689,9 +2689,15 @@ impl PlatformWindow for MacWindow {
         this.release_intermediates_if_occluded();
 
         report.breakdown.accumulate(overlay_report.breakdown);
-        if overlay_report.outcome != PresentOutcome::Presented {
-            report.outcome = overlay_report.outcome;
-        }
+        // The base layer holds the window's content, so the present's
+        // outcome is the base's. An overlay layer whose drawable size is
+        // still zero drops every frame, and reporting that as the frame's
+        // outcome would count every frame as lost while the content was
+        // reaching the screen. An overlay that defers after the base landed
+        // is not retried: its plane keeps the previous frame until the window
+        // next presents. It cannot defer while its layer waits for drawables
+        // rather than timing out.
+        report.breakdown.overlay_outcome = Some(overlay_report.outcome);
         report
     }
 

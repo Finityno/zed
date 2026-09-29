@@ -255,6 +255,10 @@ pub enum SerializedHangContributor {
         /// The most surfaces any layer had submitted but not yet seen
         /// displayed when it asked for the next one.
         drawables_in_flight: u8,
+        /// For a window that splits its frame across a base and an overlay
+        /// surface, what became of the overlay's half, named like `outcome`;
+        /// `outcome` itself is the base surface's. Absent without an overlay.
+        overlay_outcome: Option<&'static str>,
         /// How many other events in the interval contain this one.
         depth: usize,
     },
@@ -402,6 +406,7 @@ impl SerializedHangContributor {
                     commit_ms: as_millis(breakdown.commit),
                     layers: breakdown.layers,
                     drawables_in_flight: breakdown.drawables_in_flight,
+                    overlay_outcome: breakdown.overlay_outcome.map(crate::PresentOutcome::name),
                     depth,
                 }
             }
@@ -688,7 +693,9 @@ mod tests {
     }
 
     /// A slow present names which part of it was slow, so a report can tell
-    /// a starved drawable pool from slow encoding or a GPU backlog.
+    /// a starved drawable pool from slow encoding or a GPU backlog. An
+    /// overlay that failed over a base that landed is named on its own,
+    /// without making the frame read as lost.
     #[test]
     fn serialized_present_carries_its_breakdown() {
         let startup = scheduler::Instant::now();
@@ -706,6 +713,7 @@ mod tests {
                     commit: Duration::from_millis(1),
                     layers: 2,
                     drawables_in_flight: 2,
+                    overlay_outcome: Some(crate::PresentOutcome::Dropped),
                 },
             },
         };
@@ -730,6 +738,7 @@ mod tests {
                 commit_ms,
                 layers,
                 drawables_in_flight,
+                overlay_outcome,
                 ..
             },
         ] = serialized.contributors.as_slice()
@@ -743,6 +752,7 @@ mod tests {
         assert_eq!(*commit_ms, 1.0);
         assert_eq!(*layers, 2);
         assert_eq!(*drawables_in_flight, 2);
+        assert_eq!(*overlay_outcome, Some("dropped"));
     }
 
     #[test]

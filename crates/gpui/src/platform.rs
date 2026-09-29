@@ -871,6 +871,12 @@ pub struct PresentBreakdown {
     /// displayed or discarded when it asked for the next one; a count near
     /// the layer's maximum means the compositor is holding them.
     pub drawables_in_flight: u8,
+    /// What became of the overlay surface's half of the frame, for a window
+    /// that splits its scene across a base and an overlay surface and drew
+    /// the overlay. The present's own outcome is the base surface's, which
+    /// holds the window's content, so an overlay that failed is reported
+    /// here rather than counting a frame whose base landed as lost.
+    pub overlay_outcome: Option<PresentOutcome>,
 }
 
 impl PresentBreakdown {
@@ -881,6 +887,7 @@ impl PresentBreakdown {
         self.commit += other.commit;
         self.layers = self.layers.saturating_add(other.layers);
         self.drawables_in_flight = self.drawables_in_flight.max(other.drawables_in_flight);
+        self.overlay_outcome = self.overlay_outcome.or(other.overlay_outcome);
     }
 }
 
