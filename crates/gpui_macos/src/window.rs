@@ -869,6 +869,11 @@ struct MacWindowState {
     select_next_tab_callback: Option<Box<dyn FnMut()>>,
     select_previous_tab_callback: Option<Box<dyn FnMut()>>,
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
+    /// Whether this window was given a tabbing identifier, and so may be a
+    /// native tab. Kept per window because `allowsAutomaticWindowTabbing` is
+    /// class-wide: configuring any window overwrites it, so it does not say
+    /// whether this one can be a tab.
+    native_tabbing: bool,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
@@ -1411,6 +1416,9 @@ impl MacWindow {
                 select_next_tab_callback: None,
                 select_previous_tab_callback: None,
                 toggle_tab_bar_callback: None,
+                // Only these kinds are given the identifier below.
+                native_tabbing: allows_automatic_window_tabbing
+                    && matches!(kind, WindowKind::Normal | WindowKind::Floating),
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
@@ -1789,7 +1797,11 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
-        let native_window = self.0.lock().native_window;
+        let native_window = {
+            let mut lock = self.0.lock();
+            lock.native_tabbing = tabbing_identifier.is_some();
+            lock.native_window
+        };
         unsafe {
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
@@ -3926,8 +3938,8 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // path is properly established. Without this guard, the focus state would remain unset until
     // the first mouse click, causing keybindings to be non-functional.
     //
-    // It is also only done for a window that shares a native tab group with another, or that was
-    // hidden while native tabbing is on. The frame presents inside a Core Animation transaction,
+    // It is also only done for a window that shares a native tab group with another, or that can
+    // be a native tab and was hidden. The frame presents inside a Core Animation transaction,
     // on the main thread, while AppKit's activation is still in progress, so a wait for a
     // drawable there (a compositor still holding the window's drawables from before it was
     // deactivated) stalls the activation for every app, not just this one. A visible window with
@@ -3935,21 +3947,18 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // window is visible, presents on the next refresh. A hidden window's display link is stopped,
     // so without this frame it would show its content from before it was hidden until the
     // occlusion change restarts the link and a refresh passes: this is the tab left in front
-    // after closing the one above it, which AppKit may already have taken out of the group. With
-    // native tabbing off no window can be a tab, so a hidden one (behind another app's window and
-    // brought forward with Cmd-Tab) is left to its display link.
+    // after closing the one above it, which AppKit may already have taken out of the group. A
+    // window given no tabbing identifier is never a tab, so a hidden one (behind another app's
+    // window and brought forward with Cmd-Tab) is left to its display link.
     if selector == sel!(windowDidBecomeKey:) && is_active {
         // Asked before the window-state lock is taken, so nothing AppKit does in answering can
         // find it held.
-        let (shares_a_tab_group, native_tabbing_enabled) = unsafe {
+        let shares_a_tab_group = unsafe {
             let tabbed_windows: id = msg_send![native_window, tabbedWindows];
-            let shares_a_tab_group = !tabbed_windows.is_null() && {
+            !tabbed_windows.is_null() && {
                 let count: NSUInteger = msg_send![tabbed_windows, count];
                 count > 1
-            };
-            let native_tabbing_enabled: BOOL =
-                msg_send![class!(NSWindow), allowsAutomaticWindowTabbing];
-            (shares_a_tab_group, native_tabbing_enabled == YES)
+            }
         };
         let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
@@ -3959,7 +3968,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 .frame_source
                 .as_ref()
                 .is_some_and(WindowFrameSource::is_running);
-            if (shares_a_tab_group || (native_tabbing_enabled && !display_link_running))
+            if (shares_a_tab_group || (lock.native_tabbing && !display_link_running))
                 && let Some(mut callback) = lock.request_frame_callback.take()
             {
                 lock.set_presents_with_transaction(true);
