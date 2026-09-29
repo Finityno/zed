@@ -1074,6 +1074,20 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        // `nextDrawable` hands back an autoreleased drawable, and the command
+        // buffer and pass descriptors are autoreleased too. Without a pool of
+        // its own the frame's drawable stays retained until the main run
+        // loop's pool drains, which a main thread busy for several frames in
+        // a row puts off; Core Animation cannot reuse a drawable that is still
+        // retained, so the layer's three-drawable pool empties faster and the
+        // next `nextDrawable` waits. `present_drawable` retains the drawable
+        // for as long as the command buffer needs it, and `render_frame`
+        // returns an owned command buffer, so nothing used after the pool
+        // outlives it.
+        objc2::rc::autoreleasepool(|_| self.draw_in_pool(scene))
+    }
+
+    fn draw_in_pool(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
