@@ -267,6 +267,12 @@ impl WindowFrameSource {
             unsubscribe(display_id, subscriber_id);
         }
     }
+
+    /// Whether this source is subscribed to a display's link, and so
+    /// delivers a frame request on that display's next refresh.
+    pub fn is_running(&self) -> bool {
+        self.registration.is_some()
+    }
 }
 
 impl Drop for WindowFrameSource {

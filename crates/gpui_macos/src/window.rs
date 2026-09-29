@@ -3902,6 +3902,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     }
 
     let executor = lock.foreground_executor.clone();
+    let native_window = lock.native_window;
     drop(lock);
 
     let a11y_events = {
@@ -3921,25 +3922,40 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // path is properly established. Without this guard, the focus state would remain unset until
     // the first mouse click, causing keybindings to be non-functional.
     //
-    // It is also only done for a window that shares a native tab group with another. The frame
-    // presents inside a Core Animation transaction, on the main thread, while AppKit's activation
-    // is still in progress, so a wait for a drawable there (a compositor still holding the
-    // window's drawables from before it was deactivated) stalls the activation for every app,
-    // not just this one. A window with no sibling tab has no tab switch to hide, and its display
-    // link, which runs whenever the window is visible, presents on the next refresh.
+    // It is also only done for a window that shares a native tab group with another, or that was
+    // hidden while native tabbing is on. The frame presents inside a Core Animation transaction,
+    // on the main thread, while AppKit's activation is still in progress, so a wait for a
+    // drawable there (a compositor still holding the window's drawables from before it was
+    // deactivated) stalls the activation for every app, not just this one. A visible window with
+    // no sibling tab has no tab switch to hide, and its display link, which runs whenever the
+    // window is visible, presents on the next refresh. A hidden window's display link is stopped,
+    // so without this frame it would show its content from before it was hidden until the
+    // occlusion change restarts the link and a refresh passes: this is the tab left in front
+    // after closing the one above it, which AppKit may already have taken out of the group. With
+    // native tabbing off no window can be a tab, so a hidden one (behind another app's window and
+    // brought forward with Cmd-Tab) is left to its display link.
     if selector == sel!(windowDidBecomeKey:) && is_active {
+        // Asked before the window-state lock is taken, so nothing AppKit does in answering can
+        // find it held.
+        let (shares_a_tab_group, native_tabbing_enabled) = unsafe {
+            let tabbed_windows: id = msg_send![native_window, tabbedWindows];
+            let shares_a_tab_group = !tabbed_windows.is_null() && {
+                let count: NSUInteger = msg_send![tabbed_windows, count];
+                count > 1
+            };
+            let native_tabbing_enabled: BOOL =
+                msg_send![class!(NSWindow), allowsAutomaticWindowTabbing];
+            (shares_a_tab_group, native_tabbing_enabled == YES)
+        };
         let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
 
         if lock.activated_least_once {
-            let shares_a_tab_group = unsafe {
-                let tabbed_windows: id = msg_send![lock.native_window, tabbedWindows];
-                !tabbed_windows.is_null() && {
-                    let count: NSUInteger = msg_send![tabbed_windows, count];
-                    count > 1
-                }
-            };
-            if shares_a_tab_group
+            let display_link_running = lock
+                .frame_source
+                .as_ref()
+                .is_some_and(WindowFrameSource::is_running);
+            if (shares_a_tab_group || (native_tabbing_enabled && !display_link_running))
                 && let Some(mut callback) = lock.request_frame_callback.take()
             {
                 lock.set_presents_with_transaction(true);
