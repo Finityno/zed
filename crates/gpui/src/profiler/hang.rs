@@ -255,9 +255,10 @@ pub enum SerializedHangContributor {
         /// The most surfaces any layer had submitted but not yet seen
         /// displayed when it asked for the next one.
         drawables_in_flight: u8,
-        /// `drawables_in_flight` read above the layer's maximum and was
-        /// clamped to it: a displayed-or-discarded notice was lost, so the
-        /// count may overstate what the compositor holds.
+        /// The layer's in-flight count has read above its maximum since it
+        /// last started afresh, and is clamped to it: a displayed-or-discarded
+        /// notice was lost, so `drawables_in_flight` may overstate what the
+        /// compositor holds.
         drawables_in_flight_clamped: bool,
         /// For a window that splits its frame across a base and an overlay
         /// surface, what became of the overlay's half, named like `outcome`;

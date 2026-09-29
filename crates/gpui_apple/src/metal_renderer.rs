@@ -252,6 +252,12 @@ pub struct MetalRenderer {
     /// and with every new layer, since a layer is only ever made along with
     /// its renderer.
     drawables_in_flight: Arc<AtomicU32>,
+    /// Set once `drawables_in_flight` has read above the layer's maximum,
+    /// which only presented handlers that never ran can cause. Clamping
+    /// removes only the excess over the maximum, so the count may go on
+    /// overstating what is in flight; this stays set, and every report says
+    /// so, until the count starts afresh.
+    drawables_in_flight_overstated: bool,
     /// Presents deferred in a row because `nextDrawable` returned none; used
     /// to log a run of them once instead of once per display refresh, and to
     /// end a run that goes on too long (see `missing_drawable_outcome`).
@@ -686,6 +692,7 @@ impl MetalRenderer {
             render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
             drawables_in_flight: Arc::new(AtomicU32::new(0)),
+            drawables_in_flight_overstated: false,
             consecutive_deferred_presents: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -1243,17 +1250,20 @@ impl MetalRenderer {
     }
 
     /// How many drawables are in flight, for a present's report, and whether
-    /// the count had to be clamped to the layer's maximum drawable count to
-    /// say so. More than the maximum can only mean presented handlers that
-    /// never ran (a command buffer that failed after commit, say); the count
-    /// is lowered to the maximum, which still bounds the drawables really in
-    /// flight from above, so one lost handler cannot keep it climbing.
-    fn read_drawables_in_flight(&self, layer: &metal::MetalLayerRef) -> (u8, bool) {
+    /// the count is known to overstate them. More than the layer's maximum
+    /// drawable count can only mean presented handlers that never ran (a
+    /// command buffer that failed after commit, say); the count is lowered to
+    /// the maximum, which still bounds the drawables really in flight from
+    /// above, so lost handlers cannot keep it climbing. That removes only the
+    /// excess, so the bias below the maximum stays, and so does the flag,
+    /// until [`Self::forget_drawables_in_flight`].
+    fn read_drawables_in_flight(&mut self, layer: &metal::MetalLayerRef) -> (u8, bool) {
         let maximum = layer.maximum_drawable_count().min(u8::MAX as NSUInteger) as u32;
         let count = self
             .drawables_in_flight
             .fetch_min(maximum, Ordering::Relaxed);
-        (count.min(maximum) as u8, count > maximum)
+        self.drawables_in_flight_overstated |= count > maximum;
+        (count.min(maximum) as u8, self.drawables_in_flight_overstated)
     }
 
     /// Starts the in-flight count afresh, for a window that has just been
@@ -1265,6 +1275,7 @@ impl MetalRenderer {
     /// is visible again, until it has presented past them.
     pub fn forget_drawables_in_flight(&mut self) {
         self.drawables_in_flight = Arc::new(AtomicU32::new(0));
+        self.drawables_in_flight_overstated = false;
     }
 
     /// Counts `drawable` as in flight until Core Animation displays or
@@ -3688,14 +3699,16 @@ mod present_report_tests {
 
     /// A layer never has more drawables out than its maximum, so a count
     /// above it can only come from presented handlers that never ran. It
-    /// reads as the maximum, flagged, and is lowered so it stops climbing;
-    /// hiding the window starts it afresh.
+    /// reads as the maximum, flagged, and is lowered so it stops climbing.
+    /// Lowering it removes only the excess, so it stays flagged, however low
+    /// it later reads, until hiding the window starts it afresh.
     #[test]
     fn an_in_flight_count_above_the_layer_maximum_is_clamped_flagged_and_forgotten() {
         let mut renderer =
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
         let layer = renderer.layer.clone().expect("a window renderer has a layer");
         let maximum = layer.maximum_drawable_count() as u8;
+        assert_eq!(renderer.read_drawables_in_flight(&layer), (0, false));
         renderer.drawables_in_flight.store(7, Ordering::Relaxed);
 
         assert_eq!(renderer.read_drawables_in_flight(&layer), (maximum, true));
@@ -3706,8 +3719,14 @@ mod present_report_tests {
         );
         assert_eq!(
             renderer.read_drawables_in_flight(&layer),
-            (maximum, false),
-            "a count at the maximum is one the layer can have"
+            (maximum, true),
+            "the lost handlers' bias below the maximum is still in the count"
+        );
+        renderer.drawables_in_flight.store(1, Ordering::Relaxed);
+        assert_eq!(
+            renderer.read_drawables_in_flight(&layer),
+            (1, true),
+            "and still may be as it falls"
         );
 
         renderer.forget_drawables_in_flight();
