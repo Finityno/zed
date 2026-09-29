@@ -2008,13 +2008,15 @@ impl Element for Div {
             bounds.size
         } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             let mut state = scroll_handle.0.borrow_mut();
-            state.child_bounds = Vec::with_capacity(request_layout.child_layout_ids.len());
+            let mut children = Vec::with_capacity(request_layout.child_layout_ids.len());
             for child_layout_id in &request_layout.child_layout_ids {
                 let child_bounds = window.layout_bounds(*child_layout_id);
                 child_min = child_min.min(&child_bounds.origin);
                 child_max = child_max.max(&child_bounds.bottom_right());
-                state.child_bounds.push(child_bounds);
+                children.push(child_bounds);
             }
+            state.version.bump_if(state.child_bounds != children);
+            state.child_bounds = children;
             (child_max - child_min).into()
         } else {
             for child_layout_id in &request_layout.child_layout_ids {
@@ -2517,22 +2519,28 @@ impl Interactivity {
                     }
                 }
 
-                window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                            } else {
-                                None
-                            };
+                // Opacity is applied as the element paints. With view retention
+                // on it is also applied while it prepaints, where a view nested
+                // inside compares the opacity it inherits with the last frame's.
+                let prepaint_opacity = style.opacity.filter(|_| cx.view_retention());
+                window.with_element_opacity(prepaint_opacity, |window| {
+                    window.with_text_style(style.text_style().cloned(), |window| {
+                        window.with_content_mask(
+                            style.overflow_mask(bounds, window.rem_size()),
+                            |window| {
+                                let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                    Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                } else {
+                                    None
+                                };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = f(&style, scroll_offset, hitbox, window, cx);
-                            (result, element_state)
-                        },
-                    )
+                                let scroll_offset =
+                                    self.clamp_scroll_position(bounds, &style, window, cx);
+                                let result = f(&style, scroll_offset, hitbox, window, cx);
+                                (result, element_state)
+                            },
+                        )
+                    })
                 })
             },
         )
@@ -2611,6 +2619,7 @@ impl Interactivity {
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
+            let offset_before = *scroll_offset;
 
             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
             if scroll_to_bottom {
@@ -2622,12 +2631,16 @@ impl Interactivity {
             // Publish the live bounds so the paint-time wheel listener can tell an event it
             // actually consumed from one that ran into the end of the content. Covers the
             // untracked case too, where there is no `ScrollHandle` to read from.
-            if let Some(scroll_max_cell) = self.scroll_max.as_ref() {
-                scroll_max_cell.set(scroll_max);
-            }
+            let max_before = self.scroll_max.as_ref().map(|cell| cell.replace(scroll_max));
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
+                // Views that read the handle are built again only when what
+                // they read changed; see `ScrollHandleState::version`.
+                let changed = scroll_handle_state.bounds != bounds
+                    || *scroll_offset != offset_before
+                    || max_before != Some(scroll_max);
                 scroll_handle_state.bounds = bounds;
+                scroll_handle_state.version.bump_if(changed);
             }
 
             *scroll_offset
@@ -3490,6 +3503,10 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let scroll_version = self
+                .tracked_scroll_handle
+                .as_ref()
+                .map(|handle| handle.0.borrow().version.clone());
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3569,6 +3586,9 @@ impl Interactivity {
 
                     let moved = *scroll_offset != old_scroll_offset;
                     if moved {
+                        if let Some(version) = &scroll_version {
+                            version.bump();
+                        }
                         cx.notify(current_view);
                     }
                     if propagate_scroll_at_bounds_only {
@@ -4437,6 +4457,10 @@ struct ScrollHandleState {
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
+    /// Bumped whenever what the handle answers changes, so that a view that
+    /// read it is built again rather than drawn from the last frame, with
+    /// view retention on.
+    version: crate::window::view_retention::dependencies::StateVersion,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4472,16 +4496,27 @@ impl ScrollHandle {
 
     /// Get the current scroll offset.
     pub fn offset(&self) -> Point<Pixels> {
+        self.note_read();
         *self.0.borrow().offset.borrow()
+    }
+
+    fn note_read(&self) {
+        crate::window::view_retention::dependencies::note_state_read(&self.0.borrow().version);
+    }
+
+    fn changed(&self) {
+        self.0.borrow().version.bump();
     }
 
     /// Get the maximum scroll offset.
     pub fn max_offset(&self) -> Point<Pixels> {
+        self.note_read();
         self.0.borrow().max_offset.get()
     }
 
     /// Get the top child that's scrolled into view.
     pub fn top_item(&self) -> usize {
+        self.note_read();
         let state = self.0.borrow();
         let top = state.bounds.top() - state.offset.borrow().y;
 
@@ -4501,6 +4536,7 @@ impl ScrollHandle {
 
     /// Get the bottom child that's scrolled into view.
     pub fn bottom_item(&self) -> usize {
+        self.note_read();
         let state = self.0.borrow();
         let bottom = state.bounds.bottom() - state.offset.borrow().y;
 
@@ -4520,16 +4556,19 @@ impl ScrollHandle {
 
     /// Return the bounds into which this child is painted
     pub fn bounds(&self) -> Bounds<Pixels> {
+        self.note_read();
         self.0.borrow().bounds
     }
 
     /// Get the bounds for a specific child.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
+        self.note_read();
         self.0.borrow().child_bounds.get(ix).cloned()
     }
 
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     pub fn scroll_to_item(&self, ix: usize) {
+        self.changed();
         let mut state = self.0.borrow_mut();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
@@ -4540,6 +4579,7 @@ impl ScrollHandle {
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     /// This scrolls the minimal amount to ensure that the child is the first visible element
     pub fn scroll_to_top_of_item(&self, ix: usize) {
+        self.changed();
         let mut state = self.0.borrow_mut();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
@@ -4556,6 +4596,7 @@ impl ScrollHandle {
         let Some(active_item) = state.active_item else {
             return;
         };
+        let offset_before = *state.offset.borrow();
 
         let active_item = match state.child_bounds.get(active_item.index) {
             Some(bounds) => {
@@ -4596,10 +4637,13 @@ impl ScrollHandle {
             None => Some(active_item),
         };
         state.active_item = active_item;
+        let moved = *state.offset.borrow() != offset_before;
+        state.version.bump_if(moved);
     }
 
     /// Scrolls to the bottom.
     pub fn scroll_to_bottom(&self) {
+        self.changed();
         let mut state = self.0.borrow_mut();
         state.scroll_to_bottom = true;
     }
@@ -4609,7 +4653,9 @@ impl ScrollHandle {
     /// As you scroll further down the offset becomes more negative.
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
+        let changed = *state.offset.borrow() != position;
         *state.offset.borrow_mut() = position;
+        state.version.bump_if(changed);
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.
@@ -4644,6 +4690,7 @@ impl ScrollHandle {
 
     /// Get the count of children for scrollable item.
     pub fn children_count(&self) -> usize {
+        self.note_read();
         self.0.borrow().child_bounds.len()
     }
 }

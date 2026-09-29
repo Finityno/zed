@@ -158,6 +158,21 @@ impl LayoutKeys {
         key
     }
 
+    /// The key of the element being prepainted.
+    pub(crate) fn prepaint_scope(&self) -> u64 {
+        self.prepaint_scope
+    }
+
+    /// Begins the element whose key is `key` again, for what it lays out
+    /// from here on to be keyed as it was when its layout was requested:
+    /// a view built during its prepaint, whose layout was kept.
+    pub(crate) fn push_key(&mut self, key: u64) {
+        self.stack.push(LayoutKeyFrame {
+            key,
+            next_unidentified_child: 0,
+        });
+    }
+
     /// Ends the element most recently begun.
     #[inline]
     pub(crate) fn pop(&mut self) {

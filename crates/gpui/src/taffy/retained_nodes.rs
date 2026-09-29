@@ -298,6 +298,55 @@ impl TaffyLayoutEngine {
         Claim::Reused(key, id)
     }
 
+    /// Claims every node kept under `keys` without asking anything of them,
+    /// as [`Self::keep_retained`] does, if every one is still kept and not yet
+    /// claimed this frame; otherwise claims none. For a view laid out as it
+    /// was last frame without being built, whose layout stands only if all
+    /// of its nodes do.
+    pub(crate) fn try_keep_retained(&mut self, keys: &[u64]) -> bool {
+        let retention = &self.retention;
+        let frame = retention.frame;
+        let all_kept = keys.iter().all(|key| {
+            retention
+                .retained
+                .get(key)
+                .is_some_and(|node| node.claimed_in_frame != frame)
+        });
+        if all_kept {
+            self.keep_retained(keys);
+        }
+        all_kept
+    }
+
+    /// Hands back the claims [`Self::keep_retained`] made on `keys`, for the
+    /// element that asked for them to claim them again as it lays out.
+    pub(crate) fn release_kept(&mut self, keys: &[u64]) {
+        let retention = &mut self.retention;
+        let frame = retention.frame;
+        for key in keys {
+            if let Some(node) = retention.retained.get_mut(key)
+                && node.claimed_in_frame == frame
+            {
+                node.claimed_in_frame = frame.wrapping_sub(1);
+                retention.claimed_this_frame -= 1;
+                retention.counts.nodes_kept = retention.counts.nodes_kept.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Writes made to kept nodes and nodes made so far: layout requests that
+    /// asked for something other than what the nodes held.
+    pub(crate) fn layout_writes(&self) -> u64 {
+        let counts = &self.retention.counts;
+        counts.style_writes + counts.children_writes + counts.nodes_created + counts.measured_nodes_dirtied
+    }
+
+    /// How many nodes made this frame will be released at its end, having no
+    /// key or one another element took.
+    pub(crate) fn transient_count(&self) -> usize {
+        self.retention.transient.len()
+    }
+
     /// Whether the node kept under `key` was claimed this frame.
     pub(crate) fn claimed_this_frame(&self, key: u64) -> bool {
         self.retention

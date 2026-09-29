@@ -22,8 +22,13 @@ pub struct FrameWorkStats {
     /// Views rendered, whether plain or cached ones that could not be reused.
     pub views_rendered: u64,
     /// Cached views whose previous frame's output was reused rather than
-    /// rendered.
+    /// rendered, and with view retention on ([`crate::App::set_view_retention`])
+    /// any view drawn again from the last frame. A view drawn again counts
+    /// once; the views nested in it are copied along without being counted.
     pub views_reused: u64,
+    /// With view retention on, why the views that were built were built
+    /// rather than drawn again from the last frame.
+    pub view_rebuilds: ViewRebuildCounts,
     /// Layout nodes requested from the layout engine.
     pub layout_nodes: u64,
     /// Layout nodes kept from an earlier frame and handed out again.
@@ -82,6 +87,34 @@ pub struct FrameWorkStats {
     pub measure_time: Duration,
     /// Time spent shaping [`Self::lines_shaped`].
     pub shape_time: Duration,
+}
+
+/// How many views were built for each [`crate::ViewRebuildReason`], with
+/// view retention on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewRebuildCounts {
+    /// [`crate::ViewRebuildReason::FirstDraw`].
+    pub first_draw: u64,
+    /// [`crate::ViewRebuildReason::WindowRefresh`].
+    pub window_refresh: u64,
+    /// [`crate::ViewRebuildReason::Accessibility`].
+    pub accessibility: u64,
+    /// [`crate::ViewRebuildReason::Notified`].
+    pub notified: u64,
+    /// [`crate::ViewRebuildReason::EntityChanged`].
+    pub entity_changed: u64,
+    /// [`crate::ViewRebuildReason::GlobalChanged`].
+    pub global_changed: u64,
+    /// [`crate::ViewRebuildReason::StateChanged`].
+    pub state_changed: u64,
+    /// [`crate::ViewRebuildReason::Deadline`].
+    pub deadline: u64,
+    /// [`crate::ViewRebuildReason::HoverChanged`].
+    pub hover_changed: u64,
+    /// [`crate::ViewRebuildReason::ContextChanged`].
+    pub context_changed: u64,
+    /// [`crate::ViewRebuildReason::OptedOut`].
+    pub opted_out: u64,
 }
 
 /// What a window keeps to fill in [`FrameWorkStats`]; the shaping counts are

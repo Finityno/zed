@@ -77,10 +77,12 @@ mod layout_keys;
 mod layout_retention_tests;
 #[cfg(test)]
 mod replay_tests;
+pub(crate) mod view_retention;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
-pub use frame_work::FrameWorkStats;
+pub use frame_work::{FrameWorkStats, ViewRebuildCounts};
+pub use view_retention::{DrawDependency, ViewRebuildReason};
 pub(crate) use frame_work::add_elapsed;
 pub(crate) use glyph_painting::LineGlyphPainter;
 
@@ -790,6 +792,9 @@ impl HitboxId {
     ///
     /// See [`Hitbox::is_hovered`] for details.
     pub fn is_hovered(self, window: &Window) -> bool {
+        if let Some(hovered) = view_retention::note_hover_read(window, self, false) {
+            return hovered;
+        }
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
@@ -805,9 +810,25 @@ impl HitboxId {
     ///
     /// See [`HitboxId::is_hovered`] for more details.
     pub(crate) fn is_hovered_ignoring_last_input(self, window: &Window) -> bool {
+        if let Some(hovered) = view_retention::note_hover_read(window, self, true) {
+            return hovered;
+        }
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
+        }
+        self.hit_test(window)
+    }
+
+    /// What [`Self::is_hovered`], or with `ignoring_modality`
+    /// [`Self::is_hovered_ignoring_last_input`], answers, without noting that
+    /// it was asked.
+    pub(crate) fn hovered_now(self, window: &Window, ignoring_modality: bool) -> bool {
+        if window.captured_hitbox == Some(self) {
+            return true;
+        }
+        if !ignoring_modality && window.last_input_modality == InputModality::Keyboard {
+            return false;
         }
         self.hit_test(window)
     }
@@ -1006,6 +1027,9 @@ pub(crate) struct DeferredDraw {
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The retained views it was deferred from, whose dependencies what it
+    /// reads while it is drawn are.
+    enclosing_views: view_retention::EnclosingViews,
 }
 
 pub(crate) struct Frame {
@@ -1033,6 +1057,9 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// The views drawn in this frame with view retention on, for the next
+    /// frame to draw again from it.
+    pub(crate) retained_views: view_retention::RetainedViews,
     shrink: FrameShrink,
 }
 
@@ -1115,6 +1142,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            retained_views: Default::default(),
             shrink: FrameShrink::default(),
         }
     }
@@ -1138,6 +1166,7 @@ impl Frame {
             .clear_vec(&mut self.window_control_hitboxes);
         shrink.deferred_draws.clear_vec(&mut self.deferred_draws);
         self.tab_stops.clear();
+        self.retained_views.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1311,7 +1340,8 @@ pub struct Window {
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
     glyph_raster_cache: glyph_painting::GlyphRasterCache,
     pub(crate) frame_work: frame_work::FrameWorkCounters,
-    opacity_cycle_stack: Vec<OpacityCycle>,
+    pub(crate) opacity_cycle_stack: Vec<OpacityCycle>,
+    pub(crate) view_retention: view_retention::ViewRetention,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2278,6 +2308,7 @@ impl Window {
             glyph_raster_cache: glyph_painting::GlyphRasterCache::default(),
             frame_work: frame_work::FrameWorkCounters::default(),
             opacity_cycle_stack: Vec::new(),
+            view_retention: view_retention::ViewRetention::new(cx),
             element_opacity: 1.0,
             glass_content: false,
             requested_autoscroll: None,
@@ -3682,6 +3713,9 @@ impl Window {
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Pointer>();
         self.mouse_position
     }
 
@@ -3721,6 +3755,9 @@ impl Window {
 
     /// The current state of the keyboard's modifiers
     pub fn modifiers(&self) -> Modifiers {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Keys>();
         self.modifiers
     }
 
@@ -3736,13 +3773,24 @@ impl Window {
 
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Keys>();
         self.capslock
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
-    #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let arena_clear_needed = self.draw_frame(cx);
+        if cx.view_retention() {
+            return self.verify_retained_frame(arena_clear_needed, cx);
+        }
+        arena_clear_needed
+    }
+
+    #[profiling::function]
+    fn draw_frame(&mut self, cx: &mut App) -> ArenaClearNeeded {
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3757,7 +3805,7 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
-        self.invalidate_entities();
+        self.invalidate_entities(cx);
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         if self.rendered_scene_may_reference_retired_tiles() {
@@ -3836,6 +3884,7 @@ impl Window {
                 });
         }
 
+        self.finish_retained_views_frame(cx);
         self.layout_engine.as_mut().unwrap().clear();
         self.layout_keys.end_frame();
         self.text_system().finish_frame();
@@ -3982,8 +4031,11 @@ impl Window {
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
-    fn invalidate_entities(&mut self) {
+    fn invalidate_entities(&mut self, cx: &App) {
         let mut views = self.invalidator.take_views();
+        if cx.view_retention() {
+            self.begin_retained_views_frame(&views);
+        }
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -4358,6 +4410,7 @@ impl Window {
                     absolute_offset,
                     prepaint_range,
                     beneath_native_surfaces,
+                    enclosing_views,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4372,6 +4425,7 @@ impl Window {
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.beneath_native_surfaces,
+                        deferred_draw.enclosing_views.clone(),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -4380,6 +4434,7 @@ impl Window {
                 if let Some(mut element) = element {
                     self.prepainting_deferred_draw_beneath_native_surfaces =
                         Some(beneath_native_surfaces);
+                    let recording = self.begin_deferred_view(&enclosing_views, cx);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -4387,6 +4442,7 @@ impl Window {
                             });
                         });
                     });
+                    self.finish_deferred_view(recording, cx);
                     self.prepainting_deferred_draw_beneath_native_surfaces = None;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
@@ -4432,13 +4488,15 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
+                let recording = self.begin_deferred_view(&deferred_draw.enclosing_views, cx);
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                             element.paint(window, cx);
                         });
                     })
-                })
+                });
+                self.finish_deferred_view(recording, cx);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
@@ -4521,6 +4579,9 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
+                    // Drawn from the last frame: what it read is part of the
+                    // records copied along with the views it came from.
+                    enclosing_views: Default::default(),
                 }),
         );
     }
@@ -4541,6 +4602,22 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_paint_inside(range, None);
+    }
+
+    /// Reuses `range` of the last frame's paint, as [`Self::reuse_paint`]
+    /// does, rebasing its primitives from the time transition they were
+    /// painted inside to the one current now; see [`Scene::replay_inside`].
+    pub(crate) fn reuse_paint_rebased(
+        &mut self,
+        range: Range<PaintIndex>,
+        painted_inside: u32,
+        replayed_inside: u32,
+    ) {
+        self.reuse_paint_inside(range, Some((painted_inside, replayed_inside)));
+    }
+
+    fn reuse_paint_inside(&mut self, range: Range<PaintIndex>, rebase: Option<(u32, u32)>) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
@@ -4589,9 +4666,10 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
+        self.next_frame.scene.replay_inside(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
+            rebase,
         );
     }
 
@@ -4819,6 +4897,7 @@ impl Window {
             .layout_engine
             .as_mut()
             .map(|engine| engine.begin_transaction());
+        let retained_transaction = self.begin_retained_transaction();
         let result = f(self);
         if let Some(start) = layout_transaction
             && let Some(engine) = self.layout_engine.as_mut()
@@ -4840,6 +4919,8 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            // The retained views recorded since point into what was truncated.
+            self.roll_back_retained_transaction(retained_transaction);
         }
         result
     }
@@ -5153,6 +5234,7 @@ impl Window {
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
+            enclosing_views: self.enclosing_views(),
         });
     }
 
@@ -6318,6 +6400,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
+        let ambient_before = view_retention::dependencies::AmbientInput::of(self);
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
@@ -6447,6 +6530,7 @@ impl Window {
             }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
+        ambient_before.stamp_changes(self, cx);
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);

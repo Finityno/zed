@@ -222,6 +222,22 @@ impl<'a, T: 'static> Context<'a, T> {
         self.app.notify(self.entity_state.entity_id);
     }
 
+    /// Whether this view may be drawn again from the last frame, with view
+    /// retention on ([`App::set_view_retention`]). A view that is not is
+    /// built on every frame it is drawn in, though the views around and
+    /// inside it can still be drawn again: for a view whose render reads
+    /// something it is not notified of and cannot declare with
+    /// [`crate::Window::depend_on`] or [`crate::Window::rebuild_at`].
+    /// Views are retainable unless they say otherwise.
+    pub fn set_view_retainable(&mut self, retainable: bool) {
+        let entity_id = self.entity_state.entity_id;
+        if retainable {
+            self.app.non_retainable_views.remove(&entity_id);
+        } else {
+            self.app.non_retainable_views.insert(entity_id);
+        }
+    }
+
     /// Spawn the future returned by the given function.
     /// The function is provided a weak handle to the entity owned by this context and a context that can be held across await points.
     /// The returned task must be held or detached.

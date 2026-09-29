@@ -119,7 +119,7 @@ pub struct Scene {
     animated_quads: Vec<u32>,
     /// Moves referenced by each primitive's transition id (`pad`, or the
     /// background's transition bits for quads).
-    transitions: Vec<SceneTransition>,
+    pub(crate) transitions: Vec<SceneTransition>,
     /// The transition primitives inserted now are stamped with, set by
     /// [`crate::Window::with_time_transition`].
     current_transition: u32,
@@ -393,6 +393,10 @@ impl Scene {
     /// Copies `transition` and the transitions it was pushed inside from
     /// `prev_scene`, parents first, so a replayed id always names a later
     /// entry than its parent's. `0` when the scene has run out of ids.
+    ///
+    /// `remapped` starts out holding the transition the replayed range was
+    /// painted inside, mapped to the one it is replayed inside, when those
+    /// differ; see [`Self::replay_inside`].
     fn remap_transition(
         &mut self,
         prev_scene: &Scene,
@@ -403,7 +407,9 @@ impl Scene {
             return id;
         }
         let mut entry = prev_scene.transitions[transition as usize - 1];
-        if entry.parent != 0 {
+        if let Some(&(_, id)) = remapped.iter().find(|(source, _)| *source == entry.parent) {
+            entry.parent = id;
+        } else if entry.parent != 0 {
             entry.parent = self.remap_transition(prev_scene, entry.parent, remapped);
         }
         let id = self.push_transition(entry).unwrap_or(0);
@@ -423,16 +429,38 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        self.replay_inside(range, prev_scene, None);
+    }
+
+    /// Replays `range` of `prev_scene`, as [`Self::replay`] does, into a scene
+    /// where what it was painted inside differs: `rebase` maps the transition
+    /// the range was painted inside (`0` for none) to the one it is replayed
+    /// inside. Primitives that carried the old one carry the new one, and
+    /// transitions pushed inside the range are parented to it, so content
+    /// replayed into a transition that started since moves with it rather
+    /// than with a copy of the one it was painted in.
+    pub(crate) fn replay_inside(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        rebase: Option<(u32, u32)>,
+    ) {
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
         let mut remapped_animation = (0, 0);
         let mut remapped_transitions: Vec<(u32, u32)> = Vec::new();
+        let rebase = rebase.filter(|(from, to)| from != to);
+        remapped_transitions.extend(rebase);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
                     let transition = primitive_transition(&primitive);
-                    if transition != 0 {
+                    if let Some((from, to)) = rebase
+                        && transition == from
+                    {
+                        set_primitive_transition(&mut primitive, to);
+                    } else if transition != 0 {
                         let remapped =
                             self.remap_transition(prev_scene, transition, &mut remapped_transitions);
                         set_primitive_transition(&mut primitive, remapped);
