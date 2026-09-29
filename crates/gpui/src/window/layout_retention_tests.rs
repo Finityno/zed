@@ -993,18 +993,70 @@ impl Render for Dashboard {
     }
 }
 
-/// Prints what a frame of a large, mostly unchanging tree costs with layout
-/// nodes kept and without. Run with
-/// `cargo test -p gpui --lib --features test-support dashboard_frame_work -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn dashboard_frame_work() {
+/// A transcript of paragraphs in a list, the last of which grows by a word a
+/// frame, as a streamed reply does.
+struct Transcript {
+    list_state: ListState,
+    paragraphs: usize,
+    last_words: usize,
+}
+
+impl Render for Transcript {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let paragraphs = self.paragraphs;
+        let last_words = self.last_words;
+        div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .child(
+                // A sidebar that does not change, as most of a window does not
+                // while one reply streams in.
+                div().flex().flex_col().w(px(240.)).children((0..120).map(|row| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .child(div().size(px(10.)).bg(PALETTE[row % PALETTE.len()]))
+                        .child(WORDS[row % WORDS.len()])
+                        .child(SharedString::from(format!("{row}")))
+                })),
+            )
+            .child(
+            list(self.list_state.clone(), move |ix, _, _| {
+                let words = if ix + 1 == paragraphs {
+                    last_words
+                } else {
+                    20 + ix % 30
+                };
+                let text: String = (0..words)
+                    .map(|word| WORDS[(ix + word) % WORDS.len()])
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                div()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .child(div().text_color(PALETTE[1]).child(format!("message {ix}")))
+                    .child(div().w(px(560.)).child(text))
+                    .into_any_element()
+            })
+            .w(px(600.))
+            .h_full(),
+        )
+    }
+}
+
+fn measure_frames<V: Render>(
+    name: &str,
+    view: impl Fn(&mut Context<V>) -> V + Clone + 'static,
+    mut step: impl FnMut(&mut V, &mut Context<V>),
+) {
     for retained in [false, true] {
         let mut cx = text_system_context(0);
-        let window = cx.add_window(|_, _| Dashboard {
-            panels: 40,
-            labels: 40,
-            frame: 0,
+        let window = cx.add_window({
+            let view = view.clone();
+            move |_, cx| view(cx)
         });
         cx.update_window(window.into(), |_, window, _| {
             window.layout_keys.set_enabled(retained)
@@ -1015,23 +1067,25 @@ fn dashboard_frame_work() {
             cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
                 .unwrap();
         }
-        let frames = 30;
         cx.update_window(window.into(), |_, window, _| {
             window.reset_frame_work_stats(true)
         })
         .unwrap();
-        for _ in 0..frames {
+        for _ in 0..30 {
             window
                 .update(&mut cx, |view, _, cx| {
-                    view.frame += 1;
+                    step(view, cx);
                     cx.notify();
                 })
                 .unwrap();
             cx.update_window(window.into(), |_, window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
+                if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
             })
             .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
         }
         let work = cx
             .update_window(window.into(), |_, window, _| window.frame_work_stats())
@@ -1040,10 +1094,11 @@ fn dashboard_frame_work() {
         let per_frame_ms =
             |duration: std::time::Duration| duration.as_secs_f64() * 1000. / work.frames as f64;
         eprintln!(
-            "retained layout {retained}: per frame {:.0} nodes, {:.0} reused, {:.0} created, \
-             {:.0} measured nodes dirtied, {:.0} carried, {:.0} replayed, {:.0} measure calls, \
-             {:.0} replay measure calls, {:.1} lines shaped; \
-             build {:.2} ms, prepaint {:.2} ms (layout {:.2} ms, measuring {:.2} ms), paint {:.2} ms",
+            "{name}, layout nodes kept {retained}: per frame {:.0} nodes, {:.0} reused, \
+             {:.1} created, {:.1} measured nodes dirtied, {:.0} carried, {:.1} replayed, \
+             {:.0} measure calls, {:.1} replay measure calls, {:.1} lines shaped; \
+             build {:.2} ms, prepaint {:.2} ms (layout {:.2} ms, measuring {:.2} ms), \
+             paint {:.2} ms",
             per_frame(work.layout_nodes),
             per_frame(work.layout_nodes_reused),
             per_frame(work.layout_nodes_created),
@@ -1060,6 +1115,50 @@ fn dashboard_frame_work() {
             per_frame_ms(work.paint_time),
         );
     }
+}
+
+/// Prints what frames of a few large, mostly unchanging windows cost with
+/// layout nodes kept and without: a dashboard where one label ticks, a
+/// transcript whose last paragraph grows, and the same transcript scrolled.
+/// Every frame is drawn twice, once with the change and once as it is, as a
+/// window redrawn for a hover or an animation would be. Run with
+/// `cargo test -p gpui --lib --features test-support frame_work_of_large_windows -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn frame_work_of_large_windows() {
+    measure_frames(
+        "dashboard, one label ticking",
+        |_| Dashboard {
+            panels: 40,
+            labels: 40,
+            frame: 0,
+        },
+        |view, _| view.frame += 1,
+    );
+    let transcript = |_: &mut Context<Transcript>| Transcript {
+        list_state: {
+            let state = ListState::new(200, ListAlignment::Bottom, px(200.));
+            state.set_follow_mode(crate::FollowMode::Tail);
+            state
+        },
+        paragraphs: 200,
+        last_words: 1,
+    };
+    measure_frames("transcript, streaming", transcript, |view, _| {
+        view.last_words += 1
+    });
+    measure_frames(
+        "transcript, scrolling 7 px a frame",
+        move |cx| {
+            let view = transcript(cx);
+            view.list_state.scroll_to(ListOffset {
+                item_ix: 100,
+                offset_in_item: px(0.),
+            });
+            view
+        },
+        |view, _| view.list_state.scroll_by(px(7.)),
+    );
 }
 
 /// Text in a narrow box, above a probe that lands below it.
