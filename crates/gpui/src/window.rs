@@ -4791,7 +4791,16 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let layout_transaction = self
+            .layout_engine
+            .as_mut()
+            .map(|engine| engine.begin_transaction());
         let result = f(self);
+        if let Some(start) = layout_transaction
+            && let Some(engine) = self.layout_engine.as_mut()
+        {
+            engine.end_transaction(start, result.is_err());
+        }
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
             self.next_frame

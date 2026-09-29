@@ -45,6 +45,11 @@ pub(crate) struct LayoutRetention {
     /// Retained nodes claimed this frame. When every retained node was, the
     /// end of the frame has nothing to sweep.
     claimed_this_frame: usize,
+    /// Keys claimed since the outermost open transaction began, for a
+    /// transaction rolled back to hand back. See
+    /// [`TaffyLayoutEngine::begin_transaction`].
+    transaction_claims: Vec<u64>,
+    open_transactions: usize,
     /// The fingerprint of the default style, which every text leaf asks for,
     /// under the rem size and scale factor it was taken at.
     default_fingerprint: Option<(Pixels, f32, u64)>,
@@ -254,7 +259,41 @@ impl TaffyLayoutEngine {
         node.claimed_in_frame = frame;
         retention.claimed_this_frame += 1;
         retention.counts.nodes_reused += 1;
+        if retention.open_transactions > 0 {
+            retention.transaction_claims.push(key);
+        }
         Claim::Reused(key, node.id)
+    }
+
+    /// Begins a stretch of layout requests that may be rolled back, as
+    /// [`crate::Window::transact`] rolls back a prepaint that has to be done
+    /// again. Returns where the stretch begins.
+    pub(crate) fn begin_transaction(&mut self) -> usize {
+        let retention = &mut self.retention;
+        retention.open_transactions += 1;
+        retention.transaction_claims.len()
+    }
+
+    /// Ends the stretch begun at `start`. Rolled back, the nodes it claimed
+    /// are handed back, so the requests made again claim them rather than
+    /// finding them taken and making nodes of their own.
+    pub(crate) fn end_transaction(&mut self, start: usize, rolled_back: bool) {
+        let retention = &mut self.retention;
+        if rolled_back {
+            let frame = retention.frame;
+            for key in retention.transaction_claims.drain(start..) {
+                if let Some(node) = retention.retained.get_mut(&key)
+                    && node.claimed_in_frame == frame
+                {
+                    node.claimed_in_frame = frame.wrapping_sub(1);
+                    retention.claimed_this_frame -= 1;
+                }
+            }
+        }
+        retention.open_transactions -= 1;
+        if retention.open_transactions == 0 {
+            retention.transaction_claims.clear();
+        }
     }
 
     fn retain(
@@ -271,6 +310,9 @@ impl TaffyLayoutEngine {
             retention.transient.push(id);
             return;
         };
+        if retention.open_transactions > 0 {
+            retention.transaction_claims.push(key);
+        }
         retention.retained.insert(
             key,
             RetainedNode {
@@ -971,6 +1013,27 @@ mod tests {
         assert_eq!(frame(&mut engine, true), 0.);
         assert_eq!(frame(&mut engine, false), 30.);
         assert_eq!(engine.retention.counts.nodes_created, 3);
+    }
+
+    /// Requests rolled back with the prepaint they were made in hand their
+    /// nodes back, and the requests made again find them.
+    #[test]
+    fn requests_made_again_after_a_rollback_find_their_nodes() {
+        let mut engine = TaffyLayoutEngine::new();
+        let frame = |engine: &mut TaffyLayoutEngine| {
+            let transaction = engine.begin_transaction();
+            let child = engine.request_keyed_layout(Some(2), &sized(5.), px(16.), 1., &[]);
+            engine.request_keyed_layout(Some(1), &Style::default(), px(16.), 1., &[child]);
+            engine.end_transaction(transaction, true);
+            let child = engine.request_keyed_layout(Some(2), &sized(5.), px(16.), 1., &[]);
+            engine.request_keyed_layout(Some(1), &Style::default(), px(16.), 1., &[child]);
+            engine.clear();
+        };
+        frame(&mut engine);
+        assert_eq!(engine.retention.counts.nodes_created, 2);
+        frame(&mut engine);
+        assert_eq!(engine.retention.counts.nodes_created, 2);
+        assert_eq!(engine.taffy.total_node_count(), 2);
     }
 
     /// A frame asking for what the last one asked for writes nothing, and

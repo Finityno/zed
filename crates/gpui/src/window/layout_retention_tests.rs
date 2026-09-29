@@ -93,6 +93,7 @@ enum Change {
     SegmentCount { count: usize },
     SegmentWidth { width: f32 },
     Tint,
+    Select { row: usize },
     Resize { width: f32, height: f32 },
     Redraw,
 }
@@ -159,7 +160,10 @@ impl Change {
             80..83 => Change::SegmentWidth {
                 width: rng.random_range(40.0..300.0),
             },
-            83..87 => Change::Tint,
+            83..85 => Change::Tint,
+            85..87 => Change::Select {
+                row: rng.random_range(0..64),
+            },
             87..90 => Change::Resize {
                 width: rng.random_range(300.0..1000.0),
                 height: rng.random_range(240.0..800.0),
@@ -185,6 +189,8 @@ struct OracleView {
     segments: Vec<usize>,
     segment_width: Pixels,
     tint: usize,
+    /// The row that asks the list to scroll it into view when it is shown.
+    selected: Option<u64>,
     badge: crate::Entity<Badge>,
     uniform_scroll: UniformListScrollHandle,
     list_state: ListState,
@@ -214,6 +220,7 @@ impl OracleView {
             segments: vec![0, 5, 8],
             segment_width: px(160.),
             tint: 0,
+            selected: None,
             badge: cx.new(|_| Badge { count: 0 }),
             uniform_scroll: UniformListScrollHandle::new(),
             list_state: ListState::new(INITIAL_ROWS as usize, ListAlignment::Top, px(40.)),
@@ -290,6 +297,9 @@ impl OracleView {
                     cx.notify();
                 });
             }
+            Change::Select { row } => {
+                self.selected = (!self.rows.is_empty()).then(|| self.rows[row % self.rows.len()]);
+            }
             Change::Resize { .. } | Change::Redraw => return,
         }
         cx.notify();
@@ -313,9 +323,21 @@ fn render_cell(cell: CellState, tint: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn render_row(row: u64, identity: RowIdentity) -> AnyElement {
+fn render_row(row: u64, identity: RowIdentity, selected: bool) -> AnyElement {
     let word = WORDS[(row as usize * 7) % WORDS.len()];
     let row_element = div()
+        .when(selected, |this| {
+            // Asks the list to scroll the row into view, which rolls the
+            // list's prepaint back and lays its items out again.
+            this.child(
+                crate::canvas(
+                    |bounds, window, _| window.request_autoscroll(bounds),
+                    |_, _, _, _| {},
+                )
+                .w(px(4.))
+                .h(px(ROW_HEIGHT)),
+            )
+        })
         .flex()
         .flex_row()
         .gap_2()
@@ -379,7 +401,11 @@ impl Render for OracleView {
             .set_offset(point(px(0.), -self.scroll_top));
         let uniform_rows = uniform_list("uniform rows", rows.len(), {
             let rows = rows.clone();
-            move |range, _, _| range.map(|ix| render_row(rows[ix], identity)).collect()
+            move |range, _, _| {
+                range
+                    .map(|ix| render_row(rows[ix], identity, false))
+                    .collect()
+            }
         })
         .track_scroll(&self.uniform_scroll)
         .w(px(260.))
@@ -393,8 +419,9 @@ impl Render for OracleView {
                 offset_in_item: px(self.scroll_top.as_f32() % ROW_HEIGHT),
             });
         }
+        let selected = self.selected;
         let list_rows = list(self.list_state.clone(), move |ix, _, _| {
-            render_row(rows[ix], identity)
+            render_row(rows[ix], identity, selected == Some(rows[ix]))
         })
         .w(px(260.))
         .h(px(120.));
