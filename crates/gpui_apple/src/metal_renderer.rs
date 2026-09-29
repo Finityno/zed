@@ -246,7 +246,11 @@ pub struct MetalRenderer {
     /// Drawables handed to `present` whose presented handler has not run
     /// yet: queued behind the one on screen, or held by a compositor that is
     /// not showing the window. Shared with the handlers, which run on a
-    /// Metal thread.
+    /// Metal thread. A handler that never runs leaves it raised, so it is
+    /// clamped when read ([`Self::read_drawables_in_flight`]) and starts
+    /// afresh when the window is hidden ([`Self::forget_drawables_in_flight`])
+    /// and with every new layer, since a layer is only ever made along with
+    /// its renderer.
     drawables_in_flight: Arc<AtomicU32>,
     /// Presents deferred in a row because `nextDrawable` returned none; used
     /// to log a run of them once instead of once per display refresh, and to
@@ -1150,10 +1154,10 @@ impl MetalRenderer {
         if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
             return dropped(breakdown);
         }
-        breakdown.drawables_in_flight = self
-            .drawables_in_flight
-            .load(Ordering::Relaxed)
-            .min(u8::MAX as u32) as u8;
+        let (drawables_in_flight, drawables_in_flight_clamped) =
+            self.read_drawables_in_flight(&layer);
+        breakdown.drawables_in_flight = drawables_in_flight;
+        breakdown.drawables_in_flight_clamped = drawables_in_flight_clamped;
         let acquire_start = Instant::now();
         let drawable = layer.next_drawable();
         breakdown.acquire = acquire_start.elapsed();
@@ -1236,6 +1240,31 @@ impl MetalRenderer {
             self.consecutive_deferred_presents = 0;
             PresentOutcome::Dropped
         }
+    }
+
+    /// How many drawables are in flight, for a present's report, and whether
+    /// the count had to be clamped to the layer's maximum drawable count to
+    /// say so. More than the maximum can only mean presented handlers that
+    /// never ran (a command buffer that failed after commit, say); the count
+    /// is lowered to the maximum, which still bounds the drawables really in
+    /// flight from above, so one lost handler cannot keep it climbing.
+    fn read_drawables_in_flight(&self, layer: &metal::MetalLayerRef) -> (u8, bool) {
+        let maximum = layer.maximum_drawable_count().min(u8::MAX as NSUInteger) as u32;
+        let count = self
+            .drawables_in_flight
+            .fetch_min(maximum, Ordering::Relaxed);
+        (count.min(maximum) as u8, count > maximum)
+    }
+
+    /// Starts the in-flight count afresh, for a window that has just been
+    /// hidden, so a count left raised by a presented handler that never ran
+    /// does not read as a held pool for the rest of the window's life.
+    /// Handlers of drawables presented before this still decrement the count
+    /// they were registered with, not the new one; drawables the compositor
+    /// holds from before the window was hidden therefore go uncounted once it
+    /// is visible again, until it has presented past them.
+    pub fn forget_drawables_in_flight(&mut self) {
+        self.drawables_in_flight = Arc::new(AtomicU32::new(0));
     }
 
     /// Counts `drawable` as in flight until Core Animation displays or
@@ -3523,7 +3552,10 @@ mod present_report_tests {
     use super::{InstanceBufferPool, MetalRenderer, stale_texture_healing_tests::solid_quad_scene};
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
     #[test]
     fn a_layer_backed_draw_reports_acquire_encode_and_commit_separately() {
@@ -3596,5 +3628,33 @@ mod present_report_tests {
             PresentOutcome::Deferred,
             "and the next present starts a fresh run"
         );
+    }
+
+    /// A layer never has more drawables out than its maximum, so a count
+    /// above it can only come from presented handlers that never ran. It
+    /// reads as the maximum, flagged, and is lowered so it stops climbing;
+    /// hiding the window starts it afresh.
+    #[test]
+    fn an_in_flight_count_above_the_layer_maximum_is_clamped_flagged_and_forgotten() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let layer = renderer.layer.clone().expect("a window renderer has a layer");
+        let maximum = layer.maximum_drawable_count() as u8;
+        renderer.drawables_in_flight.store(7, Ordering::Relaxed);
+
+        assert_eq!(renderer.read_drawables_in_flight(&layer), (maximum, true));
+        assert_eq!(
+            renderer.drawables_in_flight.load(Ordering::Relaxed),
+            u32::from(maximum),
+            "the count is lowered to the maximum"
+        );
+        assert_eq!(
+            renderer.read_drawables_in_flight(&layer),
+            (maximum, false),
+            "a count at the maximum is one the layer can have"
+        );
+
+        renderer.forget_drawables_in_flight();
+        assert_eq!(renderer.read_drawables_in_flight(&layer), (0, false));
     }
 }

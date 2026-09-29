@@ -871,6 +871,11 @@ pub struct PresentBreakdown {
     /// displayed or discarded when it asked for the next one; a count near
     /// the layer's maximum means the compositor is holding them.
     pub drawables_in_flight: u8,
+    /// A layer's in-flight count read above the most surfaces it can have,
+    /// which happens only when the notice that one was displayed or
+    /// discarded never came. `drawables_in_flight` was clamped to that
+    /// maximum and may overstate what the compositor holds.
+    pub drawables_in_flight_clamped: bool,
     /// What became of the overlay surface's half of the frame, for a window
     /// that splits its scene across a base and an overlay surface and drew
     /// the overlay. The present's own outcome is the base surface's, which
@@ -887,6 +892,7 @@ impl PresentBreakdown {
         self.commit += other.commit;
         self.layers = self.layers.saturating_add(other.layers);
         self.drawables_in_flight = self.drawables_in_flight.max(other.drawables_in_flight);
+        self.drawables_in_flight_clamped |= other.drawables_in_flight_clamped;
         self.overlay_outcome = self.overlay_outcome.or(other.overlay_outcome);
     }
 }

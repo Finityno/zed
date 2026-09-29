@@ -255,6 +255,10 @@ pub enum SerializedHangContributor {
         /// The most surfaces any layer had submitted but not yet seen
         /// displayed when it asked for the next one.
         drawables_in_flight: u8,
+        /// `drawables_in_flight` read above the layer's maximum and was
+        /// clamped to it: a displayed-or-discarded notice was lost, so the
+        /// count may overstate what the compositor holds.
+        drawables_in_flight_clamped: bool,
         /// For a window that splits its frame across a base and an overlay
         /// surface, what became of the overlay's half, named like `outcome`;
         /// `outcome` itself is the base surface's. Absent without an overlay.
@@ -406,6 +410,7 @@ impl SerializedHangContributor {
                     commit_ms: as_millis(breakdown.commit),
                     layers: breakdown.layers,
                     drawables_in_flight: breakdown.drawables_in_flight,
+                    drawables_in_flight_clamped: breakdown.drawables_in_flight_clamped,
                     overlay_outcome: breakdown.overlay_outcome.map(crate::PresentOutcome::name),
                     depth,
                 }
@@ -713,6 +718,7 @@ mod tests {
                     commit: Duration::from_millis(1),
                     layers: 2,
                     drawables_in_flight: 2,
+                    drawables_in_flight_clamped: false,
                     overlay_outcome: Some(crate::PresentOutcome::Dropped),
                 },
             },
@@ -738,6 +744,7 @@ mod tests {
                 commit_ms,
                 layers,
                 drawables_in_flight,
+                drawables_in_flight_clamped,
                 overlay_outcome,
                 ..
             },
@@ -752,6 +759,7 @@ mod tests {
         assert_eq!(*commit_ms, 1.0);
         assert_eq!(*layers, 2);
         assert_eq!(*drawables_in_flight, 2);
+        assert!(!*drawables_in_flight_clamped);
         assert_eq!(*overlay_outcome, Some("dropped"));
     }
 

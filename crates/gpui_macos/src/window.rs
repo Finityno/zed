@@ -3715,10 +3715,14 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             lock.stop_display_link();
             // Nothing paints an occluded window, so its drawable-sized
             // intermediate textures can go; the first draw after it becomes
-            // visible again recreates them.
+            // visible again recreates them. Its in-flight drawable counts
+            // start afresh too, so one raised by a lost presented handler
+            // does not outlive the stretch of presenting it happened in.
             lock.renderer.release_intermediate_textures();
+            lock.renderer.forget_drawables_in_flight();
             if let Some(renderer) = lock.overlay_renderer.as_mut() {
                 renderer.release_intermediate_textures();
+                renderer.forget_drawables_in_flight();
             }
         }
     }
