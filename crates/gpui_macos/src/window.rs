@@ -2661,8 +2661,6 @@ impl PlatformWindow for MacWindow {
         this.overlay_scene.replay(split..scene.len(), scene);
         this.overlay_scene.finish();
 
-        this.overlay_input_active
-            .store(!this.overlay_scene.is_empty(), Ordering::Release);
         this.renderer.note_scene_tiles(&this.overlay_scene);
         let split_duration = split_start.elapsed();
         let mut report = this.renderer.draw(&this.base_scene);
@@ -2670,9 +2668,13 @@ impl PlatformWindow for MacWindow {
         if report.outcome == PresentOutcome::Deferred {
             // Presenting the overlay over a base that did not land would put
             // the two planes on different frames; the retry presents both.
+            // Input keeps following the overlay that is still on screen
+            // until then.
             this.release_intermediates_if_occluded();
             return report;
         }
+        this.overlay_input_active
+            .store(!this.overlay_scene.is_empty(), Ordering::Release);
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
