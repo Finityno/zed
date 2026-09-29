@@ -563,9 +563,19 @@ impl TextSystem {
 
     /// Get the rasterized size and location of a specific, rendered glyph.
     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        self.remembered_raster_bounds(params).map(|(bounds, _)| bounds)
+    }
+
+    /// [`Self::raster_bounds`], and whether they were remembered: bounds
+    /// that are not are asked of the platform again next time, and whoever
+    /// keeps a copy of them must not keep it either.
+    pub(crate) fn remembered_raster_bounds(
+        &self,
+        params: &RenderGlyphParams,
+    ) -> Result<(Bounds<DevicePixels>, bool)> {
         let raster_bounds = self.raster_bounds.upgradable_read();
         if let Some(bounds) = raster_bounds.get(params) {
-            Ok(*bounds)
+            Ok((*bounds, true))
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
             let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
@@ -592,11 +602,11 @@ impl TextSystem {
                 && self.glyph_may_have_ink(params)
             {
                 self.report_empty_raster_bounds(params);
-                return Ok(bounds);
+                return Ok((bounds, false));
             }
 
             raster_bounds.insert(params.clone(), bounds);
-            Ok(bounds)
+            Ok((bounds, true))
         }
     }
 

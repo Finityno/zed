@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, StrikethroughStyle,
-    TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px,
-    size, underline_y_offset,
+    App, Bounds, Half, Hsla, LineGlyphPainter, LineLayout, Pixels, Point, Result, SharedString,
+    StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black,
+    fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -121,7 +121,7 @@ impl ShapedLine {
         align: TextAlign,
         align_width: Option<Pixels>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
         mut paint_underline: impl FnMut(
             Range<usize>,
             Point<Pixels>,
@@ -139,7 +139,6 @@ impl ShapedLine {
             &self.decoration_runs,
             &[],
             window,
-            cx,
             &mut paint_underline,
         )
     }
@@ -152,7 +151,7 @@ impl ShapedLine {
         align: TextAlign,
         align_width: Option<Pixels>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Result<()> {
         paint_line_background(
             origin,
@@ -163,7 +162,6 @@ impl ShapedLine {
             &self.decoration_runs,
             &[],
             window,
-            cx,
         )?;
 
         Ok(())
@@ -381,7 +379,7 @@ impl LineLayout {
         align_width: Option<Pixels>,
         decoration_runs: &[DecorationRun],
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Result<()> {
         paint_line(
             origin,
@@ -392,7 +390,6 @@ impl LineLayout {
             decoration_runs,
             &[],
             window,
-            cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
         )
     }
@@ -410,7 +407,7 @@ impl LineLayout {
         align_width: Option<Pixels>,
         decoration_runs: &[DecorationRun],
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Result<()> {
         paint_line_background(
             origin,
@@ -421,7 +418,6 @@ impl LineLayout {
             decoration_runs,
             &[],
             window,
-            cx,
         )
     }
 }
@@ -452,7 +448,7 @@ impl WrappedLine {
         align: TextAlign,
         bounds: Option<Bounds<Pixels>>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
@@ -468,7 +464,6 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             window,
-            cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
         )?;
 
@@ -483,7 +478,7 @@ impl WrappedLine {
         align: TextAlign,
         bounds: Option<Bounds<Pixels>>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
@@ -499,7 +494,6 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             window,
-            cx,
         )?;
 
         Ok(())
@@ -515,7 +509,6 @@ fn paint_line(
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
     window: &mut Window,
-    cx: &mut App,
     paint_underline: &mut dyn FnMut(
         Range<usize>,
         Point<Pixels>,
@@ -541,7 +534,8 @@ fn paint_line(
         let mut color = black();
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
-        let text_system = cx.text_system().clone();
+        let content_mask = window.content_mask();
+        let mut glyph_painter = LineGlyphPainter::new(window);
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
@@ -560,8 +554,13 @@ fn paint_line(
             // The font's bounding box, which contains every glyph's ink by construction. It is
             // expressed relative to the BASELINE with y pointing up, so it has to be flipped
             // and positioned on the baseline to say where ink can actually land on screen.
-            let max_glyph_box = text_system.bounding_box(run.font_id, layout.font_size);
+            let font_extents = window.font_extents(run.font_id, layout.font_size);
+            let max_glyph_box = font_extents.bounding_box;
             max_glyph_size = max_glyph_box.size;
+            // A backend whose box has a zero origin (advance metrics rather
+            // than outline extents, as the cosmic-text one reports) has left
+            // the descent out of it, so take that from the font.
+            let descent = font_extents.descent.abs();
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -733,10 +732,6 @@ fn paint_line(
                 let vertical_offset = point(px(0.0), glyph.position.y);
                 let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
                 let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
-                // A backend whose box has a zero origin (advance metrics rather
-                // than outline extents, as the cosmic-text one reports) has
-                // left the descent out of it, so take that from the font.
-                let descent = text_system.descent(run.font_id, layout.font_size).abs();
                 let ink_bottom = (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
                 // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
                 // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
@@ -755,7 +750,6 @@ fn paint_line(
                     size: size(max_glyph_size.width * 3., cull_bottom - cull_top),
                 };
 
-                let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     if glyph.is_emoji {
                         window.paint_emoji(
@@ -765,7 +759,8 @@ fn paint_line(
                             layout.font_size,
                         )?;
                     } else {
-                        window.paint_glyph(
+                        glyph_painter.paint_glyph(
+                            window,
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
@@ -823,8 +818,15 @@ fn paint_line_background(
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
     window: &mut Window,
-    cx: &mut App,
 ) -> Result<()> {
+    // Painting no background would still walk every glyph and push a layer,
+    // which costs the scene a bounds-tree insertion per line.
+    if decoration_runs
+        .iter()
+        .all(|run| run.background_color.is_none())
+    {
+        return Ok(());
+    }
     let line_bounds = Bounds::new(
         origin,
         size(
@@ -837,7 +839,6 @@ fn paint_line_background(
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
-        let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
@@ -852,7 +853,10 @@ fn paint_line_background(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = window
+                .font_extents(run.font_id, layout.font_size)
+                .bounding_box
+                .size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -1315,7 +1319,6 @@ mod tests {
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
                     window,
-                    cx,
                     &mut |range, origin, width, style, window| {
                         strokes.push((range, origin, width, *style));
                         window.paint_underline(origin, width, style);

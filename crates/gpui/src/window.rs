@@ -19,7 +19,7 @@ use crate::{
     RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubscriberSet, Subscription,
     TimeTransition,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
@@ -70,9 +70,11 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 #[cfg(feature = "profiler")]
 mod draw_profile;
+mod glyph_painting;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
+pub(crate) use glyph_painting::LineGlyphPainter;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1285,6 +1287,7 @@ pub struct Window {
     pub(crate) glass_content: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
+    glyph_raster_cache: glyph_painting::GlyphRasterCache,
     opacity_cycle_stack: Vec<OpacityCycle>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2247,6 +2250,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             text_shimmer_stack: Vec::new(),
+            glyph_raster_cache: glyph_painting::GlyphRasterCache::default(),
             opacity_cycle_stack: Vec::new(),
             element_opacity: 1.0,
             glass_content: false,
@@ -3807,6 +3811,7 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        self.glyph_raster_cache.finish_draw();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -5423,85 +5428,7 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        let (integer_origin, subpixel_variant) = quantize_glyph_origin(glyph_origin);
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor,
-            is_emoji: false,
-            subpixel_rendering,
-            dilation,
-        };
-
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.snapped_content_mask();
-
-            if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity),
-                    effect: self.current_text_effect(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
-            } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity),
-                    effect: self.current_text_effect(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
-            return false;
-        }
-
-        if !self.platform_window.is_subpixel_rendering_supported() {
-            return false;
-        }
-
-        let mode = match self.text_rendering_mode.get() {
-            TextRenderingMode::PlatformDefault => self
-                .text_system()
-                .recommended_rendering_mode(font_id, font_size),
-            mode => mode,
-        };
-
-        mode == TextRenderingMode::Subpixel
+        LineGlyphPainter::new(self).paint_glyph(self, origin, font_id, glyph_id, font_size, color)
     }
 
     /// Paints an emoji glyph into the scene for the next frame at the current z-index.
