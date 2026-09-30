@@ -382,10 +382,16 @@ mod tests {
             after.user + after.system > before.user + before.system,
             "and costs the thread CPU time: {before:?} -> {after:?}"
         );
-        assert!(
-            after.decompressions.is_some(),
-            "macOS 12 and later report decompressions"
-        );
+        // Older kernels fill an earlier revision of `task_vm_info`, without
+        // the counter.
+        if crate::window::is_macos_version_at_least(
+            cocoa::foundation::NSOperatingSystemVersion::new(12, 0, 0),
+        ) {
+            assert!(
+                after.decompressions.is_some(),
+                "macOS 12 and later report decompressions"
+            );
+        }
         assert!(after.major_faults.is_some());
     }
 
