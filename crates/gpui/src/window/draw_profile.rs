@@ -966,6 +966,11 @@ mod tests {
             [false],
             "only the thread-CPU start sample is read"
         );
+        assert_eq!(
+            cx.dispatcher.take_unread_draw_resource_samples(),
+            [sample(4, 7, 5100)],
+            "the end sample is left unread"
+        );
         assert_eq!(fixture.detail(&fast), None, "and nothing is recorded");
     }
 

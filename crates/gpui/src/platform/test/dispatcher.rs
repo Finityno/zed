@@ -102,10 +102,19 @@ impl TestDispatcher {
         self.num_cpus_override.store(count, Ordering::SeqCst);
     }
 
-    /// Queues samples for [`PlatformDispatcher::sample_draw_resources`] to
-    /// return, one per call; once they run out it returns `None`.
+    /// Sets the samples [`PlatformDispatcher::sample_draw_resources`]
+    /// returns, one per call; once they run out it returns `None`. Replaces
+    /// any samples an earlier script left unread, so a draw that took fewer
+    /// samples than scripted cannot shift the next script's readings.
     pub fn script_draw_resource_samples(&self, samples: impl IntoIterator<Item = ResourceSample>) {
-        self.draw_resources.lock().samples.extend(samples);
+        let mut draw_resources = self.draw_resources.lock();
+        draw_resources.samples.clear();
+        draw_resources.samples.extend(samples);
+    }
+
+    /// Takes the scripted samples no call has read yet.
+    pub fn take_unread_draw_resource_samples(&self) -> Vec<ResourceSample> {
+        self.draw_resources.lock().samples.drain(..).collect()
     }
 
     /// Takes the `process_counters` argument of every
