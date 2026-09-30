@@ -11,7 +11,7 @@
 
 use super::{TextLayout, TextLayoutInner};
 use crate::{
-    App, AvailableSpace, DecorationRun, Hsla, LayoutId, Pixels, SharedString, Size,
+    App, AvailableSpace, DecorationRun, Hsla, LayoutId, Pixels, SharedString, Size, px,
     StrikethroughStyle, TextOverflow, TextRun, TextStyle, TruncateFrom, UnderlineStyle,
     WhiteSpace, Window, WrappedLine, taffy::Adopted,
 };
@@ -516,7 +516,7 @@ pub(super) fn fit_to_width(layout: &TextLayout, width: Pixels, window: &mut Wind
             return;
         };
         if !Rc::ptr_eq(&inputs.layout.borrow().0, &layout.0)
-            || shaped_for_width(inner, &inputs.text_style, width)
+            || shaped_for_width(inner, &inputs.text_style, width, window.scale_factor())
         {
             return;
         }
@@ -544,12 +544,28 @@ pub(super) fn fit_to_width(layout: &TextLayout, width: Pixels, window: &mut Wind
 /// breaks in the same places, since a word that did not fit on a line at the
 /// greater width does not fit at the narrower one either. Truncation is
 /// greedy in the same way.
-fn shaped_for_width(inner: &TextLayoutInner, style: &TextStyle, width: Pixels) -> bool {
+///
+/// Taffy measures at the width it computes, and the box's edges are then
+/// snapped to device pixels, so the box can be up to a device pixel narrower
+/// or wider than the width the text was measured at: a width within a device
+/// pixel of the box's is the box's width. Shaped again at the snapped width,
+/// a line ending in its last pixel would break a word earlier and paint a
+/// line more than the box was laid out for.
+fn shaped_for_width(
+    inner: &TextLayoutInner,
+    style: &TextStyle,
+    width: Pixels,
+    scale_factor: f32,
+) -> bool {
     let Some(size) = inner.size else {
         return true;
     };
-    let fits = size.width <= width;
-    let shaped_at = |at: Option<Pixels>| at == Some(width) || (fits && at.is_none_or(|at| at >= width));
+    let device_pixel = px(1. / scale_factor);
+    let near = |at: Pixels| (at - width).abs() <= device_pixel;
+    let fits = size.width <= width + device_pixel;
+    let shaped_at = |at: Option<Pixels>| {
+        at.is_some_and(near) || (fits && at.is_none_or(|at| at + device_pixel >= width))
+    };
     let wrapped = style.white_space != WhiteSpace::Normal
         || shaped_at(inner.wrap_width)
         || (fits
@@ -561,6 +577,10 @@ fn shaped_for_width(inner: &TextLayoutInner, style: &TextStyle, width: Pixels) -
         || shaped_at(inner.truncate_width)
         || style
             .line_clamp
-            .is_some_and(|lines| inner.truncate_width == Some(width * lines as f32));
+            .is_some_and(|lines| {
+                inner
+                    .truncate_width
+                    .is_some_and(|at| (at - width * lines as f32).abs() <= device_pixel * lines as f32)
+            });
     wrapped && truncated
 }

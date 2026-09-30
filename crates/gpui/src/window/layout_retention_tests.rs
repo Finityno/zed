@@ -18,7 +18,7 @@ use crate::{
     uniform_list,
 };
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, rc::Rc, sync::Arc};
 
 const WORDS: [&str; 12] = [
     "a",
@@ -1739,4 +1739,51 @@ fn a_reused_cached_view_keeps_its_layout_nodes() {
     });
     assert!(rebuilt.views_rendered >= 2, "{rebuilt:?}");
     assert_eq!(rebuilt.layout_nodes_created, 0, "{rebuilt:?}");
+}
+
+/// Text measured at a fractional width is laid out in a box whose edges are
+/// snapped to device pixels, up to a device pixel narrower: it keeps the
+/// lines it was measured into rather than breaking a word earlier and
+/// painting a line more than its box holds. Retention plays no part.
+#[test]
+fn text_in_a_box_snapped_narrower_keeps_its_lines() {
+    struct Row {
+        layout: Rc<RefCell<Option<crate::TextLayout>>>,
+    }
+    impl Render for Row {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let text = crate::StyledText::new("aaaa aaaa");
+            *self.layout.borrow_mut() = Some(text.layout().clone());
+            div()
+                .flex()
+                .flex_row()
+                .w(px(101.))
+                .text_size(px(16.75))
+                .child(div().flex_1().min_w_0().child(text))
+                .child(div().flex_1().min_w_0())
+        }
+    }
+    let mut cx = crate::TestAppContext::single();
+    let layout = Rc::new(RefCell::new(None));
+    let window = cx.add_window({
+        let layout = layout.clone();
+        move |_, _| Row { layout }
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.set_scale_factor(1.0);
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let layout = layout.borrow().clone().unwrap();
+    let lines: usize = layout
+        .line_layouts()
+        .iter()
+        .map(|line| line.wrap_boundaries.len() + 1)
+        .sum();
+    let bounds = layout.bounds();
+    let painted = layout.line_height() * lines as f32;
+    assert!(
+        painted <= bounds.size.height,
+        "{lines} lines paint {painted:?} tall into {bounds:?}"
+    );
 }
