@@ -1,7 +1,9 @@
-use crate::{PlatformDispatcher, Priority, RunnableVariant};
+use crate::{PlatformDispatcher, Priority, ResourceSample, RunnableVariant};
+use parking_lot::Mutex;
 use scheduler::Instant;
 use scheduler::{Clock, Scheduler, SessionId, TestScheduler, TestSchedulerConfig, Yield};
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -18,6 +20,14 @@ pub struct TestDispatcher {
     session_id: SessionId,
     scheduler: Arc<TestScheduler>,
     num_cpus_override: Arc<AtomicUsize>,
+    draw_resources: Arc<Mutex<ScriptedDrawResources>>,
+}
+
+/// Draw resource samples a test scripted, and the requests made for them.
+#[derive(Default)]
+struct ScriptedDrawResources {
+    samples: VecDeque<ResourceSample>,
+    requests: Vec<bool>,
 }
 
 impl TestDispatcher {
@@ -38,6 +48,7 @@ impl TestDispatcher {
             session_id: scheduler.allocate_session_id(),
             scheduler,
             num_cpus_override: Arc::new(AtomicUsize::new(0)),
+            draw_resources: Arc::default(),
         }
     }
 
@@ -91,6 +102,28 @@ impl TestDispatcher {
         self.num_cpus_override.store(count, Ordering::SeqCst);
     }
 
+    /// Sets the samples [`PlatformDispatcher::sample_draw_resources`]
+    /// returns, one per call; once they run out it returns `None`. Replaces
+    /// any samples an earlier script left unread, so a draw that took fewer
+    /// samples than scripted cannot shift the next script's readings.
+    pub fn script_draw_resource_samples(&self, samples: impl IntoIterator<Item = ResourceSample>) {
+        let mut draw_resources = self.draw_resources.lock();
+        draw_resources.samples.clear();
+        draw_resources.samples.extend(samples);
+    }
+
+    /// Takes the scripted samples no call has read yet.
+    pub fn take_unread_draw_resource_samples(&self) -> Vec<ResourceSample> {
+        self.draw_resources.lock().samples.drain(..).collect()
+    }
+
+    /// Takes the `process_counters` argument of every
+    /// [`PlatformDispatcher::sample_draw_resources`] call made since the
+    /// last time this was called.
+    pub fn take_draw_resource_requests(&self) -> Vec<bool> {
+        std::mem::take(&mut self.draw_resources.lock().requests)
+    }
+
     /// Returns the overridden CPU count, or `None` if no override is set.
     pub fn num_cpus_override(&self) -> Option<usize> {
         match self.num_cpus_override.load(Ordering::SeqCst) {
@@ -107,6 +140,7 @@ impl Clone for TestDispatcher {
             session_id,
             scheduler: self.scheduler.clone(),
             num_cpus_override: self.num_cpus_override.clone(),
+            draw_resources: self.draw_resources.clone(),
         }
     }
 }
@@ -138,6 +172,12 @@ impl PlatformDispatcher for TestDispatcher {
 
     fn as_test(&self) -> Option<&TestDispatcher> {
         Some(self)
+    }
+
+    fn sample_draw_resources(&self, process_counters: bool) -> Option<ResourceSample> {
+        let mut draw_resources = self.draw_resources.lock();
+        draw_resources.requests.push(process_counters);
+        draw_resources.samples.pop_front()
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {

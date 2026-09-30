@@ -15,6 +15,8 @@ use std::{
     thread::ThreadId,
     time::Duration,
 };
+#[cfg(feature = "profiler")]
+use std::sync::atomic::AtomicU8;
 
 mod actions;
 #[cfg(feature = "profiler")]
@@ -797,6 +799,507 @@ pub struct FrameTiming {
     pub draw_start: Instant,
     /// When `Window::draw` finished.
     pub draw_end: Instant,
+    /// Where the draw's time went, and what it cost the thread.
+    pub breakdown: DrawBreakdown,
+}
+
+/// Where one window draw's time went.
+///
+/// The phases interleave inside a draw, so each is charged wherever it runs
+/// rather than as one top-level span:
+///
+/// - `request_layout` is building the root element tree, including every
+///   uncached view's `render`.
+/// - `layout` is every taffy layout pass, with its measure closures (text
+///   shaping), wherever it ran.
+/// - `prepaint` is prepaint without taffy. A cached view that missed its
+///   cache, and a list's items, are rendered during prepaint, so their
+///   `render` counts here. It also covers the inspector, deferred draws,
+///   the prompt, drag or tooltip, and the hit test.
+/// - `paint` covers painting the tree, deferred draws, overlays and the
+///   inspector hitbox.
+/// - `finish` is from the end of paint to the focus listeners: building and
+///   sending the accessibility update, the debug overlay, installing the
+///   input handler, clearing the layout tree, freeing the previous frame's
+///   text layouts, finishing the scene and clearing the old frame.
+/// - `focus` is the focus-lost and focus-change listeners, which run app
+///   callbacks.
+/// - `other` is the remainder: setup before the tree is built, and the
+///   bookkeeping after the focus listeners. The seven parts add up to the
+///   draw's duration.
+///
+/// When the platform draws another window synchronously inside a draw, the
+/// inner draw is charged, whole, to the outer draw's current phase, and its
+/// cost to the thread to the outer draw's resource counters.
+///
+/// Durations are stored as whole microseconds to keep journal slots small.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct DrawBreakdown {
+    pub(crate) request_layout_us: u32,
+    pub(crate) layout_us: u32,
+    pub(crate) prepaint_us: u32,
+    pub(crate) paint_us: u32,
+    pub(crate) finish_us: u32,
+    pub(crate) focus_us: u32,
+    pub(crate) other_us: u32,
+    pub(crate) layout_passes: u16,
+    pub(crate) views_rendered: u16,
+    pub(crate) views_reused: u16,
+    pub(crate) flags: u8,
+}
+
+#[cfg(feature = "profiler")]
+impl DrawBreakdown {
+    pub(crate) const DETAIL_RECORDED: u8 = 1 << 0;
+    pub(crate) const PHASES_MEASURED: u8 = 1 << 1;
+
+    /// Whether the phases and counts were measured. A breakdown built by
+    /// hand (benchmarks, or a frame timing from outside a window draw) is
+    /// all zeros, which is not the same as a draw that spent no time.
+    pub fn phases_measured(&self) -> bool {
+        self.flags & Self::PHASES_MEASURED != 0
+    }
+
+    /// Building the root element tree.
+    pub fn request_layout(&self) -> Duration {
+        Duration::from_micros(self.request_layout_us as u64)
+    }
+
+    /// Every taffy layout pass and its measure closures.
+    pub fn layout(&self) -> Duration {
+        Duration::from_micros(self.layout_us as u64)
+    }
+
+    /// Prepaint, excluding the layout passes that ran inside it.
+    pub fn prepaint(&self) -> Duration {
+        Duration::from_micros(self.prepaint_us as u64)
+    }
+
+    /// Painting the tree and its overlays.
+    pub fn paint(&self) -> Duration {
+        Duration::from_micros(self.paint_us as u64)
+    }
+
+    /// Finishing the frame, from the end of paint to the focus listeners.
+    pub fn finish(&self) -> Duration {
+        Duration::from_micros(self.finish_us as u64)
+    }
+
+    /// The focus listeners.
+    pub fn focus(&self) -> Duration {
+        Duration::from_micros(self.focus_us as u64)
+    }
+
+    /// The rest of the draw: setup, and the bookkeeping after the focus
+    /// listeners.
+    pub fn other(&self) -> Duration {
+        Duration::from_micros(self.other_us as u64)
+    }
+
+    /// How many taffy layout passes ran.
+    pub fn layout_passes(&self) -> u16 {
+        self.layout_passes
+    }
+
+    /// How many entity views called `render`.
+    pub fn views_rendered(&self) -> u16 {
+        self.views_rendered
+    }
+
+    /// How many cached views replayed last frame's prepaint instead of
+    /// rendering.
+    pub fn views_reused(&self) -> u16 {
+        self.views_reused
+    }
+
+    pub(crate) fn phases_us(&self) -> u64 {
+        self.request_layout_us as u64
+            + self.layout_us as u64
+            + self.prepaint_us as u64
+            + self.paint_us as u64
+            + self.finish_us as u64
+            + self.focus_us as u64
+    }
+
+    /// Whether the draw reached [`draw_detail_threshold`] and recorded what
+    /// it cost the thread or its slowest views; fetch them with
+    /// [`slow_draw_detail`].
+    pub fn detail_recorded(&self) -> bool {
+        self.flags & Self::DETAIL_RECORDED != 0
+    }
+}
+
+/// What a draw cost the drawing thread, as the difference between two
+/// platform samples (see [`crate::PlatformDispatcher::sample_draw_resources`]).
+///
+/// Every counter is optional: a platform, or a sampling policy, that did not
+/// measure it reports `None`, never zero.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct DrawResources {
+    user_us: u32,
+    system_us: u32,
+    faults: u32,
+    major_faults: u32,
+    decompressions: u32,
+    flags: u8,
+}
+
+#[cfg(feature = "profiler")]
+impl DrawResources {
+    const CPU_MEASURED: u8 = 1 << 0;
+    const FAULTS_MEASURED: u8 = 1 << 1;
+    const MAJOR_FAULTS_MEASURED: u8 = 1 << 2;
+    const DECOMPRESSIONS_MEASURED: u8 = 1 << 3;
+    const FAULTS_PROCESS_WIDE: u8 = 1 << 4;
+
+    /// The change between two samples taken on the same thread. Counters
+    /// only one of the samples carries are not measured; deltas saturate.
+    pub(crate) fn between(start: &crate::ResourceSample, end: &crate::ResourceSample) -> Self {
+        fn micros(duration: Duration) -> u32 {
+            duration.as_micros().min(u32::MAX as u128) as u32
+        }
+        fn count(start: Option<u64>, end: Option<u64>) -> Option<u32> {
+            Some(end?.saturating_sub(start?).min(u32::MAX as u64) as u32)
+        }
+
+        let mut resources = Self {
+            user_us: micros(end.user.saturating_sub(start.user)),
+            system_us: micros(end.system.saturating_sub(start.system)),
+            flags: Self::CPU_MEASURED,
+            ..Self::default()
+        };
+        if let Some(faults) = count(start.faults, end.faults) {
+            resources.faults = faults;
+            resources.flags |= Self::FAULTS_MEASURED;
+        }
+        if let Some(major_faults) = count(start.major_faults, end.major_faults) {
+            resources.major_faults = major_faults;
+            resources.flags |= Self::MAJOR_FAULTS_MEASURED;
+        }
+        if let Some(decompressions) = count(start.decompressions, end.decompressions) {
+            resources.decompressions = decompressions;
+            resources.flags |= Self::DECOMPRESSIONS_MEASURED;
+        }
+        if resources.flags & (Self::FAULTS_MEASURED | Self::MAJOR_FAULTS_MEASURED) != 0
+            && (start.fault_scope == crate::FaultScope::Process
+                || end.fault_scope == crate::FaultScope::Process)
+        {
+            resources.flags |= Self::FAULTS_PROCESS_WIDE;
+        }
+        resources
+    }
+
+    fn measured(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    /// CPU time the thread spent in user mode during the draw.
+    pub fn user_cpu(&self) -> Option<Duration> {
+        self.measured(Self::CPU_MEASURED)
+            .then(|| Duration::from_micros(self.user_us as u64))
+    }
+
+    /// CPU time the thread spent in the kernel during the draw. On macOS
+    /// this includes decompressing compressed memory the thread faulted on.
+    pub fn system_cpu(&self) -> Option<Duration> {
+        self.measured(Self::CPU_MEASURED)
+            .then(|| Duration::from_micros(self.system_us as u64))
+    }
+
+    /// Page faults during the draw. See [`Self::faults_process_wide`] for
+    /// whose.
+    pub fn faults(&self) -> Option<u32> {
+        self.measured(Self::FAULTS_MEASURED).then_some(self.faults)
+    }
+
+    /// Faults that had to read from disk (macOS: page-ins; Linux: major
+    /// faults).
+    pub fn major_faults(&self) -> Option<u32> {
+        self.measured(Self::MAJOR_FAULTS_MEASURED)
+            .then_some(self.major_faults)
+    }
+
+    /// Pages decompressed from the compressor during the draw (macOS only;
+    /// process-wide).
+    pub fn decompressions(&self) -> Option<u32> {
+        self.measured(Self::DECOMPRESSIONS_MEASURED)
+            .then_some(self.decompressions)
+    }
+
+    /// Whether the fault counters are the whole process's, so background
+    /// threads' faults during the draw are included (macOS), rather than
+    /// the drawing thread's alone (Linux).
+    pub fn faults_process_wide(&self) -> bool {
+        self.measured(Self::FAULTS_PROCESS_WIDE)
+    }
+}
+
+/// When a window draw reads the thread's resource counters (see
+/// [`DrawResources`] and [`set_draw_resource_sampling`]).
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DrawResourceSampling {
+    /// Never.
+    Off,
+    /// The thread's CPU time only, which costs well under a microsecond a
+    /// draw on macOS.
+    ThreadCpu,
+    /// The thread's CPU time, plus the process-wide fault counters when the
+    /// window's last draw ended at least [`DRAW_QUIET_GAP`] ago or was
+    /// slow. Those are the draws most likely to stall on memory that was
+    /// compressed or paged out while the app sat idle, and it keeps the
+    /// costlier reads off the draws of a steady animation.
+    AfterQuiet,
+    /// The thread's CPU time and the process-wide fault counters on every
+    /// draw. About 2 µs a draw on macOS in a small process, more with many
+    /// threads; for investigations.
+    Always,
+}
+
+#[cfg(feature = "profiler")]
+static DRAW_RESOURCE_SAMPLING: AtomicU8 = AtomicU8::new(DrawResourceSampling::AfterQuiet as u8);
+
+/// Sets when window draws read resource counters. Every draw reads its
+/// start sample under this policy; only draws that take at least
+/// [`draw_detail_threshold`] read an end sample and record the difference.
+#[cfg(feature = "profiler")]
+pub fn set_draw_resource_sampling(sampling: DrawResourceSampling) {
+    DRAW_RESOURCE_SAMPLING.store(sampling as u8, Ordering::Relaxed);
+}
+
+/// The policy [`set_draw_resource_sampling`] set; `AfterQuiet` by default.
+#[cfg(feature = "profiler")]
+pub fn draw_resource_sampling() -> DrawResourceSampling {
+    match DRAW_RESOURCE_SAMPLING.load(Ordering::Relaxed) {
+        0 => DrawResourceSampling::Off,
+        1 => DrawResourceSampling::ThreadCpu,
+        3 => DrawResourceSampling::Always,
+        _ => DrawResourceSampling::AfterQuiet,
+    }
+}
+
+/// How long a window must have gone without drawing for
+/// [`DrawResourceSampling::AfterQuiet`] to read the process-wide counters.
+#[cfg(feature = "profiler")]
+pub const DRAW_QUIET_GAP: Duration = Duration::from_millis(250);
+
+#[cfg(feature = "profiler")]
+static DRAW_DETAIL_THRESHOLD_MICROS: AtomicU64 = AtomicU64::new(8_000);
+
+/// Sets how long a draw must take for its detail (its resource counters,
+/// and its slowest views when those are timed) to be recorded. 8 ms by
+/// default.
+#[cfg(feature = "profiler")]
+pub fn set_draw_detail_threshold(threshold: Duration) {
+    DRAW_DETAIL_THRESHOLD_MICROS.store(
+        threshold.as_micros().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// The threshold [`set_draw_detail_threshold`] set.
+#[cfg(feature = "profiler")]
+pub fn draw_detail_threshold() -> Duration {
+    Duration::from_micros(DRAW_DETAIL_THRESHOLD_MICROS.load(Ordering::Relaxed))
+}
+
+/// When a window draw times its views' `render`, prepaint and paint, to
+/// name the slowest in a slow draw (see [`set_view_timing`]).
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ViewTiming {
+    /// Never.
+    Off,
+    /// A draw is timed from its start when the window's previous draw
+    /// reached [`draw_detail_threshold`], which catches a view that is slow
+    /// on every draw. Any other draw starts being timed part way, at the
+    /// start of prepaint, the end of a layout pass or the start of paint,
+    /// once it has run for half the threshold.
+    OnSlowDraws,
+    /// Every draw, from its start; for investigations and stress runs.
+    Always,
+}
+
+#[cfg(feature = "profiler")]
+static VIEW_TIMING: AtomicU8 = AtomicU8::new(ViewTiming::OnSlowDraws as u8);
+
+/// Sets when window draws time their views. A draw that is timed costs two
+/// `Instant::now()` calls per view per phase; a draw that is not costs a
+/// branch per view. Only draws that reach [`draw_detail_threshold`] record
+/// their slowest views, into a buffer [`slow_draw_detail`] reads.
+#[cfg(feature = "profiler")]
+pub fn set_view_timing(timing: ViewTiming) {
+    VIEW_TIMING.store(timing as u8, Ordering::Relaxed);
+}
+
+/// The policy [`set_view_timing`] set; `OnSlowDraws` by default.
+#[cfg(feature = "profiler")]
+pub fn view_timing() -> ViewTiming {
+    match VIEW_TIMING.load(Ordering::Relaxed) {
+        0 => ViewTiming::Off,
+        2 => ViewTiming::Always,
+        _ => ViewTiming::OnSlowDraws,
+    }
+}
+
+/// How many of a slow draw's views [`SlowDrawDetail`] keeps.
+#[cfg(feature = "profiler")]
+pub const SLOW_DRAW_VIEW_COUNT: usize = 5;
+
+/// The least time of its own a view must have spent in a slow draw to be
+/// recorded in [`SlowDrawDetail`].
+#[cfg(feature = "profiler")]
+pub const SLOW_DRAW_VIEW_MIN: Duration = Duration::from_millis(1);
+
+/// One view's share of a slow draw.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ViewRenderTime {
+    /// The view's type, as `std::any::type_name` spells it, whichever of
+    /// its phases was timed: a cached view that replayed its previous
+    /// frame, or a view that rendered before timing started, is named
+    /// too. Only time charged solely through a deferred draw is
+    /// `"<unnamed view>"`.
+    pub type_name: &'static str,
+    /// Time spent in the view's `render`, prepaint and paint, excluding the
+    /// time of the views nested inside it. Work a view does for elements
+    /// it owns, such as a list's items, counts as its own.
+    pub self_time: Duration,
+    /// How many times the view rendered in the draw.
+    pub renders: u16,
+}
+
+/// What one slow draw recorded beside the journal: what it cost the
+/// drawing thread, and its slowest views by their own time.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowDrawDetail {
+    /// The window that was drawn.
+    pub window_id: WindowId,
+    /// When the draw started, which with `window_id` identifies it.
+    pub draw_start: Instant,
+    /// How long the draw took.
+    pub duration: Duration,
+    /// What the draw cost the thread, where the platform and the sampling
+    /// policy measured it.
+    pub resources: DrawResources,
+    /// For a draw whose views were timed, where in it the timing started.
+    /// Anything rendered earlier is not attributed.
+    pub views_timed_from: Option<ViewTimingStart>,
+    /// Up to [`SLOW_DRAW_VIEW_COUNT`] views that spent at least
+    /// [`SLOW_DRAW_VIEW_MIN`] of their own, longest first.
+    pub views: heapless::Vec<ViewRenderTime, SLOW_DRAW_VIEW_COUNT>,
+}
+
+// Kept beside the journal rather than in it, so journal slots stay small.
+// Only draws at the detail threshold record here, but a stretch of them can
+// run at the display's rate while hang detection drains once a second, so
+// the buffer covers about two seconds of 120 Hz slow draws and, once full,
+// replaces the fastest recent draw rather than the oldest (see
+// `push_slow_draw_detail`). About 70 KB.
+#[cfg(feature = "profiler")]
+const SLOW_DRAW_DETAIL_CAPACITY: usize = 256;
+
+/// How long a slow draw's detail is kept before any newer slow draw may
+/// replace it, which gives hang detection several drains to read it.
+#[cfg(feature = "profiler")]
+const SLOW_DRAW_DETAIL_RETENTION: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "profiler")]
+type SlowDrawDetailBuffer = heapless::Vec<SlowDrawDetail, SLOW_DRAW_DETAIL_CAPACITY>;
+
+#[cfg(feature = "profiler")]
+static SLOW_DRAW_DETAILS: spin::Mutex<SlowDrawDetailBuffer> =
+    spin::Mutex::new(heapless::Vec::new());
+
+/// Records a slow draw's detail, returning whether it was kept.
+#[cfg(feature = "profiler")]
+pub(crate) fn record_slow_draw_detail(detail: SlowDrawDetail) -> bool {
+    push_slow_draw_detail(&mut SLOW_DRAW_DETAILS.lock(), detail)
+}
+
+/// Adds `detail` to `buffer`. A full buffer replaces its oldest entry once
+/// that is past [`SLOW_DRAW_DETAIL_RETENTION`]; while every entry is
+/// younger, it replaces the fastest draw, or drops `detail` if that is the
+/// fastest. A hang's draws are the slowest around it, so a stretch of
+/// merely slow draws cannot evict them before they are read.
+#[cfg(feature = "profiler")]
+fn push_slow_draw_detail(buffer: &mut SlowDrawDetailBuffer, detail: SlowDrawDetail) -> bool {
+    let detail = match buffer.push(detail) {
+        Ok(()) => return true,
+        Err(detail) => detail,
+    };
+    let Some(oldest) = buffer.iter_mut().min_by_key(|entry| entry.draw_start) else {
+        return false;
+    };
+    let oldest_age = detail
+        .draw_start
+        .saturating_duration_since(oldest.draw_start);
+    if oldest_age >= SLOW_DRAW_DETAIL_RETENTION {
+        *oldest = detail;
+        return true;
+    }
+    match buffer.iter_mut().min_by_key(|entry| entry.duration) {
+        Some(fastest) if fastest.duration < detail.duration => {
+            *fastest = detail;
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "profiler")]
+fn find_slow_draw_detail(
+    buffer: &SlowDrawDetailBuffer,
+    window_id: WindowId,
+    draw_start: Instant,
+) -> Option<SlowDrawDetail> {
+    buffer
+        .iter()
+        .find(|detail| detail.window_id == window_id && detail.draw_start == draw_start)
+        .cloned()
+}
+
+/// The detail of the draw of `window_id` that started at `draw_start`, if
+/// that draw recorded it (see [`DrawBreakdown::detail_recorded`]) and it has
+/// not been replaced since (see `SLOW_DRAW_DETAIL_RETENTION`).
+#[cfg(feature = "profiler")]
+pub fn slow_draw_detail(window_id: WindowId, draw_start: Instant) -> Option<SlowDrawDetail> {
+    find_slow_draw_detail(&SLOW_DRAW_DETAILS.lock(), window_id, draw_start)
+}
+
+/// Where in a slow draw its views started being timed (see
+/// [`SlowDrawDetail::views_timed_from`]).
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ViewTimingStart {
+    /// From the start of the draw: every view is attributed.
+    Start,
+    /// From the start of prepaint: views rendered while building the root
+    /// tree are not attributed.
+    Prepaint,
+    /// From the end of a layout pass part way through prepaint, typically
+    /// a list item's or a cache-missed view's: what ran before it,
+    /// including the render that made the draw slow, is not attributed.
+    /// The views being drawn at that moment are charged from then on.
+    Layout,
+    /// From the start of paint: only paint is attributed.
+    Paint,
+}
+
+#[cfg(feature = "profiler")]
+impl ViewTimingStart {
+    /// A stable lowercase name for logs and telemetry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Prepaint => "prepaint",
+            Self::Layout => "layout",
+            Self::Paint => "paint",
+        }
+    }
 }
 
 #[cfg(feature = "profiler")]
@@ -914,6 +1417,8 @@ pub struct WindowProfiler {
     animating_at_last_present: bool,
     pending_frame: Option<FrameTiming>,
     deferred_presents: u64,
+    #[cfg(test)]
+    last_draw: Option<FrameTiming>,
 }
 
 #[cfg(feature = "profiler")]
@@ -946,6 +1451,8 @@ impl WindowProfiler {
             animating_at_last_present: false,
             pending_frame: None,
             deferred_presents: 0,
+            #[cfg(test)]
+            last_draw: None,
         };
         journal::record_frame_pending(window_id, Instant::now());
         Ok(profiler)
@@ -1030,17 +1537,27 @@ impl WindowProfiler {
         journal::end_foreground_turn();
     }
 
-    /// Records the beginning of a window draw.
-    pub fn begin_draw(&mut self) {
+    /// Records the beginning of a window draw and returns when it started.
+    pub fn begin_draw(&mut self) -> Instant {
         journal::begin_foreground_turn();
         let started_at = Instant::now();
         journal::record_frame_pending(self.window_id, started_at);
         self.active_activities
             .push(WindowActivity::Draw { started_at });
+        started_at
     }
 
     /// Records the end of a window draw and returns the draw duration.
-    pub fn end_draw(&mut self, dirty_at: Option<Instant>, invalidations: u64) -> Duration {
+    ///
+    /// `breakdown` carries the draw's phases as measured from the start
+    /// [`Self::begin_draw`] returned; its `other` part is set here, to the
+    /// rest of the draw, so the parts add up to the draw's duration.
+    pub fn end_draw(
+        &mut self,
+        dirty_at: Option<Instant>,
+        invalidations: u64,
+        mut breakdown: DrawBreakdown,
+    ) -> Duration {
         let Some(WindowActivity::Draw {
             started_at: draw_start,
         }) = self.active_activities.pop()
@@ -1051,13 +1568,22 @@ impl WindowProfiler {
         };
 
         let draw_end = Instant::now();
+        let draw_us = draw_end.duration_since(draw_start).as_micros();
+        breakdown.other_us = draw_us
+            .saturating_sub(breakdown.phases_us() as u128)
+            .min(u32::MAX as u128) as u32;
         let frame_timing = FrameTiming {
             window_id: self.window_id,
             dirty_at: dirty_at.filter(|at| journal::frame_sample_is_valid(self.window_id, *at)),
             invalidations,
             draw_start,
             draw_end,
+            breakdown,
         };
+        #[cfg(test)]
+        {
+            self.last_draw = Some(frame_timing);
+        }
         let draw_duration = frame_timing.draw_duration();
         if !journal::power_interrupted_since(draw_start) {
             self.record_draw_timing(frame_timing);
@@ -1085,6 +1611,12 @@ impl WindowProfiler {
             next_frame_scheduled,
             report,
         );
+    }
+
+    /// The most recent draw [`Self::end_draw`] recorded.
+    #[cfg(test)]
+    pub(crate) fn last_draw(&self) -> Option<FrameTiming> {
+        self.last_draw
     }
 
     /// Returns a snapshot of the current input-latency histograms.
@@ -1343,7 +1875,7 @@ mod tests {
                 journal::record_window_visibility(id, crate::WindowVisibility::Hidden);
                 journal::record_window_visibility(id, crate::WindowVisibility::Visible);
             }
-            profiler.end_draw(Some(old), 1);
+            profiler.end_draw(Some(old), 1, DrawBreakdown::default());
             let now = Instant::now();
             profiler.record_present_at(now, now, true, true);
             assert_eq!(
@@ -1354,11 +1886,71 @@ mod tests {
             assert_eq!(profiler.dirty_to_present_histogram.len(), 1);
             assert_eq!(profiler.present_interval_histogram.len(), 0);
             profiler.begin_draw();
-            profiler.end_draw(Some(Instant::now()), 1);
+            profiler.end_draw(Some(Instant::now()), 1, DrawBreakdown::default());
             let now = Instant::now();
             profiler.record_present_at(now, now, true, true);
             assert_eq!(profiler.dirty_to_present_histogram.len(), 2);
         }
+    }
+
+    #[test]
+    fn a_hangs_detail_outlives_a_stretch_of_slow_draws() {
+        let mut buffer = SlowDrawDetailBuffer::new();
+        let start = Instant::now();
+        let slow_draw = |window: u64, at: Duration, duration_ms: u64| SlowDrawDetail {
+            window_id: WindowId::from(window),
+            draw_start: start + at,
+            duration: Duration::from_millis(duration_ms),
+            resources: DrawResources::default(),
+            views_timed_from: None,
+            views: heapless::Vec::new(),
+        };
+        let ms = Duration::from_millis;
+        let hang = slow_draw(1, ms(0), 336);
+        assert!(push_slow_draw_detail(&mut buffer, hang.clone()));
+        assert_eq!(
+            find_slow_draw_detail(&buffer, WindowId::from(1), start),
+            Some(hang.clone())
+        );
+        assert_eq!(
+            find_slow_draw_detail(&buffer, WindowId::from(1), start + ms(1)),
+            None,
+            "a draw is identified by its window and its start"
+        );
+
+        for draw in 1..SLOW_DRAW_DETAIL_CAPACITY as u64 {
+            assert!(push_slow_draw_detail(
+                &mut buffer,
+                slow_draw(2, ms(draw), 10)
+            ));
+        }
+        assert!(
+            !push_slow_draw_detail(&mut buffer, slow_draw(2, ms(300), 10)),
+            "a full buffer of recent draws drops a draw no slower than any of them"
+        );
+        assert!(push_slow_draw_detail(
+            &mut buffer,
+            slow_draw(2, ms(301), 20)
+        ));
+        assert!(
+            find_slow_draw_detail(&buffer, WindowId::from(2), start + ms(301)).is_some(),
+            "and replaces the fastest with a slower one"
+        );
+        assert_eq!(
+            find_slow_draw_detail(&buffer, WindowId::from(1), start),
+            Some(hang),
+            "the hang's detail survives the stretch of slow draws after it"
+        );
+
+        assert!(push_slow_draw_detail(
+            &mut buffer,
+            slow_draw(2, SLOW_DRAW_DETAIL_RETENTION, 10)
+        ));
+        assert_eq!(
+            find_slow_draw_detail(&buffer, WindowId::from(1), start),
+            None,
+            "until it is past retention and the oldest"
+        );
     }
 
     #[test]
@@ -1371,7 +1963,7 @@ mod tests {
         let mut collector = FrameTimingCollector::new();
 
         window_profiler.begin_draw();
-        window_profiler.end_draw(Some(dirty_at), 3);
+        window_profiler.end_draw(Some(dirty_at), 3, DrawBreakdown::default());
         assert!(
             collector
                 .collect_unseen()
@@ -1382,7 +1974,7 @@ mod tests {
         set_trace_enabled(true);
         let mut collector = FrameTimingCollector::new();
         window_profiler.begin_draw();
-        window_profiler.end_draw(Some(dirty_at), 3);
+        window_profiler.end_draw(Some(dirty_at), 3, DrawBreakdown::default());
 
         let timing = collector
             .collect_unseen()
@@ -1455,7 +2047,7 @@ mod tests {
         let mut collector = FrameTimingCollector::new();
 
         window_profiler.begin_draw();
-        window_profiler.end_draw(None, 0);
+        window_profiler.end_draw(None, 0, DrawBreakdown::default());
         assert!(
             FRAME_TIMINGS
                 .lock()
@@ -1637,7 +2229,7 @@ mod tests {
         window_profiler.begin_draw();
         begin_input_at(&mut window_profiler, Instant::now());
         window_profiler.end_input(true);
-        window_profiler.end_draw(None, 0);
+        window_profiler.end_draw(None, 0, DrawBreakdown::default());
 
         let snapshot = window_profiler.input_latency_snapshot();
         assert!(snapshot.latency_histogram.is_empty());
@@ -1728,6 +2320,7 @@ mod tests {
             invalidations: 1,
             draw_start: draw_end - Duration::from_millis(2),
             draw_end,
+            breakdown: Default::default(),
         });
     }
 }

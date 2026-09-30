@@ -57,6 +57,11 @@ const MAX_INTERVAL_EVENTS: usize = 16 * 1024;
 // worst-case traffic between consumer drains.
 const MAX_JOURNAL_ENTRIES: usize = (4 * 1024 * 1024) / core::mem::size_of::<JournalSlot>();
 
+// Every byte an entry grows by costs the ring capacity, and the largest
+// entry (a presentation boundary, which carries its drawn frame) sets the
+// slot size for all of them. Grow this deliberately, not by accident.
+const _: () = assert!(core::mem::size_of::<ForegroundJournalEntry>() <= 224);
+
 // Absorbs brief collisions with a collector reading the exact slot being
 // wrapped. The foreground never waits for a reader; queued entries are retried
 // in order on the next publication.
@@ -1370,6 +1375,7 @@ mod tests {
             invalidations: 1,
             draw_start: start + Duration::from_millis(3),
             draw_end: start + Duration::from_millis(4),
+            breakdown: Default::default(),
         };
         let presentation = PresentTiming {
             window_id: frame.window_id,
@@ -3101,6 +3107,7 @@ mod tests {
             invalidations: 1,
             draw_start: draw_end,
             draw_end,
+            breakdown: Default::default(),
         }
     }
 
