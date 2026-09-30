@@ -537,6 +537,7 @@ impl FocusId {
 
     /// Obtains whether this handle contains the given handle in the most recently rendered frame.
     pub(crate) fn contains(&self, other: Self, window: &Window) -> bool {
+        window.note_actions_read();
         window
             .rendered_frame
             .dispatch_tree
@@ -7525,6 +7526,7 @@ impl Window {
 
     /// Returns the current context stack.
     pub fn context_stack(&self) -> Vec<KeyContext> {
+        self.note_actions_read();
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         dispatch_tree

@@ -125,8 +125,9 @@ pub(crate) mod ambient {
     pub(crate) struct Appearance;
     /// Which actions are available and bound where the window is focused:
     /// [`crate::Window::is_action_available`],
-    /// [`crate::Window::available_actions`] and the binding lookups, which
-    /// answer from the frame last drawn and the keymap.
+    /// [`crate::Window::available_actions`], the binding lookups,
+    /// [`crate::Window::context_stack`] and focus containment, which answer
+    /// from the frame last drawn and the keymap.
     pub(crate) struct Actions;
 }
 
