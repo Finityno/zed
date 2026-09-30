@@ -180,21 +180,26 @@ struct ViewContext {
     text_style: TextStyle,
     opacity: f32,
     rem_size: Pixels,
+    /// The image cache images without their own load through.
+    image_cache: Option<EntityId>,
 }
 
 /// What a view's paint inherited that turns into what its primitives hold:
-/// the text effect glyphs are stamped with, the opacity cycle quads are
-/// stamped with, and the time transition everything is moved with.
+/// the text effect glyphs are stamped with, the opacity cycle and glass mode
+/// quads are stamped with, and the time transition everything is moved with.
 #[derive(Clone, Default)]
 struct PaintContext {
     shimmer: Option<TextShimmerStyle>,
     opacity_cycle: Option<OpacityCycle>,
+    glass_content: bool,
     transition: u32,
 }
 
 impl PaintContext {
     fn effects_match(&self, other: &Self) -> bool {
-        self.shimmer == other.shimmer && self.opacity_cycle == other.opacity_cycle
+        self.shimmer == other.shimmer
+            && self.opacity_cycle == other.opacity_cycle
+            && self.glass_content == other.glass_content
     }
 }
 
@@ -743,7 +748,12 @@ impl Window {
             text_style: self.text_style(),
             opacity: self.element_opacity,
             rem_size: self.rem_size(),
+            image_cache: self.inherited_image_cache(),
         }
+    }
+
+    fn inherited_image_cache(&self) -> Option<EntityId> {
+        self.image_cache_stack.last().map(|cache| cache.entity_id())
     }
 
     fn view_context_matches(&self, previous: usize, bounds: Bounds<Pixels>) -> bool {
@@ -753,6 +763,7 @@ impl Window {
             && context.rem_size == self.rem_size()
             && context.content_mask == self.content_mask()
             && context.text_style == self.text_style()
+            && context.image_cache == self.inherited_image_cache()
     }
 
     /// Lays out the view last frame's record `previous` stands for as it was
@@ -761,11 +772,12 @@ impl Window {
         let records = &self.rendered_frame.retained_views.records;
         let record = &records[previous];
         let layout = record.layout.as_ref()?;
-        let text_style_matches = record.context.text_style == self.text_style()
-            && record.context.rem_size == self.rem_size();
+        let inherited_matches = record.context.text_style == self.text_style()
+            && record.context.rem_size == self.rem_size()
+            && record.context.image_cache == self.inherited_image_cache();
         if layout.view_key.is_none()
             || layout.view_key != self.layout_keys.current()
-            || !text_style_matches
+            || !inherited_matches
         {
             return None;
         }
@@ -1025,8 +1037,8 @@ impl Window {
         record.paint_context = current.clone();
 
         // The hovers were checked against the last frame's hitboxes, and this
-        // frame's may put something over the view; the text effect and
-        // opacity cycle it inherits are only known now. Either is too late
+        // frame's may put something over the view; the text effect, opacity
+        // cycle and glass mode it inherits are only known now. Either is too late
         // to build the view in this frame, so it is notified for the next.
         if !hovers.iter().all(|hover| hover.unchanged(self)) || !recorded.effects_match(&current) {
             self.request_animation_frame();
@@ -1039,6 +1051,7 @@ impl Window {
         PaintContext {
             shimmer: self.text_shimmer_stack.last().copied(),
             opacity_cycle: self.opacity_cycle_stack.last().copied(),
+            glass_content: self.glass_content,
             transition: self.next_frame.scene.current_transition(),
         }
     }
@@ -1064,6 +1077,7 @@ impl Window {
                     text_style: TextStyle::default(),
                     opacity: 1.,
                     rem_size: Pixels::ZERO,
+                    image_cache: None,
                 }),
                 paint_context: PaintContext::default(),
                 dependencies: RenderDependencies::default(),

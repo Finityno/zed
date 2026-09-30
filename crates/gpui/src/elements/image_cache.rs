@@ -51,6 +51,10 @@ impl AnyImageCache {
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         (self.load_fn)(&self.image_cache, resource, window, cx)
     }
+
+    pub(crate) fn entity_id(&self) -> crate::EntityId {
+        self.image_cache.entity_id()
+    }
 }
 
 mod any_image_cache {

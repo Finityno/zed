@@ -947,12 +947,13 @@ fn list_state_changes_build_the_views_that_read_it() {
 }
 
 /// Keeps a view's content painted inside whatever transition its host puts
-/// it in, and a host that wraps it in opacity cycles or shimmers.
+/// it in, and a host that wraps it in opacity cycles, shimmers or glass mode.
 struct Mover {
     child: Entity<Leaf>,
     started_at: Instant,
     transition: Option<Duration>,
     cycle: bool,
+    glass: bool,
 }
 
 struct Leaf;
@@ -975,7 +976,7 @@ impl Render for Mover {
                 .offset(point(px(0.), px(10.)), point(px(0.), px(0.)))
         });
         let cycle = self.cycle;
-        div().size_full().child(Wrapper {
+        div().size_full().when(self.glass, |this| this.glass(true)).child(Wrapper {
             child: Some(child),
             transition,
             cycle,
@@ -1075,6 +1076,7 @@ fn mover_windows(cx: &mut TestAppContext) -> [WindowHandle<Mover>; 2] {
             started_at,
             transition: None,
             cycle: false,
+            glass: false,
         })
     })
 }
@@ -1171,6 +1173,101 @@ fn a_view_drawn_again_into_another_opacity_cycle_is_built_on_the_next_frame() {
     assert!(asked >= 1, "the reused leaf asks for the next frame");
     draw_pair(&mut cx, windows);
     assert_eq!(cycled(&mut cx, windows[0]), cycled(&mut cx, windows[1]));
+}
+
+/// A view drawn again inside glass mode it was not painted in asks for the
+/// next frame, on which it is built inside it.
+#[test]
+fn a_view_drawn_again_into_glass_mode_is_built_on_the_next_frame() {
+    let mut cx = TestAppContext::single();
+    let windows = mover_windows(&mut cx);
+    draw_pair(&mut cx, windows);
+    for window in windows {
+        window
+            .update(&mut cx, |mover, _, cx| {
+                mover.glass = true;
+                cx.notify();
+            })
+            .unwrap();
+    }
+    draw_pair(&mut cx, windows);
+    let glass = |cx: &mut TestAppContext, window: WindowHandle<Mover>| {
+        cx.update_window(window.into(), |_, window, _| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|quad| quad.background.is_glass_content())
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    assert_ne!(glass(&mut cx, windows[0]), glass(&mut cx, windows[1]));
+    let asked = cx
+        .update_window(windows[0].into(), |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    assert!(asked >= 1, "the reused leaf asks for the next frame");
+    draw_pair(&mut cx, windows);
+    assert_eq!(glass(&mut cx, windows[0]), glass(&mut cx, windows[1]));
+}
+
+/// A view whose host swapped the image cache it inherits for another is
+/// built again, so that its images load through the new one.
+#[test]
+fn a_view_under_another_image_cache_is_built_again() {
+    struct Counted(Rc<Cell<usize>>);
+    impl Render for Counted {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().w(px(40.)).h(px(20.)).bg(PALETTE[1])
+        }
+    }
+    struct Host {
+        caches: [Entity<crate::RetainAllImageCache>; 2],
+        current: usize,
+        child: Entity<Counted>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .image_cache(self.caches[self.current].clone())
+                .child(self.child.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        move |_, cx| Host {
+            caches: [
+                crate::RetainAllImageCache::new(cx),
+                crate::RetainAllImageCache::new(cx),
+            ],
+            current: 0,
+            child: cx.new(|_| Counted(renders)),
+        }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    };
+    draw(&mut cx);
+    cx.run_until_parked();
+    let settled = renders.get();
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    draw(&mut cx);
+    assert_eq!(renders.get(), settled, "under the same cache the child is drawn again");
+    window
+        .update(&mut cx, |host, _, cx| {
+            host.current = 1;
+            cx.notify();
+        })
+        .unwrap();
+    draw(&mut cx);
+    assert!(renders.get() > settled, "under another cache the child is built");
 }
 
 /// A view holding a draw deferred beneath native surfaces, drawn again,
