@@ -852,6 +852,14 @@ pub struct DrawBreakdown {
 #[cfg(feature = "profiler")]
 impl DrawBreakdown {
     pub(crate) const DETAIL_RECORDED: u8 = 1 << 0;
+    pub(crate) const PHASES_MEASURED: u8 = 1 << 1;
+
+    /// Whether the phases and counts were measured. A breakdown built by
+    /// hand (benchmarks, or a frame timing from outside a window draw) is
+    /// all zeros, which is not the same as a draw that spent no time.
+    pub fn phases_measured(&self) -> bool {
+        self.flags & Self::PHASES_MEASURED != 0
+    }
 
     /// Building the root element tree.
     pub fn request_layout(&self) -> Duration {

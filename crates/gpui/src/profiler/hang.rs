@@ -233,31 +233,33 @@ pub enum SerializedHangContributor {
         /// Invalidations coalesced into the frame.
         invalidations: u64,
         /// Of `duration_ms`, building the root element tree (see
-        /// [`crate::DrawBreakdown`] for what each phase covers).
-        request_layout_ms: f64,
+        /// [`crate::DrawBreakdown`] for what each phase covers). This and
+        /// the other phases and counts are absent for a draw whose phases
+        /// were not measured, rather than zero.
+        request_layout_ms: Option<f64>,
         /// Of `duration_ms`, every taffy layout pass and its measure
         /// closures, wherever they ran.
-        layout_ms: f64,
+        layout_ms: Option<f64>,
         /// Of `duration_ms`, prepaint without its layout passes, including
         /// cached views and list items rendered during it.
-        prepaint_ms: f64,
+        prepaint_ms: Option<f64>,
         /// Of `duration_ms`, painting.
-        paint_ms: f64,
+        paint_ms: Option<f64>,
         /// Of `duration_ms`, finishing the frame between paint and the
         /// focus listeners: the accessibility update, freeing the previous
         /// frame's text layouts and layout tree, and the scene finish.
-        finish_ms: f64,
+        finish_ms: Option<f64>,
         /// Of `duration_ms`, the focus listeners.
-        focus_ms: f64,
+        focus_ms: Option<f64>,
         /// Of `duration_ms`, the rest: setup, and the bookkeeping after the
         /// focus listeners. The seven parts add up to `duration_ms`.
-        other_ms: f64,
+        other_ms: Option<f64>,
         /// Taffy layout passes the draw ran.
-        layout_passes: u16,
+        layout_passes: Option<u16>,
         /// Entity views that rendered.
-        views_rendered: u16,
+        views_rendered: Option<u16>,
         /// Cached views that replayed their previous prepaint.
-        views_reused: u16,
+        views_reused: Option<u16>,
         /// CPU time the drawing thread spent in user mode; absent when not
         /// measured (a fast draw, or a platform that cannot).
         user_cpu_ms: Option<f64>,
@@ -462,6 +464,8 @@ impl SerializedHangContributor {
             },
             ForegroundEvent::Draw(timing) => {
                 let breakdown = timing.breakdown;
+                let measured = breakdown.phases_measured();
+                let phase = |part: Duration| measured.then(|| as_millis(part));
                 let detail = breakdown
                     .detail_recorded()
                     .then(|| super::slow_draw_detail(timing.window_id, timing.draw_start))
@@ -489,16 +493,16 @@ impl SerializedHangContributor {
                     duration_ms,
                     dirty_to_draw_ms: timing.dirty_to_draw_duration().map(as_millis),
                     invalidations: timing.invalidations,
-                    request_layout_ms: as_millis(breakdown.request_layout()),
-                    layout_ms: as_millis(breakdown.layout()),
-                    prepaint_ms: as_millis(breakdown.prepaint()),
-                    paint_ms: as_millis(breakdown.paint()),
-                    finish_ms: as_millis(breakdown.finish()),
-                    focus_ms: as_millis(breakdown.focus()),
-                    other_ms: as_millis(breakdown.other()),
-                    layout_passes: breakdown.layout_passes(),
-                    views_rendered: breakdown.views_rendered(),
-                    views_reused: breakdown.views_reused(),
+                    request_layout_ms: phase(breakdown.request_layout()),
+                    layout_ms: phase(breakdown.layout()),
+                    prepaint_ms: phase(breakdown.prepaint()),
+                    paint_ms: phase(breakdown.paint()),
+                    finish_ms: phase(breakdown.finish()),
+                    focus_ms: phase(breakdown.focus()),
+                    other_ms: phase(breakdown.other()),
+                    layout_passes: measured.then_some(breakdown.layout_passes()),
+                    views_rendered: measured.then_some(breakdown.views_rendered()),
+                    views_reused: measured.then_some(breakdown.views_reused()),
                     user_cpu_ms: resources.user_cpu().map(as_millis),
                     system_cpu_ms: resources.system_cpu().map(as_millis),
                     faults: resources.faults(),
@@ -895,7 +899,7 @@ mod tests {
             layout_passes: 41,
             views_rendered: 7,
             views_reused: 3,
-            flags: crate::DrawBreakdown::DETAIL_RECORDED,
+            flags: crate::DrawBreakdown::PHASES_MEASURED | crate::DrawBreakdown::DETAIL_RECORDED,
         };
         let sample = |user_us: u64, system_us: u64, faults: u64, decompressions: u64| {
             crate::ResourceSample {
@@ -1002,16 +1006,16 @@ mod tests {
                 "duration_ms": 200.0,
                 "dirty_to_draw_ms": null,
                 "invalidations": 1,
-                "request_layout_ms": 0.0,
-                "layout_ms": 0.0,
-                "prepaint_ms": 0.0,
-                "paint_ms": 0.0,
-                "finish_ms": 0.0,
-                "focus_ms": 0.0,
-                "other_ms": 200.0,
-                "layout_passes": 0,
-                "views_rendered": 0,
-                "views_reused": 0,
+                "request_layout_ms": null,
+                "layout_ms": null,
+                "prepaint_ms": null,
+                "paint_ms": null,
+                "finish_ms": null,
+                "focus_ms": null,
+                "other_ms": null,
+                "layout_passes": null,
+                "views_rendered": null,
+                "views_reused": null,
                 "user_cpu_ms": null,
                 "system_cpu_ms": null,
                 "faults": null,

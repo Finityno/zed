@@ -283,7 +283,8 @@ impl DrawClock {
     /// `slow` records whether the draw reached the detail threshold, for
     /// the next draw's sampling decisions.
     pub(crate) fn finish(&mut self, now: Instant, slow: bool) -> DrawBreakdown {
-        if self.active {
+        let measured = self.active;
+        if measured {
             self.charge(now);
         }
         self.active = false;
@@ -302,6 +303,11 @@ impl DrawClock {
             layout_passes: self.layout_passes,
             views_rendered: self.views_rendered,
             views_reused: self.views_reused,
+            flags: if measured {
+                DrawBreakdown::PHASES_MEASURED
+            } else {
+                0
+            },
             ..DrawBreakdown::default()
         }
     }
@@ -749,6 +755,7 @@ mod tests {
 
     fn assert_parts_add_up(timing: &FrameTiming) {
         let breakdown = timing.breakdown;
+        assert!(breakdown.phases_measured(), "{breakdown:?}");
         let parts = breakdown.request_layout()
             + breakdown.layout()
             + breakdown.prepaint()
