@@ -848,6 +848,31 @@ mod tests {
         assert!(breakdown.prepaint() < SPIN, "{breakdown:?}");
     }
 
+    #[gpui::test]
+    fn a_draw_that_skips_drawing_builds_no_tree(cx: &mut TestAppContext) {
+        let _knobs = Knobs::defaults();
+        cx.skip_drawing();
+        let fixture = open_window(cx);
+        let skipped = fixture.redraw(&fixture.worker, cx);
+        assert_parts_add_up(&skipped);
+        let breakdown = skipped.breakdown;
+        assert_eq!(
+            [
+                breakdown.request_layout(),
+                breakdown.layout(),
+                breakdown.prepaint(),
+                breakdown.paint(),
+            ],
+            [Duration::ZERO; 4],
+            "{breakdown:?}"
+        );
+        assert_eq!(
+            (breakdown.layout_passes(), breakdown.views_rendered()),
+            (0, 0),
+            "{breakdown:?}"
+        );
+    }
+
     struct Focusable {
         handle: FocusHandle,
     }
