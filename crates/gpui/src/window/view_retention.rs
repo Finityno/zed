@@ -275,6 +275,12 @@ pub(crate) struct ViewRetention {
     nested_states: Vec<Range<usize>>,
     /// How many retained view recordings are open.
     open_recordings: usize,
+    /// Whether the deferred draw being drawn was deferred from inside a view
+    /// notified since the last frame; see [`EnclosingViews`].
+    deferred_inside_notified: bool,
+    /// [`crate::key_dispatch::DispatchTree::action_fingerprint`] of the frame
+    /// last drawn, to tell when which actions are available changed.
+    actions_fingerprint: u64,
     /// Bumped as every frame begins. A view that opted out reads it, so that
     /// the views around it depend on it too and are never drawn again whole,
     /// which would copy it along.
@@ -300,6 +306,8 @@ impl ViewRetention {
             nested_keys: Vec::new(),
             nested_states: Vec::new(),
             open_recordings: 0,
+            deferred_inside_notified: false,
+            actions_fingerprint: 0,
             frames_since_verification: 0,
             verification_interval: verification_interval(),
         }
@@ -310,7 +318,13 @@ impl ViewRetention {
 /// when something was deferred: what drawing it reads and the hovers it is
 /// drawn by are theirs too, though it is drawn after them.
 #[derive(Clone, Default)]
-pub(crate) struct EnclosingViews(SmallVec<[usize; 4]>);
+pub(crate) struct EnclosingViews {
+    views: SmallVec<[usize; 4]>,
+    /// Whether one of the views around it was notified since the last
+    /// frame: drawn later, it has only the view it was deferred from around
+    /// it, and would otherwise not know.
+    inside_notified: bool,
+}
 
 /// Something deferred from retained views, being drawn.
 pub(crate) struct DeferredViewRecording {
@@ -613,12 +627,20 @@ impl Window {
     }
 
     /// Ends the retained bookkeeping of the frame being drawn.
-    pub(crate) fn finish_retained_views_frame(&mut self, cx: &App) {
+    pub(crate) fn finish_retained_views_frame(&mut self, cx: &mut App) {
+        if cx.view_retention() {
+            let fingerprint = self.next_frame.dispatch_tree.action_fingerprint();
+            if fingerprint != self.view_retention.actions_fingerprint {
+                self.view_retention.actions_fingerprint = fingerprint;
+                dependencies::ambient_changed::<dependencies::ambient::Actions>(cx);
+            }
+        }
         let retention = &mut self.view_retention;
         retention.hovers.clear();
         retention.hover_reads.get_mut().clear();
         retention.notified.clear();
         retention.view_stack.clear();
+        retention.deferred_inside_notified = false;
         self.next_frame.retained_views.finish_frame();
         self.schedule_deadline_frame(cx);
     }
@@ -627,11 +649,12 @@ impl Window {
     /// last frame.
     fn inside_notified_view(&self) -> bool {
         let notified = &self.view_retention.notified;
-        !notified.is_empty()
-            && self
-                .rendered_entity_stack
-                .iter()
-                .any(|entity| notified.contains(entity))
+        self.view_retention.deferred_inside_notified
+            || (!notified.is_empty()
+                && self
+                    .rendered_entity_stack
+                    .iter()
+                    .any(|entity| notified.contains(entity)))
     }
 
     /// The record `id` left last frame, if nothing about this frame rules out
@@ -1119,7 +1142,10 @@ impl Window {
     /// The retained views being prepainted right now, for something deferred
     /// from them to count as theirs.
     pub(crate) fn enclosing_views(&self) -> EnclosingViews {
-        EnclosingViews(self.next_frame.retained_views.open.iter().copied().collect())
+        EnclosingViews {
+            views: self.next_frame.retained_views.open.iter().copied().collect(),
+            inside_notified: self.inside_notified_view(),
+        }
     }
 
     /// Starts drawing something deferred as a part of the retained views it
@@ -1129,12 +1155,13 @@ impl Window {
         enclosing: &EnclosingViews,
         cx: &mut App,
     ) -> Option<DeferredViewRecording> {
-        if enclosing.0.is_empty() {
+        self.view_retention.deferred_inside_notified = enclosing.inside_notified;
+        if enclosing.views.is_empty() {
             return None;
         }
         let views = &self.next_frame.retained_views;
         let ids: SmallVec<[GlobalElementId; 4]> = enclosing
-            .0
+            .views
             .iter()
             .map(|&index| views.records[index].id.clone())
             .collect();
@@ -1160,7 +1187,7 @@ impl Window {
         self.take_hover_reads();
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         self.view_retention.view_stack.clear();
-        let enclosing = &recording.enclosing.0;
+        let enclosing = &recording.enclosing.views;
         let views = &mut self.next_frame.retained_views;
         views.add_dependencies(enclosing, &dependencies);
         views.add_hovers(enclosing, &self.view_retention.hovers[recording.hovers_start..]);

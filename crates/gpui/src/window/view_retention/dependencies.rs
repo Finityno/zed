@@ -125,6 +125,20 @@ pub(crate) mod ambient {
     /// The modifier keys and caps lock: [`crate::Window::modifiers`] and
     /// [`crate::Window::capslock`].
     pub(crate) struct Keys;
+    /// The window's appearance: [`crate::Window::appearance`].
+    pub(crate) struct Appearance;
+    /// Which actions are available and bound where the window is focused:
+    /// [`crate::Window::is_action_available`] and
+    /// [`crate::Window::bindings_for_action`], which answer from the frame
+    /// last drawn and the keymap.
+    pub(crate) struct Actions;
+}
+
+/// Stamps a change to one of the window's [`ambient`] states.
+pub(crate) fn ambient_changed<T: 'static>(cx: &mut App) {
+    if cx.entities.access_log.enabled {
+        cx.dependencies.global_changed(TypeId::of::<T>());
+    }
 }
 
 /// A window's handle on the app's recording, so that reading the window's own

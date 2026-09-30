@@ -140,6 +140,23 @@ pub(crate) struct DispatchActionListener {
 }
 
 impl DispatchTree {
+    /// A hash of what decides which actions are available and bound where:
+    /// the tree's shape, its key contexts, focusable nodes and the actions
+    /// each node handles.
+    pub(crate) fn action_fingerprint(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = collections::FxHasher::default();
+        for node in &self.nodes {
+            node.parent.map(|parent| parent.0).hash(&mut hasher);
+            node.context.hash(&mut hasher);
+            node.focus_id.hash(&mut hasher);
+            for listener in &node.action_listeners {
+                listener.action_type.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     pub fn new(keymap: Rc<RefCell<Keymap>>, action_registry: Rc<ActionRegistry>) -> Self {
         Self {
             node_stack: Vec::new(),

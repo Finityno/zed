@@ -3180,7 +3180,11 @@ impl Window {
     }
 
     pub(crate) fn appearance_changed(&mut self, cx: &mut App) {
-        self.appearance = self.platform_window.appearance();
+        let appearance = self.platform_window.appearance();
+        if appearance != self.appearance {
+            view_retention::dependencies::ambient_changed::<view_retention::dependencies::ambient::Appearance>(cx);
+        }
+        self.appearance = appearance;
 
         self.appearance_observers
             .clone()
@@ -3195,6 +3199,9 @@ impl Window {
 
     /// Returns the appearance of the current window.
     pub fn appearance(&self) -> WindowAppearance {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Appearance>();
         self.appearance
     }
 
@@ -3694,8 +3701,15 @@ impl Window {
         self.default_prevented
     }
 
+    fn note_actions_read(&self) {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Actions>();
+    }
+
     /// Determine whether the given action is available along the dispatch path to the currently focused element.
     pub fn is_action_available(&self, action: &dyn Action, cx: &App) -> bool {
+        self.note_actions_read();
         let node_id =
             self.focus_node_id_in_rendered_frame(self.focused(cx).map(|handle| handle.id));
         self.rendered_frame
@@ -3705,6 +3719,7 @@ impl Window {
 
     /// Determine whether the given action is available along the dispatch path to the given focus_handle.
     pub fn is_action_available_in(&self, action: &dyn Action, focus_handle: &FocusHandle) -> bool {
+        self.note_actions_read();
         let node_id = self.focus_node_id_in_rendered_frame(Some(focus_handle.id));
         self.rendered_frame
             .dispatch_tree
@@ -7537,6 +7552,7 @@ impl Window {
     /// Returns key bindings that invoke an action on the currently focused element. Bindings are
     /// returned in the order they were added. For display, the last binding should take precedence.
     pub fn bindings_for_action(&self, action: &dyn Action) -> Vec<KeyBinding> {
+        self.note_actions_read();
         self.rendered_frame
             .dispatch_tree
             .bindings_for_action(action, &self.rendered_frame.dispatch_tree.context_stack)
@@ -7545,6 +7561,7 @@ impl Window {
     /// Returns the highest precedence key binding that invokes an action on the currently focused
     /// element. This is more efficient than getting the last result of `bindings_for_action`.
     pub fn highest_precedence_binding_for_action(&self, action: &dyn Action) -> Option<KeyBinding> {
+        self.note_actions_read();
         self.rendered_frame
             .dispatch_tree
             .highest_precedence_binding_for_action(

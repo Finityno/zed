@@ -397,11 +397,18 @@ impl Scene {
     /// `remapped` starts out holding the transition the replayed range was
     /// painted inside, mapped to the one it is replayed inside, when those
     /// differ; see [`Self::replay_inside`].
+    ///
+    /// With `landed_before` given, a transition that has landed by then and
+    /// rests where it started (no offset, full opacity) is left out, its
+    /// primitives taking its parent's: it no longer moves or fades anything,
+    /// and content drawn again frame after frame would otherwise copy it
+    /// forever, against the scene's budget of transitions.
     fn remap_transition(
         &mut self,
         prev_scene: &Scene,
         transition: u32,
         remapped: &mut Vec<(u32, u32)>,
+        landed_before: Option<std::time::Instant>,
     ) -> u32 {
         if let Some(&(_, id)) = remapped.iter().find(|(source, _)| *source == transition) {
             return id;
@@ -410,7 +417,12 @@ impl Scene {
         if let Some(&(_, id)) = remapped.iter().find(|(source, _)| *source == entry.parent) {
             entry.parent = id;
         } else if entry.parent != 0 {
-            entry.parent = self.remap_transition(prev_scene, entry.parent, remapped);
+            entry.parent =
+                self.remap_transition(prev_scene, entry.parent, remapped, landed_before);
+        }
+        if landed_before.is_some_and(|now| entry.transition.rests_at_identity_by(now)) {
+            remapped.push((transition, entry.parent));
+            return entry.parent;
         }
         let id = self.push_transition(entry).unwrap_or(0);
         remapped.push((transition, id));
@@ -449,6 +461,9 @@ impl Scene {
         // label's glyphs share one remapped entry rather than one each.
         let mut remapped_animation = (0, 0);
         let mut remapped_transitions: Vec<(u32, u32)> = Vec::new();
+        // Only content drawn again from a view's record is compacted; a
+        // cached view's replay stays as it was.
+        let landed_before = rebase.map(|_| std::time::Instant::now());
         let rebase = rebase.filter(|(from, to)| from != to);
         remapped_transitions.extend(rebase);
         for operation in &prev_scene.paint_operations[range] {
@@ -461,8 +476,12 @@ impl Scene {
                     {
                         set_primitive_transition(&mut primitive, to);
                     } else if transition != 0 {
-                        let remapped =
-                            self.remap_transition(prev_scene, transition, &mut remapped_transitions);
+                        let remapped = self.remap_transition(
+                            prev_scene,
+                            transition,
+                            &mut remapped_transitions,
+                            landed_before,
+                        );
                         set_primitive_transition(&mut primitive, remapped);
                     }
                     if let Primitive::Quad(quad) = &mut primitive
@@ -2241,6 +2260,12 @@ impl TimeTransition {
     pub fn easing(mut self, easing: fn(f32) -> f32) -> Self {
         self.easing = easing;
         self
+    }
+
+    /// Whether the transition has landed by `now` and rests where it was
+    /// painted: no offset, full opacity.
+    pub(crate) fn rests_at_identity_by(&self, now: std::time::Instant) -> bool {
+        self.ends_at() <= now && self.to_offset == Point::default() && self.to_opacity == 1.0
     }
 
     /// When the transition lands.

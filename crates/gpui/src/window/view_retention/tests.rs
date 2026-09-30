@@ -1098,9 +1098,11 @@ fn a_view_drawn_again_moves_with_the_transition_it_is_drawn_in() {
         assert_eq!(first_difference(&actual, &expected), None);
     };
     change(&mut cx, None);
-    change(&mut cx, Some(Duration::from_millis(200)));
+    // Long enough not to land while the test runs: a landed transition is
+    // left out of content drawn again.
+    change(&mut cx, Some(Duration::from_secs(600)));
     cx.executor().advance_clock(Duration::from_millis(50));
-    change(&mut cx, Some(Duration::from_millis(300)));
+    change(&mut cx, Some(Duration::from_secs(900)));
     change(&mut cx, None);
     let reused = cx
         .update_window(windows[0].into(), |_, window, _| window.frame_work_stats().views_reused)
@@ -1838,4 +1840,235 @@ fn frame_work_by_view_depth() {
             );
         }
     }
+}
+
+/// A view painting inside a transition of its own that has landed where it
+/// started, drawn again: the transition is left out rather than copied frame
+/// after frame, and the view paints where it would with it.
+#[test]
+fn a_landed_transition_is_left_out_of_a_view_drawn_again() {
+    struct Settled {
+        started_at: Instant,
+    }
+    impl Render for Settled {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(Wrapper {
+                child: Some(
+                    div()
+                        .w(px(40.))
+                        .h(px(20.))
+                        .bg(PALETTE[1])
+                        .into_any_element(),
+                ),
+                transition: Some(
+                    crate::TimeTransition::new(self.started_at, Duration::from_millis(10))
+                        .offset(point(px(0.), px(10.)), point(px(0.), px(0.))),
+                ),
+                cycle: false,
+            })
+        }
+    }
+    struct Host {
+        settled: Entity<Settled>,
+        tint: usize,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(PALETTE[self.tint % PALETTE.len()])
+                .child(self.settled.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    // Landed long before the test began, by the clock the scene uses.
+    let started_at = Instant::now() - Duration::from_secs(60);
+    let windows = [(); 2].map(|_| {
+        cx.add_window(move |_, cx| Host {
+            settled: cx.new(|_| Settled { started_at }),
+            tint: 0,
+        })
+    });
+    let frame = |cx: &mut TestAppContext, refresh: bool, window: WindowHandle<Host>| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if refresh {
+                window.refresh();
+            }
+            window.reset_frame_work_stats(false);
+            window.draw(cx).clear(cx);
+            let scene = &window.rendered_frame.scene;
+            (
+                scene
+                    .quads
+                    .iter()
+                    .map(|quad| format!("{:?}", quad.bounds))
+                    .collect::<Vec<_>>(),
+                scene.transitions.len(),
+                window.frame_work_stats().views_reused,
+            )
+        })
+        .unwrap()
+    };
+    frame(&mut cx, false, windows[0]);
+    frame(&mut cx, true, windows[1]);
+    for window in windows {
+        window
+            .update(&mut cx, |host, _, cx| {
+                host.tint += 1;
+                cx.notify();
+            })
+            .unwrap();
+    }
+    let (retained_quads, retained_transitions, reused) = frame(&mut cx, false, windows[0]);
+    let (quads, transitions, _) = frame(&mut cx, true, windows[1]);
+    assert_eq!(reused, 1);
+    assert_eq!(retained_quads, quads);
+    assert_eq!(transitions, 1);
+    assert_eq!(retained_transitions, 0);
+}
+
+mod probe_actions {
+    use crate as gpui;
+    gpui::actions!(retention_probe, [Probe]);
+}
+
+/// A view reading the window's appearance, or the bindings for an action,
+/// is built again once they change.
+#[test]
+fn appearance_and_key_bindings_are_dependencies() {
+    struct Reader {
+        renders: Rc<Cell<usize>>,
+    }
+    impl Render for Reader {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let dark = window.appearance() == crate::WindowAppearance::Dark;
+            let bound = window.bindings_for_action(&probe_actions::Probe).len();
+            div().child(SharedString::from(format!("{dark} {bound}")))
+        }
+    }
+    struct Host {
+        reader: Entity<Reader>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.reader.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        move |_, cx| Host {
+            reader: cx.new(|_| Reader { renders }),
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    let settled = renders.get();
+    frame(&mut cx);
+    assert_eq!(renders.get(), settled, "nothing changed");
+    cx.test_window(window.into())
+        .simulate_appearance_change(crate::WindowAppearance::Dark);
+    cx.run_until_parked();
+    frame(&mut cx);
+    assert!(renders.get() > settled, "the appearance changed");
+    let settled = renders.get();
+    cx.update(|cx| cx.bind_keys([crate::KeyBinding::new("ctrl-p", probe_actions::Probe, None)]));
+    frame(&mut cx);
+    assert!(renders.get() > settled, "the key bindings changed");
+}
+
+/// A cached view inside a deferred draw, from a view inside one notified
+/// since the last frame, counts as inside it: a model it read, updated
+/// without being notified, builds it again as it would the rest.
+#[test]
+fn a_deferred_view_inside_a_notified_view_counts_as_inside_it() {
+    struct Shown(usize);
+    struct Content {
+        model: Entity<Shown>,
+    }
+    impl Render for Content {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let value = self.model.read(cx).0;
+            div().w(px(10. + value as f32)).h(px(10.)).bg(PALETTE[2])
+        }
+    }
+    struct Popover {
+        content: Entity<Content>,
+    }
+    impl Render for Popover {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(deferred(
+                self.content
+                    .clone()
+                    .cached(StyleRefinement::default().w(px(60.)).h(px(10.))),
+            ))
+        }
+    }
+    struct Host {
+        popover: Entity<Popover>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.popover.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let model = cx.new(|_| Shown(0));
+    let window = cx.add_window({
+        let model = model.clone();
+        move |_, cx| Host {
+            popover: cx.new(|cx| Popover {
+                content: cx.new(|_| Content { model }),
+            }),
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|quad| quad.bounds.size.width)
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    // The popover is built, so that the view it defers is prepainted and
+    // leaves a record: drawn again whole, it would copy its deferred draw
+    // without one.
+    let popover = window.read_with(&cx, |host, _| host.popover.clone()).unwrap();
+    popover.update(&mut cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let widths = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, _| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|quad| quad.bounds.size.width)
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    let before = widths(&mut cx);
+    model.update(&mut cx, |shown, _| shown.0 = 20);
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    cx.run_until_parked();
+    let after = widths(&mut cx);
+    assert_ne!(after, before, "the deferred view shows the model as it is");
 }
