@@ -120,6 +120,7 @@ struct ListObserved {
     follow_state: FollowState,
     alignment: ListAlignment,
     bounds: Option<Bounds<Pixels>>,
+    padding: Option<Edges<Pixels>>,
     scrollbar_drag_start_height: Option<Pixels>,
 }
 
@@ -1373,6 +1374,7 @@ impl StateInner {
             follow_state: self.follow_state,
             alignment: self.alignment,
             bounds: self.last_layout_bounds,
+            padding: self.last_padding,
             scrollbar_drag_start_height: self.scrollbar_drag_start_height,
         }
     }
