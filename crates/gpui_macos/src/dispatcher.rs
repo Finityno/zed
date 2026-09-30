@@ -1,5 +1,8 @@
 use dispatch2::{DispatchQueue, DispatchQueueGlobalPriority, DispatchTime, GlobalQueueIdentifier};
-use gpui::{ActivityGuard, PlatformDispatcher, Priority, RunnableMeta, RunnableVariant};
+use gpui::{
+    ActivityGuard, FaultScope, PlatformDispatcher, Priority, ResourceSample, RunnableMeta,
+    RunnableVariant,
+};
 use gpui_util::ResultExt;
 use mach2::{
     kern_return::KERN_SUCCESS,
@@ -85,6 +88,110 @@ impl PlatformDispatcher for MacDispatcher {
             NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
         )
     }
+
+    fn sample_draw_resources(&self, process_counters: bool) -> Option<ResourceSample> {
+        sample_resources(process_counters)
+    }
+}
+
+thread_local! {
+    // `pthread_mach_thread_np` returns the thread's port without taking a
+    // new send right, unlike `mach_thread_self`, which leaks one per call
+    // unless it is deallocated.
+    static CURRENT_THREAD_PORT: libc::mach_port_t =
+        // SAFETY: always safe to call with the current thread.
+        unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+}
+
+/// Reads the calling thread's CPU time (`thread_info`, about 0.4 µs) and,
+/// when `process_counters` is set, the task's fault, page-in and
+/// decompression counters (`task_info`, about 1 µs each in a process with
+/// 150 threads, since the kernel walks them).
+///
+/// The fault counters are the whole task's: macOS has no per-thread fault
+/// count. Decompressing a compressed page runs in the faulting thread, so
+/// it shows up in that thread's system time.
+fn sample_resources(process_counters: bool) -> Option<ResourceSample> {
+    let (user, system) = thread_cpu_times()?;
+    let mut sample = ResourceSample {
+        user,
+        system,
+        faults: None,
+        major_faults: None,
+        decompressions: None,
+        fault_scope: FaultScope::Process,
+    };
+    if process_counters {
+        if let Some(events) = task_events() {
+            sample.faults = Some(events.faults.max(0) as u64);
+            sample.major_faults = Some(events.pageins.max(0) as u64);
+        }
+        sample.decompressions = task_decompressions();
+    }
+    Some(sample)
+}
+
+fn thread_cpu_times() -> Option<(Duration, Duration)> {
+    let port = CURRENT_THREAD_PORT.with(|port| *port);
+    let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::zeroed();
+    let mut count = libc::THREAD_BASIC_INFO_COUNT;
+    // SAFETY: `info` has room for THREAD_BASIC_INFO_COUNT integers, and
+    // `port` names the calling thread, which outlives the call.
+    let result = unsafe {
+        libc::thread_info(
+            port,
+            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+            info.as_mut_ptr() as libc::thread_info_t,
+            &mut count,
+        )
+    };
+    if result != KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: thread_info succeeded, so it filled `info`.
+    let info = unsafe { info.assume_init() };
+    let duration = |time: libc::time_value_t| {
+        Duration::from_secs(time.seconds.max(0) as u64)
+            + Duration::from_micros(time.microseconds.max(0) as u64)
+    };
+    Some((duration(info.user_time), duration(info.system_time)))
+}
+
+fn task_events() -> Option<mach2::task_info::task_events_info> {
+    let mut info = mach2::task_info::task_events_info::default();
+    let mut count = mach2::task_info::TASK_EVENTS_INFO_COUNT;
+    // SAFETY: `info` has room for TASK_EVENTS_INFO_COUNT integers.
+    let result = unsafe {
+        mach2::task::task_info(
+            mach2::traps::mach_task_self(),
+            mach2::task_info::TASK_EVENTS_INFO,
+            &mut info as *mut _ as mach2::task_info::task_info_t,
+            &mut count,
+        )
+    };
+    (result == KERN_SUCCESS).then_some(info)
+}
+
+fn task_decompressions() -> Option<u64> {
+    use mach2::task_info::{TASK_VM_INFO, task_info_t, task_vm_info};
+    // `decompressions` arrived in revision 5 of the structure: a kernel
+    // that fills fewer integers than reach past it did not write it.
+    const REVISION_5_COUNT: u32 = ((std::mem::offset_of!(task_vm_info, decompressions)
+        + std::mem::size_of::<i32>())
+        / std::mem::size_of::<u32>()) as u32;
+    let mut info = task_vm_info::default();
+    let mut count = (std::mem::size_of::<task_vm_info>() / std::mem::size_of::<u32>()) as u32;
+    // SAFETY: `info` has room for `count` integers.
+    let result = unsafe {
+        mach2::task::task_info(
+            mach2::traps::mach_task_self(),
+            TASK_VM_INFO,
+            &mut info as *mut _ as task_info_t,
+            &mut count,
+        )
+    };
+    (result == KERN_SUCCESS && count >= REVISION_5_COUNT)
+        .then(|| info.decompressions.max(0) as u64)
 }
 
 pub(crate) struct MacActivity {
@@ -233,4 +340,46 @@ extern "C" fn trampoline(context: *mut c_void) {
 /// genuine idle point that follows.
 extern "C" fn main_thread_trampoline(context: *mut c_void) {
     run_runnable(context);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample_resources;
+
+    #[test]
+    fn touching_fresh_memory_shows_up_in_the_samples() {
+        let before = sample_resources(true).expect("thread_info succeeds");
+        const SIZE: usize = 64 * 1024 * 1024;
+        let mut memory = vec![0u8; SIZE];
+        for page in memory.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&memory);
+        let after = sample_resources(true).expect("thread_info succeeds");
+
+        let faults = after.faults.expect("TASK_EVENTS_INFO succeeds")
+            - before.faults.expect("TASK_EVENTS_INFO succeeds");
+        assert!(
+            faults >= 4096,
+            "touching 64 MiB of fresh pages faults them in: {faults} faults"
+        );
+        assert!(
+            after.user + after.system > before.user + before.system,
+            "and costs the thread CPU time: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.decompressions.is_some(),
+            "macOS 12 and later report decompressions"
+        );
+        assert!(after.major_faults.is_some());
+    }
+
+    #[test]
+    fn thread_cpu_time_alone_reads_no_process_counters() {
+        let sample = sample_resources(false).expect("thread_info succeeds");
+        assert_eq!(
+            (sample.faults, sample.major_faults, sample.decompressions),
+            (None, None, None)
+        );
+    }
 }

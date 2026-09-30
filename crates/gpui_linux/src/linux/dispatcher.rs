@@ -8,8 +8,8 @@ use gpui_util::ResultExt;
 use std::{mem::MaybeUninit, thread, time::Duration};
 
 use gpui::{
-    PlatformDispatcher, Priority, PriorityQueueReceiver, PriorityQueueSender, RunnableVariant,
-    profiler,
+    FaultScope, PlatformDispatcher, Priority, PriorityQueueReceiver, PriorityQueueSender,
+    ResourceSample, RunnableVariant, profiler,
 };
 
 struct TimerAfter {
@@ -133,6 +133,33 @@ impl PlatformDispatcher for LinuxDispatcher {
             // which is acceptable during shutdown.
             std::mem::forget(err);
         }
+    }
+
+    /// `getrusage(RUSAGE_THREAD)` reads the calling thread's own CPU time
+    /// and faults in one call, so the fault counters come with every
+    /// sample. The CPU times are tick-sampled unless the kernel does
+    /// precise (`VIRT_CPU_ACCOUNTING`) accounting.
+    fn sample_draw_resources(&self, _process_counters: bool) -> Option<ResourceSample> {
+        let mut usage = MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `usage` is a valid, writable rusage.
+        if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: getrusage succeeded, so it filled `usage`.
+        let usage = unsafe { usage.assume_init() };
+        let duration = |time: libc::timeval| {
+            Duration::from_secs(time.tv_sec.max(0) as u64)
+                + Duration::from_micros(time.tv_usec.max(0) as u64)
+        };
+        let major_faults = usage.ru_majflt.max(0) as u64;
+        Some(ResourceSample {
+            user: duration(usage.ru_utime),
+            system: duration(usage.ru_stime),
+            faults: Some(usage.ru_minflt.max(0) as u64 + major_faults),
+            major_faults: Some(major_faults),
+            decompressions: None,
+            fault_scope: FaultScope::Thread,
+        })
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
