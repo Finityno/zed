@@ -44,6 +44,7 @@ use crate::{
 };
 use collections::FxHashMap;
 use dependencies::{AmbientReads, DependencyChange, DependencyRecording, RenderDependencies};
+use gpui_util::ResultExt;
 use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{any::TypeId, cell::RefCell, ops::Range, rc::Rc, sync::OnceLock, time::Instant};
@@ -587,7 +588,7 @@ impl Window {
                 window.view_retention.deadline_frame = None;
                 window.invalidator.set_dirty(true);
             })
-            .ok();
+            .log_err();
         });
         self.view_retention.deadline_frame = Some((deadline, task));
     }
@@ -636,6 +637,14 @@ impl Window {
             if fingerprint != self.view_retention.actions_fingerprint {
                 self.view_retention.actions_fingerprint = fingerprint;
                 dependencies::ambient_changed::<dependencies::ambient::Actions>(cx);
+                // Views drawn in this frame answered from the last frame's
+                // actions; the ones that read them are built again in a
+                // follow-up frame, asked for once this draw has returned.
+                self.spawn(cx, async move |cx| {
+                    cx.update(|window, _| window.invalidator.set_dirty(true))
+                        .log_err();
+                })
+                .detach();
             }
         }
         let retention = &mut self.view_retention;

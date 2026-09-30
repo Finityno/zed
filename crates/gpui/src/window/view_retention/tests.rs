@@ -675,6 +675,8 @@ fn shell_window(cx: &mut TestAppContext) -> (WindowHandle<Shell>, Rc<Shared>) {
         move |_, cx| Shell::new(&shared, cx)
     });
     draw(cx, window);
+    // The first frame sets the window's actions, which asks for another.
+    cx.run_until_parked();
     (window, shared)
 }
 
@@ -1989,6 +1991,56 @@ fn appearance_and_key_bindings_are_dependencies() {
     cx.update(|cx| cx.bind_keys([crate::KeyBinding::new("ctrl-p", probe_actions::Probe, None)]));
     frame(&mut cx);
     assert!(renders.get() > settled, "the key bindings changed");
+}
+
+/// A frame that changes which actions are available asks for a follow-up
+/// frame, in which the views that read them are built again: they were drawn
+/// from the actions of the frame before.
+#[test]
+fn a_frame_changing_the_actions_asks_for_another() {
+    struct Host {
+        handles: bool,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .when(self.handles, |this| {
+                    this.on_action(|_: &probe_actions::Probe, _, _| {})
+                })
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let window = cx.add_window(|_, _| Host { handles: false });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap()
+    };
+    // The frames the window drew on its own, after one drawn here.
+    let frames_after = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.reset_frame_work_stats(false);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.frame_work_stats().frames)
+            .unwrap()
+    };
+    frame(&mut cx);
+    cx.run_until_parked();
+    assert_eq!(frames_after(&mut cx), 0, "nothing changed");
+    window
+        .update(&mut cx, |host, _, cx| {
+            host.handles = true;
+            cx.notify();
+        })
+        .unwrap();
+    assert_eq!(frames_after(&mut cx), 1, "the actions changed");
+    assert_eq!(frames_after(&mut cx), 0, "the follow-up frame changed nothing");
 }
 
 /// A cached view inside a deferred draw, from a view inside one notified
