@@ -103,10 +103,13 @@ thread_local! {
         unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
 }
 
-/// Reads the calling thread's CPU time (`thread_info`, about 0.4 µs) and,
+/// Reads the calling thread's CPU time (`thread_info`, about 0.5 µs) and,
 /// when `process_counters` is set, the task's fault, page-in and
-/// decompression counters (`task_info`, about 1 µs each in a process with
-/// 150 threads, since the kernel walks them).
+/// decompression counters (two `task_info` calls). Measured in a test
+/// process on Apple silicon, the two calls together cost about 1.7 µs, and
+/// about 2.9 µs with 150 more parked threads, since `TASK_EVENTS_INFO`
+/// walks the task's threads. Their cost in a large app, whose memory map
+/// `TASK_VM_INFO` may also walk, has not been measured.
 ///
 /// The fault counters are the whole task's: macOS has no per-thread fault
 /// count. Decompressing a compressed page runs in the faulting thread, so
@@ -123,12 +126,19 @@ fn sample_resources(process_counters: bool) -> Option<ResourceSample> {
     };
     if process_counters {
         if let Some(events) = task_events() {
-            sample.faults = Some(events.faults.max(0) as u64);
-            sample.major_faults = Some(events.pageins.max(0) as u64);
+            sample.faults = unsaturated(events.faults);
+            sample.major_faults = unsaturated(events.pageins);
         }
         sample.decompressions = task_decompressions();
     }
     Some(sample)
+}
+
+/// `TASK_EVENTS_INFO`'s counters are 32-bit, and the kernel pins them at
+/// `i32::MAX` once they would overflow, after which a difference between
+/// two readings is zero rather than the true count.
+fn unsaturated(count: i32) -> Option<u64> {
+    (count < i32::MAX).then(|| count.max(0) as u64)
 }
 
 fn thread_cpu_times() -> Option<(Duration, Duration)> {
@@ -359,9 +369,14 @@ mod tests {
 
         let faults = after.faults.expect("TASK_EVENTS_INFO succeeds")
             - before.faults.expect("TASK_EVENTS_INFO succeeds");
+        // SAFETY: sysconf has no preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        let pages = SIZE as u64 / page_size;
+        // Half the pages leaves room for the kernel faulting several pages
+        // in at once.
         assert!(
-            faults >= 4096,
-            "touching 64 MiB of fresh pages faults them in: {faults} faults"
+            faults >= pages / 2,
+            "touching 64 MiB of fresh pages faults them in: {faults} faults for {pages} pages"
         );
         assert!(
             after.user + after.system > before.user + before.system,

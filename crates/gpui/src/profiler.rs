@@ -1053,8 +1053,8 @@ pub enum DrawResourceSampling {
     /// costlier reads off the draws of a steady animation.
     AfterQuiet,
     /// The thread's CPU time and the process-wide fault counters on every
-    /// draw. About 2 µs a draw on macOS with 150 threads; for
-    /// investigations.
+    /// draw. About 2 µs a draw on macOS in a small process, more with many
+    /// threads; for investigations.
     Always,
 }
 

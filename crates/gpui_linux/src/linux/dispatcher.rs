@@ -137,8 +137,9 @@ impl PlatformDispatcher for LinuxDispatcher {
 
     /// `getrusage(RUSAGE_THREAD)` reads the calling thread's own CPU time
     /// and faults in one call, so the fault counters come with every
-    /// sample. The CPU times are tick-sampled unless the kernel does
-    /// precise (`VIRT_CPU_ACCOUNTING`) accounting.
+    /// sample. Their sum, the thread's total CPU time, is precise; only its
+    /// split into user and system time is scaled from tick samples, unless
+    /// the kernel does precise (`VIRT_CPU_ACCOUNTING`) accounting.
     fn sample_draw_resources(&self, _process_counters: bool) -> Option<ResourceSample> {
         let mut usage = MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: `usage` is a valid, writable rusage.

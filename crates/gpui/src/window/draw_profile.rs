@@ -1,8 +1,10 @@
 //! Per-draw accounting behind [`crate::DrawBreakdown`]: where a window draw's
 //! time went, phase by phase.
 //!
-//! The fast path is a handful of `Instant::now()` calls per draw plus two per
-//! taffy layout pass; everything costlier runs only for slow draws.
+//! The fast path is a handful of `Instant::now()` calls per draw, two per
+//! taffy layout pass and, under the default sampling policy, one read of the
+//! thread's CPU time (a system call); everything costlier runs only after a
+//! quiet gap or for slow draws.
 
 use std::time::Duration;
 
@@ -537,6 +539,14 @@ mod tests {
             profiler::set_draw_resource_sampling(sampling);
             Self { _lock: lock }
         }
+
+        /// Holds the knobs at their defaults, for tests whose draws another
+        /// test's settings would otherwise change.
+        fn defaults() -> Self {
+            let knobs = Self::set(Duration::from_millis(8), DrawResourceSampling::AfterQuiet);
+            profiler::set_view_timing(ViewTiming::OnSlowDraws);
+            knobs
+        }
     }
 
     impl Drop for Knobs {
@@ -772,6 +782,7 @@ mod tests {
 
     #[gpui::test]
     fn a_draw_is_split_into_phases_that_add_up(cx: &mut TestAppContext) {
+        let _knobs = Knobs::defaults();
         let fixture = open_window(cx);
         let first = fixture.last_draw(cx);
         assert_parts_add_up(&first);
@@ -812,6 +823,7 @@ mod tests {
     fn render_work_counts_as_request_layout_and_measure_work_as_layout(
         cx: &mut TestAppContext,
     ) {
+        let _knobs = Knobs::defaults();
         let fixture = open_window(cx);
 
         fixture.spin_in.set(SpinIn::Render);
@@ -848,6 +860,7 @@ mod tests {
 
     #[gpui::test]
     fn focus_listeners_count_as_focus(cx: &mut TestAppContext) {
+        let _knobs = Knobs::defaults();
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), |_, cx| {
                 cx.new(|cx| Focusable {

@@ -18,7 +18,11 @@ use serde::Serialize;
 /// Version of the power/visibility-aware measurement rules.
 ///
 /// 4: draws carry a phase breakdown and, where measured, thread CPU and
-/// memory-fault counters; the sampling adds < 3 µs inside the draw span.
+/// memory-fault counters. Inside the draw span this adds a thread-CPU read
+/// at the start of every draw (about 0.5 µs on macOS), two timestamps per
+/// taffy layout pass (about 5 µs for a draw of 100 passes) and, after a
+/// quiet gap or a slow draw, the process fault counters (about 1.7 µs on
+/// macOS, more in a process with many threads).
 ///
 /// 3: a present the platform deferred is foreground work, not a presentation:
 /// it no longer seals an interval, clears a pending frame, or ends the input
