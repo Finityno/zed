@@ -2160,7 +2160,7 @@ impl App {
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
-        crate::window::view_retention::dependencies::global_changed(self, global_type);
+        crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
             .get_mut(&global_type)
@@ -2173,7 +2173,8 @@ impl App {
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
         crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
-        crate::window::view_retention::dependencies::global_changed(self, global_type);
+        crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
+        crate::window::view_retention::dependencies::note_global_presence_read::<G>(self);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
             .entry(global_type)
@@ -2242,9 +2243,42 @@ impl App {
     pub(crate) fn end_global_lease<G: Global>(&mut self, lease: GlobalLease<G>) {
         let global_type = TypeId::of::<G>();
 
-        crate::window::view_retention::dependencies::global_changed(self, global_type);
+        crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type.insert(global_type, lease.global);
+    }
+
+    /// Sets the global of the given type, as [`Self::set_global`] does, only
+    /// if it differs from the one set, returning whether it did. An unchanged
+    /// global notifies no observers and, with view retention on
+    /// ([`Self::set_view_retention`]), builds no view that read it: for
+    /// state written on every render that rarely changes.
+    pub fn set_global_if_changed<G: Global + PartialEq>(&mut self, global: G) -> bool {
+        if self.try_global::<G>() == Some(&global) {
+            return false;
+        }
+        self.set_global(global);
+        true
+    }
+
+    /// Updates the global of the given type, as `update_global` does, marking
+    /// it written only if `update` changed it: an unchanged global notifies
+    /// no observers and, with view retention on, builds no view that read it.
+    pub fn update_global_if_changed<G: Global + Clone + PartialEq, R>(
+        &mut self,
+        update: impl FnOnce(&mut G, &mut Self) -> R,
+    ) -> R {
+        let mut lease = self.lease_global::<G>();
+        let before = (*lease).clone();
+        let result = update(&mut lease, self);
+        if *lease == before {
+            let global_type = TypeId::of::<G>();
+            self.globals_by_type.insert(global_type, lease.global);
+            crate::window::view_retention::dependencies::note_global_read(self, global_type);
+        } else {
+            self.end_global_lease(lease);
+        }
+        result
     }
 
     pub(crate) fn new_entity_observer(

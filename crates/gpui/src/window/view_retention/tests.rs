@@ -47,7 +47,29 @@ struct Model {
     labels: Vec<usize>,
 }
 
+/// A window's summary of the model, which cards show and a view drawn after
+/// them writes as it renders.
+struct Summary(usize);
+
+/// Works the model's summary out as it renders, after the cards reading it
+/// were drawn, and writes it when it changed.
+struct Summarizer {
+    model: Entity<Model>,
+    summary: Entity<Summary>,
+}
+
+impl Render for Summarizer {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let summary = self.model.read(cx).labels.iter().sum::<usize>() % 7;
+        if self.summary.read(cx).0 != summary {
+            self.summary.update(cx, |written, _| written.0 = summary);
+        }
+        div().w(px(4.)).h(px(4.))
+    }
+}
+
 /// A global some cards read.
+#[derive(PartialEq)]
 struct Theme(usize);
 
 impl Global for Theme {}
@@ -90,6 +112,7 @@ struct Card {
     count: usize,
     kind: CardKind,
     popover: bool,
+    summary: Entity<Summary>,
     /// Asks the list it is in to scroll it into view, which rolls the list's
     /// prepaint back and lays its items out again.
     reveal: bool,
@@ -98,7 +121,7 @@ struct Card {
 }
 
 impl Card {
-    fn new(ix: usize, shared: Rc<Shared>, cx: &mut Context<Self>) -> Self {
+    fn new(ix: usize, shared: Rc<Shared>, summary: Entity<Summary>, cx: &mut Context<Self>) -> Self {
         let kind = CardKind::of(ix);
         if matches!(kind, CardKind::OptedOut) {
             cx.set_view_retainable(false);
@@ -109,6 +132,7 @@ impl Card {
             count: 0,
             kind,
             popover: false,
+            summary,
             reveal: false,
             inner: cx.new(|_| Inner { ix, count: 0, model }),
             shared,
@@ -122,7 +146,8 @@ impl Render for Card {
         let detail: SharedString = match self.kind {
             CardKind::Model => {
                 let labels = &shared.model.read(cx).labels;
-                WORDS[labels[self.ix % labels.len()]].into()
+                let word = WORDS[labels[self.ix % labels.len()]];
+                format!("{word} {}", self.summary.read(cx).0).into()
             }
             CardKind::Global => format!("theme {}", cx.global::<Theme>().0).into(),
             CardKind::Dependency => {
@@ -235,21 +260,30 @@ struct Shell {
     list_state: ListState,
     /// Shows where the list is scrolled to, beside it.
     list_reader: Entity<ScrollReader>,
+    summarizer: Entity<Summarizer>,
+    summary: Entity<Summary>,
     column: bool,
     tint: usize,
 }
 
 impl Shell {
     fn new(shared: &Rc<Shared>, cx: &mut Context<Self>) -> Self {
+        let summary = cx.new(|_| Summary(0));
         let cards = (0..CARDS)
-            .map(|ix| cx.new(|cx| Card::new(ix, shared.clone(), cx)))
+            .map(|ix| cx.new(|cx| Card::new(ix, shared.clone(), summary.clone(), cx)))
             .collect();
         let list_cards: Vec<_> = (0..CARDS)
-            .map(|ix| cx.new(|cx| Card::new(ix + 100, shared.clone(), cx)))
+            .map(|ix| cx.new(|cx| Card::new(ix + 100, shared.clone(), summary.clone(), cx)))
             .collect();
         let list_state = ListState::new(list_cards.len(), ListAlignment::Top, px(20.));
         Self {
             cards,
+            summarizer: cx.new({
+                let model = shared.model.clone();
+                let summary = summary.clone();
+                |_| Summarizer { model, summary }
+            }),
+            summary,
             list_reader: cx.new(|_| ScrollReader {
                 list_state: list_state.clone(),
                 seen: Rc::default(),
@@ -288,6 +322,7 @@ impl Render for Shell {
                     card.clone().into_any_element()
                 }
             }))
+            .child(self.summarizer.clone())
     }
 }
 
@@ -484,7 +519,8 @@ impl Oracle {
                 let shared = self.shared.clone();
                 self.update_shells(move |shell, cx| {
                     let ix = shell.cards.len();
-                    let card = cx.new(|cx| Card::new(ix, shared.clone(), cx));
+                    let summary = shell.summary.clone();
+                    let card = cx.new(|cx| Card::new(ix, shared.clone(), summary, cx));
                     shell.cards.insert(0, card);
                 })
             }
@@ -546,20 +582,22 @@ impl Oracle {
     }
 
     fn draw(&mut self) -> (Vec<String>, Vec<String>, usize) {
-        let expected = self
-            .cx
-            .update_window(self.from_scratch.into(), |_, window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-                describe_frame(window)
-            })
-            .unwrap();
+        // The window drawing views again draws first, so that what a view
+        // writes as it draws reaches the other window's readers no sooner.
         let (actual, reused) = self
             .cx
             .update_window(self.retaining.into(), |_, window, cx| {
                 window.reset_frame_work_stats(false);
                 window.draw(cx).clear(cx);
                 (describe_frame(window), window.frame_work_stats().views_reused as usize)
+            })
+            .unwrap();
+        let expected = self
+            .cx
+            .update_window(self.from_scratch.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                describe_frame(window)
             })
             .unwrap();
         (actual, expected, reused)
@@ -682,7 +720,9 @@ fn retention_is_off_unless_asked_for() {
     let mut cx = TestAppContext::single();
     assert!(!cx.update(|cx| cx.view_retention()));
     cx.update(|cx| cx.set_global(Theme(0)));
-    let model = cx.new(|_| Model { labels: vec![0; CARDS] });
+    let model = cx.new(|_| Model {
+        labels: vec![0; CARDS],
+    });
     let shared = Rc::new(Shared {
         model,
         registry: Rc::new(Cell::new(0)),
@@ -1509,6 +1549,173 @@ fn a_uniform_list_scrolling_to_an_item_builds_the_views_reading_it() {
     let offset = handle.0.borrow().base_handle.offset().y;
     assert!(offset < px(0.), "the list scrolled");
     assert_eq!(seen.get(), offset, "the reader shows the list's offset");
+}
+
+struct Setting(usize);
+
+impl Global for Setting {}
+
+/// A view reading a global through `update_global` is built again once the
+/// global is set, and one reading it back after writing it as it renders
+/// does not depend on its own write.
+#[test]
+fn a_global_read_through_an_update_is_a_dependency() {
+    struct Reader {
+        seen: Rc<Cell<usize>>,
+        renders: Rc<Cell<usize>>,
+    }
+    impl Render for Reader {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let value = cx.update_global::<Setting, _>(|setting, _| setting.0);
+            self.seen.set(value);
+            div().child(SharedString::from(format!("{value}")))
+        }
+    }
+    struct Host {
+        reader: Entity<Reader>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.reader.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| {
+        cx.set_view_retention(true);
+        cx.set_global(Setting(0));
+    });
+    let seen = Rc::new(Cell::new(usize::MAX));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let seen = seen.clone();
+        let renders = renders.clone();
+        move |_, cx| Host {
+            reader: cx.new(|_| Reader { seen, renders }),
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    let settled = renders.get();
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    frame(&mut cx);
+    assert_eq!(renders.get(), settled, "its own write does not build it again");
+    cx.update(|cx| cx.set_global(Setting(5)));
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    frame(&mut cx);
+    assert_eq!(seen.get(), 5, "the reader shows the global's value");
+}
+
+/// Setting a global to what it holds, or updating it without changing it,
+/// through the change-only setters builds no view that read it.
+#[test]
+fn unchanged_globals_set_through_the_change_only_setters_build_nothing() {
+    let mut cx = TestAppContext::single();
+    let (window, _) = shell_window(&mut cx);
+    let work = work_after(&mut cx, window, |cx| {
+        cx.update(|cx| {
+            assert!(!cx.set_global_if_changed(Theme(0)));
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        })
+    });
+    assert_eq!(work.view_rebuilds.global_changed, 0, "{work:?}");
+    let work = work_after(&mut cx, window, |cx| {
+        cx.update(|cx| cx.set_global_if_changed(Theme(2)));
+    });
+    assert!(work.view_rebuilds.global_changed >= 1, "{work:?}");
+}
+
+/// A view that read a model before a view drawn after it wrote the model
+/// during the same draw shows what was written on the next frame, though the
+/// view around both is drawn again as a whole.
+#[test]
+fn a_write_during_a_draw_reaches_the_views_that_read_before_it() {
+    struct Measured(usize);
+    struct Reader {
+        model: Entity<Measured>,
+        seen: Rc<Cell<usize>>,
+    }
+    impl Render for Reader {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let width = self.model.read(cx).0;
+            self.seen.set(width);
+            div().child(SharedString::from(format!("{width}")))
+        }
+    }
+    struct Writer {
+        model: Entity<Measured>,
+    }
+    impl Render for Writer {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.model.update(cx, |model, _| {
+                if model.0 != 100 {
+                    model.0 = 100;
+                }
+            });
+            div()
+        }
+    }
+    struct Parent {
+        reader: Entity<Reader>,
+        writer: Entity<Writer>,
+    }
+    impl Render for Parent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.reader.clone()).child(self.writer.clone())
+        }
+    }
+    struct Other(usize);
+    impl Render for Other {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(SharedString::from(format!("{}", self.0)))
+        }
+    }
+    struct Root {
+        parent: Entity<Parent>,
+        other: Entity<Other>,
+    }
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.parent.clone()).child(self.other.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let model = cx.new(|_| Measured(0));
+    let seen = Rc::new(Cell::new(usize::MAX));
+    let other = cx.new(|_| Other(0));
+    let window = cx.add_window({
+        let seen = seen.clone();
+        let model = model.clone();
+        let other = other.clone();
+        move |_, cx| Root {
+            parent: cx.new(|cx| Parent {
+                reader: cx.new(|_| Reader {
+                    model: model.clone(),
+                    seen,
+                }),
+                writer: cx.new(|_| Writer { model }),
+            }),
+            other,
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap()
+    };
+    frame(&mut cx);
+    for _ in 0..3 {
+        other.update(&mut cx, |other, cx| {
+            other.0 += 1;
+            cx.notify();
+        });
+        frame(&mut cx);
+    }
+    assert_eq!(seen.get(), 100, "the reader shows what was written after it read");
 }
 
 /// A view that opted out is built on every frame it is drawn in, though the

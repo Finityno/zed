@@ -11,7 +11,6 @@
 
 use crate::{App, EntityId, EntityMap};
 use collections::{FxHashMap, FxHashSet, TypeIdHashMap};
-use smallvec::SmallVec;
 use std::{
     any::TypeId,
     cell::{Cell, RefCell},
@@ -23,12 +22,17 @@ use std::{
 /// changed, and the globals read while a recording is open.
 #[derive(Default)]
 pub(crate) struct AppDependencies {
-    /// Counts the changes to globals, each stamped into `global_changed_at`.
+    /// Counts the changes to globals made while no recording is open, each
+    /// stamped into `global_changed_at`.
     global_generation: u64,
     global_changed_at: TypeIdHashMap<u64>,
-    /// Every global read while a recording is open, pointer and modifier
-    /// reads included (see [`ambient`]).
-    global_read_log: Rc<RefCell<Vec<TypeId>>>,
+    /// When each global was last written while a recording was open, in the
+    /// entities' write generation: written while a window draws.
+    global_written_at: TypeIdHashMap<u64>,
+    /// Every global read while a recording is open, with the write
+    /// generation it was read at, pointer and modifier reads included (see
+    /// [`ambient`]).
+    global_read_log: Rc<RefCell<Vec<(TypeId, u64)>>>,
 }
 
 impl AppDependencies {
@@ -54,17 +58,44 @@ pub(crate) fn note_global_presence_read<G: 'static>(cx: &App) {
 /// Records that the global of type `global` was read.
 #[inline]
 pub(crate) fn note_global_read(cx: &App, global: TypeId) {
-    if cx.entities.access_log.recording() {
-        cx.dependencies.global_read_log.borrow_mut().push(global);
+    let log = &cx.entities.access_log;
+    if log.recording() {
+        cx.dependencies
+            .global_read_log
+            .borrow_mut()
+            .push((global, log.write_generation));
     }
 }
 
 /// Stamps a change to the global of type `global_type`, as it is written.
+///
+/// Written while a window draws, it is a write in the entities' write
+/// generation: a view that read the global before the write read what it
+/// held before, and a view that writes it and reads it back does not
+/// depend on itself.
 #[inline]
 pub(crate) fn global_changed(cx: &mut App, global_type: TypeId) {
-    if cx.entities.access_log.enabled {
+    let log = &mut cx.entities.access_log;
+    if !log.enabled {
+        return;
+    }
+    if log.recording() {
+        log.write_generation += 1;
+        cx.dependencies
+            .global_written_at
+            .insert(global_type, log.write_generation);
+    } else {
         cx.dependencies.global_changed(global_type);
     }
+}
+
+/// Records that the global of type `global_type` is written and read, as
+/// `global_mut` or `update_global` do: after the write, so that the view
+/// writing it does not depend on its own write.
+#[inline]
+pub(crate) fn global_written_and_read(cx: &mut App, global_type: TypeId) {
+    global_changed(cx, global_type);
+    note_global_read(cx, global_type);
 }
 
 /// Stamps a change to whether a global of type `G` is set, when it is about
@@ -100,15 +131,17 @@ pub(crate) mod ambient {
 /// state while a view is drawn is recorded as a global read would be.
 #[derive(Clone)]
 pub(crate) struct AmbientReads {
-    globals: Rc<RefCell<Vec<TypeId>>>,
+    globals: Rc<RefCell<Vec<(TypeId, u64)>>>,
     recordings: Rc<Cell<usize>>,
 }
 
 impl AmbientReads {
     #[inline]
     pub(crate) fn note<T: 'static>(&self) {
+        // Input changes these, never a view while it is drawn, so the
+        // write generation they are read at does not matter.
         if self.recordings.get() > 0 {
-            self.globals.borrow_mut().push(TypeId::of::<T>());
+            self.globals.borrow_mut().push((TypeId::of::<T>(), 0));
         }
     }
 }
@@ -236,8 +269,8 @@ pub(crate) struct EntityAccessLog {
     /// and logs are for.
     pub(crate) enabled: bool,
     /// Every entity accessed while a recording is open, in order and with
-    /// repeats.
-    access_log: RefCell<Vec<EntityId>>,
+    /// repeats, with the write generation it was accessed at.
+    access_log: RefCell<Vec<(EntityId, u64)>>,
     /// Where in `access_log` the last recording or replay began or ended; an
     /// access repeating the one just before it is only left out after this.
     boundary: Cell<usize>,
@@ -285,22 +318,23 @@ impl EntityAccessLog {
         }
     }
 
-    fn changed_since(&self, entities: &[EntityId], generation: u64, updates: bool) -> bool {
+    fn changed_since(&self, entities: &[(EntityId, u64)], generation: u64, updates: bool) -> bool {
         let after = |stamps: &FxHashMap<EntityId, u64>, entity| {
             stamps.get(entity).is_some_and(|at| *at > generation)
         };
         generation != self.update_generation
-            && entities.iter().any(|entity| {
+            && entities.iter().any(|(entity, _)| {
                 after(&self.changed_at, entity) || (updates && after(&self.updated_at, entity))
             })
     }
 
-    fn written_since(&self, entities: &[EntityId], writes: &Writes) -> bool {
-        self.write_generation != writes.to
-            && entities.iter().any(|entity| {
+    /// Whether an entity in `entities` was written after it was read.
+    fn written_since(&self, entities: &[(EntityId, u64)], floor: u64) -> bool {
+        self.write_generation > floor
+            && entities.iter().any(|(entity, read_at)| {
                 self.written_at
                     .get(entity)
-                    .is_some_and(|written_at| writes.is_foreign(*written_at))
+                    .is_some_and(|written_at| *written_at > (*read_at).max(floor))
             })
     }
 }
@@ -323,10 +357,14 @@ pub(crate) fn note_access(entities: &EntityMap, entity_id: EntityId) {
     if log.recordings.get() > 0 {
         let mut accesses = log.access_log.borrow_mut();
         // A view reads the same entity many times in a row as it renders.
-        if accesses.len() > log.boundary.get() && accesses.last() == Some(&entity_id) {
+        if accesses.len() > log.boundary.get()
+            && accesses
+                .last()
+                .is_some_and(|(last, read_at)| *last == entity_id && *read_at == log.write_generation)
+        {
             return;
         }
-        accesses.push(entity_id);
+        accesses.push((entity_id, log.write_generation));
     }
 }
 
@@ -356,33 +394,30 @@ pub(crate) fn note_notify(entities: &mut EntityMap, entity_id: EntityId) {
 /// the entity holds without a notification, as when a view changes a model it
 /// renders and notifies only itself; a view inside a notified view that read
 /// it is drawn again, as the whole notified view would have been. While the
-/// window draws, an update is a write, and a view that read the entity is
-/// drawn again unless it wrote the entity itself while it was being built.
-/// The update that renders a view is neither.
+/// window draws, an update is a write: a view that read the entity before it
+/// (a sibling drawn earlier, the view around both, or the writer itself
+/// before it wrote) read what it held before and is drawn again. The update
+/// is recorded as read after the write, so that a view writing an entity and
+/// reading it back does not depend on its own write. The update that renders
+/// a view is neither.
 #[inline]
 pub(crate) fn note_update(entities: &mut EntityMap, entity_id: EntityId) {
-    note_access(entities, entity_id);
     let log = &mut entities.access_log;
-    if !log.enabled {
-        return;
-    }
-    if log.rendering == Some(entity_id) {
-        log.rendering = None;
-        if log.recordings.get() > 0 {
-            return;
+    if log.enabled {
+        if log.rendering == Some(entity_id) {
+            log.rendering = None;
+        } else if log.queried != Some(entity_id) {
+            if log.recordings.get() == 0 {
+                log.update_generation += 1;
+                log.updated_at.insert(entity_id, log.update_generation);
+                log.updated_unnotified.insert(entity_id);
+            } else {
+                log.write_generation += 1;
+                log.written_at.insert(entity_id, log.write_generation);
+            }
         }
     }
-    if log.queried == Some(entity_id) {
-        return;
-    }
-    if log.recordings.get() == 0 {
-        log.update_generation += 1;
-        log.updated_at.insert(entity_id, log.update_generation);
-        log.updated_unnotified.insert(entity_id);
-    } else {
-        log.write_generation += 1;
-        log.written_at.insert(entity_id, log.write_generation);
-    }
+    note_access(entities, entity_id);
 }
 
 /// Marks the next lease of `entity_id` as the framework rendering it.
@@ -423,43 +458,16 @@ pub(crate) struct DependencyRecording {
     deadlines: usize,
     generation: u64,
     updates: u64,
-    writes: u64,
-}
-
-/// Where in the write generation a view was built: writes after `from`
-/// change what it read, except those it made itself, in the `own` stretches.
-#[derive(Clone, Default, Debug)]
-pub(crate) struct Writes {
-    from: u64,
-    to: u64,
-    own: SmallVec<[(u64, u64); 2]>,
-}
-
-impl Writes {
-    fn is_foreign(&self, written_at: u64) -> bool {
-        written_at > self.from
-            && !self
-                .own
-                .iter()
-                .any(|(began, finished)| written_at > *began && written_at <= *finished)
-    }
-
-    fn union(&self, other: &Self) -> Self {
-        let mut own = self.own.clone();
-        own.extend_from_slice(&other.own);
-        Writes {
-            from: self.from.min(other.from),
-            to: self.to.max(other.to),
-            own,
-        }
-    }
 }
 
 /// What a view read while it was drawn.
 #[derive(Clone, Default, Debug)]
 pub(crate) struct RenderDependencies {
-    pub(crate) entities: Rc<[EntityId]>,
-    pub(crate) globals: Rc<[TypeId]>,
+    /// The entities read, by id, each with the write generation it was
+    /// first read at: a write after that changes what the view read.
+    pub(crate) entities: Rc<[(EntityId, u64)]>,
+    /// The globals read, likewise.
+    pub(crate) globals: Rc<[(TypeId, u64)]>,
     /// Versioned state, with the version each was read at.
     pub(crate) states: Rc<[(StateVersion, u64)]>,
     /// The earliest time the view said it would look different at.
@@ -468,7 +476,9 @@ pub(crate) struct RenderDependencies {
     pub(crate) generation: u64,
     /// The entity update generation the recording began at.
     pub(crate) updates: u64,
-    pub(crate) writes: Writes,
+    /// A write generation every read is known to be up to date with: a view
+    /// drawn again was checked against every write up to it.
+    pub(crate) floor: u64,
 }
 
 impl RenderDependencies {
@@ -476,16 +486,13 @@ impl RenderDependencies {
     /// `writes`: a reused view's, checked when it was reused.
     pub(crate) fn written_up_to(&self, writes: u64) -> Self {
         Self {
-            writes: Writes {
-                from: writes,
-                to: writes,
-                own: SmallVec::new(),
-            },
+            floor: self.floor.max(writes),
             ..self.clone()
         }
     }
 
-    /// Both sets at once, as of the earlier generation.
+    /// Both sets at once, as of the earlier generation, each read as of the
+    /// earlier of the two.
     pub(crate) fn union(&self, other: &Self) -> Self {
         let mut states = self.states.to_vec();
         for state in other.states.iter() {
@@ -494,8 +501,8 @@ impl RenderDependencies {
             }
         }
         Self {
-            entities: merge_sorted(&self.entities, &other.entities),
-            globals: merge_sorted(&self.globals, &other.globals),
+            entities: merge_reads(&self.entities, self.floor, &other.entities, other.floor),
+            globals: merge_reads(&self.globals, self.floor, &other.globals, other.floor),
             states: states.into(),
             rebuild_at: match (self.rebuild_at, other.rebuild_at) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -503,29 +510,39 @@ impl RenderDependencies {
             },
             generation: self.generation.min(other.generation),
             updates: self.updates.min(other.updates),
-            writes: self.writes.union(&other.writes),
+            floor: 0,
         }
     }
 }
 
-fn merge_sorted<T: Ord + Copy>(a: &Rc<[T]>, b: &Rc<[T]>) -> Rc<[T]> {
-    if b.is_empty() || Rc::ptr_eq(a, b) {
+/// Two sets of reads, each keyed and sorted by what was read, as one: a
+/// read in both is taken as of the earlier of the two, each first raised to
+/// its set's floor.
+fn merge_reads<T: Ord + Copy>(
+    a: &Rc<[(T, u64)]>,
+    a_floor: u64,
+    b: &Rc<[(T, u64)]>,
+    b_floor: u64,
+) -> Rc<[(T, u64)]> {
+    if b.is_empty() && a_floor == 0 {
         return a.clone();
     }
-    if a.is_empty() {
+    if a.is_empty() && b_floor == 0 {
         return b.clone();
     }
-    let mut merged: Vec<T> = a.iter().chain(b.iter()).copied().collect();
-    merged.sort_unstable();
-    merged.dedup();
+    let mut merged: Vec<(T, u64)> = a
+        .iter()
+        .map(|(key, read_at)| (*key, (*read_at).max(a_floor)))
+        .chain(b.iter().map(|(key, read_at)| (*key, (*read_at).max(b_floor))))
+        .collect();
+    earliest_reads(&mut merged);
     merged.into()
 }
 
-fn sorted_unique<T: Ord + Copy>(items: &[T]) -> Rc<[T]> {
-    let mut items = items.to_vec();
-    items.sort_unstable();
-    items.dedup();
-    items.into()
+/// Sorts reads by what was read and keeps the earliest read of each.
+fn earliest_reads<T: Ord + Copy>(reads: &mut Vec<(T, u64)>) {
+    reads.sort_unstable();
+    reads.dedup_by_key(|(key, _)| *key);
 }
 
 /// The first read of each state, at the earliest version read, so that a
@@ -567,7 +584,6 @@ impl App {
             deadlines: DEADLINES.with_borrow(Vec::len),
             generation: self.dependencies.global_generation,
             updates: log.update_generation,
-            writes: log.write_generation,
         }
     }
 
@@ -577,12 +593,15 @@ impl App {
         recording: DependencyRecording,
     ) -> RenderDependencies {
         let entities = {
-            let accesses = self.entities.access_log.access_log.borrow();
-            sorted_unique(&accesses[recording.entities..])
+            let mut accesses = self.entities.access_log.access_log.borrow()[recording.entities..]
+                .to_vec();
+            earliest_reads(&mut accesses);
+            accesses.into()
         };
         let globals = {
-            let reads = self.dependencies.global_read_log.borrow();
-            sorted_unique(&reads[recording.globals..])
+            let mut reads = self.dependencies.global_read_log.borrow()[recording.globals..].to_vec();
+            earliest_reads(&mut reads);
+            reads.into()
         };
         let states = STATE_READS.with_borrow(|reads| unique_states(&reads[recording.states..]));
         let rebuild_at = DEADLINES.with_borrow(|deadlines| {
@@ -601,11 +620,6 @@ impl App {
         }
         self.entities.mark_access_boundary();
 
-        let log = &self.entities.access_log;
-        let mut own = SmallVec::new();
-        if log.write_generation > recording.writes {
-            own.push((recording.writes, log.write_generation));
-        }
         RenderDependencies {
             entities,
             globals,
@@ -615,11 +629,7 @@ impl App {
             // it was open, after being read, counts as changed.
             generation: recording.generation,
             updates: recording.updates,
-            writes: Writes {
-                from: recording.writes,
-                to: log.write_generation,
-                own,
-            },
+            floor: 0,
         }
     }
 
@@ -630,18 +640,22 @@ impl App {
         let recording = self.entities.access_log.recording();
         {
             let accessed = self.entities.accessed_entities.get_mut();
-            accessed.extend(dependencies.entities.iter().copied());
+            accessed.extend(dependencies.entities.iter().map(|(entity, _)| *entity));
         }
         if recording {
-            self.entities
-                .access_log
-                .access_log
-                .get_mut()
-                .extend(dependencies.entities.iter().copied());
-            self.dependencies
-                .global_read_log
-                .borrow_mut()
-                .extend(dependencies.globals.iter().copied());
+            let floor = dependencies.floor;
+            self.entities.access_log.access_log.get_mut().extend(
+                dependencies
+                    .entities
+                    .iter()
+                    .map(|(entity, read_at)| (*entity, (*read_at).max(floor))),
+            );
+            self.dependencies.global_read_log.borrow_mut().extend(
+                dependencies
+                    .globals
+                    .iter()
+                    .map(|(global, read_at)| (*global, (*read_at).max(floor))),
+            );
             STATE_READS.with_borrow_mut(|reads| reads.extend(dependencies.states.iter().cloned()));
             if let Some(deadline) = dependencies.rebuild_at {
                 DEADLINES.with_borrow_mut(|deadlines| deadlines.push(deadline));
@@ -667,15 +681,21 @@ impl App {
     ) -> Option<DependencyChange> {
         let log = &self.entities.access_log;
         if log.changed_since(&dependencies.entities, dependencies.updates, inside_notified)
-            || log.written_since(&dependencies.entities, &dependencies.writes)
+            || log.written_since(&dependencies.entities, dependencies.floor)
         {
             return Some(DependencyChange::Entity);
         }
-        if dependencies.globals.iter().any(|global| {
+        let floor = dependencies.floor;
+        if dependencies.globals.iter().any(|(global, read_at)| {
             self.dependencies
                 .global_changed_at
                 .get(global)
                 .is_some_and(|changed_at| *changed_at > dependencies.generation)
+                || self
+                    .dependencies
+                    .global_written_at
+                    .get(global)
+                    .is_some_and(|written_at| *written_at > (*read_at).max(floor))
         }) {
             return Some(DependencyChange::Global);
         }
