@@ -797,6 +797,219 @@ pub struct FrameTiming {
     pub draw_start: Instant,
     /// When `Window::draw` finished.
     pub draw_end: Instant,
+    /// Where the draw's time went, and what it cost the thread.
+    pub breakdown: DrawBreakdown,
+}
+
+/// Where one window draw's time went.
+///
+/// The phases interleave inside a draw, so each is charged wherever it runs
+/// rather than as one top-level span:
+///
+/// - `request_layout` is building the root element tree, including every
+///   uncached view's `render`.
+/// - `layout` is every taffy layout pass, with its measure closures (text
+///   shaping), wherever it ran.
+/// - `prepaint` is prepaint without taffy. A cached view that missed its
+///   cache, and a list's items, are rendered during prepaint, so their
+///   `render` counts here. It also covers the inspector, deferred draws,
+///   the prompt, drag or tooltip, and the hit test.
+/// - `paint` covers painting the tree, deferred draws, overlays and the
+///   inspector hitbox.
+/// - `other` is the remainder: setup, the frame finish, focus listeners and
+///   the accessibility update. The five parts add up to the draw's duration.
+///
+/// Durations are stored as whole microseconds to keep journal slots small.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct DrawBreakdown {
+    pub(crate) request_layout_us: u32,
+    pub(crate) layout_us: u32,
+    pub(crate) prepaint_us: u32,
+    pub(crate) paint_us: u32,
+    pub(crate) other_us: u32,
+    pub(crate) layout_passes: u16,
+    pub(crate) views_rendered: u16,
+    pub(crate) views_reused: u16,
+    /// [`DrawResources`]' flag bits, plus [`Self::VIEWS_RECORDED`].
+    pub(crate) flags: u8,
+    pub(crate) views_timed_from: Option<ViewTimingStart>,
+    /// [`DrawResources`]' counters, stored flat so the flags share one byte
+    /// and the struct packs into 48 bytes.
+    resource_counts: [u32; 5],
+}
+
+#[cfg(feature = "profiler")]
+impl DrawBreakdown {
+    pub(crate) const VIEWS_RECORDED: u8 = 1 << 7;
+
+    /// Building the root element tree.
+    pub fn request_layout(&self) -> Duration {
+        Duration::from_micros(self.request_layout_us as u64)
+    }
+
+    /// Every taffy layout pass and its measure closures.
+    pub fn layout(&self) -> Duration {
+        Duration::from_micros(self.layout_us as u64)
+    }
+
+    /// Prepaint, excluding the layout passes that ran inside it.
+    pub fn prepaint(&self) -> Duration {
+        Duration::from_micros(self.prepaint_us as u64)
+    }
+
+    /// Painting the tree and its overlays.
+    pub fn paint(&self) -> Duration {
+        Duration::from_micros(self.paint_us as u64)
+    }
+
+    /// The rest of the draw: setup, frame finish, focus listeners and the
+    /// accessibility update.
+    pub fn other(&self) -> Duration {
+        Duration::from_micros(self.other_us as u64)
+    }
+
+    /// How many taffy layout passes ran.
+    pub fn layout_passes(&self) -> u16 {
+        self.layout_passes
+    }
+
+    /// How many entity views called `render`.
+    pub fn views_rendered(&self) -> u16 {
+        self.views_rendered
+    }
+
+    /// How many cached views replayed last frame's prepaint instead of
+    /// rendering.
+    pub fn views_reused(&self) -> u16 {
+        self.views_reused
+    }
+
+    /// What the draw cost the thread, where the platform measures it. Only
+    /// draws at or above [`draw_detail_threshold`] are measured.
+    pub fn resources(&self) -> DrawResources {
+        let [user_us, system_us, faults, major_faults, decompressions] = self.resource_counts;
+        DrawResources {
+            user_us,
+            system_us,
+            faults,
+            major_faults,
+            decompressions,
+            flags: self.flags & DrawResources::ALL_FLAGS,
+        }
+    }
+
+    /// Whether the draw's slowest views were recorded; fetch them with
+    /// [`slow_draw_views`].
+    pub fn views_recorded(&self) -> bool {
+        self.flags & Self::VIEWS_RECORDED != 0
+    }
+
+    /// For a slow draw whose views were timed, the point in the draw the
+    /// timing started from. Anything rendered earlier is not attributed.
+    pub fn views_timed_from(&self) -> Option<ViewTimingStart> {
+        self.views_timed_from
+    }
+}
+
+/// What a draw cost the drawing thread, as the difference between two
+/// platform samples (see [`crate::PlatformDispatcher::sample_draw_resources`]).
+///
+/// Every counter is optional: a platform, or a sampling policy, that did not
+/// measure it reports `None`, never zero.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct DrawResources {
+    user_us: u32,
+    system_us: u32,
+    faults: u32,
+    major_faults: u32,
+    decompressions: u32,
+    flags: u8,
+}
+
+#[cfg(feature = "profiler")]
+impl DrawResources {
+    const CPU_MEASURED: u8 = 1 << 0;
+    const FAULTS_MEASURED: u8 = 1 << 1;
+    const MAJOR_FAULTS_MEASURED: u8 = 1 << 2;
+    const DECOMPRESSIONS_MEASURED: u8 = 1 << 3;
+    const FAULTS_PROCESS_WIDE: u8 = 1 << 4;
+    const ALL_FLAGS: u8 = Self::CPU_MEASURED
+        | Self::FAULTS_MEASURED
+        | Self::MAJOR_FAULTS_MEASURED
+        | Self::DECOMPRESSIONS_MEASURED
+        | Self::FAULTS_PROCESS_WIDE;
+
+    fn measured(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    /// CPU time the thread spent in user mode during the draw.
+    pub fn user_cpu(&self) -> Option<Duration> {
+        self.measured(Self::CPU_MEASURED)
+            .then(|| Duration::from_micros(self.user_us as u64))
+    }
+
+    /// CPU time the thread spent in the kernel during the draw. On macOS
+    /// this includes decompressing compressed memory the thread faulted on.
+    pub fn system_cpu(&self) -> Option<Duration> {
+        self.measured(Self::CPU_MEASURED)
+            .then(|| Duration::from_micros(self.system_us as u64))
+    }
+
+    /// Page faults during the draw. See [`Self::faults_process_wide`] for
+    /// whose.
+    pub fn faults(&self) -> Option<u32> {
+        self.measured(Self::FAULTS_MEASURED).then_some(self.faults)
+    }
+
+    /// Faults that had to read from disk (macOS: page-ins; Linux: major
+    /// faults).
+    pub fn major_faults(&self) -> Option<u32> {
+        self.measured(Self::MAJOR_FAULTS_MEASURED)
+            .then_some(self.major_faults)
+    }
+
+    /// Pages decompressed from the compressor during the draw (macOS only;
+    /// process-wide).
+    pub fn decompressions(&self) -> Option<u32> {
+        self.measured(Self::DECOMPRESSIONS_MEASURED)
+            .then_some(self.decompressions)
+    }
+
+    /// Whether the fault counters are the whole process's, so background
+    /// threads' faults during the draw are included (macOS), rather than
+    /// the drawing thread's alone (Linux).
+    pub fn faults_process_wide(&self) -> bool {
+        self.measured(Self::FAULTS_PROCESS_WIDE)
+    }
+}
+
+/// Where in a slow draw its views started being timed (see
+/// [`DrawBreakdown::views_timed_from`]).
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ViewTimingStart {
+    /// From the start of the draw: every view is attributed.
+    Start,
+    /// From the start of prepaint: views rendered while building the root
+    /// tree are not attributed.
+    Prepaint,
+    /// From the start of paint: only paint is attributed.
+    Paint,
+}
+
+#[cfg(feature = "profiler")]
+impl ViewTimingStart {
+    /// A stable lowercase name for logs and telemetry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Prepaint => "prepaint",
+            Self::Paint => "paint",
+        }
+    }
 }
 
 #[cfg(feature = "profiler")]
@@ -1057,6 +1270,7 @@ impl WindowProfiler {
             invalidations,
             draw_start,
             draw_end,
+            breakdown: Default::default(),
         };
         let draw_duration = frame_timing.draw_duration();
         if !journal::power_interrupted_since(draw_start) {
@@ -1728,6 +1942,7 @@ mod tests {
             invalidations: 1,
             draw_start: draw_end - Duration::from_millis(2),
             draw_end,
+            breakdown: Default::default(),
         });
     }
 }
