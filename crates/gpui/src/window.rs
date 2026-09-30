@@ -5941,12 +5941,24 @@ impl Window {
         id: EntityId,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.with_named_view(id, Default::default(), f)
+    }
+
+    /// Like [`Self::with_rendered_view`], naming the view for the profiler.
+    #[inline]
+    #[cfg_attr(not(feature = "profiler"), allow(unused_variables))]
+    pub(crate) fn with_named_view<R>(
+        &mut self,
+        id: EntityId,
+        view_name: crate::view::ViewName,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.rendered_entity_stack.push(id);
         #[cfg(feature = "profiler")]
         self.view_timer.enter();
         let result = f(self);
         #[cfg(feature = "profiler")]
-        self.view_timer.exit(id);
+        self.view_timer.exit(id, view_name);
         self.rendered_entity_stack.pop();
         result
     }

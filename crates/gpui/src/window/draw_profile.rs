@@ -13,7 +13,7 @@ use collections::FxHashMap;
 use crate::{
     App, DRAW_QUIET_GAP, DrawBreakdown, DrawResourceSampling, DrawResources, EntityId,
     PlatformDispatcher, ResourceSample, SLOW_DRAW_VIEW_COUNT, SLOW_DRAW_VIEW_MIN, SlowDrawViews,
-    ViewRenderTime, ViewTiming, ViewTimingStart, Window, profiler,
+    ViewRenderTime, ViewTiming, ViewTimingStart, Window, profiler, view::ViewName,
 };
 
 impl Window {
@@ -297,8 +297,7 @@ impl DrawClock {
 pub(crate) struct ViewTimer {
     armed: Option<ViewTimingStart>,
     stack: Vec<TimedView>,
-    self_times: FxHashMap<EntityId, Duration>,
-    renders: FxHashMap<EntityId, (&'static str, u16)>,
+    views: FxHashMap<EntityId, ViewTotals>,
 }
 
 struct TimedView {
@@ -306,13 +305,23 @@ struct TimedView {
     nested: Duration,
 }
 
+/// One view's share of a timed draw so far.
+#[derive(Default)]
+struct ViewTotals {
+    self_time: Duration,
+    /// Set by any of the view's phases, not only its render: a view timed
+    /// from part way through a draw, or a cached view replaying its last
+    /// prepaint, is still named.
+    type_name: Option<&'static str>,
+    renders: u16,
+}
+
 impl ViewTimer {
     pub(crate) fn new() -> Self {
         Self {
             armed: None,
             stack: Vec::new(),
-            self_times: FxHashMap::default(),
-            renders: FxHashMap::default(),
+            views: FxHashMap::default(),
         }
     }
 
@@ -321,7 +330,7 @@ impl ViewTimer {
     fn reset(&mut self, armed: Option<ViewTimingStart>) {
         self.armed = armed;
         self.stack.clear();
-        if !self.self_times.is_empty() || !self.renders.is_empty() {
+        if !self.views.is_empty() {
             self.clear();
         }
     }
@@ -357,15 +366,16 @@ impl ViewTimer {
         }
     }
 
-    /// The view most recently entered is being left.
+    /// The view most recently entered is being left. `view_name` is its
+    /// type's name where the caller knows it.
     #[inline]
-    pub(crate) fn exit(&mut self, entity_id: EntityId) {
+    pub(crate) fn exit(&mut self, entity_id: EntityId, view_name: ViewName) {
         if self.armed.is_some() {
-            self.exit_timed(entity_id);
+            self.exit_timed(entity_id, view_name.0);
         }
     }
 
-    fn exit_timed(&mut self, entity_id: EntityId) {
+    fn exit_timed(&mut self, entity_id: EntityId, type_name: Option<&'static str>) {
         let Some(view) = self.stack.pop() else {
             debug_assert!(false, "a timed view was left that was never entered");
             return;
@@ -374,12 +384,17 @@ impl ViewTimer {
         if let Some(parent) = self.stack.last_mut() {
             parent.nested += total;
         }
-        *self.self_times.entry(entity_id).or_default() += total.saturating_sub(view.nested);
+        let totals = self.views.entry(entity_id).or_default();
+        totals.self_time += total.saturating_sub(view.nested);
+        if type_name.is_some() {
+            totals.type_name = type_name;
+        }
     }
 
     fn record_render(&mut self, entity_id: EntityId, type_name: &'static str) {
-        let renders = &mut self.renders.entry(entity_id).or_insert((type_name, 0)).1;
-        *renders = renders.saturating_add(1);
+        let totals = self.views.entry(entity_id).or_default();
+        totals.type_name = Some(type_name);
+        totals.renders = totals.renders.saturating_add(1);
     }
 
     /// Stops timing, returning where the draw's timing started, if it was
@@ -390,42 +405,32 @@ impl ViewTimer {
 
     /// The views with the most time of their own, longest first.
     fn slowest_views(&self) -> heapless::Vec<ViewRenderTime, SLOW_DRAW_VIEW_COUNT> {
-        let mut slowest = heapless::Vec::<(EntityId, Duration), SLOW_DRAW_VIEW_COUNT>::new();
-        for (&entity_id, &self_time) in &self.self_times {
-            if self_time < SLOW_DRAW_VIEW_MIN {
+        let mut slowest = heapless::Vec::<ViewRenderTime, SLOW_DRAW_VIEW_COUNT>::new();
+        for totals in self.views.values() {
+            if totals.self_time < SLOW_DRAW_VIEW_MIN {
                 continue;
             }
-            if slowest.push((entity_id, self_time)).is_err()
-                && let Some(fastest) = slowest.iter_mut().min_by_key(|(_, time)| *time)
-                && fastest.1 < self_time
+            let view = ViewRenderTime {
+                type_name: totals.type_name.unwrap_or("<unnamed view>"),
+                self_time: totals.self_time,
+                renders: totals.renders,
+            };
+            if let Err(view) = slowest.push(view)
+                && let Some(fastest) = slowest.iter_mut().min_by_key(|view| view.self_time)
+                && fastest.self_time < view.self_time
             {
-                *fastest = (entity_id, self_time);
+                *fastest = view;
             }
         }
-        slowest.sort_unstable_by_key(|(_, self_time)| std::cmp::Reverse(*self_time));
+        slowest.sort_unstable_by_key(|view| std::cmp::Reverse(view.self_time));
         slowest
-            .into_iter()
-            .map(|(entity_id, self_time)| {
-                let (type_name, renders) = self
-                    .renders
-                    .get(&entity_id)
-                    .copied()
-                    .unwrap_or(("<unrendered view>", 0));
-                ViewRenderTime {
-                    type_name,
-                    self_time,
-                    renders,
-                }
-            })
-            .collect()
     }
 
     /// Forgets a timed draw's times, keeping the maps' capacity for the
     /// next one.
     fn clear(&mut self) {
         self.stack.clear();
-        self.self_times.clear();
-        self.renders.clear();
+        self.views.clear();
     }
 }
 
@@ -482,12 +487,13 @@ mod tests {
 
     use scheduler::Instant;
 
+    use super::ViewTimer;
     use crate::{
         AppContext as _, Context, DRAW_QUIET_GAP, DrawResourceSampling, Entity, FaultScope,
         FrameTiming, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
-        RequestFrameOptions, ResourceSample, SlowDrawViews, Style, Styled as _, TestAppContext,
-        TestWindow, ViewTiming, ViewTimingStart, Window, WindowHandle, WindowOptions, div, list,
-        profiler, px, size,
+        RequestFrameOptions, ResourceSample, SLOW_DRAW_VIEW_MIN, SlowDrawViews, Style, Styled as _,
+        TestAppContext, TestWindow, ViewTiming, ViewTimingStart, Window, WindowHandle,
+        WindowOptions, div, list, profiler, px, size, view::ViewName,
     };
 
     const SPIN: Duration = Duration::from_millis(3);
@@ -545,17 +551,18 @@ mod tests {
         Nowhere,
         Render,
         Measure,
+        RenderAndPaint,
     }
 
     /// Renders nothing but a leaf that is measured by a closure, spinning
-    /// in its render or its measure closure when asked to.
+    /// in its render, its measure closure or its paint when asked to.
     struct Worker {
         spin_in: Rc<Cell<SpinIn>>,
     }
 
     impl Render for Worker {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            if self.spin_in.get() == SpinIn::Render {
+            if matches!(self.spin_in.get(), SpinIn::Render | SpinIn::RenderAndPaint) {
                 spin(SPIN);
             }
             let spin_in = self.spin_in.clone();
@@ -629,6 +636,9 @@ mod tests {
             _: &mut Window,
             _: &mut crate::App,
         ) {
+            if self.spin_in.get() == SpinIn::RenderAndPaint {
+                spin(SPIN);
+            }
         }
     }
 
@@ -973,6 +983,52 @@ mod tests {
             None,
             "once draws are fast again nothing is timed"
         );
+    }
+
+    #[gpui::test]
+    fn a_view_that_rendered_before_timing_started_is_named_by_its_paint(cx: &mut TestAppContext) {
+        let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::Off);
+        profiler::set_view_timing(ViewTiming::OnSlowDraws);
+        let fixture = open_window(cx);
+        fixture.redraw(&fixture.worker, cx);
+
+        profiler::set_draw_detail_threshold(Duration::from_millis(1));
+        fixture.spin_in.set(SpinIn::RenderAndPaint);
+        let slow = fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            slow.breakdown.views_timed_from(),
+            Some(ViewTimingStart::Prepaint)
+        );
+        let recorded = recorded_views(&fixture, &slow).expect("the slow paint's view");
+        let slowest = recorded.views.first().expect("a view spent 3 ms painting");
+        assert!(
+            slowest.type_name.ends_with("::Worker") && slowest.self_time >= SPIN,
+            "{recorded:?}"
+        );
+        assert_eq!(slowest.renders, 0, "its render was not timed");
+    }
+
+    #[test]
+    fn a_timed_view_is_named_by_whichever_phase_names_it() {
+        let mut timer = ViewTimer::new();
+        timer.reset(Some(ViewTimingStart::Start));
+        let replayed = crate::EntityId::from(1u64);
+        let unnamed = crate::EntityId::from(2u64);
+        for (entity_id, view_name) in [
+            (replayed, ViewName(Some("app::Replayed"))),
+            (unnamed, ViewName::default()),
+        ] {
+            timer.enter();
+            spin(SLOW_DRAW_VIEW_MIN);
+            timer.exit(entity_id, view_name);
+        }
+        let mut names = timer
+            .slowest_views()
+            .iter()
+            .map(|view| (view.type_name, view.renders))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, [("<unnamed view>", 0), ("app::Replayed", 0)]);
     }
 
     const ROW_SPIN: Duration = Duration::from_millis(6);

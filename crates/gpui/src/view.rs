@@ -24,6 +24,8 @@ use std::{
 pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
+    #[cfg(feature = "profiler")]
+    type_name: fn() -> &'static str,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -31,6 +33,8 @@ impl<V: Render> From<Entity<V>> for AnyView {
         AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
+            #[cfg(feature = "profiler")]
+            type_name: type_name::<V>,
         }
     }
 }
@@ -50,6 +54,8 @@ impl AnyView {
         AnyWeakView {
             entity: self.entity.downgrade(),
             render: self.render,
+            #[cfg(feature = "profiler")]
+            type_name: self.type_name,
         }
     }
 
@@ -61,6 +67,8 @@ impl AnyView {
             Err(entity) => Err(Self {
                 entity,
                 render: self.render,
+                #[cfg(feature = "profiler")]
+                type_name: self.type_name,
             }),
         }
     }
@@ -95,6 +103,11 @@ impl View for AnyView {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         (self.render)(&self, window, cx)
     }
+
+    #[cfg(feature = "profiler")]
+    fn view_type_name(&self) -> &'static str {
+        (self.type_name)()
+    }
 }
 
 impl<V: 'static + Render> IntoElement for Entity<V> {
@@ -122,6 +135,8 @@ impl IntoElement for AnyView {
 pub struct AnyWeakView {
     entity: AnyWeakEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
+    #[cfg(feature = "profiler")]
+    type_name: fn() -> &'static str,
 }
 
 impl AnyWeakView {
@@ -131,6 +146,8 @@ impl AnyWeakView {
         Some(AnyView {
             entity,
             render: self.render,
+            #[cfg(feature = "profiler")]
+            type_name: self.type_name,
         })
     }
 }
@@ -140,6 +157,8 @@ impl<V: 'static + Render> From<WeakEntity<V>> for AnyWeakView {
         AnyWeakView {
             entity: view.into(),
             render: any_view::render::<V>,
+            #[cfg(feature = "profiler")]
+            type_name: type_name::<V>,
         }
     }
 }
@@ -204,6 +223,13 @@ pub trait View: 'static + Sized {
 
     /// Render this view into an element tree, consuming `self`.
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
+
+    /// The name the profiler gives this view in a slow draw.
+    #[doc(hidden)]
+    #[cfg(feature = "profiler")]
+    fn view_type_name(&self) -> &'static str {
+        type_name::<Self>()
+    }
 }
 
 /// A stateless component (`RenderOnce`) is a `View` with no identity.
@@ -232,6 +258,11 @@ impl<T: Render> View for Entity<T> {
             Render::render(this, window, cx).into_any_element()
         })
     }
+
+    #[cfg(feature = "profiler")]
+    fn view_type_name(&self) -> &'static str {
+        type_name::<T>()
+    }
 }
 
 impl<T: Render> Entity<T> {
@@ -255,8 +286,24 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    view_name: ViewName,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
+}
+
+/// A view's name for the profiler, carried to each of its phases because a
+/// view can be timed in prepaint or paint without rendering in that draw.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ViewName(#[cfg(feature = "profiler")] pub(crate) Option<&'static str>);
+
+impl ViewName {
+    #[cfg_attr(not(feature = "profiler"), allow(unused_variables))]
+    fn of<V: View>(view: &V) -> Self {
+        #[cfg(feature = "profiler")]
+        return Self(Some(view.view_type_name()));
+        #[cfg(not(feature = "profiler"))]
+        Self()
+    }
 }
 
 impl<V: View> ViewElement<V> {
@@ -267,6 +314,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            view_name: ViewName::of(&view),
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -337,6 +385,7 @@ impl<V: View> Element for ViewElement<V> {
             let view = &mut self.view;
             request_layout_view(
                 entity_id,
+                self.view_name,
                 self.cached_style.as_ref(),
                 window,
                 cx,
@@ -367,6 +416,7 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path.
             prepaint_view(
                 entity_id,
+                self.view_name,
                 global_id,
                 bounds,
                 element,
@@ -400,6 +450,7 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path.
             paint_view(
                 entity_id,
+                self.view_name,
                 self.cached_style.is_some(),
                 global_id,
                 element,
@@ -425,12 +476,13 @@ impl Render for EmptyView {
 #[inline(never)]
 fn request_layout_view(
     entity_id: EntityId,
+    view_name: ViewName,
     cached_style: Option<&StyleRefinement>,
     window: &mut Window,
     cx: &mut App,
     render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
 ) -> (LayoutId, Option<AnyElement>) {
-    window.with_rendered_view(entity_id, |window| {
+    window.with_named_view(entity_id, view_name, |window| {
         let caching_disabled = window.is_inspector_picking(cx);
         match cached_style {
             Some(style) if !caching_disabled => {
@@ -465,6 +517,7 @@ fn request_layout_component(
 #[inline(never)]
 fn prepaint_view(
     entity_id: EntityId,
+    view_name: ViewName,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -473,7 +526,7 @@ fn prepaint_view(
     render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
 ) -> Option<AnyElement> {
     window.set_view_id(entity_id);
-    window.with_rendered_view(entity_id, |window| {
+    window.with_named_view(entity_id, view_name, |window| {
         if let Some(mut element) = element.take() {
             element.prepaint(window, cx);
             return Some(element);
@@ -550,13 +603,14 @@ fn prepaint_component(
 #[inline(never)]
 fn paint_view(
     entity_id: EntityId,
+    view_name: ViewName,
     cached: bool,
     global_id: Option<&GlobalElementId>,
     element: &mut Option<AnyElement>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.with_rendered_view(entity_id, |window| {
+    window.with_named_view(entity_id, view_name, |window| {
         let caching_disabled = window.is_inspector_picking(cx);
         if cached && !caching_disabled {
             window.with_element_state::<ViewElementState, _>(

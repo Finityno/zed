@@ -1164,9 +1164,11 @@ pub const SLOW_DRAW_VIEW_MIN: Duration = Duration::from_millis(1);
 #[cfg(feature = "profiler")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ViewRenderTime {
-    /// The view's type, as `std::any::type_name` spells it. A view that was
-    /// timed but did not render in the draw (a cached view that replayed
-    /// its previous frame) is `"<unrendered view>"`.
+    /// The view's type, as `std::any::type_name` spells it, whichever of
+    /// its phases was timed: a cached view that replayed its previous
+    /// frame, or a view that rendered before timing started, is named
+    /// too. Only time charged solely through a deferred draw is
+    /// `"<unnamed view>"`.
     pub type_name: &'static str,
     /// Time spent in the view's `render`, prepaint and paint, excluding the
     /// time of the views nested inside it. Work a view does for elements
