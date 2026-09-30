@@ -193,8 +193,6 @@ mod any_view {
             .a11y
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
-        #[cfg(feature = "profiler")]
-        window.record_view_render(view.entity_id(), std::any::type_name::<V>());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -252,8 +250,6 @@ impl<T: Render> View for Entity<T> {
 
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        #[cfg(feature = "profiler")]
-        window.record_view_render(Entity::entity_id(&self), std::any::type_name::<T>());
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })
@@ -492,6 +488,8 @@ fn request_layout_view(
                 (layout_id, None)
             }
             _ => {
+                #[cfg(feature = "profiler")]
+                window.record_view_render(entity_id, view_name);
                 let mut element = render(window, cx);
                 let layout_id = element.request_layout(window, cx);
                 (layout_id, Some(element))
@@ -557,6 +555,8 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
+                #[cfg(feature = "profiler")]
+                window.record_view_render(entity_id, view_name);
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {

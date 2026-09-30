@@ -84,12 +84,14 @@ impl Window {
         }
     }
 
-    /// An entity view of type `type_name` is about to call `render`.
+    /// A view with an identity is about to call `render`. Recorded where
+    /// the view element calls it, so hand-written [`crate::View`]s count
+    /// as well as entities.
     #[inline]
-    pub(crate) fn record_view_render(&mut self, entity_id: EntityId, type_name: &'static str) {
+    pub(crate) fn record_view_render(&mut self, entity_id: EntityId, view_name: ViewName) {
         self.draw_clock.count_render();
         if self.view_timer.is_armed() {
-            self.view_timer.record_render(entity_id, type_name);
+            self.view_timer.record_render(entity_id, view_name.0);
         }
     }
 
@@ -414,9 +416,11 @@ impl ViewTimer {
         }
     }
 
-    fn record_render(&mut self, entity_id: EntityId, type_name: &'static str) {
+    fn record_render(&mut self, entity_id: EntityId, type_name: Option<&'static str>) {
         let totals = self.views.entry(entity_id).or_default();
-        totals.type_name = Some(type_name);
+        if type_name.is_some() {
+            totals.type_name = type_name;
+        }
         totals.renders = totals.renders.saturating_add(1);
     }
 
@@ -1246,6 +1250,66 @@ mod tests {
                 .count(),
             2,
             "the first row rendered before timing started: {recorded:?}"
+        );
+    }
+
+    /// A hand-written view: props from its parent, identity from an entity.
+    struct Handwritten {
+        identity: Entity<Cached>,
+    }
+
+    impl crate::View for Handwritten {
+        fn entity_id(&self) -> Option<crate::EntityId> {
+            Some(self.identity.entity_id())
+        }
+
+        fn render(self, _: &mut Window, _: &mut crate::App) -> impl IntoElement {
+            spin(SPIN);
+            div().w(px(10.)).h(px(10.))
+        }
+    }
+
+    struct HandwrittenHost {
+        identity: Entity<Cached>,
+    }
+
+    impl Render for HandwrittenHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(crate::ViewElement::new(Handwritten {
+                identity: self.identity.clone(),
+            }))
+        }
+    }
+
+    #[gpui::test]
+    fn a_hand_written_view_is_counted_and_named(cx: &mut TestAppContext) {
+        let _knobs = Knobs::set(Duration::from_millis(1), DrawResourceSampling::Off);
+        profiler::set_view_timing(ViewTiming::Always);
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                let identity = cx.new(|_| Cached);
+                cx.new(|_| HandwrittenHost { identity })
+            })
+            .unwrap()
+        });
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_active_status_change(true);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let draw = window
+            .update(cx, |_, window, _| window.window_profiler.last_draw())
+            .unwrap()
+            .expect("a draw was recorded");
+        assert_eq!(
+            draw.breakdown.views_rendered(),
+            2,
+            "the host and the hand-written view render: {:?}",
+            draw.breakdown
+        );
+        let recorded = recorded_detail(window.window_id(), &draw).expect("the slow draw's views");
+        let slowest = recorded.views.first().expect("a view spent 3 ms");
+        assert!(
+            slowest.type_name.ends_with("::Handwritten") && slowest.renders == 1,
+            "{recorded:?}"
         );
     }
 }
