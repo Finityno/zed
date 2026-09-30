@@ -12,7 +12,7 @@
 use super::{DrawDependency, ViewRebuildReason, describe_frame, first_difference};
 use crate::{
     AnyElement, App, Context, Entity, Global, Hsla, IntoElement, ListAlignment,
-    ListOffset, ListState, Modifiers, Render, SharedString, StyleRefinement, TestAppContext,
+    ListOffset, ListState, Modifiers, Pixels, Render, SharedString, StyleRefinement, TestAppContext,
     Window, WindowHandle, deferred, div, hsla, list, point, prelude::*, px, size,
 };
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
@@ -233,6 +233,8 @@ struct Shell {
     cards: Vec<Entity<Card>>,
     list_cards: Vec<Entity<Card>>,
     list_state: ListState,
+    /// Shows where the list is scrolled to, beside it.
+    list_reader: Entity<ScrollReader>,
     column: bool,
     tint: usize,
 }
@@ -245,9 +247,14 @@ impl Shell {
         let list_cards: Vec<_> = (0..CARDS)
             .map(|ix| cx.new(|cx| Card::new(ix + 100, shared.clone(), cx)))
             .collect();
+        let list_state = ListState::new(list_cards.len(), ListAlignment::Top, px(20.));
         Self {
             cards,
-            list_state: ListState::new(list_cards.len(), ListAlignment::Top, px(20.)),
+            list_reader: cx.new(|_| ScrollReader {
+                list_state: list_state.clone(),
+                seen: Rc::default(),
+            }),
+            list_state,
             list_cards,
             column: false,
             tint: 0,
@@ -270,6 +277,8 @@ impl Render for Shell {
             .gap_1()
             .when(self.column, |this| this.flex_col())
             .bg(PALETTE[self.tint % PALETTE.len()])
+            .child(items)
+            .child(self.list_reader.clone())
             .children(self.cards.iter().enumerate().map(|(ix, card)| {
                 if ix == 1 {
                     card.clone()
@@ -279,7 +288,6 @@ impl Render for Shell {
                     card.clone().into_any_element()
                 }
             }))
-            .child(items)
     }
 }
 
@@ -301,6 +309,7 @@ enum Change {
     InsertCard,
     RemoveCard { ix: usize },
     Scroll { top: usize },
+    Wheel { delta: f32 },
     Mouse { x: f32, y: f32 },
     Resize { width: f32, height: f32 },
     Redraw,
@@ -336,7 +345,10 @@ impl Change {
             75..80 => Change::Scroll {
                 top: rng.random_range(0..CARDS),
             },
-            80..92 => Change::Mouse {
+            80..84 => Change::Wheel {
+                delta: rng.random_range(-120.0..120.0),
+            },
+            84..92 => Change::Mouse {
                 x: rng.random_range(0.0..700.0),
                 y: rng.random_range(0.0..500.0),
             },
@@ -499,6 +511,26 @@ impl Oracle {
                         );
                     })
                     .unwrap();
+                }
+            }
+            Change::Wheel { delta } => {
+                for window in self.windows() {
+                    let viewport = window
+                        .read_with(&self.cx, |shell, _| shell.list_state.viewport_bounds())
+                        .unwrap();
+                    self.cx
+                        .update_window(window.into(), |_, window, cx| {
+                            window.dispatch_event(
+                                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                                    position: viewport.center(),
+                                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                                    modifiers: Modifiers::default(),
+                                    touch_phase: crate::TouchPhase::Moved,
+                                }),
+                                cx,
+                            );
+                        })
+                        .unwrap();
                 }
             }
             Change::Resize { width, height } => {
@@ -1327,4 +1359,152 @@ fn frame_work_with_views_drawn_again() {
 fn draw_board(cx: &mut TestAppContext, window: WindowHandle<Board>) {
     cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
         .unwrap();
+}
+
+/// A view beside a list, reading where it is scrolled to.
+struct ScrollReader {
+    list_state: ListState,
+    seen: Rc<Cell<usize>>,
+}
+
+impl Render for ScrollReader {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let top = self.list_state.logical_scroll_top();
+        self.seen.set(top.item_ix);
+        div().child(SharedString::from(format!(
+            "top {} {}",
+            top.item_ix,
+            top.offset_in_item.as_f32().round()
+        )))
+    }
+}
+
+struct ScrollHost {
+    reader: Entity<ScrollReader>,
+    list_state: ListState,
+}
+
+impl Render for ScrollHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.reader.clone()).child(
+            list(self.list_state.clone(), |ix, _, _| {
+                div()
+                    .h(px(20.))
+                    .child(SharedString::from(format!("row {ix}")))
+                    .into_any_element()
+            })
+            .h(px(60.))
+            .w(px(100.)),
+        )
+    }
+}
+
+/// A view reading a list's scroll position is built again once the wheel
+/// scrolls the list.
+#[test]
+fn a_wheel_scroll_builds_the_views_reading_the_list() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let list_state = ListState::new(20, ListAlignment::Top, px(0.)).measure_all();
+    let seen = Rc::new(Cell::new(usize::MAX));
+    let window = cx.add_window({
+        let list_state = list_state.clone();
+        let seen = seen.clone();
+        move |_, cx| ScrollHost {
+            reader: cx.new(|_| ScrollReader {
+                list_state: list_state.clone(),
+                seen,
+            }),
+            list_state,
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    assert_eq!(seen.get(), 0);
+    let viewport = list_state.viewport_bounds();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(
+            crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: crate::ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                modifiers: Modifiers::default(),
+                touch_phase: crate::TouchPhase::Moved,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    let top = list_state.logical_scroll_top().item_ix;
+    assert!(top > 0, "the wheel scrolled the list");
+    frame(&mut cx);
+    frame(&mut cx);
+    assert_eq!(seen.get(), top, "the reader shows where the list is scrolled to");
+}
+
+/// A view reading a uniform list's offset is built again once the list
+/// scrolls an item into view as it prepaints.
+#[test]
+fn a_uniform_list_scrolling_to_an_item_builds_the_views_reading_it() {
+    struct Reader {
+        handle: crate::UniformListScrollHandle,
+        seen: Rc<Cell<Pixels>>,
+    }
+    impl Render for Reader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let offset = self.handle.0.borrow().base_handle.offset().y;
+            self.seen.set(offset);
+            div().child(SharedString::from(format!("{offset:?}")))
+        }
+    }
+    struct Host {
+        reader: Entity<Reader>,
+        handle: crate::UniformListScrollHandle,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.reader.clone()).child(
+                crate::uniform_list("rows", 50, |range, _, _| {
+                    range
+                        .map(|ix| div().h(px(20.)).child(SharedString::from(format!("row {ix}"))))
+                        .collect()
+                })
+                .track_scroll(&self.handle)
+                .h(px(60.))
+                .w(px(100.)),
+            )
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let handle = crate::UniformListScrollHandle::new();
+    let seen = Rc::new(Cell::new(px(1.)));
+    let window = cx.add_window({
+        let handle = handle.clone();
+        let seen = seen.clone();
+        move |_, cx| Host {
+            reader: cx.new(|_| Reader {
+                handle: handle.clone(),
+                seen,
+            }),
+            handle,
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    assert_eq!(seen.get(), px(0.));
+    handle.scroll_to_item(30, crate::ScrollStrategy::Top);
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    frame(&mut cx);
+    frame(&mut cx);
+    let offset = handle.0.borrow().base_handle.offset().y;
+    assert!(offset < px(0.), "the list scrolled");
+    assert_eq!(seen.get(), offset, "the reader shows the list's offset");
 }

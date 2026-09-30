@@ -1430,6 +1430,7 @@ impl StateInner {
         if self.reset {
             return;
         }
+        let observed_before = self.observed();
 
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
@@ -1459,6 +1460,7 @@ impl StateInner {
         if delta.y > px(0.) {
             self.follow_state.stop_following();
         }
+        self.version.bump_if(self.observed() != observed_before);
 
         if let Some(handler) = self.scroll_handler.as_mut() {
             let visible_range = Self::visible_range(&self.items, height, scroll_top);

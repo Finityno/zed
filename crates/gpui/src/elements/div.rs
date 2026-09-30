@@ -2400,6 +2400,12 @@ impl Interactivity {
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                     let scroll_handle_state = scroll_handle.0.borrow();
+                    // What the handle is asked to do (scroll to an item, to the
+                    // bottom) takes effect as this element prepaints, so the
+                    // view drawing it depends on the handle.
+                    crate::window::view_retention::dependencies::note_state_read(
+                        &scroll_handle_state.version,
+                    );
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
                     self.scroll_max = Some(scroll_handle_state.max_offset.clone());
@@ -4504,8 +4510,12 @@ impl ScrollHandle {
         crate::window::view_retention::dependencies::note_state_read(&self.0.borrow().version);
     }
 
-    fn changed(&self) {
-        self.0.borrow().version.bump();
+    /// Marks the handle changed if its offset is no longer `before`, for an
+    /// element that moved it without going through the handle.
+    pub(crate) fn changed_if_moved_from(&self, before: Point<Pixels>) {
+        let state = self.0.borrow();
+        let moved = *state.offset.borrow() != before;
+        state.version.bump_if(moved);
     }
 
     /// Get the maximum scroll offset.
@@ -4568,20 +4578,29 @@ impl ScrollHandle {
 
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     pub fn scroll_to_item(&self, ix: usize) {
-        self.changed();
-        let mut state = self.0.borrow_mut();
-        state.active_item = Some(ScrollActiveItem {
+        self.set_active_item(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::default(),
         });
     }
 
+    /// Asks the next prepaint to scroll `item` into view, marking the handle
+    /// changed only if that is a new request: the element tracking the handle
+    /// has to be prepainted for it to take effect.
+    fn set_active_item(&self, item: ScrollActiveItem) {
+        let mut state = self.0.borrow_mut();
+        let changed = state.active_item.is_none_or(|active| {
+            active.index != item.index
+                || mem::discriminant(&active.strategy) != mem::discriminant(&item.strategy)
+        });
+        state.active_item = Some(item);
+        state.version.bump_if(changed);
+    }
+
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     /// This scrolls the minimal amount to ensure that the child is the first visible element
     pub fn scroll_to_top_of_item(&self, ix: usize) {
-        self.changed();
-        let mut state = self.0.borrow_mut();
-        state.active_item = Some(ScrollActiveItem {
+        self.set_active_item(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::Top,
         });
@@ -4643,9 +4662,10 @@ impl ScrollHandle {
 
     /// Scrolls to the bottom.
     pub fn scroll_to_bottom(&self) {
-        self.changed();
         let mut state = self.0.borrow_mut();
+        let changed = !state.scroll_to_bottom;
         state.scroll_to_bottom = true;
+        state.version.bump_if(changed);
     }
 
     /// Set the offset explicitly. The offset is the distance from the top left of the
