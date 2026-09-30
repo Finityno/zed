@@ -298,22 +298,63 @@ impl TaffyLayoutEngine {
         Claim::Reused(key, id)
     }
 
-    /// Claims every node kept under `keys` without asking anything of them,
-    /// as [`Self::keep_retained`] does, if every one is still kept and not yet
-    /// claimed this frame; otherwise claims none. For a view laid out as it
-    /// was last frame without being built, whose layout stands only if all
-    /// of its nodes do.
-    pub(crate) fn try_keep_retained(&mut self, keys: &[u64]) -> bool {
+    /// How many keys the claimed-key log holds, while a recording is open.
+    pub(crate) fn claimed_keys_len(&self) -> usize {
+        self.retention.claimed_keys.len()
+    }
+
+    /// Ends the recording begun at `start`, as
+    /// [`Self::finish_recording_claimed_keys`] does, leaving out the
+    /// stretches of the log in `nested` (which must be in order): the keys
+    /// the views nested in a view recorded for themselves. Returns the keys
+    /// and where the recording ended in the log.
+    pub(crate) fn finish_recording_own_keys(
+        &mut self,
+        start: usize,
+        nested: &[std::ops::Range<usize>],
+    ) -> (Vec<u64>, usize) {
+        let retention = &mut self.retention;
+        let end = retention.claimed_keys.len();
+        let mut keys = Vec::new();
+        let mut from = start;
+        for range in nested {
+            if range.start > from {
+                keys.extend_from_slice(&retention.claimed_keys[from..range.start.min(end)]);
+            }
+            from = from.max(range.end);
+        }
+        if from < end {
+            keys.extend_from_slice(&retention.claimed_keys[from..end]);
+        }
+        retention.open_key_recordings -= 1;
+        if retention.open_key_recordings == 0 {
+            retention.claimed_keys.clear();
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        (keys, end)
+    }
+
+    /// Claims the nodes kept under every one of `key_sets` without asking
+    /// anything of them, as [`Self::keep_retained`] does, if every one is
+    /// still kept and not yet claimed this frame; otherwise claims none. For
+    /// a view laid out as it was last frame without being built, whose
+    /// layout stands only if all of its nodes, and its nested views', do.
+    pub(crate) fn try_keep_retained_sets(&mut self, key_sets: &[&[u64]]) -> bool {
         let retention = &self.retention;
         let frame = retention.frame;
-        let all_kept = keys.iter().all(|key| {
-            retention
-                .retained
-                .get(key)
-                .is_some_and(|node| node.claimed_in_frame != frame)
+        let all_kept = key_sets.iter().all(|keys| {
+            keys.iter().all(|key| {
+                retention
+                    .retained
+                    .get(key)
+                    .is_some_and(|node| node.claimed_in_frame != frame)
+            })
         });
         if all_kept {
-            self.keep_retained(keys);
+            for keys in key_sets {
+                self.keep_retained(keys);
+            }
         }
         all_kept
     }

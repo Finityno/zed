@@ -1769,3 +1769,73 @@ fn a_view_that_opted_out_is_built_inside_a_view_drawn_again() {
     frame(&mut cx);
     assert_ne!(text(&mut cx), before, "the view that opted out was built");
 }
+
+/// A view holding another, to nest the board below a chain of views.
+struct Wrap {
+    child: crate::AnyView,
+}
+
+impl Render for Wrap {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.child.clone())
+    }
+}
+
+/// The work of drawing a board of 240 panels, one of which changes per
+/// frame, directly in the window and below a chain of twelve views, with
+/// views drawn again and without: what each view drawn again costs should
+/// not grow with how many nodes and views are nested in it. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn frame_work_by_view_depth() {
+    for depth in [0usize, 12] {
+        for retained in [false, true] {
+            let mut cx = TestAppContext::single();
+            cx.update(|cx| cx.set_view_retention(retained));
+            let panels: Vec<_> = (0..240)
+                .map(|ix| cx.new(|_| Panel { ix, value: 0 }))
+                .collect();
+            let board = cx.new(|_| Board {
+                panels: panels.clone(),
+            });
+            let mut top: crate::AnyView = board.into();
+            for _ in 0..depth {
+                let child = top.clone();
+                top = cx.new(|_| Wrap { child }).into();
+            }
+            let window = cx.add_window(move |_, _| Wrap { child: top });
+            cx.simulate_window_resize(window.into(), size(px(3200.), px(2400.)));
+            let frame = |cx: &mut TestAppContext| {
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            };
+            for _ in 0..3 {
+                frame(&mut cx);
+            }
+            cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(true))
+                .unwrap();
+            let frames = 60;
+            let started = Instant::now();
+            for frame_ix in 0..frames {
+                panels[frame_ix % panels.len()].update(&mut cx, |panel, cx| {
+                    panel.value += 1;
+                    cx.notify();
+                });
+                frame(&mut cx);
+            }
+            let elapsed = started.elapsed();
+            let work = cx
+                .update_window(window.into(), |_, window, _| window.frame_work_stats())
+                .unwrap();
+            eprintln!(
+                "depth {depth} retained {retained}: {:?} per change; rendered {} reused {} \
+                 layout nodes {} per frame",
+                elapsed / frames as u32,
+                work.views_rendered / work.frames,
+                work.views_reused / work.frames,
+                work.layout_nodes / work.frames,
+            );
+        }
+    }
+}

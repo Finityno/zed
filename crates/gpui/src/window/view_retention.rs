@@ -219,6 +219,10 @@ struct LayoutRecording {
     keys: Option<usize>,
     transient: usize,
     element_states: usize,
+    /// Where this recording's nested stretches begin in `nested_keys` and
+    /// `nested_states`.
+    nested_keys: usize,
+    nested_states: usize,
     dependencies: DependencyRecording,
 }
 
@@ -227,6 +231,7 @@ struct ViewRecording {
     index: Option<usize>,
     dependencies: DependencyRecording,
     layout_keys: usize,
+    nested_keys: usize,
     hovers_start: usize,
 }
 
@@ -260,6 +265,16 @@ pub(crate) struct ViewRetention {
     /// different at, and the task asking for a frame at the earliest one.
     deadline: Option<Instant>,
     deadline_frame: Option<(Instant, Task<()>)>,
+    /// The stretches of the layout engine's claimed-key log, and of the
+    /// frame's accessed element states, that views nested in the ones being
+    /// recorded took for themselves, in order: a record holds only its own
+    /// keys and states, and a view drawn again gathers its nested views'
+    /// from their records, so that what a view built costs does not grow
+    /// with how much is nested in it.
+    nested_keys: Vec<Range<usize>>,
+    nested_states: Vec<Range<usize>>,
+    /// How many retained view recordings are open.
+    open_recordings: usize,
     /// Bumped as every frame begins. A view that opted out reads it, so that
     /// the views around it depend on it too and are never drawn again whole,
     /// which would copy it along.
@@ -282,6 +297,9 @@ impl ViewRetention {
             deadline: None,
             deadline_frame: None,
             every_frame: Default::default(),
+            nested_keys: Vec::new(),
+            nested_states: Vec::new(),
+            open_recordings: 0,
             frames_since_verification: 0,
             verification_interval: verification_interval(),
         }
@@ -685,19 +703,96 @@ impl Window {
     /// Lays out the view last frame's record `previous` stands for as it was
     /// laid out then, without building it, if its nodes are all still there.
     fn reuse_view_layout(&mut self, previous: usize) -> Option<LayoutId> {
-        let record = &self.rendered_frame.retained_views.records[previous];
+        let records = &self.rendered_frame.retained_views.records;
+        let record = &records[previous];
         let layout = record.layout.as_ref()?;
         let text_style_matches = record.context.text_style == self.text_style()
             && record.context.rem_size == self.rem_size();
         if layout.view_key.is_none()
             || layout.view_key != self.layout_keys.current()
-            || !text_style_matches || !self.layout_engine.as_mut()?.try_keep_retained(&layout.keys) {
+            || !text_style_matches
+        {
             return None;
         }
-        self.next_frame
-            .accessed_element_states
-            .extend(layout.element_states.iter().cloned());
-        Some(layout.root)
+        let root = layout.root;
+        // The view's own nodes and those of the views nested in it, each of
+        // which recorded its own.
+        let subtree = &records[previous..=previous + record.nested];
+        let key_sets: Vec<&[u64]> = subtree
+            .iter()
+            .filter_map(|record| record.layout.as_deref())
+            .map(|layout| layout.keys.as_slice())
+            .collect();
+        let engine = self.layout_engine.as_mut()?;
+        let keys_before = engine.claimed_keys_len();
+        if !engine.try_keep_retained_sets(&key_sets) {
+            return None;
+        }
+        let keys_after = engine.claimed_keys_len();
+        let states = &mut self.next_frame.accessed_element_states;
+        let states_before = states.len();
+        for layout in subtree.iter().filter_map(|record| record.layout.as_deref()) {
+            states.extend(layout.element_states.iter().cloned());
+        }
+        let states_after = states.len();
+        self.note_nested(keys_before..keys_after, states_before..states_after);
+        Some(root)
+    }
+
+    /// Marks stretches of the claimed-key log and of the accessed element
+    /// states as a nested view's, which the records being made leave out.
+    fn note_nested(&mut self, keys: Range<usize>, states: Range<usize>) {
+        let retention = &mut self.view_retention;
+        if retention.open_recordings > 0 {
+            retention.nested_keys.push(keys);
+            retention.nested_states.push(states);
+        }
+    }
+
+    /// Ends a recording of a view's own layout keys begun at `start`, whose
+    /// nested stretches begin at `nested` in `nested_keys`, handing the
+    /// whole recording to the one around it as nested.
+    fn finish_own_keys(&mut self, start: usize, nested: usize) -> Vec<u64> {
+        let retention = &mut self.view_retention;
+        retention.open_recordings = retention.open_recordings.saturating_sub(1);
+        let Some(engine) = self.layout_engine.as_mut() else {
+            return Vec::new();
+        };
+        let nested_from = nested.min(retention.nested_keys.len());
+        let (keys, end) = engine.finish_recording_own_keys(start, &retention.nested_keys[nested_from..]);
+        retention.nested_keys.truncate(nested);
+        if retention.open_recordings == 0 {
+            retention.nested_keys.clear();
+            retention.nested_states.clear();
+        } else {
+            retention.nested_keys.push(start..end);
+        }
+        keys
+    }
+
+    /// The element states accessed since `start`, leaving out the stretches
+    /// nested views took from `nested` on in `nested_states`, handing the
+    /// whole stretch to the recording around it as nested.
+    fn own_element_states(&mut self, start: usize, nested: usize) -> Vec<(GlobalElementId, TypeId)> {
+        let states = &self.next_frame.accessed_element_states;
+        let retention = &mut self.view_retention;
+        let end = states.len();
+        let mut own = Vec::new();
+        let mut from = start;
+        for range in &retention.nested_states[nested.min(retention.nested_states.len())..] {
+            if range.start > from {
+                own.extend(states[from..range.start.min(end)].iter().cloned());
+            }
+            from = from.max(range.end);
+        }
+        if from < end {
+            own.extend(states[from..end].iter().cloned());
+        }
+        retention.nested_states.truncate(nested);
+        if retention.open_recordings > 0 {
+            retention.nested_states.push(start..end);
+        }
+        own
     }
 
     fn begin_view_layout(&mut self, cx: &mut App) -> LayoutRecording {
@@ -705,10 +800,16 @@ impl Window {
             Some(engine) => (Some(engine.record_claimed_keys()), engine.transient_count()),
             None => (None, 0),
         };
+        let retention = &mut self.view_retention;
+        if keys.is_some() {
+            retention.open_recordings += 1;
+        }
         LayoutRecording {
             keys,
             transient,
             element_states: self.next_frame.accessed_element_states.len(),
+            nested_keys: retention.nested_keys.len(),
+            nested_states: retention.nested_states.len(),
             dependencies: cx.begin_recording_dependencies(),
         }
     }
@@ -720,21 +821,28 @@ impl Window {
         cx: &mut App,
     ) -> (Option<Rc<RetainedLayout>>, RenderDependencies) {
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
-        let (Some(keys), Some(engine)) = (recording.keys, self.layout_engine.as_mut()) else {
+        let Some(keys) = recording.keys else {
             return (None, dependencies);
         };
-        let keys = engine.finish_recording_claimed_keys(keys);
+        // The states first: the recording around this one takes the keys
+        // and states it hands over as nested once both are handed over.
+        let element_states =
+            self.own_element_states(recording.element_states, recording.nested_states);
+        let keys = self.finish_own_keys(keys, recording.nested_keys);
         // A node made without a key is gone at the end of the frame, so the
         // layout cannot be taken again without building the view.
-        if engine.transient_count() != recording.transient {
+        if self
+            .layout_engine
+            .as_ref()
+            .is_none_or(|engine| engine.transient_count() != recording.transient)
+        {
             return (None, dependencies);
         }
         let layout = RetainedLayout {
             root,
             view_key: self.layout_keys.current(),
             keys,
-            element_states: self.next_frame.accessed_element_states[recording.element_states..]
-                .to_vec(),
+            element_states,
         };
         (Some(Rc::new(layout)), dependencies)
     }
@@ -743,9 +851,24 @@ impl Window {
     /// as its prepaint goes, returning its record in this frame.
     fn reuse_view_prepaint(&mut self, previous: usize, cx: &mut App) -> usize {
         let (prepaint_range, dependencies, hovers) = {
-            let record = &self.rendered_frame.retained_views.records[previous];
+            let records = &self.rendered_frame.retained_views.records;
+            let record = &records[previous];
+            // The nodes the view and the views nested in it laid out as they
+            // prepainted, and their layouts' nodes where those were not kept
+            // as the view was laid out.
             if let Some(engine) = self.layout_engine.as_mut() {
-                engine.keep_retained(&record.prepaint_layout_keys);
+                let keys_before = engine.claimed_keys_len();
+                for nested in &records[previous..=previous + record.nested] {
+                    engine.keep_retained(&nested.prepaint_layout_keys);
+                    if let Some(layout) = nested.layout.as_deref() {
+                        engine.keep_retained(&layout.keys);
+                    }
+                }
+                let keys_after = engine.claimed_keys_len();
+                let retention = &mut self.view_retention;
+                if retention.open_recordings > 0 {
+                    retention.nested_keys.push(keys_before..keys_after);
+                }
             }
             (
                 record.prepaint_range.clone(),
@@ -898,14 +1021,18 @@ impl Window {
         });
         self.take_hover_reads();
         self.view_retention.view_stack.push(id.clone());
+        let layout_keys = self
+            .layout_engine
+            .as_mut()
+            .map_or(0, |engine| engine.record_claimed_keys());
+        let retention = &mut self.view_retention;
+        retention.open_recordings += 1;
         ViewRecording {
             index,
             dependencies: cx.begin_recording_dependencies(),
-            layout_keys: self
-                .layout_engine
-                .as_mut()
-                .map_or(0, |engine| engine.record_claimed_keys()),
-            hovers_start: self.view_retention.hovers.len(),
+            layout_keys,
+            nested_keys: retention.nested_keys.len(),
+            hovers_start: retention.hovers.len(),
         }
     }
 
@@ -917,11 +1044,7 @@ impl Window {
         layout_dependencies: Option<RenderDependencies>,
         cx: &mut App,
     ) -> Option<usize> {
-        let prepaint_layout_keys = self
-            .layout_engine
-            .as_mut()
-            .map(|engine| engine.finish_recording_claimed_keys(recording.layout_keys))
-            .unwrap_or_default();
+        let prepaint_layout_keys = self.finish_own_keys(recording.layout_keys, recording.nested_keys);
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         self.take_hover_reads();
         self.view_retention.view_stack.pop();
@@ -1336,8 +1459,16 @@ impl Window {
         else {
             return self.build_view_at(bounds, global_id, render, cx);
         };
-        if let Some(engine) = self.layout_engine.as_mut() {
-            engine.release_kept(&kept.keys);
+        {
+            let records = &self.rendered_frame.retained_views.records;
+            let nested = records[previous].nested;
+            if let Some(engine) = self.layout_engine.as_mut() {
+                for record in &records[previous..=previous + nested] {
+                    if let Some(layout) = record.layout.as_deref() {
+                        engine.release_kept(&layout.keys);
+                    }
+                }
+            }
         }
         let writes_before = self
             .layout_engine
