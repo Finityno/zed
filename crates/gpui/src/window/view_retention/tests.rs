@@ -1692,7 +1692,6 @@ fn a_write_during_a_draw_reaches_the_views_that_read_before_it() {
     let other = cx.new(|_| Other(0));
     let window = cx.add_window({
         let seen = seen.clone();
-        let model = model.clone();
         let other = other.clone();
         move |_, cx| Root {
             parent: cx.new(|cx| Parent {
