@@ -68,6 +68,8 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+#[cfg(feature = "profiler")]
+mod draw_profile;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -1335,6 +1337,8 @@ pub struct Window {
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
+    #[cfg(feature = "profiler")]
+    pub(crate) draw_clock: draw_profile::DrawClock,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -2277,6 +2281,8 @@ impl Window {
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
+            #[cfg(feature = "profiler")]
+            draw_clock: draw_profile::DrawClock::new(),
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
@@ -3704,7 +3710,10 @@ impl Window {
         #[cfg(feature = "profiler")]
         let frame_dirty = self.invalidator.take_frame_dirty();
         #[cfg(feature = "profiler")]
-        self.window_profiler.begin_draw();
+        {
+            let draw_start = self.window_profiler.begin_draw();
+            self.draw_clock.begin(draw_start);
+        }
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
@@ -3858,9 +3867,12 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         {
-            let draw_duration = self
-                .window_profiler
-                .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+            let breakdown = self.draw_clock.finish(Instant::now());
+            let draw_duration = self.window_profiler.end_draw(
+                frame_dirty.dirty_at,
+                frame_dirty.invalidations,
+                breakdown,
+            );
             self.debug_frame_overlay.record_frame(draw_duration);
         }
 
@@ -4087,7 +4099,12 @@ impl Window {
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
+        #[cfg(feature = "profiler")]
+        self.draw_clock
+            .mark(draw_profile::DrawClockPhase::RequestLayout);
         let root_layout_id = root_element.request_layout(self, cx);
+        #[cfg(feature = "profiler")]
+        self.draw_clock.mark(draw_profile::DrawClockPhase::Prepaint);
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -4125,6 +4142,8 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        #[cfg(feature = "profiler")]
+        self.draw_clock.mark(draw_profile::DrawClockPhase::Paint);
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -4149,6 +4168,9 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(feature = "profiler")]
+        self.draw_clock.mark(draw_profile::DrawClockPhase::Other);
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -5819,9 +5841,13 @@ impl Window {
     ) {
         self.invalidator.debug_assert_prepaint();
 
+        #[cfg(feature = "profiler")]
+        let layout_started_at = self.draw_clock.begin_layout();
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
+        #[cfg(feature = "profiler")]
+        self.draw_clock.end_layout(layout_started_at);
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by

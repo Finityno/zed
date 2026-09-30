@@ -836,7 +836,7 @@ pub struct DrawBreakdown {
     pub(crate) views_timed_from: Option<ViewTimingStart>,
     /// [`DrawResources`]' counters, stored flat so the flags share one byte
     /// and the struct packs into 48 bytes.
-    resource_counts: [u32; 5],
+    pub(crate) resource_counts: [u32; 5],
 }
 
 #[cfg(feature = "profiler")]
@@ -897,6 +897,13 @@ impl DrawBreakdown {
             decompressions,
             flags: self.flags & DrawResources::ALL_FLAGS,
         }
+    }
+
+    pub(crate) fn phases_us(&self) -> u64 {
+        self.request_layout_us as u64
+            + self.layout_us as u64
+            + self.prepaint_us as u64
+            + self.paint_us as u64
     }
 
     /// Whether the draw's slowest views were recorded; fetch them with
@@ -1127,6 +1134,8 @@ pub struct WindowProfiler {
     animating_at_last_present: bool,
     pending_frame: Option<FrameTiming>,
     deferred_presents: u64,
+    #[cfg(test)]
+    last_draw: Option<FrameTiming>,
 }
 
 #[cfg(feature = "profiler")]
@@ -1159,6 +1168,8 @@ impl WindowProfiler {
             animating_at_last_present: false,
             pending_frame: None,
             deferred_presents: 0,
+            #[cfg(test)]
+            last_draw: None,
         };
         journal::record_frame_pending(window_id, Instant::now());
         Ok(profiler)
@@ -1243,17 +1254,27 @@ impl WindowProfiler {
         journal::end_foreground_turn();
     }
 
-    /// Records the beginning of a window draw.
-    pub fn begin_draw(&mut self) {
+    /// Records the beginning of a window draw and returns when it started.
+    pub fn begin_draw(&mut self) -> Instant {
         journal::begin_foreground_turn();
         let started_at = Instant::now();
         journal::record_frame_pending(self.window_id, started_at);
         self.active_activities
             .push(WindowActivity::Draw { started_at });
+        started_at
     }
 
     /// Records the end of a window draw and returns the draw duration.
-    pub fn end_draw(&mut self, dirty_at: Option<Instant>, invalidations: u64) -> Duration {
+    ///
+    /// `breakdown` carries the draw's phases as measured from the start
+    /// [`Self::begin_draw`] returned; its `other` part is set here, to the
+    /// rest of the draw, so the parts add up to the draw's duration.
+    pub fn end_draw(
+        &mut self,
+        dirty_at: Option<Instant>,
+        invalidations: u64,
+        mut breakdown: DrawBreakdown,
+    ) -> Duration {
         let Some(WindowActivity::Draw {
             started_at: draw_start,
         }) = self.active_activities.pop()
@@ -1264,14 +1285,22 @@ impl WindowProfiler {
         };
 
         let draw_end = Instant::now();
+        let draw_us = draw_end.duration_since(draw_start).as_micros();
+        breakdown.other_us = draw_us
+            .saturating_sub(breakdown.phases_us() as u128)
+            .min(u32::MAX as u128) as u32;
         let frame_timing = FrameTiming {
             window_id: self.window_id,
             dirty_at: dirty_at.filter(|at| journal::frame_sample_is_valid(self.window_id, *at)),
             invalidations,
             draw_start,
             draw_end,
-            breakdown: Default::default(),
+            breakdown,
         };
+        #[cfg(test)]
+        {
+            self.last_draw = Some(frame_timing);
+        }
         let draw_duration = frame_timing.draw_duration();
         if !journal::power_interrupted_since(draw_start) {
             self.record_draw_timing(frame_timing);
@@ -1299,6 +1328,12 @@ impl WindowProfiler {
             next_frame_scheduled,
             report,
         );
+    }
+
+    /// The most recent draw [`Self::end_draw`] recorded.
+    #[cfg(test)]
+    pub(crate) fn last_draw(&self) -> Option<FrameTiming> {
+        self.last_draw
     }
 
     /// Returns a snapshot of the current input-latency histograms.
@@ -1557,7 +1592,7 @@ mod tests {
                 journal::record_window_visibility(id, crate::WindowVisibility::Hidden);
                 journal::record_window_visibility(id, crate::WindowVisibility::Visible);
             }
-            profiler.end_draw(Some(old), 1);
+            profiler.end_draw(Some(old), 1, DrawBreakdown::default());
             let now = Instant::now();
             profiler.record_present_at(now, now, true, true);
             assert_eq!(
@@ -1568,7 +1603,7 @@ mod tests {
             assert_eq!(profiler.dirty_to_present_histogram.len(), 1);
             assert_eq!(profiler.present_interval_histogram.len(), 0);
             profiler.begin_draw();
-            profiler.end_draw(Some(Instant::now()), 1);
+            profiler.end_draw(Some(Instant::now()), 1, DrawBreakdown::default());
             let now = Instant::now();
             profiler.record_present_at(now, now, true, true);
             assert_eq!(profiler.dirty_to_present_histogram.len(), 2);
@@ -1585,7 +1620,7 @@ mod tests {
         let mut collector = FrameTimingCollector::new();
 
         window_profiler.begin_draw();
-        window_profiler.end_draw(Some(dirty_at), 3);
+        window_profiler.end_draw(Some(dirty_at), 3, DrawBreakdown::default());
         assert!(
             collector
                 .collect_unseen()
@@ -1596,7 +1631,7 @@ mod tests {
         set_trace_enabled(true);
         let mut collector = FrameTimingCollector::new();
         window_profiler.begin_draw();
-        window_profiler.end_draw(Some(dirty_at), 3);
+        window_profiler.end_draw(Some(dirty_at), 3, DrawBreakdown::default());
 
         let timing = collector
             .collect_unseen()
@@ -1669,7 +1704,7 @@ mod tests {
         let mut collector = FrameTimingCollector::new();
 
         window_profiler.begin_draw();
-        window_profiler.end_draw(None, 0);
+        window_profiler.end_draw(None, 0, DrawBreakdown::default());
         assert!(
             FRAME_TIMINGS
                 .lock()
@@ -1851,7 +1886,7 @@ mod tests {
         window_profiler.begin_draw();
         begin_input_at(&mut window_profiler, Instant::now());
         window_profiler.end_input(true);
-        window_profiler.end_draw(None, 0);
+        window_profiler.end_draw(None, 0, DrawBreakdown::default());
 
         let snapshot = window_profiler.input_latency_snapshot();
         assert!(snapshot.latency_histogram.is_empty());

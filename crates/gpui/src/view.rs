@@ -174,6 +174,8 @@ mod any_view {
             .a11y
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
+        #[cfg(feature = "profiler")]
+        window.draw_clock.count_render();
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -224,6 +226,8 @@ impl<T: Render> View for Entity<T> {
 
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        #[cfg(feature = "profiler")]
+        window.draw_clock.count_render();
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })
@@ -488,6 +492,8 @@ fn prepaint_view(
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
+                    #[cfg(feature = "profiler")]
+                    window.draw_clock.count_reuse();
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
                     cx.entities
