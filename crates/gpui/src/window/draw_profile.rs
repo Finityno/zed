@@ -8,9 +8,12 @@ use std::time::Duration;
 
 use scheduler::Instant;
 
+use collections::FxHashMap;
+
 use crate::{
-    App, DRAW_QUIET_GAP, DrawBreakdown, DrawResourceSampling, DrawResources, PlatformDispatcher,
-    ResourceSample, Window, profiler,
+    App, DRAW_QUIET_GAP, DrawBreakdown, DrawResourceSampling, DrawResources, EntityId,
+    PlatformDispatcher, ResourceSample, SLOW_DRAW_VIEW_COUNT, SLOW_DRAW_VIEW_MIN, SlowDrawViews,
+    ViewRenderTime, ViewTiming, ViewTimingStart, Window, profiler,
 };
 
 impl Window {
@@ -22,9 +25,48 @@ impl Window {
             || self.draw_clock.last_draw_end.is_none_or(|last_draw_end| {
                 draw_start.saturating_duration_since(last_draw_end) >= DRAW_QUIET_GAP
             });
+        let time_views = match profiler::view_timing() {
+            ViewTiming::Off => false,
+            ViewTiming::OnSlowDraws => self.draw_clock.previous_draw_slow,
+            ViewTiming::Always => true,
+        };
         self.draw_clock.begin(draw_start);
         self.draw_resources
             .begin(after_quiet_or_slow, cx.background_executor().dispatcher().as_ref());
+        if time_views {
+            self.view_timer.arm(ViewTimingStart::Start);
+        }
+    }
+
+    /// Moves the draw clock to `phase`. Entering prepaint or paint also
+    /// starts timing views when the draw has already run for half the
+    /// detail threshold, reusing the mark's timestamp; this runs only
+    /// between root-level phases, where no view is being timed, so a view's
+    /// timing never starts halfway through it.
+    pub(super) fn mark_draw_phase(&mut self, phase: DrawClockPhase) {
+        let now = self.draw_clock.mark(phase);
+        let timed_from = match phase {
+            DrawClockPhase::Prepaint => ViewTimingStart::Prepaint,
+            DrawClockPhase::Paint => ViewTimingStart::Paint,
+            DrawClockPhase::Other | DrawClockPhase::RequestLayout => return,
+        };
+        if !self.view_timer.is_armed()
+            && self.draw_clock.active
+            && profiler::view_timing() == ViewTiming::OnSlowDraws
+            && self.draw_clock.elapsed(now) >= profiler::draw_detail_threshold() / 2
+        {
+            debug_assert!(self.rendered_entity_stack.is_empty());
+            self.view_timer.arm(timed_from);
+        }
+    }
+
+    /// An entity view of type `type_name` is about to call `render`.
+    #[inline]
+    pub(crate) fn record_view_render(&mut self, entity_id: EntityId, type_name: &'static str) {
+        self.draw_clock.count_render();
+        if self.view_timer.is_armed() {
+            self.view_timer.record_render(entity_id, type_name);
+        }
     }
 
     /// Ends the profiler's record of a draw and returns its duration. A draw
@@ -41,9 +83,26 @@ impl Window {
         let resources = self
             .draw_resources
             .finish(slow, cx.background_executor().dispatcher().as_ref());
+        let draw_start = self.draw_clock.draw_start;
         let mut breakdown = self.draw_clock.finish(now, slow);
         if let Some(resources) = resources {
             breakdown.set_resources(resources);
+        }
+        if let Some(timed_from) = self.view_timer.finish() {
+            if slow {
+                breakdown.views_timed_from = Some(timed_from);
+                let views = self.view_timer.slowest_views();
+                if !views.is_empty() {
+                    profiler::record_slow_draw_views(SlowDrawViews {
+                        window_id: self.handle.window_id(),
+                        draw_start,
+                        timed_from,
+                        views,
+                    });
+                    breakdown.flags |= DrawBreakdown::VIEWS_RECORDED;
+                }
+            }
+            self.view_timer.clear();
         }
         self.window_profiler
             .end_draw(dirty_at, invalidations, breakdown)
@@ -215,6 +274,118 @@ impl DrawClock {
     }
 }
 
+/// Times each view's `render`, prepaint and paint, net of the views nested
+/// inside it, for the draws [`crate::ViewTiming`] selects.
+pub(crate) struct ViewTimer {
+    armed: Option<ViewTimingStart>,
+    stack: Vec<TimedView>,
+    self_times: FxHashMap<EntityId, Duration>,
+    renders: FxHashMap<EntityId, (&'static str, u16)>,
+}
+
+struct TimedView {
+    started_at: Instant,
+    nested: Duration,
+}
+
+impl ViewTimer {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: None,
+            stack: Vec::new(),
+            self_times: FxHashMap::default(),
+            renders: FxHashMap::default(),
+        }
+    }
+
+    fn arm(&mut self, from: ViewTimingStart) {
+        self.stack.clear();
+        self.armed = Some(from);
+    }
+
+    #[inline]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// A view is being entered; returns whether it is timed, in which case
+    /// [`Self::exit`] must be called when it is left.
+    #[inline]
+    pub(crate) fn enter(&mut self) -> bool {
+        if self.armed.is_none() {
+            return false;
+        }
+        self.stack.push(TimedView {
+            started_at: Instant::now(),
+            nested: Duration::ZERO,
+        });
+        true
+    }
+
+    /// The timed view most recently entered is being left.
+    pub(crate) fn exit(&mut self, entity_id: EntityId) {
+        let Some(view) = self.stack.pop() else {
+            return;
+        };
+        let total = view.started_at.elapsed();
+        if let Some(parent) = self.stack.last_mut() {
+            parent.nested += total;
+        }
+        *self.self_times.entry(entity_id).or_default() += total.saturating_sub(view.nested);
+    }
+
+    fn record_render(&mut self, entity_id: EntityId, type_name: &'static str) {
+        let renders = &mut self.renders.entry(entity_id).or_insert((type_name, 0)).1;
+        *renders = renders.saturating_add(1);
+    }
+
+    /// Stops timing, returning where the draw's timing started, if it was
+    /// timed. The times stay readable until [`Self::clear`].
+    fn finish(&mut self) -> Option<ViewTimingStart> {
+        self.armed.take()
+    }
+
+    /// The views with the most time of their own, longest first.
+    fn slowest_views(&self) -> heapless::Vec<ViewRenderTime, SLOW_DRAW_VIEW_COUNT> {
+        let mut slowest = heapless::Vec::<(EntityId, Duration), SLOW_DRAW_VIEW_COUNT>::new();
+        for (&entity_id, &self_time) in &self.self_times {
+            if self_time < SLOW_DRAW_VIEW_MIN {
+                continue;
+            }
+            if slowest.push((entity_id, self_time)).is_err()
+                && let Some(fastest) = slowest.iter_mut().min_by_key(|(_, time)| *time)
+                && fastest.1 < self_time
+            {
+                *fastest = (entity_id, self_time);
+            }
+        }
+        slowest.sort_unstable_by_key(|(_, self_time)| std::cmp::Reverse(*self_time));
+        slowest
+            .into_iter()
+            .map(|(entity_id, self_time)| {
+                let (type_name, renders) = self
+                    .renders
+                    .get(&entity_id)
+                    .copied()
+                    .unwrap_or(("<unrendered view>", 0));
+                ViewRenderTime {
+                    type_name,
+                    self_time,
+                    renders,
+                }
+            })
+            .collect()
+    }
+
+    /// Forgets a timed draw's times, keeping the maps' capacity for the
+    /// next one.
+    fn clear(&mut self) {
+        self.stack.clear();
+        self.self_times.clear();
+        self.renders.clear();
+    }
+}
+
 /// Reads the thread's resource counters at the start of a draw, and again
 /// at the end of a slow one.
 pub(crate) struct DrawResourceSampler {
@@ -271,8 +442,9 @@ mod tests {
     use crate::{
         AppContext as _, Context, DRAW_QUIET_GAP, DrawResourceSampling, Entity, FaultScope,
         FrameTiming, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
-        RequestFrameOptions, ResourceSample, Style, Styled as _, TestAppContext, TestWindow,
-        Window, WindowHandle, WindowOptions, div, list, profiler, px, size,
+        RequestFrameOptions, ResourceSample, SlowDrawViews, Style, Styled as _, TestAppContext,
+        TestWindow, ViewTiming, ViewTimingStart, Window, WindowHandle, WindowOptions, div, list,
+        profiler, px, size,
     };
 
     const SPIN: Duration = Duration::from_millis(3);
@@ -300,6 +472,7 @@ mod tests {
         fn drop(&mut self) {
             profiler::set_draw_detail_threshold(Duration::from_millis(8));
             profiler::set_draw_resource_sampling(DrawResourceSampling::AfterQuiet);
+            profiler::set_view_timing(ViewTiming::OnSlowDraws);
         }
     }
 
@@ -671,5 +844,91 @@ mod tests {
         fixture.redraw(&fixture.worker, cx);
         assert_eq!(cx.dispatcher.take_draw_resource_requests(), [false; 0]);
         drop(knobs);
+    }
+
+    fn recorded_views(fixture: &Fixture, timing: &FrameTiming) -> Option<SlowDrawViews> {
+        let views = profiler::slow_draw_views(fixture.window.window_id(), timing.draw_start);
+        assert_eq!(
+            views.is_some(),
+            timing.breakdown.views_recorded(),
+            "the breakdown's flag matches the recorded views"
+        );
+        views
+    }
+
+    #[gpui::test]
+    fn a_slow_draw_names_its_slowest_view(cx: &mut TestAppContext) {
+        let _knobs = Knobs::set(Duration::from_millis(1), DrawResourceSampling::Off);
+        profiler::set_view_timing(ViewTiming::Always);
+        let fixture = open_window(cx);
+
+        fixture.spin_in.set(SpinIn::Render);
+        let slow = fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            slow.breakdown.views_timed_from(),
+            Some(ViewTimingStart::Start)
+        );
+        let recorded = recorded_views(&fixture, &slow).expect("the slow draw's views");
+        assert_eq!(recorded.timed_from, ViewTimingStart::Start);
+        let slowest = recorded.views.first().expect("a view spent 3 ms");
+        assert!(
+            slowest.type_name.ends_with("::Worker"),
+            "the spinning view ranks first: {recorded:?}"
+        );
+        assert!(slowest.self_time >= SPIN);
+        assert_eq!(slowest.renders, 1);
+        assert!(
+            recorded
+                .views
+                .iter()
+                .all(|view| !view.type_name.ends_with("::Root")),
+            "the root's own time excludes the worker nested in it: {recorded:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn on_slow_draws_times_views_after_a_slow_draw_or_partway_through_one(
+        cx: &mut TestAppContext,
+    ) {
+        let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::Off);
+        profiler::set_view_timing(ViewTiming::OnSlowDraws);
+        let fixture = open_window(cx);
+
+        let fast = fixture.redraw(&fixture.worker, cx);
+        assert_eq!(fast.breakdown.views_timed_from(), None);
+        assert_eq!(recorded_views(&fixture, &fast), None, "a fast draw records nothing");
+
+        profiler::set_draw_detail_threshold(Duration::from_millis(1));
+        fixture.spin_in.set(SpinIn::Render);
+        let first_slow = fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            first_slow.breakdown.views_timed_from(),
+            Some(ViewTimingStart::Prepaint),
+            "a draw that ran long while building the tree is timed from prepaint"
+        );
+        assert_eq!(
+            recorded_views(&fixture, &first_slow),
+            None,
+            "which misses the render that made it slow"
+        );
+
+        let repeat = fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            repeat.breakdown.views_timed_from(),
+            Some(ViewTimingStart::Start),
+            "the draw after a slow one is timed from its start"
+        );
+        let recorded = recorded_views(&fixture, &repeat).expect("the repeat's views");
+        assert!(recorded.views[0].type_name.ends_with("::Worker"), "{recorded:?}");
+
+        fixture.spin_in.set(SpinIn::Nowhere);
+        profiler::set_draw_detail_threshold(NO_DRAW_IS_SLOW);
+        fixture.redraw(&fixture.worker, cx);
+        let after = fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            after.breakdown.views_timed_from(),
+            None,
+            "once draws are fast again nothing is timed"
+        );
     }
 }

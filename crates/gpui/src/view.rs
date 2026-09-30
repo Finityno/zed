@@ -175,7 +175,7 @@ mod any_view {
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
         #[cfg(feature = "profiler")]
-        window.draw_clock.count_render();
+        window.record_view_render(view.entity_id(), std::any::type_name::<V>());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -227,7 +227,7 @@ impl<T: Render> View for Entity<T> {
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         #[cfg(feature = "profiler")]
-        window.draw_clock.count_render();
+        window.record_view_render(Entity::entity_id(&self), std::any::type_name::<T>());
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })

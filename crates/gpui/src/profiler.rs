@@ -1112,6 +1112,114 @@ pub fn draw_detail_threshold() -> Duration {
     Duration::from_micros(DRAW_DETAIL_THRESHOLD_MICROS.load(Ordering::Relaxed))
 }
 
+/// When a window draw times its views' `render`, prepaint and paint, to
+/// name the slowest in a slow draw (see [`set_view_timing`]).
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ViewTiming {
+    /// Never.
+    Off,
+    /// A draw is timed from its start when the window's previous draw
+    /// reached [`draw_detail_threshold`], which catches a view that is slow
+    /// on every draw. Any other draw starts being timed partway, at the
+    /// start of prepaint or paint, once it has run for half the threshold.
+    OnSlowDraws,
+    /// Every draw, from its start; for investigations and stress runs.
+    Always,
+}
+
+#[cfg(feature = "profiler")]
+static VIEW_TIMING: AtomicU8 = AtomicU8::new(ViewTiming::OnSlowDraws as u8);
+
+/// Sets when window draws time their views. A draw that is timed costs two
+/// `Instant::now()` calls per view per phase; a draw that is not costs a
+/// branch per view. Only draws that reach [`draw_detail_threshold`] record
+/// their slowest views, into a buffer [`slow_draw_views`] reads.
+#[cfg(feature = "profiler")]
+pub fn set_view_timing(timing: ViewTiming) {
+    VIEW_TIMING.store(timing as u8, Ordering::Relaxed);
+}
+
+/// The policy [`set_view_timing`] set; `OnSlowDraws` by default.
+#[cfg(feature = "profiler")]
+pub fn view_timing() -> ViewTiming {
+    match VIEW_TIMING.load(Ordering::Relaxed) {
+        0 => ViewTiming::Off,
+        2 => ViewTiming::Always,
+        _ => ViewTiming::OnSlowDraws,
+    }
+}
+
+/// How many of a slow draw's views [`SlowDrawViews`] keeps.
+#[cfg(feature = "profiler")]
+pub const SLOW_DRAW_VIEW_COUNT: usize = 5;
+
+/// The least time of its own a view must have spent in a slow draw to be
+/// recorded in [`SlowDrawViews`].
+#[cfg(feature = "profiler")]
+pub const SLOW_DRAW_VIEW_MIN: Duration = Duration::from_millis(1);
+
+/// One view's share of a slow draw.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ViewRenderTime {
+    /// The view's type, as `std::any::type_name` spells it. A view that was
+    /// timed but did not render in the draw (a cached view that replayed
+    /// its previous frame) is `"<unrendered view>"`.
+    pub type_name: &'static str,
+    /// Time spent in the view's `render`, prepaint and paint, excluding the
+    /// time of the views nested inside it. Work a view does for elements
+    /// it owns, such as a list's items, counts as its own.
+    pub self_time: Duration,
+    /// How many times the view rendered in the draw.
+    pub renders: u16,
+}
+
+/// The slowest views of one slow draw, by their own time, longest first.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowDrawViews {
+    /// The window that was drawn.
+    pub window_id: WindowId,
+    /// When the draw started, which with `window_id` identifies it.
+    pub draw_start: Instant,
+    /// Where in the draw the views started being timed.
+    pub timed_from: ViewTimingStart,
+    /// Up to [`SLOW_DRAW_VIEW_COUNT`] views that spent at least
+    /// [`SLOW_DRAW_VIEW_MIN`] of their own.
+    pub views: heapless::Vec<ViewRenderTime, SLOW_DRAW_VIEW_COUNT>,
+}
+
+// Kept beside the journal rather than in it, so journal slots stay small.
+// Slow draws are rare (at most a few dozen a second while the app is
+// struggling), and hang detection reads these within a second or so.
+#[cfg(feature = "profiler")]
+static SLOW_DRAW_VIEWS: spin::Mutex<heapless::Deque<SlowDrawViews, 64>> =
+    spin::Mutex::new(heapless::Deque::new());
+
+#[cfg(feature = "profiler")]
+pub(crate) fn record_slow_draw_views(views: SlowDrawViews) {
+    let mut recorded = SLOW_DRAW_VIEWS.lock();
+    if recorded.is_full() {
+        recorded.pop_front();
+    }
+    recorded.push_back(views).ok();
+}
+
+/// The slowest views of the draw of `window_id` that started at
+/// `draw_start`, if that draw recorded them (see
+/// [`DrawBreakdown::views_recorded`]) and they have not been evicted by 64
+/// newer slow draws since.
+#[cfg(feature = "profiler")]
+pub fn slow_draw_views(window_id: WindowId, draw_start: Instant) -> Option<SlowDrawViews> {
+    SLOW_DRAW_VIEWS
+        .lock()
+        .iter()
+        .rev()
+        .find(|views| views.window_id == window_id && views.draw_start == draw_start)
+        .cloned()
+}
+
 /// Where in a slow draw its views started being timed (see
 /// [`DrawBreakdown::views_timed_from`]).
 #[cfg(feature = "profiler")]

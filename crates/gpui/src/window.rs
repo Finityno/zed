@@ -1341,6 +1341,8 @@ pub struct Window {
     pub(crate) draw_clock: draw_profile::DrawClock,
     #[cfg(feature = "profiler")]
     draw_resources: draw_profile::DrawResourceSampler,
+    #[cfg(feature = "profiler")]
+    view_timer: draw_profile::ViewTimer,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -2287,6 +2289,8 @@ impl Window {
             draw_clock: draw_profile::DrawClock::new(),
             #[cfg(feature = "profiler")]
             draw_resources: draw_profile::DrawResourceSampler::new(),
+            #[cfg(feature = "profiler")]
+            view_timer: draw_profile::ViewTimer::new(),
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
@@ -4097,11 +4101,10 @@ impl Window {
         let scale_factor = self.scale_factor();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         #[cfg(feature = "profiler")]
-        self.draw_clock
-            .mark(draw_profile::DrawClockPhase::RequestLayout);
+        self.mark_draw_phase(draw_profile::DrawClockPhase::RequestLayout);
         let root_layout_id = root_element.request_layout(self, cx);
         #[cfg(feature = "profiler")]
-        self.draw_clock.mark(draw_profile::DrawClockPhase::Prepaint);
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Prepaint);
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -4140,7 +4143,7 @@ impl Window {
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
-        self.draw_clock.mark(draw_profile::DrawClockPhase::Paint);
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Paint);
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -4167,7 +4170,7 @@ impl Window {
         self.paint_inspector_hitbox(cx);
 
         #[cfg(feature = "profiler")]
-        self.draw_clock.mark(draw_profile::DrawClockPhase::Other);
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Other);
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -5939,7 +5942,13 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.rendered_entity_stack.push(id);
+        #[cfg(feature = "profiler")]
+        let timed = self.view_timer.enter();
         let result = f(self);
+        #[cfg(feature = "profiler")]
+        if timed {
+            self.view_timer.exit(id);
+        }
         self.rendered_entity_stack.pop();
         result
     }
