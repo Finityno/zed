@@ -5847,7 +5847,7 @@ impl Window {
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
         #[cfg(feature = "profiler")]
-        self.draw_clock.end_layout(layout_started_at);
+        self.end_draw_layout(layout_started_at);
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
@@ -5943,12 +5943,10 @@ impl Window {
     ) -> R {
         self.rendered_entity_stack.push(id);
         #[cfg(feature = "profiler")]
-        let timed = self.view_timer.enter();
+        self.view_timer.enter();
         let result = f(self);
         #[cfg(feature = "profiler")]
-        if timed {
-            self.view_timer.exit(id);
-        }
+        self.view_timer.exit(id);
         self.rendered_entity_stack.pop();
         result
     }

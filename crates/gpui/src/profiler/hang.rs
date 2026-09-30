@@ -272,8 +272,9 @@ pub enum SerializedHangContributor {
         /// drawing thread's (Linux).
         faults_process_wide: bool,
         /// For a draw whose views were timed, where the timing started:
-        /// `"start"`, `"prepaint"` or `"paint"`. Views rendered before that
-        /// point are not in `top_views`.
+        /// `"start"`, `"prepaint"`, `"layout"` (the end of a layout pass
+        /// part way through prepaint) or `"paint"`. Work done before that
+        /// point is not in `top_views`.
         views_timed_from: Option<&'static str>,
         /// The views that spent the most time of their own in the draw,
         /// longest first; empty when none were recorded.

@@ -33,16 +33,14 @@ impl Window {
         self.draw_clock.begin(draw_start);
         self.draw_resources
             .begin(after_quiet_or_slow, cx.background_executor().dispatcher().as_ref());
-        if time_views {
-            self.view_timer.arm(ViewTimingStart::Start);
-        }
+        // Also disarms a timer a draw that unwound part way left armed.
+        self.view_timer
+            .reset(time_views.then_some(ViewTimingStart::Start));
     }
 
-    /// Moves the draw clock to `phase`. Entering prepaint or paint also
-    /// starts timing views when the draw has already run for half the
-    /// detail threshold, reusing the mark's timestamp; this runs only
-    /// between root-level phases, where no view is being timed, so a view's
-    /// timing never starts halfway through it.
+    /// Moves the draw clock to `phase`. Entering prepaint or paint may also
+    /// start timing views part way through the draw (see
+    /// [`Self::time_views_from_now_if_slow`]), reusing the mark's timestamp.
     pub(super) fn mark_draw_phase(&mut self, phase: DrawClockPhase) {
         let now = self.draw_clock.mark(phase);
         let timed_from = match phase {
@@ -50,13 +48,34 @@ impl Window {
             DrawClockPhase::Paint => ViewTimingStart::Paint,
             DrawClockPhase::Other | DrawClockPhase::RequestLayout => return,
         };
+        self.time_views_from_now_if_slow(now, timed_from);
+    }
+
+    /// Ends a taffy layout pass [`DrawClock::begin_layout`] started. A slow
+    /// draw that did not start out timing its views starts here, part way
+    /// through prepaint, where lists and cache-missed views render: a
+    /// single slow item then leaves the rest of prepaint timed rather than
+    /// only paint. The check reuses the pass's end timestamp.
+    #[inline]
+    pub(super) fn end_draw_layout(&mut self, started_at: Option<Instant>) {
+        if let Some(now) = self.draw_clock.end_layout(started_at) {
+            self.time_views_from_now_if_slow(now, ViewTimingStart::Layout);
+        }
+    }
+
+    /// Under [`ViewTiming::OnSlowDraws`], starts timing views once the draw
+    /// has run for half the detail threshold. The views being drawn at that
+    /// moment are timed from `now` on, so the view whose prepaint turned
+    /// the draw slow is still charged for the rest of it.
+    #[inline]
+    fn time_views_from_now_if_slow(&mut self, now: Instant, timed_from: ViewTimingStart) {
         if !self.view_timer.is_armed()
             && self.draw_clock.active
-            && profiler::view_timing() == ViewTiming::OnSlowDraws
             && self.draw_clock.elapsed(now) >= profiler::draw_detail_threshold() / 2
+            && profiler::view_timing() == ViewTiming::OnSlowDraws
         {
-            debug_assert!(self.rendered_entity_stack.is_empty());
-            self.view_timer.arm(timed_from);
+            self.view_timer
+                .arm_partway(timed_from, now, self.rendered_entity_stack.len());
         }
     }
 
@@ -222,15 +241,14 @@ impl DrawClock {
     }
 
     /// Called as a taffy layout pass ends, with [`Self::begin_layout`]'s
-    /// result.
-    pub(crate) fn end_layout(&mut self, started_at: Option<Instant>) {
-        let Some(started_at) = started_at else {
-            return;
-        };
+    /// result. Returns the pass's end inside a profiled draw.
+    pub(crate) fn end_layout(&mut self, started_at: Option<Instant>) -> Option<Instant> {
+        let started_at = started_at?;
         let now = Instant::now();
         self.layout += now.saturating_duration_since(started_at);
         self.layout_passes = self.layout_passes.saturating_add(1);
         self.phase_started_at = now;
+        Some(now)
     }
 
     /// An entity view called `render`.
@@ -298,9 +316,27 @@ impl ViewTimer {
         }
     }
 
-    fn arm(&mut self, from: ViewTimingStart) {
+    /// Starts a draw: timing from its start when `armed` is set, and
+    /// otherwise disarmed with nothing left over from an earlier draw.
+    fn reset(&mut self, armed: Option<ViewTimingStart>) {
+        self.armed = armed;
         self.stack.clear();
+        if !self.self_times.is_empty() || !self.renders.is_empty() {
+            self.clear();
+        }
+    }
+
+    /// Starts timing part way through a draw, at `now`, while `depth` views
+    /// are being drawn. Those views are timed from `now` on, so the timer's
+    /// stack mirrors the window's stack of views being drawn, and every
+    /// [`Self::exit`] from here on pairs with an entry.
+    fn arm_partway(&mut self, from: ViewTimingStart, now: Instant, depth: usize) {
         self.armed = Some(from);
+        self.stack.clear();
+        self.stack.extend((0..depth).map(|_| TimedView {
+            started_at: now,
+            nested: Duration::ZERO,
+        }));
     }
 
     #[inline]
@@ -308,23 +344,30 @@ impl ViewTimer {
         self.armed.is_some()
     }
 
-    /// A view is being entered; returns whether it is timed, in which case
-    /// [`Self::exit`] must be called when it is left.
+    /// A view is being entered. While timing, every view entered is left
+    /// through [`Self::exit`], and a timer that starts mid-view mirrors the
+    /// views already entered, so enters and exits always pair.
     #[inline]
-    pub(crate) fn enter(&mut self) -> bool {
-        if self.armed.is_none() {
-            return false;
+    pub(crate) fn enter(&mut self) {
+        if self.armed.is_some() {
+            self.stack.push(TimedView {
+                started_at: Instant::now(),
+                nested: Duration::ZERO,
+            });
         }
-        self.stack.push(TimedView {
-            started_at: Instant::now(),
-            nested: Duration::ZERO,
-        });
-        true
     }
 
-    /// The timed view most recently entered is being left.
+    /// The view most recently entered is being left.
+    #[inline]
     pub(crate) fn exit(&mut self, entity_id: EntityId) {
+        if self.armed.is_some() {
+            self.exit_timed(entity_id);
+        }
+    }
+
+    fn exit_timed(&mut self, entity_id: EntityId) {
         let Some(view) = self.stack.pop() else {
+            debug_assert!(false, "a timed view was left that was never entered");
             return;
         };
         let total = view.started_at.elapsed();
@@ -929,6 +972,106 @@ mod tests {
             after.breakdown.views_timed_from(),
             None,
             "once draws are fast again nothing is timed"
+        );
+    }
+
+    const ROW_SPIN: Duration = Duration::from_millis(6);
+
+    /// A list row that spins in its render when asked to.
+    struct Row {
+        spin: Rc<Cell<bool>>,
+    }
+
+    impl Render for Row {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            if self.spin.get() {
+                spin(ROW_SPIN);
+            }
+            div().h(px(10.)).child("row")
+        }
+    }
+
+    /// A list of rows, rendered and laid out one by one during prepaint.
+    struct Rows {
+        rows: Vec<Entity<Row>>,
+        list: ListState,
+    }
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let rows = self.rows.clone();
+            div().size_full().child(
+                list(self.list.clone(), move |index, _, _| {
+                    rows[index].clone().into_any_element()
+                })
+                .h(px(100.)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_draw_slowed_by_a_list_row_times_the_rest_of_prepaint(cx: &mut TestAppContext) {
+        let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::Off);
+        profiler::set_view_timing(ViewTiming::OnSlowDraws);
+        let spin_rows = Rc::new(Cell::new(false));
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), {
+                let spin_rows = spin_rows.clone();
+                move |_, cx| {
+                    let rows = (0..3)
+                        .map(|_| {
+                            let spin = spin_rows.clone();
+                            cx.new(|_| Row { spin })
+                        })
+                        .collect();
+                    cx.new(|_| Rows {
+                        rows,
+                        list: ListState::new(3, ListAlignment::Top, px(0.)),
+                    })
+                }
+            })
+            .unwrap()
+        });
+        let root = window.entity(cx).unwrap();
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_active_status_change(true);
+        let draw = |cx: &mut TestAppContext| {
+            cx.update(|cx| root.update(cx, |_, cx| cx.notify()));
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+            window
+                .update(cx, |_, window, _| window.window_profiler.last_draw())
+                .unwrap()
+                .expect("a draw was recorded")
+        };
+        draw(cx);
+        draw(cx);
+
+        // Half the threshold is under one row's render, and far more than
+        // the draw takes to reach prepaint.
+        profiler::set_draw_detail_threshold(ROW_SPIN + ROW_SPIN / 2);
+        spin_rows.set(true);
+        let slow = draw(cx);
+        assert_eq!(
+            slow.breakdown.views_timed_from(),
+            Some(ViewTimingStart::Layout),
+            "timing starts after the first row's layout pass: {:?}",
+            slow.breakdown
+        );
+        let recorded = profiler::slow_draw_views(window.window_id(), slow.draw_start)
+            .expect("the slow draw's views");
+        let slowest = recorded.views.first().expect("a row spent 6 ms");
+        assert!(
+            slowest.type_name.ends_with("::Row") && slowest.self_time >= ROW_SPIN,
+            "the rows rendered after timing started are named: {recorded:?}"
+        );
+        assert_eq!(
+            recorded
+                .views
+                .iter()
+                .filter(|view| view.type_name.ends_with("::Row"))
+                .count(),
+            2,
+            "the first row rendered before timing started: {recorded:?}"
         );
     }
 }

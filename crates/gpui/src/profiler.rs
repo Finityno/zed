@@ -1121,8 +1121,9 @@ pub enum ViewTiming {
     Off,
     /// A draw is timed from its start when the window's previous draw
     /// reached [`draw_detail_threshold`], which catches a view that is slow
-    /// on every draw. Any other draw starts being timed partway, at the
-    /// start of prepaint or paint, once it has run for half the threshold.
+    /// on every draw. Any other draw starts being timed part way, at the
+    /// start of prepaint, the end of a layout pass or the start of paint,
+    /// once it has run for half the threshold.
     OnSlowDraws,
     /// Every draw, from its start; for investigations and stress runs.
     Always,
@@ -1245,6 +1246,11 @@ pub enum ViewTimingStart {
     /// From the start of prepaint: views rendered while building the root
     /// tree are not attributed.
     Prepaint,
+    /// From the end of a layout pass part way through prepaint, typically
+    /// a list item's or a cache-missed view's: what ran before it,
+    /// including the render that made the draw slow, is not attributed.
+    /// The views being drawn at that moment are charged from then on.
+    Layout,
     /// From the start of paint: only paint is attributed.
     Paint,
 }
@@ -1256,6 +1262,7 @@ impl ViewTimingStart {
         match self {
             Self::Start => "start",
             Self::Prepaint => "prepaint",
+            Self::Layout => "layout",
             Self::Paint => "paint",
         }
     }
