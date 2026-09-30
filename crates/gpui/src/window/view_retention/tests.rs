@@ -1993,6 +1993,59 @@ fn appearance_and_key_bindings_are_dependencies() {
     assert!(renders.get() > settled, "the key bindings changed");
 }
 
+/// A view listing the available actions is built again when an action gets
+/// its first global handler, which the window asks a frame for.
+#[test]
+fn a_new_global_action_handler_is_a_dependency() {
+    struct Reader {
+        seen: Rc<Cell<usize>>,
+        // The actions are asked of the frame before, which the first frame
+        // does not have.
+        ready: bool,
+    }
+    impl Render for Reader {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if self.ready {
+                self.seen.set(window.available_actions(cx).len());
+            }
+            div().child("actions")
+        }
+    }
+    struct Host {
+        reader: Entity<Reader>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.reader.clone())
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let seen = Rc::new(Cell::new(usize::MAX));
+    let window = cx.add_window({
+        let seen = seen.clone();
+        move |_, cx| Host {
+            reader: cx.new(|_| Reader { seen, ready: false }),
+        }
+    });
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let reader = window.read_with(&cx, |host, _| host.reader.clone()).unwrap();
+    reader.update(&mut cx, |reader, cx| {
+        reader.ready = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let before = seen.get();
+    assert_ne!(before, usize::MAX, "the view listed the actions");
+    cx.update(|cx| {
+        cx.on_action(|_: &probe_actions::Probe, _| {});
+    });
+    cx.run_until_parked();
+    assert_eq!(seen.get(), before + 1, "the view listed the new action");
+}
+
 /// A frame that changes which actions are available asks for a follow-up
 /// frame, in which the views that read them are built again: they were drawn
 /// from the actions of the frame before.

@@ -2426,6 +2426,7 @@ impl App {
         &mut self,
         listener: impl Fn(&A, &mut Self) + 'static,
     ) -> &mut Self {
+        let new_action = !self.global_action_listeners.contains_key(&TypeId::of::<A>());
         self.global_action_listeners
             .entry(TypeId::of::<A>())
             .or_default()
@@ -2435,6 +2436,14 @@ impl App {
                     listener(action, cx)
                 }
             }));
+        // The available actions include every action with a global handler,
+        // so views that listed them are built again.
+        if new_action && self.view_retention() {
+            crate::window::view_retention::dependencies::ambient_changed::<
+                crate::window::view_retention::dependencies::ambient::Actions,
+            >(self);
+            self.request_frame_in_every_window();
+        }
         self
     }
 
