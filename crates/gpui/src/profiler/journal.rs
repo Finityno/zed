@@ -60,7 +60,7 @@ const MAX_JOURNAL_ENTRIES: usize = (4 * 1024 * 1024) / core::mem::size_of::<Jour
 // Every byte an entry grows by costs the ring capacity, and the largest
 // entry (a presentation boundary, which carries its drawn frame) sets the
 // slot size for all of them. Grow this deliberately, not by accident.
-const _: () = assert!(core::mem::size_of::<ForegroundJournalEntry>() <= 240);
+const _: () = assert!(core::mem::size_of::<ForegroundJournalEntry>() <= 216);
 
 // Absorbs brief collisions with a collector reading the exact slot being
 // wrapped. The foreground never waits for a reader; queued entries are retried

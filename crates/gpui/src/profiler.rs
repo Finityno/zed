@@ -833,17 +833,12 @@ pub struct DrawBreakdown {
     pub(crate) layout_passes: u16,
     pub(crate) views_rendered: u16,
     pub(crate) views_reused: u16,
-    /// [`DrawResources`]' flag bits, plus [`Self::VIEWS_RECORDED`].
     pub(crate) flags: u8,
-    pub(crate) views_timed_from: Option<ViewTimingStart>,
-    /// [`DrawResources`]' counters, stored flat so the flags share one byte
-    /// and the struct packs into 48 bytes.
-    pub(crate) resource_counts: [u32; 5],
 }
 
 #[cfg(feature = "profiler")]
 impl DrawBreakdown {
-    pub(crate) const VIEWS_RECORDED: u8 = 1 << 7;
+    pub(crate) const DETAIL_RECORDED: u8 = 1 << 0;
 
     /// Building the root element tree.
     pub fn request_layout(&self) -> Duration {
@@ -887,31 +882,6 @@ impl DrawBreakdown {
         self.views_reused
     }
 
-    /// What the draw cost the thread, where the platform measures it. Only
-    /// draws at or above [`draw_detail_threshold`] are measured.
-    pub fn resources(&self) -> DrawResources {
-        let [user_us, system_us, faults, major_faults, decompressions] = self.resource_counts;
-        DrawResources {
-            user_us,
-            system_us,
-            faults,
-            major_faults,
-            decompressions,
-            flags: self.flags & DrawResources::ALL_FLAGS,
-        }
-    }
-
-    pub(crate) fn set_resources(&mut self, resources: DrawResources) {
-        self.resource_counts = [
-            resources.user_us,
-            resources.system_us,
-            resources.faults,
-            resources.major_faults,
-            resources.decompressions,
-        ];
-        self.flags = (self.flags & !DrawResources::ALL_FLAGS) | resources.flags;
-    }
-
     pub(crate) fn phases_us(&self) -> u64 {
         self.request_layout_us as u64
             + self.layout_us as u64
@@ -919,16 +889,11 @@ impl DrawBreakdown {
             + self.paint_us as u64
     }
 
-    /// Whether the draw's slowest views were recorded; fetch them with
-    /// [`slow_draw_views`].
-    pub fn views_recorded(&self) -> bool {
-        self.flags & Self::VIEWS_RECORDED != 0
-    }
-
-    /// For a slow draw whose views were timed, the point in the draw the
-    /// timing started from. Anything rendered earlier is not attributed.
-    pub fn views_timed_from(&self) -> Option<ViewTimingStart> {
-        self.views_timed_from
+    /// Whether the draw reached [`draw_detail_threshold`] and recorded what
+    /// it cost the thread or its slowest views; fetch them with
+    /// [`slow_draw_detail`].
+    pub fn detail_recorded(&self) -> bool {
+        self.flags & Self::DETAIL_RECORDED != 0
     }
 }
 
@@ -955,11 +920,6 @@ impl DrawResources {
     const MAJOR_FAULTS_MEASURED: u8 = 1 << 2;
     const DECOMPRESSIONS_MEASURED: u8 = 1 << 3;
     const FAULTS_PROCESS_WIDE: u8 = 1 << 4;
-    const ALL_FLAGS: u8 = Self::CPU_MEASURED
-        | Self::FAULTS_MEASURED
-        | Self::MAJOR_FAULTS_MEASURED
-        | Self::DECOMPRESSIONS_MEASURED
-        | Self::FAULTS_PROCESS_WIDE;
 
     /// The change between two samples taken on the same thread. Counters
     /// only one of the samples carries are not measured; deltas saturate.
@@ -1135,7 +1095,7 @@ static VIEW_TIMING: AtomicU8 = AtomicU8::new(ViewTiming::OnSlowDraws as u8);
 /// Sets when window draws time their views. A draw that is timed costs two
 /// `Instant::now()` calls per view per phase; a draw that is not costs a
 /// branch per view. Only draws that reach [`draw_detail_threshold`] record
-/// their slowest views, into a buffer [`slow_draw_views`] reads.
+/// their slowest views, into a buffer [`slow_draw_detail`] reads.
 #[cfg(feature = "profiler")]
 pub fn set_view_timing(timing: ViewTiming) {
     VIEW_TIMING.store(timing as u8, Ordering::Relaxed);
@@ -1151,12 +1111,12 @@ pub fn view_timing() -> ViewTiming {
     }
 }
 
-/// How many of a slow draw's views [`SlowDrawViews`] keeps.
+/// How many of a slow draw's views [`SlowDrawDetail`] keeps.
 #[cfg(feature = "profiler")]
 pub const SLOW_DRAW_VIEW_COUNT: usize = 5;
 
 /// The least time of its own a view must have spent in a slow draw to be
-/// recorded in [`SlowDrawViews`].
+/// recorded in [`SlowDrawDetail`].
 #[cfg(feature = "profiler")]
 pub const SLOW_DRAW_VIEW_MIN: Duration = Duration::from_millis(1);
 
@@ -1178,68 +1138,107 @@ pub struct ViewRenderTime {
     pub renders: u16,
 }
 
-/// The slowest views of one slow draw, by their own time, longest first.
+/// What one slow draw recorded beside the journal: what it cost the
+/// drawing thread, and its slowest views by their own time.
 #[cfg(feature = "profiler")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlowDrawViews {
+pub struct SlowDrawDetail {
     /// The window that was drawn.
     pub window_id: WindowId,
     /// When the draw started, which with `window_id` identifies it.
     pub draw_start: Instant,
-    /// Where in the draw the views started being timed.
-    pub timed_from: ViewTimingStart,
+    /// How long the draw took.
+    pub duration: Duration,
+    /// What the draw cost the thread, where the platform and the sampling
+    /// policy measured it.
+    pub resources: DrawResources,
+    /// For a draw whose views were timed, where in it the timing started.
+    /// Anything rendered earlier is not attributed.
+    pub views_timed_from: Option<ViewTimingStart>,
     /// Up to [`SLOW_DRAW_VIEW_COUNT`] views that spent at least
-    /// [`SLOW_DRAW_VIEW_MIN`] of their own.
+    /// [`SLOW_DRAW_VIEW_MIN`] of their own, longest first.
     pub views: heapless::Vec<ViewRenderTime, SLOW_DRAW_VIEW_COUNT>,
 }
 
 // Kept beside the journal rather than in it, so journal slots stay small.
-// Slow draws are rare (at most a few dozen a second while the app is
-// struggling), and hang detection reads these within a second or so.
+// Only draws at the detail threshold record here, but a stretch of them can
+// run at the display's rate while hang detection drains once a second, so
+// the buffer covers about two seconds of 120 Hz slow draws and, once full,
+// replaces the fastest recent draw rather than the oldest (see
+// `push_slow_draw_detail`). About 70 KB.
 #[cfg(feature = "profiler")]
-type SlowDrawViewsBuffer = heapless::Deque<SlowDrawViews, 64>;
+const SLOW_DRAW_DETAIL_CAPACITY: usize = 256;
+
+/// How long a slow draw's detail is kept before any newer slow draw may
+/// replace it, which gives hang detection several drains to read it.
+#[cfg(feature = "profiler")]
+const SLOW_DRAW_DETAIL_RETENTION: Duration = Duration::from_secs(5);
 
 #[cfg(feature = "profiler")]
-static SLOW_DRAW_VIEWS: spin::Mutex<SlowDrawViewsBuffer> =
-    spin::Mutex::new(heapless::Deque::new());
+type SlowDrawDetailBuffer = heapless::Vec<SlowDrawDetail, SLOW_DRAW_DETAIL_CAPACITY>;
 
 #[cfg(feature = "profiler")]
-pub(crate) fn record_slow_draw_views(views: SlowDrawViews) {
-    push_slow_draw_views(&mut SLOW_DRAW_VIEWS.lock(), views);
+static SLOW_DRAW_DETAILS: spin::Mutex<SlowDrawDetailBuffer> =
+    spin::Mutex::new(heapless::Vec::new());
+
+/// Records a slow draw's detail, returning whether it was kept.
+#[cfg(feature = "profiler")]
+pub(crate) fn record_slow_draw_detail(detail: SlowDrawDetail) -> bool {
+    push_slow_draw_detail(&mut SLOW_DRAW_DETAILS.lock(), detail)
 }
 
+/// Adds `detail` to `buffer`. A full buffer replaces its oldest entry once
+/// that is past [`SLOW_DRAW_DETAIL_RETENTION`]; while every entry is
+/// younger, it replaces the fastest draw, or drops `detail` if that is the
+/// fastest. A hang's draws are the slowest around it, so a stretch of
+/// merely slow draws cannot evict them before they are read.
 #[cfg(feature = "profiler")]
-fn push_slow_draw_views(buffer: &mut SlowDrawViewsBuffer, views: SlowDrawViews) {
-    if buffer.is_full() {
-        buffer.pop_front();
+fn push_slow_draw_detail(buffer: &mut SlowDrawDetailBuffer, detail: SlowDrawDetail) -> bool {
+    let detail = match buffer.push(detail) {
+        Ok(()) => return true,
+        Err(detail) => detail,
+    };
+    let Some(oldest) = buffer.iter_mut().min_by_key(|entry| entry.draw_start) else {
+        return false;
+    };
+    let oldest_age = detail
+        .draw_start
+        .saturating_duration_since(oldest.draw_start);
+    if oldest_age >= SLOW_DRAW_DETAIL_RETENTION {
+        *oldest = detail;
+        return true;
     }
-    buffer.push_back(views).ok();
+    match buffer.iter_mut().min_by_key(|entry| entry.duration) {
+        Some(fastest) if fastest.duration < detail.duration => {
+            *fastest = detail;
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(feature = "profiler")]
-fn find_slow_draw_views(
-    buffer: &SlowDrawViewsBuffer,
+fn find_slow_draw_detail(
+    buffer: &SlowDrawDetailBuffer,
     window_id: WindowId,
     draw_start: Instant,
-) -> Option<SlowDrawViews> {
+) -> Option<SlowDrawDetail> {
     buffer
         .iter()
-        .rev()
-        .find(|views| views.window_id == window_id && views.draw_start == draw_start)
+        .find(|detail| detail.window_id == window_id && detail.draw_start == draw_start)
         .cloned()
 }
 
-/// The slowest views of the draw of `window_id` that started at
-/// `draw_start`, if that draw recorded them (see
-/// [`DrawBreakdown::views_recorded`]) and they have not been evicted by 64
-/// newer slow draws since.
+/// The detail of the draw of `window_id` that started at `draw_start`, if
+/// that draw recorded it (see [`DrawBreakdown::detail_recorded`]) and it has
+/// not been replaced since (see `SLOW_DRAW_DETAIL_RETENTION`).
 #[cfg(feature = "profiler")]
-pub fn slow_draw_views(window_id: WindowId, draw_start: Instant) -> Option<SlowDrawViews> {
-    find_slow_draw_views(&SLOW_DRAW_VIEWS.lock(), window_id, draw_start)
+pub fn slow_draw_detail(window_id: WindowId, draw_start: Instant) -> Option<SlowDrawDetail> {
+    find_slow_draw_detail(&SLOW_DRAW_DETAILS.lock(), window_id, draw_start)
 }
 
 /// Where in a slow draw its views started being timed (see
-/// [`DrawBreakdown::views_timed_from`]).
+/// [`SlowDrawDetail::views_timed_from`]).
 #[cfg(feature = "profiler")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ViewTimingStart {
@@ -1862,38 +1861,62 @@ mod tests {
     }
 
     #[test]
-    fn slow_draw_views_are_found_until_evicted() {
-        let mut buffer = SlowDrawViewsBuffer::new();
+    fn a_hangs_detail_outlives_a_stretch_of_slow_draws() {
+        let mut buffer = SlowDrawDetailBuffer::new();
         let start = Instant::now();
-        let slow_draw = |window: u64, draw: u64| SlowDrawViews {
+        let slow_draw = |window: u64, at: Duration, duration_ms: u64| SlowDrawDetail {
             window_id: WindowId::from(window),
-            draw_start: start + Duration::from_millis(draw),
-            timed_from: ViewTimingStart::Start,
+            draw_start: start + at,
+            duration: Duration::from_millis(duration_ms),
+            resources: DrawResources::default(),
+            views_timed_from: None,
             views: heapless::Vec::new(),
         };
-        push_slow_draw_views(&mut buffer, slow_draw(1, 0));
-        push_slow_draw_views(&mut buffer, slow_draw(2, 0));
+        let ms = Duration::from_millis;
+        let hang = slow_draw(1, ms(0), 336);
+        assert!(push_slow_draw_detail(&mut buffer, hang.clone()));
         assert_eq!(
-            find_slow_draw_views(&buffer, WindowId::from(1), start),
-            Some(slow_draw(1, 0))
+            find_slow_draw_detail(&buffer, WindowId::from(1), start),
+            Some(hang.clone())
         );
         assert_eq!(
-            find_slow_draw_views(&buffer, WindowId::from(1), start + Duration::from_millis(1)),
+            find_slow_draw_detail(&buffer, WindowId::from(1), start + ms(1)),
             None,
             "a draw is identified by its window and its start"
         );
 
-        for draw in 1..buffer.capacity() as u64 {
-            push_slow_draw_views(&mut buffer, slow_draw(2, draw));
+        for draw in 1..SLOW_DRAW_DETAIL_CAPACITY as u64 {
+            assert!(push_slow_draw_detail(
+                &mut buffer,
+                slow_draw(2, ms(draw), 10)
+            ));
         }
-        assert_eq!(
-            find_slow_draw_views(&buffer, WindowId::from(1), start),
-            None,
-            "the oldest draw is evicted once the buffer wraps"
-        );
         assert!(
-            find_slow_draw_views(&buffer, WindowId::from(2), start).is_some(),
-            "and only the oldest"
+            !push_slow_draw_detail(&mut buffer, slow_draw(2, ms(300), 10)),
+            "a full buffer of recent draws drops a draw no slower than any of them"
+        );
+        assert!(push_slow_draw_detail(
+            &mut buffer,
+            slow_draw(2, ms(301), 20)
+        ));
+        assert!(
+            find_slow_draw_detail(&buffer, WindowId::from(2), start + ms(301)).is_some(),
+            "and replaces the fastest with a slower one"
+        );
+        assert_eq!(
+            find_slow_draw_detail(&buffer, WindowId::from(1), start),
+            Some(hang),
+            "the hang's detail survives the stretch of slow draws after it"
+        );
+
+        assert!(push_slow_draw_detail(
+            &mut buffer,
+            slow_draw(2, SLOW_DRAW_DETAIL_RETENTION, 10)
+        ));
+        assert_eq!(
+            find_slow_draw_detail(&buffer, WindowId::from(1), start),
+            None,
+            "until it is past retention and the oldest"
         );
     }
 

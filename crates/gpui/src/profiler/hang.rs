@@ -457,24 +457,27 @@ impl SerializedHangContributor {
             },
             ForegroundEvent::Draw(timing) => {
                 let breakdown = timing.breakdown;
-                let resources = breakdown.resources();
-                let top_views = if breakdown.views_recorded() {
-                    super::slow_draw_views(timing.window_id, timing.draw_start)
-                        .map(|recorded| {
-                            recorded
-                                .views
-                                .iter()
-                                .map(|view| SerializedViewTime {
-                                    view: view.type_name,
-                                    self_ms: as_millis(view.self_time),
-                                    renders: view.renders,
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let detail = breakdown
+                    .detail_recorded()
+                    .then(|| super::slow_draw_detail(timing.window_id, timing.draw_start))
+                    .flatten();
+                let resources = detail
+                    .as_ref()
+                    .map(|detail| detail.resources)
+                    .unwrap_or_default();
+                let views_timed_from = detail
+                    .as_ref()
+                    .and_then(|detail| detail.views_timed_from)
+                    .map(super::ViewTimingStart::name);
+                let top_views = detail
+                    .iter()
+                    .flat_map(|detail| &detail.views)
+                    .map(|view| SerializedViewTime {
+                        view: view.type_name,
+                        self_ms: as_millis(view.self_time),
+                        renders: view.renders,
+                    })
+                    .collect();
                 Self::Draw {
                     window_id: timing.window_id.as_u64(),
                     start_ms: since_startup(timing.draw_start),
@@ -495,7 +498,7 @@ impl SerializedHangContributor {
                     major_faults: resources.major_faults(),
                     decompressions: resources.decompressions(),
                     faults_process_wide: resources.faults_process_wide(),
-                    views_timed_from: breakdown.views_timed_from().map(super::ViewTimingStart::name),
+                    views_timed_from,
                     top_views,
                     depth,
                 }
@@ -874,7 +877,7 @@ mod tests {
         let startup = scheduler::Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let measured_window = WindowId::from(0xD4A3);
-        let mut breakdown = crate::DrawBreakdown {
+        let breakdown = crate::DrawBreakdown {
             request_layout_us: 3_100,
             layout_us: 12_400,
             prepaint_us: 180_300,
@@ -883,9 +886,7 @@ mod tests {
             layout_passes: 41,
             views_rendered: 7,
             views_reused: 3,
-            views_timed_from: Some(crate::ViewTimingStart::Start),
-            flags: crate::DrawBreakdown::VIEWS_RECORDED,
-            ..Default::default()
+            flags: crate::DrawBreakdown::DETAIL_RECORDED,
         };
         let sample = |user_us: u64, system_us: u64, faults: u64, decompressions: u64| {
             crate::ResourceSample {
@@ -897,10 +898,6 @@ mod tests {
                 fault_scope: crate::FaultScope::Process,
             }
         };
-        breakdown.set_resources(crate::DrawResources::between(
-            &sample(1_000, 2_000, 100, 7),
-            &sample(41_100, 152_200, 48_311, 47_907),
-        ));
         let measured = FrameTiming {
             window_id: measured_window,
             dirty_at: Some(at(990)),
@@ -909,17 +906,24 @@ mod tests {
             draw_end: at(1220),
             breakdown,
         };
-        crate::profiler::record_slow_draw_views(crate::SlowDrawViews {
-            window_id: measured_window,
-            draw_start: measured.draw_start,
-            timed_from: crate::ViewTimingStart::Start,
-            views: heapless::Vec::from_slice(&[crate::ViewRenderTime {
-                type_name: "chat::ChatPanel",
-                self_time: Duration::from_micros(150_200),
-                renders: 1,
-            }])
-            .expect("one view fits"),
-        });
+        assert!(crate::profiler::record_slow_draw_detail(
+            crate::SlowDrawDetail {
+                window_id: measured_window,
+                draw_start: measured.draw_start,
+                duration: measured.draw_duration(),
+                resources: crate::DrawResources::between(
+                    &sample(1_000, 2_000, 100, 7),
+                    &sample(41_100, 152_200, 48_311, 47_907),
+                ),
+                views_timed_from: Some(crate::ViewTimingStart::Start),
+                views: heapless::Vec::from_slice(&[crate::ViewRenderTime {
+                    type_name: "chat::ChatPanel",
+                    self_time: Duration::from_micros(150_200),
+                    renders: 1,
+                }])
+                .expect("one view fits"),
+            }
+        ));
         let unmeasured_window = WindowId::from(0xD4A4);
         let unmeasured = FrameTiming {
             window_id: unmeasured_window,
@@ -929,7 +933,7 @@ mod tests {
             draw_end: at(1500),
             breakdown: crate::DrawBreakdown {
                 other_us: 200_000,
-                flags: crate::DrawBreakdown::VIEWS_RECORDED,
+                flags: crate::DrawBreakdown::DETAIL_RECORDED,
                 ..Default::default()
             },
         };

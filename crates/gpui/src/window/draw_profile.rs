@@ -12,7 +12,7 @@ use collections::FxHashMap;
 
 use crate::{
     App, DRAW_QUIET_GAP, DrawBreakdown, DrawResourceSampling, DrawResources, EntityId,
-    PlatformDispatcher, ResourceSample, SLOW_DRAW_VIEW_COUNT, SLOW_DRAW_VIEW_MIN, SlowDrawViews,
+    PlatformDispatcher, ResourceSample, SLOW_DRAW_VIEW_COUNT, SLOW_DRAW_VIEW_MIN, SlowDrawDetail,
     ViewRenderTime, ViewTiming, ViewTimingStart, Window, profiler, view::ViewName,
 };
 
@@ -90,7 +90,7 @@ impl Window {
 
     /// Ends the profiler's record of a draw and returns its duration. A draw
     /// that took at least [`profiler::draw_detail_threshold`] also records
-    /// what it cost the thread.
+    /// what it cost the thread and, when they were timed, its slowest views.
     pub(super) fn end_draw_profile(
         &mut self,
         dirty_at: Option<Instant>,
@@ -98,29 +98,28 @@ impl Window {
         cx: &App,
     ) -> Duration {
         let now = Instant::now();
-        let slow = self.draw_clock.elapsed(now) >= profiler::draw_detail_threshold();
+        let duration = self.draw_clock.elapsed(now);
+        let slow = duration >= profiler::draw_detail_threshold();
         let resources = self
             .draw_resources
             .finish(slow, cx.background_executor().dispatcher().as_ref());
         let draw_start = self.draw_clock.draw_start;
         let mut breakdown = self.draw_clock.finish(now, slow);
-        if let Some(resources) = resources {
-            breakdown.set_resources(resources);
-        }
-        if let Some(timed_from) = self.view_timer.finish() {
-            if slow {
-                breakdown.views_timed_from = Some(timed_from);
-                let views = self.view_timer.slowest_views();
-                if !views.is_empty() {
-                    profiler::record_slow_draw_views(SlowDrawViews {
-                        window_id: self.handle.window_id(),
-                        draw_start,
-                        timed_from,
-                        views,
-                    });
-                    breakdown.flags |= DrawBreakdown::VIEWS_RECORDED;
-                }
+        let views_timed_from = self.view_timer.finish();
+        if slow && (resources.is_some() || views_timed_from.is_some()) {
+            let recorded = profiler::record_slow_draw_detail(SlowDrawDetail {
+                window_id: self.handle.window_id(),
+                draw_start,
+                duration,
+                resources: resources.unwrap_or_default(),
+                views_timed_from,
+                views: self.view_timer.slowest_views(),
+            });
+            if recorded {
+                breakdown.flags |= DrawBreakdown::DETAIL_RECORDED;
             }
+        }
+        if views_timed_from.is_some() {
             self.view_timer.clear();
         }
         self.window_profiler
@@ -489,11 +488,11 @@ mod tests {
 
     use super::ViewTimer;
     use crate::{
-        AppContext as _, Context, DRAW_QUIET_GAP, DrawResourceSampling, Entity, FaultScope,
-        FrameTiming, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
-        RequestFrameOptions, ResourceSample, SLOW_DRAW_VIEW_MIN, SlowDrawViews, Style, Styled as _,
-        TestAppContext, TestWindow, ViewTiming, ViewTimingStart, Window, WindowHandle,
-        WindowOptions, div, list, profiler, px, size, view::ViewName,
+        AppContext as _, Context, DRAW_QUIET_GAP, DrawResourceSampling, DrawResources, Entity,
+        FaultScope, FrameTiming, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
+        RequestFrameOptions, ResourceSample, SLOW_DRAW_VIEW_MIN, SlowDrawDetail, Style,
+        Styled as _, TestAppContext, TestWindow, ViewTiming, ViewTimingStart, Window, WindowHandle,
+        WindowId, WindowOptions, div, list, profiler, px, size, view::ViewName,
     };
 
     const SPIN: Duration = Duration::from_millis(3);
@@ -819,7 +818,8 @@ mod tests {
 
         cx.dispatcher
             .script_draw_resource_samples([sample(1, 2, 1000), sample(4, 7, 5100)]);
-        let resources = fixture.redraw(&fixture.worker, cx).breakdown.resources();
+        let measured = fixture.redraw(&fixture.worker, cx);
+        let resources = fixture.resources(&measured);
         assert_eq!(cx.dispatcher.take_draw_resource_requests(), [true, true]);
         assert_eq!(resources.user_cpu(), Some(Duration::from_millis(3)));
         assert_eq!(resources.system_cpu(), Some(Duration::from_millis(5)));
@@ -828,7 +828,8 @@ mod tests {
         assert_eq!(resources.decompressions(), Some(2050));
         assert!(resources.faults_process_wide());
 
-        let unmeasured = fixture.redraw(&fixture.worker, cx).breakdown.resources();
+        let unmeasured = fixture.redraw(&fixture.worker, cx);
+        let unmeasured = fixture.resources(&unmeasured);
         assert_eq!(
             unmeasured,
             Default::default(),
@@ -846,13 +847,13 @@ mod tests {
 
         cx.dispatcher
             .script_draw_resource_samples([sample(1, 2, 1000), sample(4, 7, 5100)]);
-        let resources = fixture.redraw(&fixture.worker, cx).breakdown.resources();
+        let fast = fixture.redraw(&fixture.worker, cx);
         assert_eq!(
             cx.dispatcher.take_draw_resource_requests(),
             [false],
             "only the thread-CPU start sample is read"
         );
-        assert_eq!(resources.user_cpu(), None, "and nothing is recorded");
+        assert_eq!(fixture.detail(&fast), None, "and nothing is recorded");
     }
 
     #[gpui::test]
@@ -899,14 +900,31 @@ mod tests {
         drop(knobs);
     }
 
-    fn recorded_views(fixture: &Fixture, timing: &FrameTiming) -> Option<SlowDrawViews> {
-        let views = profiler::slow_draw_views(fixture.window.window_id(), timing.draw_start);
+    fn recorded_detail(window: WindowId, timing: &FrameTiming) -> Option<SlowDrawDetail> {
+        let detail = profiler::slow_draw_detail(window, timing.draw_start);
         assert_eq!(
-            views.is_some(),
-            timing.breakdown.views_recorded(),
-            "the breakdown's flag matches the recorded views"
+            detail.is_some(),
+            timing.breakdown.detail_recorded(),
+            "the breakdown's flag matches the recorded detail"
         );
-        views
+        detail
+    }
+
+    impl Fixture {
+        fn detail(&self, timing: &FrameTiming) -> Option<SlowDrawDetail> {
+            recorded_detail(self.window.window_id(), timing)
+        }
+
+        fn resources(&self, timing: &FrameTiming) -> DrawResources {
+            self.detail(timing)
+                .map(|detail| detail.resources)
+                .unwrap_or_default()
+        }
+
+        fn views_timed_from(&self, timing: &FrameTiming) -> Option<ViewTimingStart> {
+            self.detail(timing)
+                .and_then(|detail| detail.views_timed_from)
+        }
     }
 
     #[gpui::test]
@@ -917,12 +935,8 @@ mod tests {
 
         fixture.spin_in.set(SpinIn::Render);
         let slow = fixture.redraw(&fixture.worker, cx);
-        assert_eq!(
-            slow.breakdown.views_timed_from(),
-            Some(ViewTimingStart::Start)
-        );
-        let recorded = recorded_views(&fixture, &slow).expect("the slow draw's views");
-        assert_eq!(recorded.timed_from, ViewTimingStart::Start);
+        let recorded = fixture.detail(&slow).expect("the slow draw's views");
+        assert_eq!(recorded.views_timed_from, Some(ViewTimingStart::Start));
         let slowest = recorded.views.first().expect("a view spent 3 ms");
         assert!(
             slowest.type_name.ends_with("::Worker"),
@@ -948,30 +962,30 @@ mod tests {
         let fixture = open_window(cx);
 
         let fast = fixture.redraw(&fixture.worker, cx);
-        assert_eq!(fast.breakdown.views_timed_from(), None);
-        assert_eq!(recorded_views(&fixture, &fast), None, "a fast draw records nothing");
+        assert_eq!(fixture.detail(&fast), None, "a fast draw records nothing");
 
         profiler::set_draw_detail_threshold(Duration::from_millis(1));
         fixture.spin_in.set(SpinIn::Render);
         let first_slow = fixture.redraw(&fixture.worker, cx);
+        let first_slow = fixture.detail(&first_slow).expect("the slow draw's detail");
         assert_eq!(
-            first_slow.breakdown.views_timed_from(),
+            first_slow.views_timed_from,
             Some(ViewTimingStart::Prepaint),
             "a draw that ran long while building the tree is timed from prepaint"
         );
         assert_eq!(
-            recorded_views(&fixture, &first_slow),
-            None,
+            first_slow.views.len(),
+            0,
             "which misses the render that made it slow"
         );
 
         let repeat = fixture.redraw(&fixture.worker, cx);
         assert_eq!(
-            repeat.breakdown.views_timed_from(),
+            fixture.views_timed_from(&repeat),
             Some(ViewTimingStart::Start),
             "the draw after a slow one is timed from its start"
         );
-        let recorded = recorded_views(&fixture, &repeat).expect("the repeat's views");
+        let recorded = fixture.detail(&repeat).expect("the repeat's views");
         assert!(recorded.views[0].type_name.ends_with("::Worker"), "{recorded:?}");
 
         fixture.spin_in.set(SpinIn::Nowhere);
@@ -979,7 +993,7 @@ mod tests {
         fixture.redraw(&fixture.worker, cx);
         let after = fixture.redraw(&fixture.worker, cx);
         assert_eq!(
-            after.breakdown.views_timed_from(),
+            fixture.views_timed_from(&after),
             None,
             "once draws are fast again nothing is timed"
         );
@@ -995,11 +1009,8 @@ mod tests {
         profiler::set_draw_detail_threshold(Duration::from_millis(1));
         fixture.spin_in.set(SpinIn::RenderAndPaint);
         let slow = fixture.redraw(&fixture.worker, cx);
-        assert_eq!(
-            slow.breakdown.views_timed_from(),
-            Some(ViewTimingStart::Prepaint)
-        );
-        let recorded = recorded_views(&fixture, &slow).expect("the slow paint's view");
+        let recorded = fixture.detail(&slow).expect("the slow paint's view");
+        assert_eq!(recorded.views_timed_from, Some(ViewTimingStart::Prepaint));
         let slowest = recorded.views.first().expect("a view spent 3 ms painting");
         assert!(
             slowest.type_name.ends_with("::Worker") && slowest.self_time >= SPIN,
@@ -1107,14 +1118,12 @@ mod tests {
         profiler::set_draw_detail_threshold(ROW_SPIN + ROW_SPIN / 2);
         spin_rows.set(true);
         let slow = draw(cx);
+        let recorded = recorded_detail(window.window_id(), &slow).expect("the slow draw's views");
         assert_eq!(
-            slow.breakdown.views_timed_from(),
+            recorded.views_timed_from,
             Some(ViewTimingStart::Layout),
-            "timing starts after the first row's layout pass: {:?}",
-            slow.breakdown
+            "timing starts after the first row's layout pass: {recorded:?}"
         );
-        let recorded = profiler::slow_draw_views(window.window_id(), slow.draw_start)
-            .expect("the slow draw's views");
         let slowest = recorded.views.first().expect("a row spent 6 ms");
         assert!(
             slowest.type_name.ends_with("::Row") && slowest.self_time >= ROW_SPIN,
