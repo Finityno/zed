@@ -1339,6 +1339,8 @@ pub struct Window {
     window_profiler: profiler::WindowProfiler,
     #[cfg(feature = "profiler")]
     pub(crate) draw_clock: draw_profile::DrawClock,
+    #[cfg(feature = "profiler")]
+    draw_resources: draw_profile::DrawResourceSampler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -2283,6 +2285,8 @@ impl Window {
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             #[cfg(feature = "profiler")]
             draw_clock: draw_profile::DrawClock::new(),
+            #[cfg(feature = "profiler")]
+            draw_resources: draw_profile::DrawResourceSampler::new(),
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
@@ -3710,10 +3714,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         let frame_dirty = self.invalidator.take_frame_dirty();
         #[cfg(feature = "profiler")]
-        {
-            let draw_start = self.window_profiler.begin_draw();
-            self.draw_clock.begin(draw_start);
-        }
+        self.begin_draw_profile(cx);
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
@@ -3867,12 +3868,8 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         {
-            let breakdown = self.draw_clock.finish(Instant::now());
-            let draw_duration = self.window_profiler.end_draw(
-                frame_dirty.dirty_at,
-                frame_dirty.invalidations,
-                breakdown,
-            );
+            let draw_duration =
+                self.end_draw_profile(frame_dirty.dirty_at, frame_dirty.invalidations, cx);
             self.debug_frame_overlay.record_frame(draw_duration);
         }
 

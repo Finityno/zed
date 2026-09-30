@@ -15,6 +15,8 @@ use std::{
     thread::ThreadId,
     time::Duration,
 };
+#[cfg(feature = "profiler")]
+use std::sync::atomic::AtomicU8;
 
 mod actions;
 #[cfg(feature = "profiler")]
@@ -899,6 +901,17 @@ impl DrawBreakdown {
         }
     }
 
+    pub(crate) fn set_resources(&mut self, resources: DrawResources) {
+        self.resource_counts = [
+            resources.user_us,
+            resources.system_us,
+            resources.faults,
+            resources.major_faults,
+            resources.decompressions,
+        ];
+        self.flags = (self.flags & !DrawResources::ALL_FLAGS) | resources.flags;
+    }
+
     pub(crate) fn phases_us(&self) -> u64 {
         self.request_layout_us as u64
             + self.layout_us as u64
@@ -948,6 +961,43 @@ impl DrawResources {
         | Self::DECOMPRESSIONS_MEASURED
         | Self::FAULTS_PROCESS_WIDE;
 
+    /// The change between two samples taken on the same thread. Counters
+    /// only one of the samples carries are not measured; deltas saturate.
+    pub(crate) fn between(start: &crate::ResourceSample, end: &crate::ResourceSample) -> Self {
+        fn micros(duration: Duration) -> u32 {
+            duration.as_micros().min(u32::MAX as u128) as u32
+        }
+        fn count(start: Option<u64>, end: Option<u64>) -> Option<u32> {
+            Some(end?.saturating_sub(start?).min(u32::MAX as u64) as u32)
+        }
+
+        let mut resources = Self {
+            user_us: micros(end.user.saturating_sub(start.user)),
+            system_us: micros(end.system.saturating_sub(start.system)),
+            flags: Self::CPU_MEASURED,
+            ..Self::default()
+        };
+        if let Some(faults) = count(start.faults, end.faults) {
+            resources.faults = faults;
+            resources.flags |= Self::FAULTS_MEASURED;
+        }
+        if let Some(major_faults) = count(start.major_faults, end.major_faults) {
+            resources.major_faults = major_faults;
+            resources.flags |= Self::MAJOR_FAULTS_MEASURED;
+        }
+        if let Some(decompressions) = count(start.decompressions, end.decompressions) {
+            resources.decompressions = decompressions;
+            resources.flags |= Self::DECOMPRESSIONS_MEASURED;
+        }
+        if resources.flags & (Self::FAULTS_MEASURED | Self::MAJOR_FAULTS_MEASURED) != 0
+            && (start.fault_scope == crate::FaultScope::Process
+                || end.fault_scope == crate::FaultScope::Process)
+        {
+            resources.flags |= Self::FAULTS_PROCESS_WIDE;
+        }
+        resources
+    }
+
     fn measured(&self, flag: u8) -> bool {
         self.flags & flag != 0
     }
@@ -991,6 +1041,75 @@ impl DrawResources {
     pub fn faults_process_wide(&self) -> bool {
         self.measured(Self::FAULTS_PROCESS_WIDE)
     }
+}
+
+/// When a window draw reads the thread's resource counters (see
+/// [`DrawResources`] and [`set_draw_resource_sampling`]).
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DrawResourceSampling {
+    /// Never.
+    Off,
+    /// The thread's CPU time only, which costs well under a microsecond a
+    /// draw on macOS.
+    ThreadCpu,
+    /// The thread's CPU time, plus the process-wide fault counters when the
+    /// window's last draw ended at least [`DRAW_QUIET_GAP`] ago or was
+    /// slow. Those are the draws most likely to stall on memory that was
+    /// compressed or paged out while the app sat idle, and it keeps the
+    /// costlier reads off the draws of a steady animation.
+    AfterQuiet,
+    /// The thread's CPU time and the process-wide fault counters on every
+    /// draw. About 2 µs a draw on macOS with 150 threads; for
+    /// investigations.
+    Always,
+}
+
+#[cfg(feature = "profiler")]
+static DRAW_RESOURCE_SAMPLING: AtomicU8 = AtomicU8::new(DrawResourceSampling::AfterQuiet as u8);
+
+/// Sets when window draws read resource counters. Every draw reads its
+/// start sample under this policy; only draws that take at least
+/// [`draw_detail_threshold`] read an end sample and record the difference.
+#[cfg(feature = "profiler")]
+pub fn set_draw_resource_sampling(sampling: DrawResourceSampling) {
+    DRAW_RESOURCE_SAMPLING.store(sampling as u8, Ordering::Relaxed);
+}
+
+/// The policy [`set_draw_resource_sampling`] set; `AfterQuiet` by default.
+#[cfg(feature = "profiler")]
+pub fn draw_resource_sampling() -> DrawResourceSampling {
+    match DRAW_RESOURCE_SAMPLING.load(Ordering::Relaxed) {
+        0 => DrawResourceSampling::Off,
+        1 => DrawResourceSampling::ThreadCpu,
+        3 => DrawResourceSampling::Always,
+        _ => DrawResourceSampling::AfterQuiet,
+    }
+}
+
+/// How long a window must have gone without drawing for
+/// [`DrawResourceSampling::AfterQuiet`] to read the process-wide counters.
+#[cfg(feature = "profiler")]
+pub const DRAW_QUIET_GAP: Duration = Duration::from_millis(250);
+
+#[cfg(feature = "profiler")]
+static DRAW_DETAIL_THRESHOLD_MICROS: AtomicU64 = AtomicU64::new(8_000);
+
+/// Sets how long a draw must take for its detail (its resource counters,
+/// and its slowest views when those are timed) to be recorded. 8 ms by
+/// default.
+#[cfg(feature = "profiler")]
+pub fn set_draw_detail_threshold(threshold: Duration) {
+    DRAW_DETAIL_THRESHOLD_MICROS.store(
+        threshold.as_micros().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// The threshold [`set_draw_detail_threshold`] set.
+#[cfg(feature = "profiler")]
+pub fn draw_detail_threshold() -> Duration {
+    Duration::from_micros(DRAW_DETAIL_THRESHOLD_MICROS.load(Ordering::Relaxed))
 }
 
 /// Where in a slow draw its views started being timed (see

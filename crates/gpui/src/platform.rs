@@ -908,6 +908,38 @@ pub struct PresentReport {
     pub breakdown: PresentBreakdown,
 }
 
+/// Whose memory faults a [`ResourceSample`]'s fault counters count.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub enum FaultScope {
+    /// The sampling thread's own faults.
+    #[default]
+    Thread,
+    /// The whole process's faults, background threads' included.
+    Process,
+}
+
+/// A reading of the calling thread's CPU time and, where the platform can
+/// read them cheaply, memory-fault counters (see
+/// [`PlatformDispatcher::sample_draw_resources`]). Counters are cumulative;
+/// the difference between two samples is what happened in between.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub struct ResourceSample {
+    /// CPU time the thread has spent in user mode.
+    pub user: Duration,
+    /// CPU time the thread has spent in the kernel. On macOS, decompressing
+    /// compressed memory on a fault runs in the faulting thread and is
+    /// charged here.
+    pub system: Duration,
+    /// Page faults, of any kind. `None` when not read.
+    pub faults: Option<u64>,
+    /// Faults that read from disk (macOS: page-ins; Linux: major faults).
+    pub major_faults: Option<u64>,
+    /// Pages decompressed from the memory compressor (macOS only).
+    pub decompressions: Option<u64>,
+    /// Whose faults `faults` and `major_faults` count.
+    pub fault_scope: FaultScope,
+}
+
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
 ///
 /// `Inactive` means visible but not receiving input (a system dialog on
@@ -1327,6 +1359,20 @@ pub trait PlatformDispatcher: Send + Sync {
 
     fn prevent_app_nap(&self, _reason: &str) -> ActivityGuard {
         ActivityGuard::noop()
+    }
+
+    /// Reads the calling thread's CPU time and, when `process_counters` is
+    /// set, the fault counters that cost more to read, for a window draw's
+    /// resource accounting. Platforms that read thread-scoped fault counters
+    /// as cheaply as the CPU time may return them regardless.
+    ///
+    /// Called on the main thread at the start of every draw and at the end
+    /// of a slow one, so it must cost at most a few microseconds. `None`
+    /// means the platform does not measure this; a platform whose thread
+    /// times are too coarse to split one draw (Windows' are 15.6 ms ticks)
+    /// should report `None` rather than mislead.
+    fn sample_draw_resources(&self, _process_counters: bool) -> Option<ResourceSample> {
+        None
     }
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]

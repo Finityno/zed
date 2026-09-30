@@ -8,7 +8,47 @@ use std::time::Duration;
 
 use scheduler::Instant;
 
-use crate::DrawBreakdown;
+use crate::{
+    App, DRAW_QUIET_GAP, DrawBreakdown, DrawResourceSampling, DrawResources, PlatformDispatcher,
+    ResourceSample, Window, profiler,
+};
+
+impl Window {
+    /// Starts the profiler's record of a draw: the phase clock and, under the
+    /// sampling policy, the thread's resource counters.
+    pub(super) fn begin_draw_profile(&mut self, cx: &App) {
+        let draw_start = self.window_profiler.begin_draw();
+        let after_quiet_or_slow = self.draw_clock.previous_draw_slow
+            || self.draw_clock.last_draw_end.is_none_or(|last_draw_end| {
+                draw_start.saturating_duration_since(last_draw_end) >= DRAW_QUIET_GAP
+            });
+        self.draw_clock.begin(draw_start);
+        self.draw_resources
+            .begin(after_quiet_or_slow, cx.background_executor().dispatcher().as_ref());
+    }
+
+    /// Ends the profiler's record of a draw and returns its duration. A draw
+    /// that took at least [`profiler::draw_detail_threshold`] also records
+    /// what it cost the thread.
+    pub(super) fn end_draw_profile(
+        &mut self,
+        dirty_at: Option<Instant>,
+        invalidations: u64,
+        cx: &App,
+    ) -> Duration {
+        let now = Instant::now();
+        let slow = self.draw_clock.elapsed(now) >= profiler::draw_detail_threshold();
+        let resources = self
+            .draw_resources
+            .finish(slow, cx.background_executor().dispatcher().as_ref());
+        let mut breakdown = self.draw_clock.finish(now, slow);
+        if let Some(resources) = resources {
+            breakdown.set_resources(resources);
+        }
+        self.window_profiler
+            .end_draw(dirty_at, invalidations, breakdown)
+    }
+}
 
 /// The draw phase the clock is currently charging.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -25,6 +65,12 @@ pub(crate) enum DrawClockPhase {
 /// of whichever phase they run in (see [`Self::begin_layout`]).
 pub(crate) struct DrawClock {
     active: bool,
+    draw_start: Instant,
+    /// When the window's previous draw ended; kept across draws.
+    last_draw_end: Option<Instant>,
+    /// Whether the window's previous draw reached the detail threshold;
+    /// kept across draws.
+    previous_draw_slow: bool,
     phase: DrawClockPhase,
     phase_started_at: Instant,
     request_layout: Duration,
@@ -38,10 +84,14 @@ pub(crate) struct DrawClock {
 
 impl DrawClock {
     pub(crate) fn new() -> Self {
+        let now = Instant::now();
         Self {
             active: false,
+            draw_start: now,
+            last_draw_end: None,
+            previous_draw_slow: false,
             phase: DrawClockPhase::Other,
-            phase_started_at: Instant::now(),
+            phase_started_at: now,
             request_layout: Duration::ZERO,
             layout: Duration::ZERO,
             prepaint: Duration::ZERO,
@@ -57,9 +107,24 @@ impl DrawClock {
     pub(crate) fn begin(&mut self, draw_start: Instant) {
         *self = Self {
             active: true,
+            draw_start,
+            last_draw_end: self.last_draw_end,
+            previous_draw_slow: self.previous_draw_slow,
+            phase: DrawClockPhase::Other,
             phase_started_at: draw_start,
-            ..Self::new()
+            request_layout: Duration::ZERO,
+            layout: Duration::ZERO,
+            prepaint: Duration::ZERO,
+            paint: Duration::ZERO,
+            layout_passes: 0,
+            views_rendered: 0,
+            views_reused: 0,
         };
+    }
+
+    /// How long the current draw has run.
+    pub(crate) fn elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.draw_start)
     }
 
     fn charge(&mut self, until: Instant) {
@@ -125,11 +190,15 @@ impl DrawClock {
 
     /// Ends the draw at `now` and returns its breakdown. `other` is left for
     /// [`crate::WindowProfiler::end_draw`], which knows the draw's end.
-    pub(crate) fn finish(&mut self, now: Instant) -> DrawBreakdown {
+    /// `slow` records whether the draw reached the detail threshold, for
+    /// the next draw's sampling decisions.
+    pub(crate) fn finish(&mut self, now: Instant, slow: bool) -> DrawBreakdown {
         if self.active {
             self.charge(now);
         }
         self.active = false;
+        self.last_draw_end = Some(now);
+        self.previous_draw_slow = slow;
         fn micros(duration: Duration) -> u32 {
             duration.as_micros().min(u32::MAX as u128) as u32
         }
@@ -146,6 +215,53 @@ impl DrawClock {
     }
 }
 
+/// Reads the thread's resource counters at the start of a draw, and again
+/// at the end of a slow one.
+pub(crate) struct DrawResourceSampler {
+    start: Option<ResourceSample>,
+    process_counters: bool,
+}
+
+impl DrawResourceSampler {
+    pub(crate) fn new() -> Self {
+        Self {
+            start: None,
+            process_counters: false,
+        }
+    }
+
+    /// Takes the start sample under the sampling policy. `after_quiet_or_slow`
+    /// says whether the window's last draw ended at least
+    /// [`DRAW_QUIET_GAP`] ago or was slow.
+    fn begin(&mut self, after_quiet_or_slow: bool, dispatcher: &dyn PlatformDispatcher) {
+        self.process_counters = match profiler::draw_resource_sampling() {
+            DrawResourceSampling::Off => {
+                self.start = None;
+                return;
+            }
+            DrawResourceSampling::ThreadCpu => false,
+            DrawResourceSampling::AfterQuiet => after_quiet_or_slow,
+            DrawResourceSampling::Always => true,
+        };
+        self.start = dispatcher.sample_draw_resources(self.process_counters);
+    }
+
+    /// For a slow draw with a start sample, takes the end sample and returns
+    /// the difference. A fast draw costs nothing here.
+    fn finish(
+        &mut self,
+        slow: bool,
+        dispatcher: &dyn PlatformDispatcher,
+    ) -> Option<DrawResources> {
+        let start = self.start.take()?;
+        if !slow {
+            return None;
+        }
+        let end = dispatcher.sample_draw_resources(self.process_counters)?;
+        Some(DrawResources::between(&start, &end))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, rc::Rc, time::Duration};
@@ -153,12 +269,53 @@ mod tests {
     use scheduler::Instant;
 
     use crate::{
-        AppContext as _, Context, Entity, FrameTiming, IntoElement, ListAlignment, ListState,
-        ParentElement as _, Render, RequestFrameOptions, Style, Styled as _, TestAppContext,
-        TestWindow, Window, WindowHandle, WindowOptions, div, list, px, size,
+        AppContext as _, Context, DRAW_QUIET_GAP, DrawResourceSampling, Entity, FaultScope,
+        FrameTiming, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
+        RequestFrameOptions, ResourceSample, Style, Styled as _, TestAppContext, TestWindow,
+        Window, WindowHandle, WindowOptions, div, list, profiler, px, size,
     };
 
     const SPIN: Duration = Duration::from_millis(3);
+
+    /// Serializes the tests that change the process-wide draw profiling
+    /// knobs, and restores the defaults when dropped.
+    struct Knobs {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static KNOBS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl Knobs {
+        fn set(detail_threshold: Duration, sampling: DrawResourceSampling) -> Self {
+            let lock = KNOBS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            profiler::set_draw_detail_threshold(detail_threshold);
+            profiler::set_draw_resource_sampling(sampling);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for Knobs {
+        fn drop(&mut self) {
+            profiler::set_draw_detail_threshold(Duration::from_millis(8));
+            profiler::set_draw_resource_sampling(DrawResourceSampling::AfterQuiet);
+        }
+    }
+
+    const EVERY_DRAW_IS_SLOW: Duration = Duration::ZERO;
+    const NO_DRAW_IS_SLOW: Duration = Duration::from_secs(3600);
+
+    fn sample(user_ms: u64, system_ms: u64, faults: u64) -> ResourceSample {
+        ResourceSample {
+            user: Duration::from_millis(user_ms),
+            system: Duration::from_millis(system_ms),
+            faults: Some(faults),
+            major_faults: Some(faults / 100),
+            decompressions: Some(faults / 2),
+            fault_scope: FaultScope::Process,
+        }
+    }
 
     fn spin(duration: Duration) {
         let started_at = Instant::now();
@@ -426,5 +583,93 @@ mod tests {
         );
         assert!(breakdown.request_layout() < SPIN, "{breakdown:?}");
         assert!(breakdown.prepaint() < SPIN, "{breakdown:?}");
+    }
+
+    #[gpui::test]
+    fn a_slow_draw_records_what_it_cost_the_thread(cx: &mut TestAppContext) {
+        let _knobs = Knobs::set(EVERY_DRAW_IS_SLOW, DrawResourceSampling::Always);
+        let fixture = open_window(cx);
+        cx.dispatcher.take_draw_resource_requests();
+
+        cx.dispatcher
+            .script_draw_resource_samples([sample(1, 2, 1000), sample(4, 7, 5100)]);
+        let resources = fixture.redraw(&fixture.worker, cx).breakdown.resources();
+        assert_eq!(cx.dispatcher.take_draw_resource_requests(), [true, true]);
+        assert_eq!(resources.user_cpu(), Some(Duration::from_millis(3)));
+        assert_eq!(resources.system_cpu(), Some(Duration::from_millis(5)));
+        assert_eq!(resources.faults(), Some(4100));
+        assert_eq!(resources.major_faults(), Some(41));
+        assert_eq!(resources.decompressions(), Some(2050));
+        assert!(resources.faults_process_wide());
+
+        let unmeasured = fixture.redraw(&fixture.worker, cx).breakdown.resources();
+        assert_eq!(
+            unmeasured,
+            Default::default(),
+            "a platform that returns no sample leaves every counter unmeasured"
+        );
+        assert_eq!(unmeasured.user_cpu(), None);
+        assert_eq!(unmeasured.faults(), None);
+    }
+
+    #[gpui::test]
+    fn a_fast_draw_takes_no_end_sample(cx: &mut TestAppContext) {
+        let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::ThreadCpu);
+        let fixture = open_window(cx);
+        cx.dispatcher.take_draw_resource_requests();
+
+        cx.dispatcher
+            .script_draw_resource_samples([sample(1, 2, 1000), sample(4, 7, 5100)]);
+        let resources = fixture.redraw(&fixture.worker, cx).breakdown.resources();
+        assert_eq!(
+            cx.dispatcher.take_draw_resource_requests(),
+            [false],
+            "only the thread-CPU start sample is read"
+        );
+        assert_eq!(resources.user_cpu(), None, "and nothing is recorded");
+    }
+
+    #[gpui::test]
+    fn after_quiet_reads_process_counters_after_a_gap_or_a_slow_draw(cx: &mut TestAppContext) {
+        let knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::AfterQuiet);
+        let fixture = open_window(cx);
+        cx.dispatcher.take_draw_resource_requests();
+        cx.dispatcher
+            .script_draw_resource_samples(std::iter::repeat_n(sample(1, 1, 1), 16));
+
+        fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            cx.dispatcher.take_draw_resource_requests(),
+            [false],
+            "a draw right after another reads the thread's CPU time only"
+        );
+
+        std::thread::sleep(DRAW_QUIET_GAP + Duration::from_millis(10));
+        fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            cx.dispatcher.take_draw_resource_requests(),
+            [true],
+            "the first draw after a quiet gap reads the process counters"
+        );
+
+        profiler::set_draw_detail_threshold(EVERY_DRAW_IS_SLOW);
+        fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            cx.dispatcher.take_draw_resource_requests(),
+            [false, false],
+            "a slow draw right after another reads its end sample like its start"
+        );
+        profiler::set_draw_detail_threshold(NO_DRAW_IS_SLOW);
+        fixture.redraw(&fixture.worker, cx);
+        assert_eq!(
+            cx.dispatcher.take_draw_resource_requests(),
+            [true],
+            "the draw after a slow one reads the process counters"
+        );
+
+        profiler::set_draw_resource_sampling(DrawResourceSampling::Off);
+        fixture.redraw(&fixture.worker, cx);
+        assert_eq!(cx.dispatcher.take_draw_resource_requests(), [false; 0]);
+        drop(knobs);
     }
 }
