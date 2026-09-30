@@ -913,7 +913,7 @@ fn draw(cx: &mut TestAppContext, window: WindowHandle<OracleView>) -> (Vec<Strin
     .unwrap()
 }
 
-fn text_system_context(seed: u64) -> TestAppContext {
+pub(crate) fn text_system_context(seed: u64) -> TestAppContext {
     TestAppContext::build_with_text_system(
         TestDispatcher::new(seed),
         None,

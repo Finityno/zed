@@ -371,7 +371,9 @@ struct Oracle {
 
 impl Oracle {
     fn new() -> Self {
-        let mut cx = TestAppContext::single();
+        // Glyphs paint as boxes named after their characters, so what text
+        // says is compared as well as where it goes.
+        let mut cx = super::super::layout_retention_tests::text_system_context(0);
         cx.update(|cx| {
             cx.set_view_retention(true);
             cx.set_global(Theme(0));
@@ -1507,4 +1509,56 @@ fn a_uniform_list_scrolling_to_an_item_builds_the_views_reading_it() {
     let offset = handle.0.borrow().base_handle.offset().y;
     assert!(offset < px(0.), "the list scrolled");
     assert_eq!(seen.get(), offset, "the reader shows the list's offset");
+}
+
+/// A view that opted out is built on every frame it is drawn in, though the
+/// view around it has nothing to be built for.
+#[test]
+fn a_view_that_opted_out_is_built_inside_a_view_drawn_again() {
+    struct Untracked {
+        value: Rc<Cell<usize>>,
+    }
+    impl Render for Untracked {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            cx.set_view_retainable(false);
+            div()
+                .w(px(10. + self.value.get() as f32))
+                .h(px(10.))
+                .bg(PALETTE[1])
+        }
+    }
+    struct Host {
+        child: Entity<Untracked>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(div().child(self.child.clone()))
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let value = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let value = value.clone();
+        move |_, cx| Host {
+            child: cx.new(|_| Untracked { value }),
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.rendered_frame.scene.monochrome_sprites.len() + window.rendered_frame.scene.len()
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    let text = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, _| describe_frame(window))
+            .unwrap()
+    };
+    let before = text(&mut cx);
+    value.set(30);
+    frame(&mut cx);
+    assert_ne!(text(&mut cx), before, "the view that opted out was built");
 }

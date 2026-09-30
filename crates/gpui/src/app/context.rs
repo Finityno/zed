@@ -231,10 +231,16 @@ impl<'a, T: 'static> Context<'a, T> {
     /// Views are retainable unless they say otherwise.
     pub fn set_view_retainable(&mut self, retainable: bool) {
         let entity_id = self.entity_state.entity_id;
-        if retainable {
-            self.app.non_retainable_views.remove(&entity_id);
+        let changed = if retainable {
+            self.app.non_retainable_views.remove(&entity_id)
         } else {
-            self.app.non_retainable_views.insert(entity_id);
+            self.app.non_retainable_views.insert(entity_id)
+        };
+        // A view opting out as it renders was checked before it did; drawn
+        // again as it is, it would be copied along with the views around it
+        // until one of them is built.
+        if changed && self.app.view_retention() {
+            self.notify();
         }
     }
 

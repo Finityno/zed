@@ -260,6 +260,10 @@ pub(crate) struct ViewRetention {
     /// different at, and the task asking for a frame at the earliest one.
     deadline: Option<Instant>,
     deadline_frame: Option<(Instant, Task<()>)>,
+    /// Bumped as every frame begins. A view that opted out reads it, so that
+    /// the views around it depend on it too and are never drawn again whole,
+    /// which would copy it along.
+    every_frame: dependencies::StateVersion,
     /// Frames that drew views again since the last one checked against a
     /// frame drawn from scratch, and how many to let pass between checks.
     frames_since_verification: u64,
@@ -277,6 +281,7 @@ impl ViewRetention {
             rebuilds: Vec::new(),
             deadline: None,
             deadline_frame: None,
+            every_frame: Default::default(),
             frames_since_verification: 0,
             verification_interval: verification_interval(),
         }
@@ -586,6 +591,7 @@ impl Window {
         let retention = &mut self.view_retention;
         retention.rebuilds.clear();
         retention.notified.clone_from(notified);
+        retention.every_frame.bump();
     }
 
     /// Ends the retained bookkeeping of the frame being drawn.
@@ -618,13 +624,17 @@ impl Window {
         entity: EntityId,
         cx: &App,
     ) -> Result<usize, ViewRebuildReason> {
+        let opted_out = cx.non_retainable_views.contains(&entity);
+        if opted_out {
+            dependencies::note_state_read(&self.view_retention.every_frame);
+        }
         if self.refreshing || cx.has_active_drag() || self.is_inspector_picking(cx) {
             return Err(ViewRebuildReason::WindowRefresh);
         }
         if self.a11y.is_active() {
             return Err(ViewRebuildReason::Accessibility);
         }
-        if cx.non_retainable_views.contains(&entity) {
+        if opted_out {
             return Err(ViewRebuildReason::OptedOut);
         }
         if self.dirty_views.contains(&entity) {
