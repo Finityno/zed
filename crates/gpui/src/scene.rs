@@ -1386,6 +1386,23 @@ mod tests {
             .map_or(ScaledPixels::from(-1.), |sprite| sprite.bounds.origin.y)
     }
 
+    /// A landed transition rests where its content was painted only when
+    /// its easing and its fade span both reach their ends.
+    #[test]
+    fn a_landed_transition_rests_only_where_it_ends_at_identity() {
+        let now = std::time::Instant::now();
+        let landed = TimeTransition::new(
+            now - std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(200),
+        )
+        .offset(point(px(0.), px(20.)), Point::default())
+        .opacity(0., 1.);
+        assert!(landed.rests_at_identity_by(now));
+        assert!(!landed.easing(|progress| progress * 0.5).rests_at_identity_by(now));
+        assert!(!landed.opacity_span(0., 2.).rests_at_identity_by(now));
+        assert!(!landed.rests_at_identity_by(now - std::time::Duration::from_secs(1)));
+    }
+
     #[test]
     fn a_landed_transition_stops_asking_for_frames() {
         let started_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -2263,12 +2280,14 @@ impl TimeTransition {
     }
 
     /// Whether the transition has landed by `now` and rests where it was
-    /// painted: no offset, full opacity. An easing that does not end at 1
-    /// leaves the content short of its endpoints, so it does not rest there.
+    /// painted: no offset, full opacity. An easing that does not end at 1,
+    /// or a fade span that ends past the transition, leaves the content short
+    /// of its endpoints, so it does not rest there.
     pub(crate) fn rests_at_identity_by(&self, now: std::time::Instant) -> bool {
         self.ends_at() <= now
             && self.to_offset == Point::default()
             && self.to_opacity == 1.0
+            && self.opacity_span.1 <= 1.0
             && (self.easing)(1.0) == 1.0
     }
 
