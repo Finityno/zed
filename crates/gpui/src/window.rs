@@ -3769,6 +3769,10 @@ impl Window {
                 );
             }
         }
+        // Drawing marks this at the end of paint already; a draw that skips
+        // drawing has only its finish left.
+        #[cfg(feature = "profiler")]
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Finish);
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
 
@@ -3814,6 +3818,8 @@ impl Window {
             .set(self.rendered_frame.scene.has_time_animations());
         self.scene_transitioning
             .set(self.rendered_frame.scene.transitions_in_flight());
+        #[cfg(feature = "profiler")]
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Focus);
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3850,6 +3856,8 @@ impl Window {
                 .clone()
                 .retain(&(), |listener| listener(&event, self, cx));
         }
+        #[cfg(feature = "profiler")]
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Other);
 
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.record_entities_accessed(cx);
@@ -4170,7 +4178,7 @@ impl Window {
         self.paint_inspector_hitbox(cx);
 
         #[cfg(feature = "profiler")]
-        self.mark_draw_phase(draw_profile::DrawClockPhase::Other);
+        self.mark_draw_phase(draw_profile::DrawClockPhase::Finish);
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();

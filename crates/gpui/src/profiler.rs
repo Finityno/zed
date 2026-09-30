@@ -818,8 +818,19 @@ pub struct FrameTiming {
 ///   the prompt, drag or tooltip, and the hit test.
 /// - `paint` covers painting the tree, deferred draws, overlays and the
 ///   inspector hitbox.
-/// - `other` is the remainder: setup, the frame finish, focus listeners and
-///   the accessibility update. The five parts add up to the draw's duration.
+/// - `finish` is from the end of paint to the focus listeners: building and
+///   sending the accessibility update, the debug overlay, installing the
+///   input handler, clearing the layout tree, freeing the previous frame's
+///   text layouts, finishing the scene and clearing the old frame.
+/// - `focus` is the focus-lost and focus-change listeners, which run app
+///   callbacks.
+/// - `other` is the remainder: setup before the tree is built, and the
+///   bookkeeping after the focus listeners. The seven parts add up to the
+///   draw's duration.
+///
+/// When the platform draws another window synchronously inside a draw, the
+/// inner draw is charged, whole, to the outer draw's current phase, and its
+/// cost to the thread to the outer draw's resource counters.
 ///
 /// Durations are stored as whole microseconds to keep journal slots small.
 #[cfg(feature = "profiler")]
@@ -829,6 +840,8 @@ pub struct DrawBreakdown {
     pub(crate) layout_us: u32,
     pub(crate) prepaint_us: u32,
     pub(crate) paint_us: u32,
+    pub(crate) finish_us: u32,
+    pub(crate) focus_us: u32,
     pub(crate) other_us: u32,
     pub(crate) layout_passes: u16,
     pub(crate) views_rendered: u16,
@@ -860,8 +873,18 @@ impl DrawBreakdown {
         Duration::from_micros(self.paint_us as u64)
     }
 
-    /// The rest of the draw: setup, frame finish, focus listeners and the
-    /// accessibility update.
+    /// Finishing the frame, from the end of paint to the focus listeners.
+    pub fn finish(&self) -> Duration {
+        Duration::from_micros(self.finish_us as u64)
+    }
+
+    /// The focus listeners.
+    pub fn focus(&self) -> Duration {
+        Duration::from_micros(self.focus_us as u64)
+    }
+
+    /// The rest of the draw: setup, and the bookkeeping after the focus
+    /// listeners.
     pub fn other(&self) -> Duration {
         Duration::from_micros(self.other_us as u64)
     }
@@ -887,6 +910,8 @@ impl DrawBreakdown {
             + self.layout_us as u64
             + self.prepaint_us as u64
             + self.paint_us as u64
+            + self.finish_us as u64
+            + self.focus_us as u64
     }
 
     /// Whether the draw reached [`draw_detail_threshold`] and recorded what

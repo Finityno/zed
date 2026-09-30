@@ -46,7 +46,10 @@ impl Window {
         let timed_from = match phase {
             DrawClockPhase::Prepaint => ViewTimingStart::Prepaint,
             DrawClockPhase::Paint => ViewTimingStart::Paint,
-            DrawClockPhase::Other | DrawClockPhase::RequestLayout => return,
+            DrawClockPhase::Other
+            | DrawClockPhase::RequestLayout
+            | DrawClockPhase::Finish
+            | DrawClockPhase::Focus => return,
         };
         self.time_views_from_now_if_slow(now, timed_from);
     }
@@ -130,12 +133,15 @@ impl Window {
 /// The draw phase the clock is currently charging.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum DrawClockPhase {
-    /// Setup, frame finish, focus listeners and the accessibility update.
-    /// Not accumulated: the breakdown derives it as the remainder.
+    /// Setup before the tree is built, and the bookkeeping after focus
+    /// listeners. Not accumulated: the breakdown derives it as the
+    /// remainder.
     Other,
     RequestLayout,
     Prepaint,
     Paint,
+    Finish,
+    Focus,
 }
 
 /// Charges elapsed draw time to phases. Taffy layout passes are carved out
@@ -154,6 +160,8 @@ pub(crate) struct DrawClock {
     layout: Duration,
     prepaint: Duration,
     paint: Duration,
+    finish: Duration,
+    focus: Duration,
     layout_passes: u16,
     views_rendered: u16,
     views_reused: u16,
@@ -173,6 +181,8 @@ impl DrawClock {
             layout: Duration::ZERO,
             prepaint: Duration::ZERO,
             paint: Duration::ZERO,
+            finish: Duration::ZERO,
+            focus: Duration::ZERO,
             layout_passes: 0,
             views_rendered: 0,
             views_reused: 0,
@@ -193,6 +203,8 @@ impl DrawClock {
             layout: Duration::ZERO,
             prepaint: Duration::ZERO,
             paint: Duration::ZERO,
+            finish: Duration::ZERO,
+            focus: Duration::ZERO,
             layout_passes: 0,
             views_rendered: 0,
             views_reused: 0,
@@ -211,6 +223,8 @@ impl DrawClock {
             DrawClockPhase::RequestLayout => self.request_layout += elapsed,
             DrawClockPhase::Prepaint => self.prepaint += elapsed,
             DrawClockPhase::Paint => self.paint += elapsed,
+            DrawClockPhase::Finish => self.finish += elapsed,
+            DrawClockPhase::Focus => self.focus += elapsed,
         }
         self.phase_started_at = until;
     }
@@ -283,6 +297,8 @@ impl DrawClock {
             layout_us: micros(self.layout),
             prepaint_us: micros(self.prepaint),
             paint_us: micros(self.paint),
+            finish_us: micros(self.finish),
+            focus_us: micros(self.focus),
             layout_passes: self.layout_passes,
             views_rendered: self.views_rendered,
             views_reused: self.views_reused,
@@ -489,10 +505,11 @@ mod tests {
     use super::ViewTimer;
     use crate::{
         AppContext as _, Context, DRAW_QUIET_GAP, DrawResourceSampling, DrawResources, Entity,
-        FaultScope, FrameTiming, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
-        RequestFrameOptions, ResourceSample, SLOW_DRAW_VIEW_MIN, SlowDrawDetail, Style,
-        Styled as _, TestAppContext, TestWindow, ViewTiming, ViewTimingStart, Window, WindowHandle,
-        WindowId, WindowOptions, div, list, profiler, px, size, view::ViewName,
+        FaultScope, FocusHandle, FrameTiming, InteractiveElement as _, IntoElement, ListAlignment,
+        ListState, ParentElement as _, Render, RequestFrameOptions, ResourceSample,
+        SLOW_DRAW_VIEW_MIN, SlowDrawDetail, Style, Styled as _, TestAppContext, TestWindow,
+        ViewTiming, ViewTimingStart, Window, WindowHandle, WindowId, WindowOptions, div, list,
+        profiler, px, size, view::ViewName,
     };
 
     const SPIN: Duration = Duration::from_millis(3);
@@ -736,11 +753,13 @@ mod tests {
             + breakdown.layout()
             + breakdown.prepaint()
             + breakdown.paint()
+            + breakdown.finish()
+            + breakdown.focus()
             + breakdown.other();
         let total = timing.draw_duration();
         assert!(
             parts <= total && total - parts <= Duration::from_micros(5),
-            "the five parts ({parts:?}) add up to the draw ({total:?}): {breakdown:?}"
+            "the seven parts ({parts:?}) add up to the draw ({total:?}): {breakdown:?}"
         );
     }
 
@@ -808,6 +827,51 @@ mod tests {
         );
         assert!(breakdown.request_layout() < SPIN, "{breakdown:?}");
         assert!(breakdown.prepaint() < SPIN, "{breakdown:?}");
+    }
+
+    struct Focusable {
+        handle: FocusHandle,
+    }
+
+    impl Render for Focusable {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.handle).size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn focus_listeners_count_as_focus(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|cx| Focusable {
+                    handle: cx.focus_handle(),
+                })
+            })
+            .unwrap()
+        });
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_active_status_change(true);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let _subscription = window
+            .update(cx, |root, window, cx| {
+                let subscription = window.on_focus_in(&root.handle, cx, |_, _| spin(SPIN));
+                window.focus(&root.handle, cx);
+                subscription
+            })
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let focusing = window
+            .update(cx, |_, window, _| window.window_profiler.last_draw())
+            .unwrap()
+            .expect("a draw was recorded");
+        assert_parts_add_up(&focusing);
+        let breakdown = focusing.breakdown;
+        assert!(
+            breakdown.focus() >= SPIN,
+            "a slow focus listener is charged to focus: {breakdown:?}"
+        );
+        assert!(breakdown.other() < SPIN, "{breakdown:?}");
+        assert!(breakdown.finish() < SPIN, "{breakdown:?}");
     }
 
     #[gpui::test]

@@ -243,9 +243,14 @@ pub enum SerializedHangContributor {
         prepaint_ms: f64,
         /// Of `duration_ms`, painting.
         paint_ms: f64,
-        /// Of `duration_ms`, the rest: setup, frame finish, focus
-        /// listeners and the accessibility update. The five parts add up to
-        /// `duration_ms`.
+        /// Of `duration_ms`, finishing the frame between paint and the
+        /// focus listeners: the accessibility update, freeing the previous
+        /// frame's text layouts and layout tree, and the scene finish.
+        finish_ms: f64,
+        /// Of `duration_ms`, the focus listeners.
+        focus_ms: f64,
+        /// Of `duration_ms`, the rest: setup, and the bookkeeping after the
+        /// focus listeners. The seven parts add up to `duration_ms`.
         other_ms: f64,
         /// Taffy layout passes the draw ran.
         layout_passes: u16,
@@ -488,6 +493,8 @@ impl SerializedHangContributor {
                     layout_ms: as_millis(breakdown.layout()),
                     prepaint_ms: as_millis(breakdown.prepaint()),
                     paint_ms: as_millis(breakdown.paint()),
+                    finish_ms: as_millis(breakdown.finish()),
+                    focus_ms: as_millis(breakdown.focus()),
                     other_ms: as_millis(breakdown.other()),
                     layout_passes: breakdown.layout_passes(),
                     views_rendered: breakdown.views_rendered(),
@@ -882,7 +889,9 @@ mod tests {
             layout_us: 12_400,
             prepaint_us: 180_300,
             paint_us: 20_100,
-            other_us: 4_100,
+            finish_us: 2_500,
+            focus_us: 600,
+            other_us: 1_000,
             layout_passes: 41,
             views_rendered: 7,
             views_reused: 3,
@@ -967,7 +976,9 @@ mod tests {
                 "layout_ms": 12.4,
                 "prepaint_ms": 180.3,
                 "paint_ms": 20.1,
-                "other_ms": 4.1,
+                "finish_ms": 2.5,
+                "focus_ms": 0.6,
+                "other_ms": 1.0,
                 "layout_passes": 41,
                 "views_rendered": 7,
                 "views_reused": 3,
@@ -995,6 +1006,8 @@ mod tests {
                 "layout_ms": 0.0,
                 "prepaint_ms": 0.0,
                 "paint_ms": 0.0,
+                "finish_ms": 0.0,
+                "focus_ms": 0.0,
                 "other_ms": 200.0,
                 "layout_passes": 0,
                 "views_rendered": 0,
