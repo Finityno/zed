@@ -119,7 +119,7 @@ pub struct Scene {
     animated_quads: Vec<u32>,
     /// Moves referenced by each primitive's transition id (`pad`, or the
     /// background's transition bits for quads).
-    transitions: Vec<SceneTransition>,
+    pub(crate) transitions: Vec<SceneTransition>,
     /// The transition primitives inserted now are stamped with, set by
     /// [`crate::Window::with_time_transition`].
     current_transition: u32,
@@ -132,6 +132,8 @@ pub struct Scene {
     transition_states: Vec<(Point<ScaledPixels>, f32)>,
     /// One tracker per vector above, in the order `clear` destructures them.
     shrink: [CapacityShrink; 12],
+    /// Room `finish` sorts in, kept across frames.
+    draw_order_scratch: DrawOrderScratch,
 }
 
 #[expect(missing_docs)]
@@ -210,6 +212,19 @@ impl Scene {
             .shrink_vec_idle(&mut self.blended_quad_indices, rendered.blended_quad_indices.len());
         opaque_quad_indices
             .shrink_vec_idle(&mut self.opaque_quad_indices, rendered.opaque_quad_indices.len());
+        self.draw_order_scratch.shrink_idle(rendered.largest_primitive_count());
+    }
+
+    fn largest_primitive_count(&self) -> usize {
+        self.shadows
+            .len()
+            .max(self.quads.len())
+            .max(self.paths.len())
+            .max(self.underlines.len())
+            .max(self.monochrome_sprites.len())
+            .max(self.subpixel_sprites.len())
+            .max(self.polychrome_sprites.len())
+            .max(self.surfaces.len())
     }
 
     pub fn len(&self) -> usize {
@@ -378,18 +393,36 @@ impl Scene {
     /// Copies `transition` and the transitions it was pushed inside from
     /// `prev_scene`, parents first, so a replayed id always names a later
     /// entry than its parent's. `0` when the scene has run out of ids.
+    ///
+    /// `remapped` starts out holding the transition the replayed range was
+    /// painted inside, mapped to the one it is replayed inside, when those
+    /// differ; see [`Self::replay_inside`].
+    ///
+    /// With `landed_before` given, a transition that has landed by then and
+    /// rests where it started (no offset, full opacity) is left out, its
+    /// primitives taking its parent's: it no longer moves or fades anything,
+    /// and content drawn again frame after frame would otherwise copy it
+    /// forever, against the scene's budget of transitions.
     fn remap_transition(
         &mut self,
         prev_scene: &Scene,
         transition: u32,
         remapped: &mut Vec<(u32, u32)>,
+        landed_before: Option<std::time::Instant>,
     ) -> u32 {
         if let Some(&(_, id)) = remapped.iter().find(|(source, _)| *source == transition) {
             return id;
         }
         let mut entry = prev_scene.transitions[transition as usize - 1];
-        if entry.parent != 0 {
-            entry.parent = self.remap_transition(prev_scene, entry.parent, remapped);
+        if let Some(&(_, id)) = remapped.iter().find(|(source, _)| *source == entry.parent) {
+            entry.parent = id;
+        } else if entry.parent != 0 {
+            entry.parent =
+                self.remap_transition(prev_scene, entry.parent, remapped, landed_before);
+        }
+        if landed_before.is_some_and(|now| entry.transition.rests_at_identity_by(now)) {
+            remapped.push((transition, entry.parent));
+            return entry.parent;
         }
         let id = self.push_transition(entry).unwrap_or(0);
         remapped.push((transition, id));
@@ -408,18 +441,47 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        self.replay_inside(range, prev_scene, None);
+    }
+
+    /// Replays `range` of `prev_scene`, as [`Self::replay`] does, into a scene
+    /// where what it was painted inside differs: `rebase` maps the transition
+    /// the range was painted inside (`0` for none) to the one it is replayed
+    /// inside. Primitives that carried the old one carry the new one, and
+    /// transitions pushed inside the range are parented to it, so content
+    /// replayed into a transition that started since moves with it rather
+    /// than with a copy of the one it was painted in.
+    pub(crate) fn replay_inside(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        rebase: Option<(u32, u32)>,
+    ) {
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
         let mut remapped_animation = (0, 0);
         let mut remapped_transitions: Vec<(u32, u32)> = Vec::new();
+        // Only content drawn again from a view's record is compacted; a
+        // cached view's replay stays as it was.
+        let landed_before = rebase.map(|_| std::time::Instant::now());
+        let rebase = rebase.filter(|(from, to)| from != to);
+        remapped_transitions.extend(rebase);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
                     let transition = primitive_transition(&primitive);
-                    if transition != 0 {
-                        let remapped =
-                            self.remap_transition(prev_scene, transition, &mut remapped_transitions);
+                    if let Some((from, to)) = rebase
+                        && transition == from
+                    {
+                        set_primitive_transition(&mut primitive, to);
+                    } else if transition != 0 {
+                        let remapped = self.remap_transition(
+                            prev_scene,
+                            transition,
+                            &mut remapped_transitions,
+                            landed_before,
+                        );
                         set_primitive_transition(&mut primitive, remapped);
                     }
                     if let Primitive::Quad(quad) = &mut primitive
@@ -452,17 +514,27 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.surfaces.sort_by_key(|surface| surface.order);
+        let scratch = &mut self.draw_order_scratch;
+        scratch.sort(&mut self.shadows, |shadow| shadow.order);
+        scratch.sort(&mut self.quads, |quad| quad.order);
+        scratch.sort(&mut self.paths, |path| path.order);
+        scratch.sort(&mut self.underlines, |underline| underline.order);
+        scratch.sort(&mut self.surfaces, |surface| surface.order);
+        // A batch draws from one atlas texture, and tile ids restart at zero
+        // in every texture, so sprites of one order group by texture first.
+        // Sprites of one order were already drawn in tile order rather than
+        // the order they were painted in (a layer, such as a line of text,
+        // gives everything in it one order), so grouping by texture does not
+        // reorder anything that was in paint order before.
+        scratch.sort_sprites(&mut self.monochrome_sprites, |sprite| {
+            (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
+        });
+        scratch.sort_sprites(&mut self.subpixel_sprites, |sprite| {
+            (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
+        });
+        scratch.sort_sprites(&mut self.polychrome_sprites, |sprite| {
+            (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
+        });
         self.partition_quads();
         self.animated_monochrome_sprites.clear();
         self.animated_monochrome_sprites.extend(
@@ -721,6 +793,89 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+        }
+    }
+}
+
+/// Room to put a finished scene in draw order, kept from frame to frame.
+///
+/// Primitives are 100 to 170 bytes, and a comparison sort moves them as often
+/// as it compares them, through a scratch buffer a stable sort allocates on
+/// every call. Sorting packed integer keys that carry each primitive's index,
+/// then permuting the primitives in place along the cycles of that order,
+/// costs one swap per primitive and allocates nothing once the keys have
+/// room. A kind already in order, as a static frame's often is, costs a scan.
+#[derive(Default)]
+struct DrawOrderScratch {
+    keys: Vec<u64>,
+    sprite_keys: Vec<u128>,
+    permutation: Vec<u32>,
+}
+
+impl DrawOrderScratch {
+    /// Sorts `items` by `key`, keeping equal keys in the order they came in.
+    fn sort<T>(&mut self, items: &mut [T], key: impl Fn(&T) -> u32) {
+        if items.is_sorted_by_key(&key) {
+            return;
+        }
+        self.keys.clear();
+        self.keys.extend(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| (u64::from(key(item)) << 32) | index as u64),
+        );
+        self.keys.sort_unstable();
+        self.permutation.clear();
+        self.permutation.extend(self.keys.iter().map(|&key| key as u32));
+        permute_in_place(items, &mut self.permutation);
+    }
+
+    /// Sorts sprites by `(order, texture, tile)`, keeping equal keys in the
+    /// order they came in.
+    fn sort_sprites<T>(&mut self, items: &mut [T], key: impl Fn(&T) -> (u32, u32, u32)) {
+        if items.is_sorted_by_key(&key) {
+            return;
+        }
+        self.sprite_keys.clear();
+        self.sprite_keys.extend(items.iter().enumerate().map(|(index, item)| {
+            let (order, texture, tile) = key(item);
+            (u128::from(order) << 96)
+                | (u128::from(texture) << 64)
+                | (u128::from(tile) << 32)
+                | index as u128
+        }));
+        self.sprite_keys.sort_unstable();
+        self.permutation.clear();
+        self.permutation.extend(self.sprite_keys.iter().map(|&key| key as u32));
+        permute_in_place(items, &mut self.permutation);
+    }
+
+    fn shrink_idle(&mut self, largest_primitive_count: usize) {
+        let capacity = largest_primitive_count
+            .saturating_mul(2)
+            .max(crate::util::MIN_RETAINED_CAPACITY);
+        self.keys.shrink_to(capacity);
+        self.sprite_keys.shrink_to(capacity);
+        self.permutation.shrink_to(capacity);
+    }
+}
+
+/// Rearranges `items` so position `i` holds what was at `sources[i]`,
+/// following each cycle of the permutation with swaps. `sources` must be a
+/// permutation of `0..items.len()`; it is left as the identity.
+fn permute_in_place<T>(items: &mut [T], sources: &mut [u32]) {
+    debug_assert_eq!(items.len(), sources.len());
+    for start in 0..sources.len() {
+        let mut position = start;
+        loop {
+            let source = sources[position] as usize;
+            sources[position] = position as u32;
+            if source == start {
+                break;
+            }
+            items.swap(position, source);
+            position = source;
         }
     }
 }
@@ -1006,6 +1161,65 @@ mod tests {
         }
     }
 
+    /// Sorting keys and permuting in place gives what a stable sort by the
+    /// same key gives, for inputs with many equal keys, already sorted runs,
+    /// and fixed points.
+    #[test]
+    fn draw_order_sort_matches_a_stable_sort() {
+        use rand::{Rng, SeedableRng};
+        let mut scratch = DrawOrderScratch::default();
+        for seed in 0..200u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let len = rng.random_range(0..300);
+            let distinct_orders = rng.random_range(1..20);
+            let items: Vec<(u32, usize)> = (0..len)
+                .map(|index| (rng.random_range(0..distinct_orders), index))
+                .collect();
+            let mut expected = items.clone();
+            expected.sort_by_key(|item| item.0);
+            let mut sorted = items;
+            scratch.sort(&mut sorted, |item| item.0);
+            assert_eq!(sorted, expected, "seed {seed}");
+            assert!(
+                scratch
+                    .permutation
+                    .iter()
+                    .enumerate()
+                    .all(|(index, &source)| source as usize == index)
+            );
+        }
+    }
+
+    /// Sprites of one order are grouped by the texture they come from, even
+    /// where tile ids of different textures interleave, so each order draws
+    /// one batch per texture rather than one per change of texture.
+    #[test]
+    fn sprites_of_one_order_batch_by_texture() {
+        let mut scene = Scene::default();
+        let mut sprite = shimmering_glyph(0);
+        sprite.effect = SpriteEffect::default();
+        // Side by side, so every sprite gets the same order.
+        for index in 0..8u32 {
+            sprite.bounds.origin.x = ScaledPixels::from(index as f32 * 20.);
+            sprite.content_mask.bounds = sprite.bounds;
+            sprite.tile.texture_id.index = index % 2;
+            sprite.tile.tile_id = crate::TileId(index / 2);
+            scene.insert_primitive(sprite);
+        }
+        scene.finish();
+        let textures: Vec<u32> = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| sprite.tile.texture_id.index)
+            .collect();
+        assert_eq!(textures, [0, 0, 0, 0, 1, 1, 1, 1]);
+        let sprite_batches = scene
+            .batches()
+            .filter(|batch| matches!(batch, PrimitiveBatch::MonochromeSprites { .. }))
+            .count();
+        assert_eq!(sprite_batches, 2);
+    }
+
     /// A shimmer's band is moved by the scene before each present; a view
     /// cached around it replays its glyphs into the next frame, and they must
     /// still name a sweep there, or the band freezes at the phase it was
@@ -1170,6 +1384,23 @@ mod tests {
             .iter()
             .find(|sprite| sprite.pad != 0)
             .map_or(ScaledPixels::from(-1.), |sprite| sprite.bounds.origin.y)
+    }
+
+    /// A landed transition rests where its content was painted only when
+    /// its easing and its fade span both reach their ends.
+    #[test]
+    fn a_landed_transition_rests_only_where_it_ends_at_identity() {
+        let now = std::time::Instant::now();
+        let landed = TimeTransition::new(
+            now - std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(200),
+        )
+        .offset(point(px(0.), px(20.)), Point::default())
+        .opacity(0., 1.);
+        assert!(landed.rests_at_identity_by(now));
+        assert!(!landed.easing(|progress| progress * 0.5).rests_at_identity_by(now));
+        assert!(!landed.opacity_span(0., 2.).rests_at_identity_by(now));
+        assert!(!landed.rests_at_identity_by(now - std::time::Duration::from_secs(1)));
     }
 
     #[test]
@@ -2046,6 +2277,18 @@ impl TimeTransition {
     pub fn easing(mut self, easing: fn(f32) -> f32) -> Self {
         self.easing = easing;
         self
+    }
+
+    /// Whether the transition has landed by `now` and rests where it was
+    /// painted: no offset, full opacity. An easing that does not end at 1,
+    /// or a fade span that ends past the transition, leaves the content short
+    /// of its endpoints, so it does not rest there.
+    pub(crate) fn rests_at_identity_by(&self, now: std::time::Instant) -> bool {
+        self.ends_at() <= now
+            && self.to_offset == Point::default()
+            && self.to_opacity == 1.0
+            && self.opacity_span.1 <= 1.0
+            && (self.easing)(1.0) == 1.0
     }
 
     /// When the transition lands.

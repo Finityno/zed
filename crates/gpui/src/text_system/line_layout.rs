@@ -8,8 +8,9 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use super::LineWrapper;
@@ -481,6 +482,11 @@ pub(crate) struct LineLayoutCache {
     /// Records the generation represented by both frame caches.
     cached_font_generation: AtomicUsize,
     admitted: Mutex<Option<Box<AdmittedFrameCache>>>,
+    /// Lines handed to the platform to shape, and the nanoseconds that took
+    /// while `shaping_timed`; see [`crate::FrameWorkStats::lines_shaped`].
+    lines_shaped: AtomicU64,
+    shape_nanos: AtomicU64,
+    shaping_timed: AtomicBool,
 }
 
 
@@ -571,13 +577,31 @@ struct FrameCache {
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct LineLayoutIndex {
     font_generation: usize,
     lines_index: usize,
     wrapped_lines_index: usize,
     lines_by_hash_index: usize,
     wrapped_lines_by_hash_index: usize,
+}
+
+impl LineLayoutIndex {
+    /// This index, taken from a range that started at `from`, as it falls in
+    /// a copy of that range starting at `to`.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        LineLayoutIndex {
+            font_generation: to.font_generation,
+            lines_index: self.lines_index - from.lines_index + to.lines_index,
+            wrapped_lines_index: self.wrapped_lines_index - from.wrapped_lines_index
+                + to.wrapped_lines_index,
+            lines_by_hash_index: self.lines_by_hash_index - from.lines_by_hash_index
+                + to.lines_by_hash_index,
+            wrapped_lines_by_hash_index: self.wrapped_lines_by_hash_index
+                - from.wrapped_lines_by_hash_index
+                + to.wrapped_lines_by_hash_index,
+        }
+    }
 }
 
 impl LineLayoutCache {
@@ -593,7 +617,38 @@ impl LineLayoutCache {
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
             admitted: Mutex::new(None),
+            lines_shaped: AtomicU64::new(0),
+            shape_nanos: AtomicU64::new(0),
+            shaping_timed: AtomicBool::new(false),
         }
+    }
+
+    /// Runs `shape`, a call into the platform to shape one line, counting it.
+    fn shape<R>(&self, shape: impl FnOnce() -> R) -> R {
+        self.lines_shaped.fetch_add(1, Ordering::Relaxed);
+        if !self.shaping_timed.load(Ordering::Relaxed) {
+            return shape();
+        }
+        let started_at = Instant::now();
+        let shaped = shape();
+        let nanos = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.shape_nanos.fetch_add(nanos, Ordering::Relaxed);
+        shaped
+    }
+
+    /// The lines shaped since the last [`Self::reset_shaping_stats`], and the
+    /// time that took if it was being kept.
+    pub(crate) fn shaping_stats(&self) -> (u64, Duration) {
+        (
+            self.lines_shaped.load(Ordering::Relaxed),
+            Duration::from_nanos(self.shape_nanos.load(Ordering::Relaxed)),
+        )
+    }
+
+    pub(crate) fn reset_shaping_stats(&self, timed: bool) {
+        self.lines_shaped.store(0, Ordering::Relaxed);
+        self.shape_nanos.store(0, Ordering::Relaxed);
+        self.shaping_timed.store(timed, Ordering::Relaxed);
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
@@ -700,7 +755,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
-    ) -> Arc<WrappedLineLayout>
+    ) -> (Arc<WrappedLineLayout>, Arc<CacheKey>)
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
@@ -715,8 +770,8 @@ impl LineLayoutCache {
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
-        if let Some(layout) = current_frame.wrapped_lines.get(key) {
-            return layout.clone();
+        if let Some((key, layout)) = current_frame.wrapped_lines.get_key_value(key) {
+            return (layout.clone(), key.clone());
         }
 
         let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
@@ -725,8 +780,8 @@ impl LineLayoutCache {
             current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
-            layout
+            current_frame.used_wrapped_lines.push(key.clone());
+            (layout, key)
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
@@ -753,9 +808,30 @@ impl LineLayoutCache {
             current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
+            current_frame.used_wrapped_lines.push(key.clone());
 
-            layout
+            (layout, key)
+        }
+    }
+
+    /// Tells the cache these lines, shaped on an earlier frame and still held
+    /// by a text element that did not ask for them again, are in use on this
+    /// one, so that it keeps them for whichever element asks next: a line
+    /// nobody asks for is dropped a frame later, and a text element whose
+    /// text lands on another layout node would have it shaped again.
+    pub(crate) fn hold_wrapped_lines<'a>(
+        &self,
+        lines: impl IntoIterator<Item = (&'a Arc<CacheKey>, &'a Arc<WrappedLineLayout>, usize)>,
+    ) {
+        let font_generation = self.clear_if_font_generation_changed();
+        let mut current_frame = self.current_frame.write();
+        for (key, layout, shaped_in) in lines {
+            if shaped_in == font_generation && !current_frame.wrapped_lines.contains_key(key) {
+                current_frame
+                    .wrapped_lines
+                    .insert(key.clone(), layout.clone());
+                current_frame.used_wrapped_lines.push(key.clone());
+            }
         }
     }
 
@@ -767,7 +843,13 @@ impl LineLayoutCache {
         }
         let mut cache = self.admitted.lock();
         AdmittedFrameCache::layout(&mut cache, source, font_size, run, |source, font_size, run| {
-            self.platform_text_system.layout_line_admitted(source, font_size, std::slice::from_ref(&run))
+            self.shape(|| {
+                self.platform_text_system.layout_line_admitted(
+                    source,
+                    font_size,
+                    std::slice::from_ref(&run),
+                )
+            })
         })
     }
 
@@ -803,9 +885,8 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
+            let mut layout =
+                self.shape(|| self.platform_text_system.layout_line(&text, font_size, runs));
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -954,9 +1035,8 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
+        let mut layout =
+            self.shape(|| self.platform_text_system.layout_line(&text, font_size, runs));
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -1039,8 +1119,9 @@ trait AsCacheKeyRef {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_>;
 }
 
+/// What the cache finds a shaped line by.
 #[derive(Clone, Debug, Eq)]
-struct CacheKey {
+pub(crate) struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,

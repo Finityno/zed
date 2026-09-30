@@ -791,6 +791,10 @@ pub struct App {
     // the tokio runtime. As any task attempting to spawn a blocking tokio task,
     // might panic.
     pub(crate) globals_by_type: TypeIdHashMap<Box<dyn Any>>,
+    pub(crate) dependencies: crate::window::view_retention::dependencies::AppDependencies,
+    /// Views that opted out of being drawn again from the last frame. See
+    /// [`Context::set_view_retainable`].
+    pub(crate) non_retainable_views: FxHashSet<EntityId>,
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
@@ -856,7 +860,8 @@ impl App {
         let synced_animation_epoch = background_executor.now();
 
         let text_system = Arc::new(TextSystem::new(platform.text_system()));
-        let entities = EntityMap::new();
+        let mut entities = EntityMap::new();
+        entities.access_log.enabled = crate::window::view_retention::view_retention_from_environment();
         let keyboard_layout = platform.keyboard_layout();
         let keyboard_mapper = platform.keyboard_mapper();
 
@@ -884,6 +889,8 @@ impl App {
                 asset_source,
                 http_client,
                 globals_by_type: Default::default(),
+                dependencies: Default::default(),
+                non_retainable_views: FxHashSet::default(),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
@@ -1869,6 +1876,7 @@ impl App {
                 self.event_listeners.remove(&entity_id);
                 self.window_invalidators_by_entity.remove(&entity_id);
                 self.current_window_by_entity.remove(&entity_id);
+                self.non_retainable_views.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
                     release_callback(entity.as_mut(), self);
                 }
@@ -2125,12 +2133,14 @@ impl App {
 
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
+        crate::window::view_retention::dependencies::note_global_presence_read::<G>(self);
         self.globals_by_type.contains_key(&TypeId::of::<G>())
     }
 
     /// Access the global of the given type. Panics if a global for that type has not been assigned.
     #[track_caller]
     pub fn global<G: Global>(&self) -> &G {
+        crate::window::view_retention::dependencies::note_global_read(self, TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2139,6 +2149,8 @@ impl App {
 
     /// Access the global of the given type if a value has been assigned.
     pub fn try_global<G: Global>(&self) -> Option<&G> {
+        crate::window::view_retention::dependencies::note_global_read(self, TypeId::of::<G>());
+        crate::window::view_retention::dependencies::note_global_presence_read::<G>(self);
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2148,6 +2160,7 @@ impl App {
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
             .get_mut(&global_type)
@@ -2159,6 +2172,9 @@ impl App {
     /// yet been assigned.
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
+        crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
+        crate::window::view_retention::dependencies::note_global_presence_read::<G>(self);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
             .entry(global_type)
@@ -2170,6 +2186,8 @@ impl App {
     /// Sets the value of the global of the given type.
     pub fn set_global<G: Global>(&mut self, global: G) {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
+        crate::window::view_retention::dependencies::global_changed(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type.insert(global_type, Box::new(global));
     }
@@ -2183,6 +2201,8 @@ impl App {
     /// Remove the global of the given type from the app context. Does not notify global observers.
     pub fn remove_global<G: Global>(&mut self) -> G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::dependencies::note_global_removed::<G>(self);
+        crate::window::view_retention::dependencies::global_changed(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         *self
             .globals_by_type
@@ -2223,8 +2243,42 @@ impl App {
     pub(crate) fn end_global_lease<G: Global>(&mut self, lease: GlobalLease<G>) {
         let global_type = TypeId::of::<G>();
 
+        crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type.insert(global_type, lease.global);
+    }
+
+    /// Sets the global of the given type, as [`Self::set_global`] does, only
+    /// if it differs from the one set, returning whether it did. An unchanged
+    /// global notifies no observers and, with view retention on
+    /// ([`Self::set_view_retention`]), builds no view that read it: for
+    /// state written on every render that rarely changes.
+    pub fn set_global_if_changed<G: Global + PartialEq>(&mut self, global: G) -> bool {
+        if self.try_global::<G>() == Some(&global) {
+            return false;
+        }
+        self.set_global(global);
+        true
+    }
+
+    /// Updates the global of the given type, as `update_global` does, marking
+    /// it written only if `update` changed it: an unchanged global notifies
+    /// no observers and, with view retention on, builds no view that read it.
+    pub fn update_global_if_changed<G: Global + Clone + PartialEq, R>(
+        &mut self,
+        update: impl FnOnce(&mut G, &mut Self) -> R,
+    ) -> R {
+        let mut lease = self.lease_global::<G>();
+        let before = (*lease).clone();
+        let result = update(&mut lease, self);
+        if *lease == before {
+            let global_type = TypeId::of::<G>();
+            self.globals_by_type.insert(global_type, lease.global);
+            crate::window::view_retention::dependencies::note_global_read(self, global_type);
+        } else {
+            self.end_global_lease(lease);
+        }
+        result
     }
 
     pub(crate) fn new_entity_observer(
@@ -2372,6 +2426,7 @@ impl App {
         &mut self,
         listener: impl Fn(&A, &mut Self) + 'static,
     ) -> &mut Self {
+        let new_action = !self.global_action_listeners.contains_key(&TypeId::of::<A>());
         self.global_action_listeners
             .entry(TypeId::of::<A>())
             .or_default()
@@ -2381,6 +2436,14 @@ impl App {
                     listener(action, cx)
                 }
             }));
+        // The available actions include every action with a global handler,
+        // so views that listed them are built again.
+        if new_action && self.view_retention() {
+            crate::window::view_retention::dependencies::ambient_changed::<
+                crate::window::view_retention::dependencies::ambient::Actions,
+            >(self);
+            self.request_frame_in_every_window();
+        }
         self
     }
 
@@ -2796,6 +2859,7 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        crate::window::view_retention::dependencies::note_notify(&mut self.entities, entity_id);
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)

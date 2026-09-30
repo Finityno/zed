@@ -197,8 +197,9 @@ impl MetalAtlasState {
     /// Records every tile `scene` references as used in the current frame.
     fn mark_scene_tiles(&mut self, scene: &Scene) {
         let frame = self.frame;
-        // `Scene::finish` sorts each sprite list by tile id within a draw order, so
-        // a glyph repeated across a line of text collapses to one lookup here.
+        // `Scene::finish` sorts each sprite list by texture and then tile id within
+        // a draw order, so a glyph repeated across a line of text collapses to one
+        // lookup here.
         let mut previous: Option<(AtlasTextureId, TileId)> = None;
         let tiles = scene
             .monochrome_sprites

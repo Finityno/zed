@@ -19,7 +19,7 @@ use crate::{
     RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubscriberSet, Subscription,
     TimeTransition,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
@@ -70,9 +70,21 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 #[cfg(feature = "profiler")]
 mod draw_profile;
+mod frame_work;
+mod glyph_painting;
+mod layout_keys;
+#[cfg(test)]
+mod layout_retention_tests;
+#[cfg(test)]
+mod replay_tests;
+pub(crate) mod view_retention;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
+pub use frame_work::{FrameWorkStats, ViewRebuildCounts};
+pub use view_retention::{DrawDependency, ViewRebuildReason};
+pub(crate) use frame_work::add_elapsed;
+pub(crate) use glyph_painting::LineGlyphPainter;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -525,6 +537,7 @@ impl FocusId {
 
     /// Obtains whether this handle contains the given handle in the most recently rendered frame.
     pub(crate) fn contains(&self, other: Self, window: &Window) -> bool {
+        window.note_actions_read();
         window
             .rendered_frame
             .dispatch_tree
@@ -780,6 +793,9 @@ impl HitboxId {
     ///
     /// See [`Hitbox::is_hovered`] for details.
     pub fn is_hovered(self, window: &Window) -> bool {
+        if let Some(hovered) = view_retention::note_hover_read(window, self, false) {
+            return hovered;
+        }
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
@@ -795,9 +811,25 @@ impl HitboxId {
     ///
     /// See [`HitboxId::is_hovered`] for more details.
     pub(crate) fn is_hovered_ignoring_last_input(self, window: &Window) -> bool {
+        if let Some(hovered) = view_retention::note_hover_read(window, self, true) {
+            return hovered;
+        }
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
+        }
+        self.hit_test(window)
+    }
+
+    /// What [`Self::is_hovered`], or with `ignoring_modality`
+    /// [`Self::is_hovered_ignoring_last_input`], answers, without noting that
+    /// it was asked.
+    pub(crate) fn hovered_now(self, window: &Window, ignoring_modality: bool) -> bool {
+        if window.captured_hitbox == Some(self) {
+            return true;
+        }
+        if !ignoring_modality && window.last_input_modality == InputModality::Keyboard {
+            return false;
         }
         self.hit_test(window)
     }
@@ -959,6 +991,17 @@ impl TooltipId {
     }
 }
 
+/// A measurement closure with the key [`Window::request_measured_layout_with_key`]
+/// was given, and the type of the closure, which the key is only compared
+/// within.
+struct KeyedMeasurement {
+    key: u64,
+    closure: std::any::TypeId,
+    measure: Box<
+        dyn Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>,
+    >,
+}
+
 pub(crate) struct TooltipBounds {
     id: TooltipId,
     bounds: Bounds<Pixels>,
@@ -985,6 +1028,9 @@ pub(crate) struct DeferredDraw {
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The retained views it was deferred from, whose dependencies what it
+    /// reads while it is drawn are.
+    enclosing_views: view_retention::EnclosingViews,
 }
 
 pub(crate) struct Frame {
@@ -1012,6 +1058,9 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// The views drawn in this frame with view retention on, for the next
+    /// frame to draw again from it.
+    pub(crate) retained_views: view_retention::RetainedViews,
     shrink: FrameShrink,
 }
 
@@ -1048,6 +1097,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    window_control_hitboxes_index: usize,
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
     mouse_listeners_index: usize,
@@ -1093,6 +1143,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            retained_views: Default::default(),
             shrink: FrameShrink::default(),
         }
     }
@@ -1116,6 +1167,7 @@ impl Frame {
             .clear_vec(&mut self.window_control_hitboxes);
         shrink.deferred_draws.clear_vec(&mut self.deferred_draws);
         self.tab_stops.clear();
+        self.retained_views.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1276,8 +1328,10 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) layout_keys: layout_keys::LayoutKeys,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    pub(crate) global_element_ids: crate::element::GlobalElementIdCache,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -1285,7 +1339,10 @@ pub struct Window {
     pub(crate) glass_content: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
-    opacity_cycle_stack: Vec<OpacityCycle>,
+    glyph_raster_cache: glyph_painting::GlyphRasterCache,
+    pub(crate) frame_work: frame_work::FrameWorkCounters,
+    pub(crate) opacity_cycle_stack: Vec<OpacityCycle>,
+    pub(crate) view_retention: view_retention::ViewRetention,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2240,14 +2297,19 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_keys: layout_keys::LayoutKeys::default(),
             root: None,
             element_id_stack: SmallVec::default(),
+            global_element_ids: crate::element::GlobalElementIdCache::default(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             text_shimmer_stack: Vec::new(),
+            glyph_raster_cache: glyph_painting::GlyphRasterCache::default(),
+            frame_work: frame_work::FrameWorkCounters::default(),
             opacity_cycle_stack: Vec::new(),
+            view_retention: view_retention::ViewRetention::new(cx),
             element_opacity: 1.0,
             glass_content: false,
             requested_autoscroll: None,
@@ -3119,7 +3181,11 @@ impl Window {
     }
 
     pub(crate) fn appearance_changed(&mut self, cx: &mut App) {
-        self.appearance = self.platform_window.appearance();
+        let appearance = self.platform_window.appearance();
+        if appearance != self.appearance {
+            view_retention::dependencies::ambient_changed::<view_retention::dependencies::ambient::Appearance>(cx);
+        }
+        self.appearance = appearance;
 
         self.appearance_observers
             .clone()
@@ -3134,6 +3200,9 @@ impl Window {
 
     /// Returns the appearance of the current window.
     pub fn appearance(&self) -> WindowAppearance {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Appearance>();
         self.appearance
     }
 
@@ -3414,7 +3483,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
+            let global_id = this.global_element_ids.get(&this.element_id_stack);
 
             f(&global_id, this)
         })
@@ -3633,8 +3702,15 @@ impl Window {
         self.default_prevented
     }
 
+    fn note_actions_read(&self) {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Actions>();
+    }
+
     /// Determine whether the given action is available along the dispatch path to the currently focused element.
     pub fn is_action_available(&self, action: &dyn Action, cx: &App) -> bool {
+        self.note_actions_read();
         let node_id =
             self.focus_node_id_in_rendered_frame(self.focused(cx).map(|handle| handle.id));
         self.rendered_frame
@@ -3644,6 +3720,7 @@ impl Window {
 
     /// Determine whether the given action is available along the dispatch path to the given focus_handle.
     pub fn is_action_available_in(&self, action: &dyn Action, focus_handle: &FocusHandle) -> bool {
+        self.note_actions_read();
         let node_id = self.focus_node_id_in_rendered_frame(Some(focus_handle.id));
         self.rendered_frame
             .dispatch_tree
@@ -3652,6 +3729,9 @@ impl Window {
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Pointer>();
         self.mouse_position
     }
 
@@ -3691,6 +3771,9 @@ impl Window {
 
     /// The current state of the keyboard's modifiers
     pub fn modifiers(&self) -> Modifiers {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Keys>();
         self.modifiers
     }
 
@@ -3706,13 +3789,24 @@ impl Window {
 
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
+        self.view_retention
+            .ambient_reads
+            .note::<view_retention::dependencies::ambient::Keys>();
         self.capslock
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
-    #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let arena_clear_needed = self.draw_frame(cx);
+        if cx.view_retention() {
+            return self.verify_retained_frame(arena_clear_needed, cx);
+        }
+        arena_clear_needed
+    }
+
+    #[profiling::function]
+    fn draw_frame(&mut self, cx: &mut App) -> ArenaClearNeeded {
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3727,7 +3821,7 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
-        self.invalidate_entities();
+        self.invalidate_entities(cx);
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         if self.rendered_scene_may_reference_retired_tiles() {
@@ -3757,6 +3851,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            self.frame_work.stats.frames += 1;
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
             {
@@ -3805,8 +3900,12 @@ impl Window {
                 });
         }
 
+        self.finish_retained_views_frame(cx);
         self.layout_engine.as_mut().unwrap().clear();
+        self.layout_keys.end_frame();
         self.text_system().finish_frame();
+        self.glyph_raster_cache.finish_draw();
+        self.global_element_ids.finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -3948,8 +4047,11 @@ impl Window {
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
-    fn invalidate_entities(&mut self) {
+    fn invalidate_entities(&mut self, cx: &App) {
         let mut views = self.invalidator.take_views();
+        if cx.view_retention() {
+            self.begin_retained_views_frame(&views);
+        }
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -4107,12 +4209,15 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        let build_started_at = self.frame_work.clock();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::RequestLayout);
         let root_layout_id = root_element.request_layout(self, cx);
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Prepaint);
+        frame_work::add_elapsed(&mut self.frame_work.stats.build_time, build_started_at);
+        let prepaint_started_at = self.frame_work.clock();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -4148,10 +4253,12 @@ impl Window {
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        frame_work::add_elapsed(&mut self.frame_work.stats.prepaint_time, prepaint_started_at);
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Paint);
+        let paint_started_at = self.frame_work.clock();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -4176,6 +4283,7 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+        frame_work::add_elapsed(&mut self.frame_work.stats.paint_time, paint_started_at);
 
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Finish);
@@ -4318,6 +4426,7 @@ impl Window {
                     absolute_offset,
                     prepaint_range,
                     beneath_native_surfaces,
+                    enclosing_views,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4332,6 +4441,7 @@ impl Window {
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.beneath_native_surfaces,
+                        deferred_draw.enclosing_views.clone(),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -4340,6 +4450,7 @@ impl Window {
                 if let Some(mut element) = element {
                     self.prepainting_deferred_draw_beneath_native_surfaces =
                         Some(beneath_native_surfaces);
+                    let recording = self.begin_deferred_view(&enclosing_views, cx);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -4347,6 +4458,7 @@ impl Window {
                             });
                         });
                     });
+                    self.finish_deferred_view(recording, cx);
                     self.prepainting_deferred_draw_beneath_native_surfaces = None;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
@@ -4392,13 +4504,15 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
+                let recording = self.begin_deferred_view(&deferred_draw.enclosing_views, cx);
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                             element.paint(window, cx);
                         });
                     })
-                })
+                });
+                self.finish_deferred_view(recording, cx);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
@@ -4481,6 +4595,9 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
+                    // Drawn from the last frame: what it read is part of the
+                    // records copied along with the views it came from.
+                    enclosing_views: Default::default(),
                 }),
         );
     }
@@ -4488,6 +4605,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_records.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
@@ -4500,6 +4618,22 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_paint_inside(range, None);
+    }
+
+    /// Reuses `range` of the last frame's paint, as [`Self::reuse_paint`]
+    /// does, rebasing its primitives from the time transition they were
+    /// painted inside to the one current now; see [`Scene::replay_inside`].
+    pub(crate) fn reuse_paint_rebased(
+        &mut self,
+        range: Range<PaintIndex>,
+        painted_inside: u32,
+        replayed_inside: u32,
+    ) {
+        self.reuse_paint_inside(range, Some((painted_inside, replayed_inside)));
+    }
+
+    fn reuse_paint_inside(&mut self, range: Range<PaintIndex>, rebase: Option<(u32, u32)>) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
@@ -4511,6 +4645,15 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        // Window controls (the caption, drag strips, minimize, maximize and
+        // close buttons) are hit-tested against the rendered frame's list, so
+        // a view reused without painting would otherwise lose them.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
@@ -4539,9 +4682,10 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
+        self.next_frame.scene.replay_inside(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
+            rebase,
         );
     }
 
@@ -4765,7 +4909,17 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let layout_transaction = self
+            .layout_engine
+            .as_mut()
+            .map(|engine| engine.begin_transaction());
+        let retained_transaction = self.begin_retained_transaction();
         let result = f(self);
+        if let Some(start) = layout_transaction
+            && let Some(engine) = self.layout_engine.as_mut()
+        {
+            engine.end_transaction(start, result.is_err());
+        }
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
             self.next_frame
@@ -4781,6 +4935,8 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            // The retained views recorded since point into what was truncated.
+            self.roll_back_retained_transaction(retained_transaction);
         }
         result
     }
@@ -5094,6 +5250,7 @@ impl Window {
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
+            enclosing_views: self.enclosing_views(),
         });
     }
 
@@ -5423,85 +5580,7 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
-        let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        let (integer_origin, subpixel_variant) = quantize_glyph_origin(glyph_origin);
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor,
-            is_emoji: false,
-            subpixel_rendering,
-            dilation,
-        };
-
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.snapped_content_mask();
-
-            if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity),
-                    effect: self.current_text_effect(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
-            } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity),
-                    effect: self.current_text_effect(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
-            return false;
-        }
-
-        if !self.platform_window.is_subpixel_rendering_supported() {
-            return false;
-        }
-
-        let mode = match self.text_rendering_mode.get() {
-            TextRenderingMode::PlatformDefault => self
-                .text_system()
-                .recommended_rendering_mode(font_id, font_size),
-            mode => mode,
-        };
-
-        mode == TextRenderingMode::Subpixel
+        LineGlyphPainter::new(self).paint_glyph(self, origin, font_id, glyph_id, font_size, color)
     }
 
     /// Paints an emoji glyph into the scene for the next frame at the current z-index.
@@ -5804,9 +5883,12 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        self.frame_work.stats.layout_nodes += 1;
 
-        self.layout_engine.as_mut().unwrap().request_layout(
-            style,
+        let key = self.layout_keys.current();
+        self.layout_engine.as_mut().unwrap().request_keyed_layout(
+            key,
+            &style,
             rem_size,
             scale_factor,
             &cx.layout_id_buffer,
@@ -5830,10 +5912,141 @@ impl Window {
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        self.frame_work.stats.layout_nodes += 1;
+        let key = self.layout_keys.current();
+        self.layout_engine.as_mut().unwrap().request_keyed_measured_layout(
+            key,
+            Some(&style),
+            rem_size,
+            scale_factor,
+            Box::new(measure),
+        )
+    }
+
+    /// Adds a self-measuring leaf, as [`Self::request_measured_layout`] does,
+    /// with a `key` saying what the measurement depends on, so that layout
+    /// kept from the last frame can be kept on this one.
+    ///
+    /// A layout node kept across frames that is given a new measurement
+    /// closure has to be measured again, and everything above it laid out
+    /// again, unless something says the new closure measures what the old one
+    /// did. `key` says so: when the element that took this node last frame
+    /// asked for it with the same key (and a closure of the same type), the
+    /// node is left clean, and the layout engine keeps what it computed for
+    /// it and for the nodes above it. The new closure is still the one called
+    /// if the engine measures the node under constraints it has not seen.
+    ///
+    /// When the key changed, the new closure is called here, under every
+    /// constraint the engine measured the node under since it was last
+    /// dirtied; if it gives every size it gave then, the node is still left
+    /// clean. Only a change in size lays out the nodes above it again.
+    ///
+    /// The key has to cover everything the closure's result depends on: a
+    /// closure returning a fixed extent can use a hash of that extent. Two
+    /// closures given the same key that would measure differently leave the
+    /// layout wrong; when in doubt, use [`Self::request_measured_layout`],
+    /// which measures every frame.
+    ///
+    /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    pub fn request_measured_layout_with_key<F>(
+        &mut self,
+        style: Style,
+        key: u64,
+        measure: F,
+        cx: &mut App,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        self.request_carried_measured_layout(
+            Some(&style),
+            KeyedMeasurement {
+                key,
+                closure: std::any::TypeId::of::<F>(),
+                measure: Box::new(measure),
+            },
+            |measurement, previous| {
+                match previous.downcast_ref::<KeyedMeasurement>() {
+                    Some(previous)
+                        if previous.key == measurement.key
+                            && previous.closure == measurement.closure =>
+                    {
+                        crate::taffy::Adopted::Measurement
+                    }
+                    _ => crate::taffy::Adopted::No,
+                }
+            },
+            |measurement, known, available, window, cx| {
+                (measurement.measure)(known, available, window, cx)
+            },
+            cx,
+        )
+    }
+
+    /// Adds a self-measuring leaf in `style`, the default one if `None`, as
+    /// [`Self::request_measured_layout`] does, whose measurement can be carried
+    /// over from the element that measured the same node last frame.
+    ///
+    /// `adopt` is given `state` and what that element left, and takes its
+    /// measurement over when it still stands; the node then stays clean, and
+    /// Taffy keeps what it cached for it and the nodes above it. Otherwise
+    /// `measure` may run here, under the constraints Taffy measured the node
+    /// under, to tell whether it still measures the same.
+    pub(crate) fn request_carried_measured_layout<S: 'static>(
+        &mut self,
+        style: Option<&Style>,
+        state: S,
+        adopt: impl FnOnce(&Rc<S>, &Rc<dyn std::any::Any>) -> crate::taffy::Adopted,
+        measure: impl Fn(&Rc<S>, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+        + 'static,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.invalidator.debug_assert_prepaint();
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.frame_work.stats.layout_nodes += 1;
+        let key = self.layout_keys.current();
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        let id = layout_engine.request_carried_measured_layout(
+            key,
+            style,
+            rem_size,
+            scale_factor,
+            state,
+            adopt,
+            measure,
+            self,
+            cx,
+        );
+        self.layout_engine = Some(layout_engine);
+        id
+    }
+
+    /// Starts recording the layout nodes claimed from here on, for a view to
+    /// keep them on frames it is drawn from the last one without being laid
+    /// out. Returns where the recording begins; recordings nest.
+    pub(crate) fn record_claimed_layout_keys(&mut self) -> usize {
         self.layout_engine
             .as_mut()
-            .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .map_or(0, |engine| engine.record_claimed_keys())
+    }
+
+    /// Ends the recording begun at `start`, returning the keys of the layout
+    /// nodes claimed while it was open.
+    pub(crate) fn finish_recording_claimed_layout_keys(&mut self, start: usize) -> Vec<u64> {
+        self.layout_engine
+            .as_mut()
+            .map(|engine| engine.finish_recording_claimed_keys(start))
+            .unwrap_or_default()
+    }
+
+    /// Keeps the layout nodes under `keys` through this frame without laying
+    /// them out, for the frame that lays them out again.
+    pub(crate) fn keep_layout_keys(&mut self, keys: &[u64]) {
+        if let Some(engine) = self.layout_engine.as_mut() {
+            engine.keep_retained(keys);
+        }
     }
 
     /// Compute the layout for the given id within the given available space.
@@ -5851,9 +6064,12 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         let layout_started_at = self.draw_clock.begin_layout();
+        let started_at = self.frame_work.clock();
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
+        self.frame_work.stats.compute_layout_calls += 1;
+        frame_work::add_elapsed(&mut self.frame_work.stats.compute_layout_time, started_at);
         #[cfg(feature = "profiler")]
         self.end_draw_layout(layout_started_at);
     }
@@ -6200,6 +6416,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
+        let ambient_before = view_retention::dependencies::AmbientInput::of(self);
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
@@ -6329,6 +6546,7 @@ impl Window {
             }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
+        ambient_before.stamp_changes(self, cx);
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
@@ -7308,6 +7526,7 @@ impl Window {
 
     /// Returns the current context stack.
     pub fn context_stack(&self) -> Vec<KeyContext> {
+        self.note_actions_read();
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         dispatch_tree
@@ -7319,6 +7538,7 @@ impl Window {
 
     /// Returns all available actions for the focused element.
     pub fn available_actions(&self, cx: &App) -> Vec<Box<dyn Action>> {
+        self.note_actions_read();
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let mut actions = self.rendered_frame.dispatch_tree.available_actions(node_id);
         for action_type in cx.global_action_listeners.keys() {
@@ -7335,6 +7555,7 @@ impl Window {
     /// Returns key bindings that invoke an action on the currently focused element. Bindings are
     /// returned in the order they were added. For display, the last binding should take precedence.
     pub fn bindings_for_action(&self, action: &dyn Action) -> Vec<KeyBinding> {
+        self.note_actions_read();
         self.rendered_frame
             .dispatch_tree
             .bindings_for_action(action, &self.rendered_frame.dispatch_tree.context_stack)
@@ -7343,6 +7564,7 @@ impl Window {
     /// Returns the highest precedence key binding that invokes an action on the currently focused
     /// element. This is more efficient than getting the last result of `bindings_for_action`.
     pub fn highest_precedence_binding_for_action(&self, action: &dyn Action) -> Option<KeyBinding> {
+        self.note_actions_read();
         self.rendered_frame
             .dispatch_tree
             .highest_precedence_binding_for_action(
@@ -7357,6 +7579,7 @@ impl Window {
         action: &dyn Action,
         context: KeyContext,
     ) -> Vec<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         dispatch_tree.bindings_for_action(action, &[context])
     }
@@ -7368,6 +7591,7 @@ impl Window {
         action: &dyn Action,
         context: KeyContext,
     ) -> Option<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         dispatch_tree.highest_precedence_binding_for_action(action, &[context])
     }
@@ -7380,6 +7604,7 @@ impl Window {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> Vec<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let Some(context_stack) = self.context_stack_for_focus_handle(focus_handle) else {
             return vec![];
@@ -7395,6 +7620,7 @@ impl Window {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> Option<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let context_stack = self.context_stack_for_focus_handle(focus_handle)?;
         dispatch_tree.highest_precedence_binding_for_action(action, &context_stack)
@@ -7402,6 +7628,7 @@ impl Window {
 
     /// Find the bindings that can follow the current input sequence for the current context stack.
     pub fn possible_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
+        self.note_actions_read();
         self.rendered_frame
             .dispatch_tree
             .possible_next_bindings_for_input(input, &self.context_stack())

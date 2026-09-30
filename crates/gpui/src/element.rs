@@ -38,10 +38,12 @@ use crate::{
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
     util::FluentBuilder, window::with_element_arena,
 };
-use derive_more::{Deref, DerefMut};
+use collections::FxHashMap;
+use derive_more::Deref;
 use std::{
     any::Any,
     fmt::{self, Debug, Display},
+    hash::{BuildHasher, Hash, Hasher},
     mem, panic,
     sync::Arc,
 };
@@ -211,8 +213,83 @@ pub trait ParentElement {
 }
 
 /// A globally unique identifier for an element, used to track state across frames.
-#[derive(Deref, DerefMut, Clone, Default, Debug, Eq, PartialEq, Hash)]
-pub struct GlobalElementId(pub(crate) Arc<[ElementId]>);
+///
+/// Element state is looked up by global id several times per element per
+/// frame, so the id works out the hash of its path once, when it is made,
+/// and hashes to that; equal ids compare their hashes before their paths.
+#[derive(Deref, Clone, Debug)]
+pub struct GlobalElementId(#[deref] pub(crate) Arc<[ElementId]>, u64);
+
+impl GlobalElementId {
+    pub(crate) fn new(path: Arc<[ElementId]>) -> Self {
+        let hash = Self::path_hash(&path);
+        GlobalElementId(path, hash)
+    }
+
+    fn path_hash(path: &[ElementId]) -> u64 {
+        collections::FxBuildHasher.hash_one(path)
+    }
+}
+
+impl Default for GlobalElementId {
+    fn default() -> Self {
+        GlobalElementId::new(Arc::from([]))
+    }
+}
+
+impl PartialEq for GlobalElementId {
+    fn eq(&self, other: &Self) -> bool {
+        self.1 == other.1 && self.0 == other.0
+    }
+}
+
+impl Eq for GlobalElementId {}
+
+impl Hash for GlobalElementId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.1);
+    }
+}
+
+/// The global ids a window handed out in this frame and the one before, by
+/// the hash of their path.
+///
+/// Nearly every element has the path it had last frame, and gets the id it
+/// had then back: a reference count, rather than a copy of the whole element
+/// id stack that is dropped id by id once the frame is done.
+#[derive(Default)]
+pub(crate) struct GlobalElementIdCache {
+    previous: FxHashMap<u64, GlobalElementId>,
+    current: FxHashMap<u64, GlobalElementId>,
+    shrink: crate::util::CapacityShrink,
+}
+
+impl GlobalElementIdCache {
+    /// The global id of `path`, one already handed out if there is one.
+    pub(crate) fn get(&mut self, path: &[ElementId]) -> GlobalElementId {
+        let hash = GlobalElementId::path_hash(path);
+        if let Some(id) = self.current.get(&hash)
+            && *id.0 == *path
+        {
+            return id.clone();
+        }
+        let id = match self.previous.get(&hash) {
+            Some(id) if *id.0 == *path => id.clone(),
+            _ => GlobalElementId(Arc::from(path), hash),
+        };
+        // A path whose hash another path's took this frame gets an id of its
+        // own, and the one handed out first stays the one kept.
+        self.current.entry(hash).or_insert_with(|| id.clone());
+        id
+    }
+
+    /// Keeps this frame's ids for the next frame to find, and lets the ones
+    /// from the frame before go.
+    pub(crate) fn finish_frame(&mut self) {
+        mem::swap(&mut self.previous, &mut self.current);
+        self.shrink.clear_map(&mut self.current);
+    }
+}
 
 impl Display for GlobalElementId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -228,15 +305,19 @@ impl Display for GlobalElementId {
 
 impl GlobalElementId {
     pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
-        use std::hash::{Hash, Hasher};
+        // The id's own hash is a 64-bit FxHash of the path, which is fine for
+        // finding element state, where a collision is told apart by comparing
+        // paths, but accessibility nodes are named by the hash alone.
         let mut hasher = std::hash::DefaultHasher::default();
-        self.hash(&mut hasher);
+        self.0.hash(&mut hasher);
         accesskit::NodeId(hasher.finish())
     }
 }
 
 trait ElementObject {
     fn inner_element(&mut self) -> &mut dyn Any;
+
+    fn element_id(&self) -> Option<ElementId>;
 
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId;
 
@@ -265,12 +346,14 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     Start,
     RequestLayout {
         layout_id: LayoutId,
+        layout_key: u64,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         request_layout: RequestLayoutState,
     },
     LayoutComputed {
         layout_id: LayoutId,
+        layout_key: u64,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         available_space: Size<AvailableSpace>,
@@ -299,10 +382,11 @@ impl<E: Element> Drawable<E> {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
-                let global_id = self
-                    .element
-                    .id()
-                    .map(|element_id| prepare_element_id(element_id, window));
+                window.frame_work.stats.elements += 1;
+                let element_id = self.element.id();
+                let layout_key = window.layout_keys.push(element_id.as_ref());
+                let global_id =
+                    element_id.map(|element_id| prepare_element_id(element_id, window));
 
                 let inspector_id;
                 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -330,9 +414,11 @@ impl<E: Element> Drawable<E> {
                 if global_id.is_some() {
                     window.element_id_stack.pop();
                 }
+                window.layout_keys.pop();
 
                 self.phase = ElementDrawPhase::RequestLayout {
                     layout_id,
+                    layout_key,
                     global_id,
                     inspector_id,
                     request_layout,
@@ -347,12 +433,14 @@ impl<E: Element> Drawable<E> {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
+                layout_key,
                 global_id,
                 inspector_id,
                 mut request_layout,
             }
             | ElementDrawPhase::LayoutComputed {
                 layout_id,
+                layout_key,
                 global_id,
                 inspector_id,
                 mut request_layout,
@@ -403,6 +491,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
+                let prepaint_scope = window.layout_keys.enter_prepaint_scope(layout_key);
                 let mut prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -411,6 +500,7 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+                window.layout_keys.exit_prepaint_scope(prepaint_scope);
                 window.next_frame.dispatch_tree.pop_node();
 
                 if pushed_a11y_node {
@@ -511,6 +601,7 @@ impl<E: Element> Drawable<E> {
         let layout_id = match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
+                layout_key,
                 global_id,
                 inspector_id,
                 request_layout,
@@ -518,6 +609,7 @@ impl<E: Element> Drawable<E> {
                 window.compute_layout(layout_id, available_space, cx);
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
+                    layout_key,
                     global_id,
                     inspector_id,
                     available_space,
@@ -527,6 +619,7 @@ impl<E: Element> Drawable<E> {
             }
             ElementDrawPhase::LayoutComputed {
                 layout_id,
+                layout_key,
                 global_id,
                 inspector_id,
                 available_space: prev_available_space,
@@ -537,6 +630,7 @@ impl<E: Element> Drawable<E> {
                 }
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
+                    layout_key,
                     global_id,
                     inspector_id,
                     available_space,
@@ -558,6 +652,10 @@ where
 {
     fn inner_element(&mut self) -> &mut dyn Any {
         &mut self.element
+    }
+
+    fn element_id(&self) -> Option<ElementId> {
+        self.element.id()
     }
 
     #[inline]
@@ -603,6 +701,11 @@ impl AnyElement {
     /// Attempt to downcast a reference to the boxed element to a specific type.
     pub fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
         self.0.inner_element().downcast_mut::<T>()
+    }
+
+    /// The id of the element stored in this `AnyElement`, if it has one.
+    pub(crate) fn element_id(&self) -> Option<ElementId> {
+        self.0.element_id()
     }
 
     /// Request the layout ID of the element stored in this `AnyElement`.
@@ -796,7 +899,7 @@ impl Element for Empty {
 #[inline(never)]
 fn prepare_element_id(element_id: ElementId, window: &mut Window) -> GlobalElementId {
     window.element_id_stack.push(element_id);
-    GlobalElementId(Arc::from(&*window.element_id_stack))
+    window.global_element_ids.get(&window.element_id_stack)
 }
 
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -806,8 +909,68 @@ fn prepare_inspector_id(
     window: &mut Window,
 ) -> InspectorElementId {
     let path = InspectorElementPath {
-        global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
+        global_id: GlobalElementId::new(Arc::from(&*window.element_id_stack)),
         source_location: source,
     };
     window.build_inspector_element_id(path)
+}
+
+#[cfg(test)]
+mod global_element_id_tests {
+    use super::*;
+
+    fn path(ids: &[&'static str]) -> Vec<ElementId> {
+        ids.iter().map(|id| ElementId::from(*id)).collect()
+    }
+
+    /// Ids made apart from one path are equal and hash alike, and ids of
+    /// different paths differ even where their hashes are made to meet.
+    #[test]
+    fn global_ids_compare_and_hash_by_path() {
+        let hash = |id: &GlobalElementId| collections::FxBuildHasher.hash_one(id);
+        let row = GlobalElementId::new(path(&["root", "table", "row"]).into());
+        let same_row = GlobalElementId::new(path(&["root", "table", "row"]).into());
+        assert_eq!(row, same_row);
+        assert_eq!(hash(&row), hash(&same_row));
+
+        let cell = GlobalElementId::new(path(&["root", "table", "cell"]).into());
+        assert_ne!(row, cell);
+        let forged = GlobalElementId(cell.0, row.1);
+        assert_ne!(row, forged);
+
+        assert_eq!(
+            GlobalElementId::default(),
+            GlobalElementId::new(path(&[]).into())
+        );
+    }
+
+    /// A path asked for again in the same frame or the next gets the id
+    /// already made for it; one unused for a whole frame is let go; and a
+    /// path sharing another's hash is never given the other's id.
+    #[test]
+    fn global_ids_are_reused_while_their_path_is_in_use() {
+        let row = path(&["root", "table", "row"]);
+        let cell = path(&["root", "table", "cell"]);
+        let mut cache = GlobalElementIdCache::default();
+
+        let first = cache.get(&row);
+        assert!(Arc::ptr_eq(&first.0, &cache.get(&row).0));
+
+        cache.finish_frame();
+        assert!(Arc::ptr_eq(&first.0, &cache.get(&row).0));
+
+        cache.finish_frame();
+        cache.finish_frame();
+        let later = cache.get(&row);
+        assert!(!Arc::ptr_eq(&first.0, &later.0));
+        assert_eq!(first, later);
+
+        let hash = GlobalElementId::path_hash(&row);
+        cache.finish_frame();
+        cache
+            .current
+            .insert(hash, GlobalElementId(Arc::from(&*cell), hash));
+        assert_eq!(&*cache.get(&row).0, &*row);
+        assert_eq!(&*cache.get(&cell).0, &*cell);
+    }
 }

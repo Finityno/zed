@@ -16,6 +16,10 @@ use taffy::{
     tree::NodeId,
 };
 
+mod retained_nodes;
+
+pub(crate) use retained_nodes::{Adopted, RetentionCounts};
+
 #[cfg(feature = "stacker")]
 type StackSafe<T> = stacksafe::StackSafe<T>;
 #[cfg(not(feature = "stacker"))]
@@ -30,6 +34,7 @@ struct NodeContext {
 }
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    retention: retained_nodes::LayoutRetention,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -52,6 +57,7 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            retention: retained_nodes::LayoutRetention::default(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -62,10 +68,13 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
-        let node_count = self.taffy.total_node_count();
-        self.last_frame_node_count = node_count;
-        self.node_high_water = self.node_high_water.max(node_count);
-        self.taffy.clear();
+        self.node_high_water = self.node_high_water.max(self.taffy.total_node_count());
+        let transient = self.transient_count();
+        self.release_unclaimed_nodes();
+        // The tree also held kept nodes this frame did not claim, which were
+        // just released; the frame itself used what is left plus its
+        // transient nodes.
+        self.last_frame_node_count = self.taffy.total_node_count() + transient;
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
@@ -75,15 +84,14 @@ impl TaffyLayoutEngine {
     /// window that has stopped drawing, when it has held more than that.
     ///
     /// Layout ids are handed out while a draw requests layout and consumed by
-    /// that same draw's prepaint; the tree is cleared at the end of every draw
-    /// and nothing keeps an id across the clear, so between draws no id names
-    /// a node in this tree and replacing it is safe. The doubled capacity is
-    /// the headroom the per-frame collections keep, so the frame still on
-    /// screen redraws without reallocating. Returns whether it rebuilt.
+    /// that same draw's prepaint, and only the retained nodes' records keep
+    /// one across draws; they are dropped with the tree, so between draws no
+    /// id names a node in the new tree and replacing it is safe. The next
+    /// frame lays out afresh, as every frame did before nodes were kept. The
+    /// doubled capacity is the headroom the per-frame collections keep, so
+    /// the frame still on screen redraws without reallocating. Returns
+    /// whether it rebuilt.
     pub fn reclaim_idle_capacity(&mut self) -> bool {
-        if self.taffy.total_node_count() != 0 {
-            return false;
-        }
         let target = self
             .last_frame_node_count
             .saturating_mul(2)
@@ -94,6 +102,7 @@ impl TaffyLayoutEngine {
         let mut taffy = TaffyTree::with_capacity(target);
         taffy.disable_rounding();
         self.taffy = taffy;
+        self.retention.forget_all();
         self.node_high_water = target;
         self.absolute_layout_bounds.shrink_to(target);
         self.absolute_outer_origins.shrink_to(target);
@@ -109,51 +118,19 @@ impl TaffyLayoutEngine {
         self.node_high_water
     }
 
-    pub fn request_layout(
-        &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        children: &[LayoutId],
-    ) -> LayoutId {
-        let taffy_style = style.to_taffy(rem_size, scale_factor);
-
-        if children.is_empty() {
-            self.taffy
-                .new_leaf(taffy_style)
-                .expect(EXPECT_MESSAGE)
-                .into()
-        } else {
-            self.taffy
-                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
-                .expect(EXPECT_MESSAGE)
-                .into()
-        }
+    /// The retained layout work done since the last [`Self::reset_retention_counts`].
+    pub(crate) fn retention_counts(&self) -> RetentionCounts {
+        self.retention.counts
     }
 
-    pub fn request_measured_layout(
-        &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>
-        + 'static,
-    ) -> LayoutId {
-        let taffy_style = style.to_taffy(rem_size, scale_factor);
-        let measure = Box::new(measure) as Box<MeasureFn>;
-        #[cfg(feature = "stacker")]
-        let measure = StackSafe::new(measure);
+    pub(crate) fn reset_retention_counts(&mut self) {
+        self.retention.counts = RetentionCounts::default();
+    }
 
-        self.taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+    /// How many nodes the tree holds, retained and transient alike.
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.taffy.total_node_count()
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -168,22 +145,7 @@ impl TaffyLayoutEngine {
         size: Size<Pixels>,
         scale_factor: f32,
     ) {
-        let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
-        let stretch_width = style.size.width.is_auto();
-        let stretch_height = style.size.height.is_auto();
-        if !stretch_width && !stretch_height {
-            return;
-        }
-        let mut style = style.clone();
-        if stretch_width {
-            style.size.width =
-                taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
-        }
-        if stretch_height {
-            style.size.height =
-                taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
-        }
-        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        self.stretch_retained_auto_size_to_fill(id, size, scale_factor);
     }
 
     // Used to understand performance
@@ -309,8 +271,14 @@ impl TaffyLayoutEngine {
                         untransform(available_space.height),
                     );
 
+                    let started_at = window.frame_work.clock();
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
+                    window.frame_work.stats.measure_calls += 1;
+                    crate::window::add_elapsed(
+                        &mut window.frame_work.stats.measure_time,
+                        started_at,
+                    );
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
             )
@@ -826,7 +794,7 @@ mod tests {
 
     fn request_leaves(engine: &mut TaffyLayoutEngine, count: usize) {
         for _ in 0..count {
-            engine.request_layout(Style::default(), crate::px(16.), 1.0, &[]);
+            engine.request_keyed_layout(None, &Style::default(), crate::px(16.), 1.0, &[]);
         }
     }
 
@@ -837,7 +805,7 @@ mod tests {
     fn idle_rebuild_sizes_the_tree_to_the_last_frame() {
         let mut engine = TaffyLayoutEngine::new();
         let ids: Vec<LayoutId> = (0..10_000)
-            .map(|_| engine.request_layout(Style::default(), crate::px(16.), 1.0, &[]))
+            .map(|_| engine.request_keyed_layout(None, &Style::default(), crate::px(16.), 1.0, &[]))
             .collect();
         // What a recompute over the whole tree leaves behind: the scratch
         // stack has held every node and is empty again.
@@ -865,6 +833,23 @@ mod tests {
         assert_eq!(engine.taffy.total_node_count(), 300);
         engine.clear();
         assert_eq!(engine.node_high_water(), 300);
+    }
+
+    /// Kept nodes a smaller frame did not claim are released when it ends,
+    /// and do not count toward the frame the idle rebuild sizes to.
+    #[test]
+    fn idle_rebuild_sizes_to_the_nodes_the_last_frame_claimed() {
+        let mut engine = TaffyLayoutEngine::new();
+        for key in 0..10_000u64 {
+            engine.request_keyed_layout(Some(key), &Style::default(), crate::px(16.), 1.0, &[]);
+        }
+        engine.clear();
+        for key in 0..100u64 {
+            engine.request_keyed_layout(Some(key), &Style::default(), crate::px(16.), 1.0, &[]);
+        }
+        engine.clear();
+        assert!(engine.reclaim_idle_capacity());
+        assert_eq!(engine.node_high_water(), 200);
     }
 
     #[test]

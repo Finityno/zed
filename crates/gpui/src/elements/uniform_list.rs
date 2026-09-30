@@ -340,6 +340,11 @@ impl Element for UniformList {
         let style = self
             .interactivity
             .compute_style(global_id, None, window, cx);
+        let offset_before = self
+            .interactivity
+            .scroll_offset
+            .as_ref()
+            .map(|offset| *offset.borrow());
         let border = style.border_widths.to_pixels(window.rem_size());
         let padding = style
             .padding
@@ -505,7 +510,7 @@ impl Element for UniformList {
                                 AvailableSpace::Definite(available_width),
                                 AvailableSpace::Definite(item_height),
                             );
-                            item.layout_as_root(available_space, window, cx);
+                            window.layout_as_list_item(&mut item, ix, available_space, cx);
                             item.prepaint_at(item_origin, window, cx);
                             frame_state.items.push(item);
                         }
@@ -531,6 +536,14 @@ impl Element for UniformList {
                             frame_state.decorations.push(decoration);
                         }
                     });
+                }
+
+                // The list clamps its offset and scrolls to an item after the
+                // container published its own changes.
+                if let Some(handle) = self.scroll_handle.as_ref()
+                    && let Some(offset_before) = offset_before
+                {
+                    handle.0.borrow().base_handle.changed_if_moved_from(offset_before);
                 }
 
                 hitbox

@@ -291,6 +291,12 @@ impl TextSystem {
         names
     }
 
+    /// Counts the times fonts were added, which can change how text already
+    /// shaped would shape now.
+    pub(crate) fn font_generation(&self) -> usize {
+        self.font_generation.load(Ordering::Acquire)
+    }
+
     /// Add a font's data to the text system.
     ///
     /// Cached font resolution and line layouts are invalidated after installation.
@@ -563,9 +569,19 @@ impl TextSystem {
 
     /// Get the rasterized size and location of a specific, rendered glyph.
     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        self.remembered_raster_bounds(params).map(|(bounds, _)| bounds)
+    }
+
+    /// [`Self::raster_bounds`], and whether they were remembered: bounds
+    /// that are not are asked of the platform again next time, and whoever
+    /// keeps a copy of them must not keep it either.
+    pub(crate) fn remembered_raster_bounds(
+        &self,
+        params: &RenderGlyphParams,
+    ) -> Result<(Bounds<DevicePixels>, bool)> {
         let raster_bounds = self.raster_bounds.upgradable_read();
         if let Some(bounds) = raster_bounds.get(params) {
-            Ok(*bounds)
+            Ok((*bounds, true))
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
             let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
@@ -592,11 +608,11 @@ impl TextSystem {
                 && self.glyph_may_have_ink(params)
             {
                 self.report_empty_raster_bounds(params);
-                return Ok(bounds);
+                return Ok((bounds, false));
             }
 
             raster_bounds.insert(params.clone(), bounds);
-            Ok(bounds)
+            Ok((bounds, true))
         }
     }
 
@@ -692,6 +708,30 @@ impl WindowTextSystem {
 
     pub(crate) fn layout_index(&self) -> LineLayoutIndex {
         self.line_layout_cache.layout_index()
+    }
+
+    /// Keeps `lines`, held across frames by a text element that did not ask
+    /// for them this frame, in the line layout cache. See
+    /// [`LineLayoutCache::hold_wrapped_lines`].
+    pub(crate) fn hold_lines<'a>(&self, lines: impl IntoIterator<Item = &'a WrappedLine>) {
+        self.line_layout_cache.hold_wrapped_lines(
+            lines
+                .into_iter()
+                .filter_map(|line| {
+                    let (key, font_generation) = line.cache_key.as_ref()?;
+                    Some((key, &line.layout, *font_generation))
+                }),
+        )
+    }
+
+    /// The lines this window shaped since [`Self::reset_shaping_stats`], and
+    /// the time that took if it was being kept.
+    pub(crate) fn shaping_stats(&self) -> (u64, std::time::Duration) {
+        self.line_layout_cache.shaping_stats()
+    }
+
+    pub(crate) fn reset_shaping_stats(&self, timed: bool) {
+        self.line_layout_cache.reset_shaping_stats(timed)
     }
 
     pub(crate) fn reuse_layouts(&self, index: Range<LineLayoutIndex>) {
@@ -845,7 +885,9 @@ impl WindowTextSystem {
         let mut process_line = |line_text: SharedString, line_start, line_end| {
             font_runs.clear();
 
-            let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
+            // Most lines carry one decoration run and highlighted ones a
+            // handful; reserving 32 allocated kilobytes on every line shaped.
+            let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(4);
             let mut run_start = line_start;
             while run_start < line_end {
                 let Some(run) = runs.peek_mut() else {
@@ -895,7 +937,10 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
-            let layout = self.line_layout_cache.layout_wrapped_line(
+            // Read before shaping, so fonts added meanwhile leave the line
+            // stamped older than it is, and it is not held; never newer.
+            let font_generation = self.font_generation();
+            let (layout, cache_key) = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
                 &font_runs,
@@ -908,6 +953,7 @@ impl WindowTextSystem {
                 layout,
                 decoration_runs,
                 text: line_text,
+                cache_key: Some((cache_key, font_generation)),
             });
 
             // Skip `\n` character.

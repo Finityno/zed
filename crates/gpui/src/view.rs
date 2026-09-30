@@ -4,6 +4,9 @@ use crate::{
     LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
     StyleRefinement, TextStyle, WeakEntity,
 };
+use crate::window::view_retention::{
+    ViewLayout, ViewLayoutState, ViewPrepaint, ViewPrepaintState,
+};
 use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
@@ -193,6 +196,7 @@ mod any_view {
             .a11y
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
+        crate::window::view_retention::dependencies::render_next(&mut cx.entities, view.entity_id());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -250,6 +254,7 @@ impl<T: Render> View for Entity<T> {
 
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        crate::window::view_retention::dependencies::render_next(&mut cx.entities, self.entity_id());
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })
@@ -345,6 +350,10 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// The layout nodes the view's content claimed when it was last laid
+    /// out, kept while the view is reused so that laying it out again finds
+    /// them.
+    layout_keys: Vec<u64>,
 }
 
 struct ViewElementCacheKey {
@@ -354,8 +363,8 @@ struct ViewElementCacheKey {
 }
 
 impl<V: View> Element for ViewElement<V> {
-    type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = Option<AnyElement>;
+    type RequestLayoutState = ViewLayoutState;
+    type PrepaintState = ViewPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         self.entity_id.map(ElementId::View)
@@ -371,7 +380,7 @@ impl<V: View> Element for ViewElement<V> {
 
     fn request_layout(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
@@ -379,23 +388,42 @@ impl<V: View> Element for ViewElement<V> {
         if let Some(entity_id) = self.entity_id {
             // Stateful path: create a reactive boundary.
             let view = &mut self.view;
-            request_layout_view(
+            let mut render = |window: &mut Window, cx: &mut App| {
+                view.take().unwrap().render(window, cx).into_any_element()
+            };
+            if cx.view_retention()
+                && let Some(id) = id
+            {
+                let (layout_id, layout) = window.request_retained_view_layout(
+                    entity_id,
+                    self.view_name,
+                    self.cached_style.as_ref(),
+                    id,
+                    &mut render,
+                    cx,
+                );
+                return (layout_id, ViewLayoutState(layout));
+            }
+            let (layout_id, element) = request_layout_view(
                 entity_id,
                 self.view_name,
                 self.cached_style.as_ref(),
                 window,
                 cx,
-                &mut |window, cx| view.take().unwrap().render(window, cx).into_any_element(),
-            )
+                &mut render,
+            );
+            (layout_id, ViewLayoutState(ViewLayout::Unretained(element)))
         } else {
             // Stateless path: isolate subtree via type name (no entity identity).
-            request_layout_component(type_name::<V>(), window, cx, &mut |window, cx| {
-                self.view
-                    .take()
-                    .unwrap()
-                    .render(window, cx)
-                    .into_any_element()
-            })
+            let (layout_id, element) =
+                request_layout_component(type_name::<V>(), window, cx, &mut |window, cx| {
+                    self.view
+                        .take()
+                        .unwrap()
+                        .render(window, cx)
+                        .into_any_element()
+                });
+            (layout_id, ViewLayoutState(ViewLayout::Unretained(element)))
         }
     }
 
@@ -404,31 +432,51 @@ impl<V: View> Element for ViewElement<V> {
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
+        layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<AnyElement> {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path.
-            prepaint_view(
+    ) -> ViewPrepaintState {
+        let layout = mem::replace(&mut layout.0, ViewLayout::Unretained(None));
+        let Some(entity_id) = self.entity_id else {
+            // Stateless path: just prepaint the element.
+            let ViewLayout::Unretained(mut element) = layout else {
+                return ViewPrepaintState(ViewPrepaint::Unretained(None));
+            };
+            return ViewPrepaintState(ViewPrepaint::Unretained(prepaint_component(
+                type_name::<V>(),
+                &mut element,
+                window,
+                cx,
+            )));
+        };
+        let view = &mut self.view;
+        let mut render = |window: &mut Window, cx: &mut App| {
+            view.take().unwrap().render(window, cx).into_any_element()
+        };
+        match (layout, global_id) {
+            (ViewLayout::Unretained(mut element), _) => ViewPrepaintState(
+                ViewPrepaint::Unretained(prepaint_view(
+                    entity_id,
+                    self.view_name,
+                    global_id,
+                    bounds,
+                    &mut element,
+                    window,
+                    cx,
+                    &mut render,
+                )),
+            ),
+            (layout, Some(global_id)) => ViewPrepaintState(window.prepaint_retained_view(
                 entity_id,
                 self.view_name,
                 global_id,
                 bounds,
-                element,
-                window,
+                layout,
+                &mut render,
                 cx,
-                &mut |window, cx| {
-                    self.view
-                        .take()
-                        .unwrap()
-                        .render(window, cx)
-                        .into_any_element()
-                },
-            )
-        } else {
-            // Stateless path: just prepaint the element.
-            prepaint_component(type_name::<V>(), element, window, cx)
+            )),
+            // A retained layout is only made for a view with an id.
+            (_, None) => ViewPrepaintState(ViewPrepaint::Unretained(None)),
         }
     }
 
@@ -438,13 +486,19 @@ impl<V: View> Element for ViewElement<V> {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        element: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path.
-            paint_view(
+        let Some(entity_id) = self.entity_id else {
+            // Stateless path: just paint the element.
+            if let ViewPrepaint::Unretained(element) = &mut prepaint.0 {
+                paint_component(std::any::type_name::<V>(), element, window, cx);
+            }
+            return;
+        };
+        match (&mut prepaint.0, global_id) {
+            (ViewPrepaint::Unretained(element), _) => paint_view(
                 entity_id,
                 self.view_name,
                 self.cached_style.is_some(),
@@ -452,10 +506,11 @@ impl<V: View> Element for ViewElement<V> {
                 element,
                 window,
                 cx,
-            );
-        } else {
-            // Stateless path: just paint the element.
-            paint_component(std::any::type_name::<V>(), element, window, cx);
+            ),
+            (prepaint, Some(global_id)) => {
+                window.paint_retained_view(entity_id, self.view_name, global_id, prepaint, cx)
+            }
+            (_, None) => {}
         }
     }
 }
@@ -490,6 +545,7 @@ fn request_layout_view(
             _ => {
                 #[cfg(feature = "profiler")]
                 window.record_view_render(entity_id, view_name);
+                window.frame_work.stats.views_rendered += 1;
                 let mut element = render(window, cx);
                 let layout_id = element.request_layout(window, cx);
                 (layout_id, Some(element))
@@ -545,6 +601,8 @@ fn prepaint_view(
                 {
                     #[cfg(feature = "profiler")]
                     window.draw_clock.count_reuse();
+                    window.frame_work.stats.views_reused += 1;
+                    window.keep_layout_keys(&element_state.layout_keys);
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
                     cx.entities
@@ -557,14 +615,17 @@ fn prepaint_view(
 
                 #[cfg(feature = "profiler")]
                 window.record_view_render(entity_id, view_name);
+                window.frame_work.stats.views_rendered += 1;
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
+                let layout_keys = window.record_claimed_layout_keys();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
                     element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
                     element.prepaint_at(bounds.origin, window, cx);
                     element
                 });
+                let layout_keys = window.finish_recording_claimed_layout_keys(layout_keys);
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
@@ -573,6 +634,7 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        layout_keys,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
