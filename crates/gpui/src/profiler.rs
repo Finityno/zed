@@ -1194,16 +1194,36 @@ pub struct SlowDrawViews {
 // Slow draws are rare (at most a few dozen a second while the app is
 // struggling), and hang detection reads these within a second or so.
 #[cfg(feature = "profiler")]
-static SLOW_DRAW_VIEWS: spin::Mutex<heapless::Deque<SlowDrawViews, 64>> =
+type SlowDrawViewsBuffer = heapless::Deque<SlowDrawViews, 64>;
+
+#[cfg(feature = "profiler")]
+static SLOW_DRAW_VIEWS: spin::Mutex<SlowDrawViewsBuffer> =
     spin::Mutex::new(heapless::Deque::new());
 
 #[cfg(feature = "profiler")]
 pub(crate) fn record_slow_draw_views(views: SlowDrawViews) {
-    let mut recorded = SLOW_DRAW_VIEWS.lock();
-    if recorded.is_full() {
-        recorded.pop_front();
+    push_slow_draw_views(&mut SLOW_DRAW_VIEWS.lock(), views);
+}
+
+#[cfg(feature = "profiler")]
+fn push_slow_draw_views(buffer: &mut SlowDrawViewsBuffer, views: SlowDrawViews) {
+    if buffer.is_full() {
+        buffer.pop_front();
     }
-    recorded.push_back(views).ok();
+    buffer.push_back(views).ok();
+}
+
+#[cfg(feature = "profiler")]
+fn find_slow_draw_views(
+    buffer: &SlowDrawViewsBuffer,
+    window_id: WindowId,
+    draw_start: Instant,
+) -> Option<SlowDrawViews> {
+    buffer
+        .iter()
+        .rev()
+        .find(|views| views.window_id == window_id && views.draw_start == draw_start)
+        .cloned()
 }
 
 /// The slowest views of the draw of `window_id` that started at
@@ -1212,12 +1232,7 @@ pub(crate) fn record_slow_draw_views(views: SlowDrawViews) {
 /// newer slow draws since.
 #[cfg(feature = "profiler")]
 pub fn slow_draw_views(window_id: WindowId, draw_start: Instant) -> Option<SlowDrawViews> {
-    SLOW_DRAW_VIEWS
-        .lock()
-        .iter()
-        .rev()
-        .find(|views| views.window_id == window_id && views.draw_start == draw_start)
-        .cloned()
+    find_slow_draw_views(&SLOW_DRAW_VIEWS.lock(), window_id, draw_start)
 }
 
 /// Where in a slow draw its views started being timed (see
@@ -1835,6 +1850,42 @@ mod tests {
             profiler.record_present_at(now, now, true, true);
             assert_eq!(profiler.dirty_to_present_histogram.len(), 2);
         }
+    }
+
+    #[test]
+    fn slow_draw_views_are_found_until_evicted() {
+        let mut buffer = SlowDrawViewsBuffer::new();
+        let start = Instant::now();
+        let slow_draw = |window: u64, draw: u64| SlowDrawViews {
+            window_id: WindowId::from(window),
+            draw_start: start + Duration::from_millis(draw),
+            timed_from: ViewTimingStart::Start,
+            views: heapless::Vec::new(),
+        };
+        push_slow_draw_views(&mut buffer, slow_draw(1, 0));
+        push_slow_draw_views(&mut buffer, slow_draw(2, 0));
+        assert_eq!(
+            find_slow_draw_views(&buffer, WindowId::from(1), start),
+            Some(slow_draw(1, 0))
+        );
+        assert_eq!(
+            find_slow_draw_views(&buffer, WindowId::from(1), start + Duration::from_millis(1)),
+            None,
+            "a draw is identified by its window and its start"
+        );
+
+        for draw in 1..buffer.capacity() as u64 {
+            push_slow_draw_views(&mut buffer, slow_draw(2, draw));
+        }
+        assert_eq!(
+            find_slow_draw_views(&buffer, WindowId::from(1), start),
+            None,
+            "the oldest draw is evicted once the buffer wraps"
+        );
+        assert!(
+            find_slow_draw_views(&buffer, WindowId::from(2), start).is_some(),
+            "and only the oldest"
+        );
     }
 
     #[test]

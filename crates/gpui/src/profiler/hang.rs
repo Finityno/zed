@@ -17,12 +17,15 @@ use serde::Serialize;
 
 /// Version of the power/visibility-aware measurement rules.
 ///
+/// 4: draws carry a phase breakdown and, where measured, thread CPU and
+/// memory-fault counters; the sampling adds < 3 µs inside the draw span.
+///
 /// 3: a present the platform deferred is foreground work, not a presentation:
 /// it no longer seals an interval, clears a pending frame, or ends the input
 /// latency and dirty-to-present spans of the frame it failed to show, and its
 /// window stays pending, even when nothing was invalidated, until a present
 /// lands or the frame outlives its deadline.
-pub const MEASUREMENT_VERSION: u32 = 3;
+pub const MEASUREMENT_VERSION: u32 = 4;
 
 use super::SerializedLocation;
 use super::journal::{
@@ -229,6 +232,52 @@ pub enum SerializedHangContributor {
         dirty_to_draw_ms: Option<f64>,
         /// Invalidations coalesced into the frame.
         invalidations: u64,
+        /// Of `duration_ms`, building the root element tree (see
+        /// [`crate::DrawBreakdown`] for what each phase covers).
+        request_layout_ms: f64,
+        /// Of `duration_ms`, every taffy layout pass and its measure
+        /// closures, wherever they ran.
+        layout_ms: f64,
+        /// Of `duration_ms`, prepaint without its layout passes, including
+        /// cached views and list items rendered during it.
+        prepaint_ms: f64,
+        /// Of `duration_ms`, painting.
+        paint_ms: f64,
+        /// Of `duration_ms`, the rest: setup, frame finish, focus
+        /// listeners and the accessibility update. The five parts add up to
+        /// `duration_ms`.
+        other_ms: f64,
+        /// Taffy layout passes the draw ran.
+        layout_passes: u16,
+        /// Entity views that rendered.
+        views_rendered: u16,
+        /// Cached views that replayed their previous prepaint.
+        views_reused: u16,
+        /// CPU time the drawing thread spent in user mode; absent when not
+        /// measured (a fast draw, or a platform that cannot).
+        user_cpu_ms: Option<f64>,
+        /// CPU time the drawing thread spent in the kernel, which on macOS
+        /// includes decompressing memory it faulted on. What is left of
+        /// `duration_ms` after both CPU times is time off the CPU: waiting
+        /// on disk, a lock or the scheduler.
+        system_cpu_ms: Option<f64>,
+        /// Page faults during the draw; see `faults_process_wide` for whose.
+        faults: Option<u32>,
+        /// Faults that read from disk.
+        major_faults: Option<u32>,
+        /// Pages decompressed from the memory compressor (macOS).
+        decompressions: Option<u32>,
+        /// Whether the fault counters are the whole process's (macOS), so
+        /// background threads' faults are included, rather than the
+        /// drawing thread's (Linux).
+        faults_process_wide: bool,
+        /// For a draw whose views were timed, where the timing started:
+        /// `"start"`, `"prepaint"` or `"paint"`. Views rendered before that
+        /// point are not in `top_views`.
+        views_timed_from: Option<&'static str>,
+        /// The views that spent the most time of their own in the draw,
+        /// longest first; empty when none were recorded.
+        top_views: Vec<SerializedViewTime>,
         /// How many other events in the interval contain this one.
         depth: usize,
     },
@@ -269,6 +318,18 @@ pub enum SerializedHangContributor {
         /// How many other events in the interval contain this one.
         depth: usize,
     },
+}
+
+/// One view's share of a slow draw (see [`crate::ViewRenderTime`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SerializedViewTime {
+    /// The view's type name.
+    pub view: &'static str,
+    /// Time the view spent itself, excluding views nested in it, in
+    /// milliseconds.
+    pub self_ms: f64,
+    /// How many times the view rendered in the draw.
+    pub renders: u16,
 }
 
 /// Milliseconds with microsecond precision: keeps `dbg!`/JSON output short
@@ -393,14 +454,51 @@ impl SerializedHangContributor {
                 caused_invalidation: timing.caused_invalidation,
                 depth,
             },
-            ForegroundEvent::Draw(timing) => Self::Draw {
-                window_id: timing.window_id.as_u64(),
-                start_ms: since_startup(timing.draw_start),
-                duration_ms,
-                dirty_to_draw_ms: timing.dirty_to_draw_duration().map(as_millis),
-                invalidations: timing.invalidations,
-                depth,
-            },
+            ForegroundEvent::Draw(timing) => {
+                let breakdown = timing.breakdown;
+                let resources = breakdown.resources();
+                let top_views = if breakdown.views_recorded() {
+                    super::slow_draw_views(timing.window_id, timing.draw_start)
+                        .map(|recorded| {
+                            recorded
+                                .views
+                                .iter()
+                                .map(|view| SerializedViewTime {
+                                    view: view.type_name,
+                                    self_ms: as_millis(view.self_time),
+                                    renders: view.renders,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                Self::Draw {
+                    window_id: timing.window_id.as_u64(),
+                    start_ms: since_startup(timing.draw_start),
+                    duration_ms,
+                    dirty_to_draw_ms: timing.dirty_to_draw_duration().map(as_millis),
+                    invalidations: timing.invalidations,
+                    request_layout_ms: as_millis(breakdown.request_layout()),
+                    layout_ms: as_millis(breakdown.layout()),
+                    prepaint_ms: as_millis(breakdown.prepaint()),
+                    paint_ms: as_millis(breakdown.paint()),
+                    other_ms: as_millis(breakdown.other()),
+                    layout_passes: breakdown.layout_passes(),
+                    views_rendered: breakdown.views_rendered(),
+                    views_reused: breakdown.views_reused(),
+                    user_cpu_ms: resources.user_cpu().map(as_millis),
+                    system_cpu_ms: resources.system_cpu().map(as_millis),
+                    faults: resources.faults(),
+                    major_faults: resources.major_faults(),
+                    decompressions: resources.decompressions(),
+                    faults_process_wide: resources.faults_process_wide(),
+                    views_timed_from: breakdown.views_timed_from().map(super::ViewTimingStart::name),
+                    top_views,
+                    depth,
+                }
+            }
             ForegroundEvent::Present(timing) => {
                 let breakdown = timing.report.breakdown;
                 Self::Present {
@@ -765,6 +863,149 @@ mod tests {
         assert_eq!(*drawables_in_flight, 2);
         assert!(!*drawables_in_flight_clamped);
         assert_eq!(*overlay_outcome, Some("dropped"));
+    }
+
+    /// A slow draw says which phase was slow, whether the thread was on the
+    /// CPU or waiting on memory, and which views spent the time; parts that
+    /// were not measured serialize as null rather than zero.
+    #[test]
+    fn serialized_draw_carries_its_breakdown() {
+        let startup = scheduler::Instant::now();
+        let at = |ms: u64| startup + Duration::from_millis(ms);
+        let measured_window = WindowId::from(0xD4A3);
+        let mut breakdown = crate::DrawBreakdown {
+            request_layout_us: 3_100,
+            layout_us: 12_400,
+            prepaint_us: 180_300,
+            paint_us: 20_100,
+            other_us: 4_100,
+            layout_passes: 41,
+            views_rendered: 7,
+            views_reused: 3,
+            views_timed_from: Some(crate::ViewTimingStart::Start),
+            flags: crate::DrawBreakdown::VIEWS_RECORDED,
+            ..Default::default()
+        };
+        let sample = |user_us: u64, system_us: u64, faults: u64, decompressions: u64| {
+            crate::ResourceSample {
+                user: Duration::from_micros(user_us),
+                system: Duration::from_micros(system_us),
+                faults: Some(faults),
+                major_faults: Some(12),
+                decompressions: Some(decompressions),
+                fault_scope: crate::FaultScope::Process,
+            }
+        };
+        breakdown.set_resources(crate::DrawResources::between(
+            &sample(1_000, 2_000, 100, 7),
+            &sample(41_100, 152_200, 48_311, 47_907),
+        ));
+        let measured = FrameTiming {
+            window_id: measured_window,
+            dirty_at: Some(at(990)),
+            invalidations: 2,
+            draw_start: at(1000),
+            draw_end: at(1220),
+            breakdown,
+        };
+        crate::profiler::record_slow_draw_views(crate::SlowDrawViews {
+            window_id: measured_window,
+            draw_start: measured.draw_start,
+            timed_from: crate::ViewTimingStart::Start,
+            views: heapless::Vec::from_slice(&[crate::ViewRenderTime {
+                type_name: "chat::ChatPanel",
+                self_time: Duration::from_micros(150_200),
+                renders: 1,
+            }])
+            .expect("one view fits"),
+        });
+        let unmeasured_window = WindowId::from(0xD4A4);
+        let unmeasured = FrameTiming {
+            window_id: unmeasured_window,
+            dirty_at: None,
+            invalidations: 1,
+            draw_start: at(1300),
+            draw_end: at(1500),
+            breakdown: crate::DrawBreakdown {
+                other_us: 200_000,
+                flags: crate::DrawBreakdown::VIEWS_RECORDED,
+                ..Default::default()
+            },
+        };
+        let snapshot = FrameSnapshot {
+            interval_start: at(1000),
+            boundary: IntervalBoundary::Idle { ended_at: at(1500) },
+            events: vec![
+                ForegroundEvent::Draw(measured),
+                ForegroundEvent::Draw(unmeasured),
+            ],
+            small_polls: Vec::new(),
+            dropped_events: 0,
+            journal_discontinuous: false,
+        };
+        let incident =
+            HangIncident::detect(snapshot, HANG_THRESHOLD, FRAME_BUDGET).expect("has contributors");
+        let serialized = SerializedHangIncident::convert(startup, &incident, 8, None);
+        assert_eq!(serialized.measurement_version, 4);
+        let contributors = serde_json::to_value(&serialized.contributors).expect("serializes");
+
+        assert_eq!(
+            contributors[0],
+            serde_json::json!({
+                "kind": "draw",
+                "window_id": measured_window.as_u64(),
+                "start_ms": 1000.0,
+                "duration_ms": 220.0,
+                "dirty_to_draw_ms": 230.0,
+                "invalidations": 2,
+                "request_layout_ms": 3.1,
+                "layout_ms": 12.4,
+                "prepaint_ms": 180.3,
+                "paint_ms": 20.1,
+                "other_ms": 4.1,
+                "layout_passes": 41,
+                "views_rendered": 7,
+                "views_reused": 3,
+                "user_cpu_ms": 40.1,
+                "system_cpu_ms": 150.2,
+                "faults": 48_211,
+                "major_faults": 0,
+                "decompressions": 47_900,
+                "faults_process_wide": true,
+                "views_timed_from": "start",
+                "top_views": [{"view": "chat::ChatPanel", "self_ms": 150.2, "renders": 1}],
+                "depth": 0,
+            })
+        );
+        assert_eq!(
+            contributors[1],
+            serde_json::json!({
+                "kind": "draw",
+                "window_id": unmeasured_window.as_u64(),
+                "start_ms": 1300.0,
+                "duration_ms": 200.0,
+                "dirty_to_draw_ms": null,
+                "invalidations": 1,
+                "request_layout_ms": 0.0,
+                "layout_ms": 0.0,
+                "prepaint_ms": 0.0,
+                "paint_ms": 0.0,
+                "other_ms": 200.0,
+                "layout_passes": 0,
+                "views_rendered": 0,
+                "views_reused": 0,
+                "user_cpu_ms": null,
+                "system_cpu_ms": null,
+                "faults": null,
+                "major_faults": null,
+                "decompressions": null,
+                "faults_process_wide": false,
+                "views_timed_from": null,
+                "top_views": [],
+                "depth": 0,
+            }),
+            "unmeasured parts are null, and views missing from the buffer are empty"
+        );
     }
 
     #[test]
