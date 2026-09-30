@@ -282,6 +282,14 @@ pub(crate) struct ViewRetention {
     /// [`crate::key_dispatch::DispatchTree::action_fingerprint`] of the frame
     /// last drawn, to tell when which actions are available changed.
     actions_fingerprint: u64,
+    /// The text system's font generation as the frame last drawn began, and
+    /// as the one being drawn began: views recorded before fonts were added
+    /// shaped their text without them, so none is drawn again.
+    drawn_font_generation: usize,
+    drawing_font_generation: usize,
+    /// The retained views a deferred draw being drawn now counts as part of,
+    /// for what it defers in turn to count as theirs too.
+    deferring_views: SmallVec<[usize; 4]>,
     /// Bumped as every frame begins. A view that opted out reads it, so that
     /// the views around it depend on it too and are never drawn again whole,
     /// which would copy it along.
@@ -309,6 +317,9 @@ impl ViewRetention {
             open_recordings: 0,
             deferred_inside_notified: false,
             actions_fingerprint: 0,
+            drawn_font_generation: 0,
+            drawing_font_generation: 0,
+            deferring_views: SmallVec::new(),
             frames_since_verification: 0,
             verification_interval: verification_interval(),
         }
@@ -330,6 +341,8 @@ pub(crate) struct EnclosingViews {
 /// Something deferred from retained views, being drawn.
 pub(crate) struct DeferredViewRecording {
     enclosing: EnclosingViews,
+    /// What [`ViewRetention::deferring_views`] held before, restored after.
+    deferring_before: SmallVec<[usize; 4]>,
     dependencies: DependencyRecording,
     hovers_start: usize,
 }
@@ -624,7 +637,10 @@ impl Window {
         &mut self,
         notified: &collections::FxHashSet<EntityId>,
     ) {
+        let font_generation = self.text_system().font_generation();
         let retention = &mut self.view_retention;
+        retention.drawn_font_generation =
+            std::mem::replace(&mut retention.drawing_font_generation, font_generation);
         retention.rebuilds.clear();
         retention.notified.clone_from(notified);
         retention.every_frame.bump();
@@ -681,7 +697,11 @@ impl Window {
         if opted_out {
             dependencies::note_state_read(&self.view_retention.every_frame);
         }
-        if self.refreshing || cx.has_active_drag() || self.is_inspector_picking(cx) {
+        if self.refreshing
+            || cx.has_active_drag()
+            || self.is_inspector_picking(cx)
+            || self.view_retention.drawn_font_generation != self.text_system().font_generation()
+        {
             return Err(ViewRebuildReason::WindowRefresh);
         }
         if self.a11y.is_active() {
@@ -1154,8 +1174,15 @@ impl Window {
     /// The retained views being prepainted right now, for something deferred
     /// from them to count as theirs.
     pub(crate) fn enclosing_views(&self) -> EnclosingViews {
+        let mut views: SmallVec<[usize; 4]> =
+            self.next_frame.retained_views.open.iter().copied().collect();
+        for &index in &self.view_retention.deferring_views {
+            if !views.contains(&index) {
+                views.push(index);
+            }
+        }
         EnclosingViews {
-            views: self.next_frame.retained_views.open.iter().copied().collect(),
+            views,
             inside_notified: self.inside_notified_view(),
         }
     }
@@ -1179,8 +1206,13 @@ impl Window {
             .collect();
         self.take_hover_reads();
         self.view_retention.view_stack.extend(ids);
+        let deferring_before = std::mem::replace(
+            &mut self.view_retention.deferring_views,
+            enclosing.views.clone(),
+        );
         Some(DeferredViewRecording {
             enclosing: enclosing.clone(),
+            deferring_before,
             dependencies: cx.begin_recording_dependencies(),
             hovers_start: self.view_retention.hovers.len(),
         })
@@ -1199,6 +1231,7 @@ impl Window {
         self.take_hover_reads();
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         self.view_retention.view_stack.clear();
+        self.view_retention.deferring_views = recording.deferring_before;
         let enclosing = &recording.enclosing.views;
         let views = &mut self.next_frame.retained_views;
         views.add_dependencies(enclosing, &dependencies);

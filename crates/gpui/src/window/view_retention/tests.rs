@@ -819,6 +819,23 @@ fn a_view_is_built_again_at_the_time_it_asked_for() {
     assert!(after.view_rebuilds.deadline >= 1, "{after:?}");
 }
 
+/// Views recorded before fonts were added shaped their text without them,
+/// so the first frame after is built whole, and the one after that draws
+/// views again.
+#[test]
+fn adding_fonts_builds_every_view_once() {
+    let mut cx = TestAppContext::single();
+    let (window, _) = shell_window(&mut cx);
+    let settled = draw(&mut cx, window);
+    assert!(settled.views_reused > 0, "{settled:?}");
+    cx.update(|cx| cx.text_system().add_fonts(Vec::new())).unwrap();
+    let after = draw(&mut cx, window);
+    assert_eq!(after.views_reused, 0, "{after:?}");
+    assert!(after.view_rebuilds.window_refresh > 0, "{after:?}");
+    let again = draw(&mut cx, window);
+    assert!(again.views_reused > 0, "{again:?}");
+}
+
 /// While accessibility is active every view is built, so that its nodes are.
 #[test]
 fn accessibility_builds_every_view() {
