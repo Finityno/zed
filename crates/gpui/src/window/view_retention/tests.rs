@@ -264,6 +264,9 @@ struct Shell {
     summary: Entity<Summary>,
     column: bool,
     tint: usize,
+    /// The index the next inserted card gets: never one a card has had, so
+    /// that no two cards share an element id after a removal.
+    next_card_ix: usize,
 }
 
 impl Shell {
@@ -292,6 +295,7 @@ impl Shell {
             list_cards,
             column: false,
             tint: 0,
+            next_card_ix: CARDS,
         }
     }
 }
@@ -518,7 +522,8 @@ impl Oracle {
             Change::InsertCard => {
                 let shared = self.shared.clone();
                 self.update_shells(move |shell, cx| {
-                    let ix = shell.cards.len();
+                    let ix = shell.next_card_ix;
+                    shell.next_card_ix += 1;
                     let summary = shell.summary.clone();
                     let card = cx.new(|cx| Card::new(ix, shared.clone(), summary, cx));
                     shell.cards.insert(0, card);

@@ -120,6 +120,11 @@ impl LayoutKeys {
     /// Begins an element, identified by `id` if it has one, returning its key.
     #[inline]
     pub(crate) fn push(&mut self, id: Option<&ElementId>) -> u64 {
+        if !self.enabled {
+            // Nothing reads the keys, so the path is not worked out; the
+            // frame only keeps pushes and pops balanced.
+            return self.push_key(0);
+        }
         let step = match id {
             Some(id) => mix(FxBuildHasher.hash_one(id), IDENTIFIED_STEP),
             None => {
@@ -150,12 +155,11 @@ impl LayoutKeys {
     }
 
     fn push_step(&mut self, step: u64) -> u64 {
+        if !self.enabled {
+            return self.push_key(0);
+        }
         let key = mix(self.parent_key(), step);
-        self.stack.push(LayoutKeyFrame {
-            key,
-            next_unidentified_child: 0,
-        });
-        key
+        self.push_key(key)
     }
 
     /// The key of the element being prepainted.
@@ -166,11 +170,12 @@ impl LayoutKeys {
     /// Begins the element whose key is `key` again, for what it lays out
     /// from here on to be keyed as it was when its layout was requested:
     /// a view built during its prepaint, whose layout was kept.
-    pub(crate) fn push_key(&mut self, key: u64) {
+    pub(crate) fn push_key(&mut self, key: u64) -> u64 {
         self.stack.push(LayoutKeyFrame {
             key,
             next_unidentified_child: 0,
         });
+        key
     }
 
     /// Ends the element most recently begun.

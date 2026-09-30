@@ -104,6 +104,10 @@ struct StateInner {
     /// Bumped whenever what the list's state answers changes; see
     /// [`ListState::changing`].
     version: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped whenever an item's height or residency changes, which the
+    /// per-item readers answer from and `version` does not cover: items can
+    /// be measured without the total height changing.
+    item_version: crate::window::view_retention::dependencies::StateVersion,
 }
 
 /// What can be read of a list's state, compared before and after a change.
@@ -485,6 +489,13 @@ impl ListState {
         crate::window::view_retention::dependencies::note_state_read(&self.0.borrow().version);
     }
 
+    /// Notes that the list's items were read, as [`Self::note_read`] does.
+    fn note_items_read(&self) {
+        let state = self.0.borrow();
+        crate::window::view_retention::dependencies::note_state_read(&state.version);
+        crate::window::view_retention::dependencies::note_state_read(&state.item_version);
+    }
+
     fn changed(&self) {
         self.0.borrow().version.bump();
     }
@@ -523,6 +534,7 @@ impl ListState {
             follow_state: FollowState::default(),
             height_hint_measurements: HeightHintMeasurements::default(),
             version: Default::default(),
+            item_version: Default::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -605,6 +617,7 @@ impl ListState {
             }),
             (),
         );
+        state.item_version.bump();
     }
 
     fn apply_uniform_item_height(&self, height: Pixels) {
@@ -625,6 +638,7 @@ impl ListState {
         let mut tree = SumTree::default();
         tree.extend(new_items, ());
         state.items = tree;
+        state.item_version.bump();
     }
 
     /// Remeasure all items while preserving proportional scroll position.
@@ -709,6 +723,7 @@ impl ListState {
             new_items
         };
         state.items = new_items;
+        state.item_version.bump();
         state.measuring_behavior.reset();
     }
 
@@ -742,6 +757,7 @@ impl ListState {
             new_items
         };
         state.items = new_items;
+        state.item_version.bump();
         state.measuring_behavior.reset();
     }
 
@@ -895,6 +911,7 @@ impl ListState {
         new_items.append(old_items.suffix(), ());
         drop(old_items);
         state.items = new_items;
+        state.item_version.bump();
 
         if let Some(ListOffset {
             item_ix,
@@ -1118,7 +1135,7 @@ impl ListState {
     /// Get the bounds for the given item in window coordinates, if it's
     /// been rendered.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
-        self.note_read();
+        self.note_items_read();
         let state = &*self.0.borrow();
 
         let bounds = state.last_layout_bounds.unwrap_or_default();
@@ -1223,7 +1240,7 @@ impl ListState {
     /// Inspect current extent and residency without retaining any additional
     /// per-item profiling state.
     pub fn diagnostics(&self) -> ListStateDiagnostics {
-        self.note_read();
+        self.note_items_read();
         let state = self.0.borrow();
         let summary = state.items.summary();
         let mut hinted_item_count = 0;
@@ -1283,7 +1300,7 @@ impl ListState {
 
     /// Return the retained height state for one item.
     pub fn item_height(&self, index: usize) -> Option<ListItemHeight> {
-        self.note_read();
+        self.note_items_read();
         let state = self.0.borrow();
         let mut cursor = state.items.cursor::<Count>(());
         cursor.seek(&Count(index), Bias::Right);
@@ -1292,7 +1309,7 @@ impl ListState {
 
     /// Visit item height states without allocating a parallel diagnostics vector.
     pub fn inspect_item_heights(&self, mut inspect: impl FnMut(usize, ListItemHeight)) {
-        self.note_read();
+        self.note_items_read();
         let state = self.0.borrow();
         for (index, item) in state.items.iter().enumerate() {
             inspect(index, item.height_state());
@@ -1307,7 +1324,7 @@ impl ListState {
     /// itself to zero height), so returning `None` in that case would make
     /// the answer oscillate from frame to frame.
     pub fn item_is_above_viewport(&self, ix: usize) -> Option<bool> {
-        self.note_read();
+        self.note_items_read();
         let viewport_bounds = self.0.borrow().last_layout_bounds?;
 
         let scroll_top = self.logical_scroll_top();
@@ -1327,7 +1344,7 @@ impl ListState {
     /// See [`Self::item_is_above_viewport`] for why a zero-height viewport
     /// still yields a definitive answer.
     pub fn item_is_below_viewport(&self, ix: usize) -> Option<bool> {
-        self.note_read();
+        self.note_items_read();
         let viewport_bounds = self.0.borrow().last_layout_bounds?;
 
         let scroll_top = self.logical_scroll_top();
@@ -1531,6 +1548,7 @@ impl StateInner {
         );
 
         let mut measured_items = Vec::default();
+        let mut items_changed = false;
         let height_hint_measurements = &mut self.height_hint_measurements;
 
         for (ix, item) in cursor.enumerate() {
@@ -1540,6 +1558,7 @@ impl StateInner {
             });
             if item.size().is_none() {
                 height_hint_measurements.record(item, size.height);
+                items_changed = true;
             }
 
             measured_items.push(ListItem::Measured {
@@ -1549,6 +1568,7 @@ impl StateInner {
         }
 
         self.items = SumTree::from_iter(measured_items, ());
+        self.item_version.bump_if(items_changed);
     }
 
     fn layout_items(
@@ -1576,6 +1596,7 @@ impl StateInner {
         }
 
         let mut rendered_focused_item = false;
+        let mut items_changed = false;
 
         let available_item_space = size(
             available_width.map_or(AvailableSpace::MaxContent, |width| {
@@ -1610,6 +1631,7 @@ impl StateInner {
                 if item.size().is_none() {
                     height_hint_measurements.record(item, element_size.height);
                 }
+                items_changed |= item.size() != Some(element_size);
 
                 // If there's a pending scroll adjustment for the scroll-top
                 // item, apply it.
@@ -1680,6 +1702,7 @@ impl StateInner {
                     if item.size().is_none() {
                         height_hint_measurements.record(item, element_size.height);
                     }
+                    items_changed |= item.size() != Some(element_size);
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
                     measured_items.push_front(ListItem::Measured {
@@ -1736,6 +1759,7 @@ impl StateInner {
                         cx,
                     );
                     height_hint_measurements.record(item, item_size.height);
+                    items_changed |= item.size() != Some(item_size);
                     (
                         item_size,
                         ListItem::Measured {
@@ -1759,6 +1783,7 @@ impl StateInner {
         cursor.seek(&Count(measured_range.end), Bias::Right);
         new_items.append(cursor.suffix(), ());
         self.items = new_items;
+        self.item_version.bump_if(items_changed);
 
         // If follow_tail mode is on but the user scrolled away
         // (is_following is false), check whether the current scroll
@@ -2036,6 +2061,9 @@ impl Element for List {
                         window.rem_size(),
                     );
 
+                    // Measuring items here changes what the state answers
+                    // before prepaint takes its snapshot to compare against.
+                    let observed_before = state.observed();
                     let layout_response = state.layout_items(
                         None,
                         available_height,
@@ -2044,6 +2072,7 @@ impl Element for List {
                         window,
                         cx,
                     );
+                    state.version.bump_if(state.observed() != observed_before);
                     let max_element_width = layout_response.max_item_width;
 
                     let summary = state.items.summary();
@@ -2136,6 +2165,7 @@ impl Element for List {
             );
 
             state.items = new_items;
+            state.item_version.bump();
             state.measuring_behavior.reset();
         }
         state.last_measured_item_width = Some(measured_item_width);

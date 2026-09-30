@@ -797,12 +797,13 @@ impl PlatformTextSystem for GlyphBoxTextSystem {
         self.0.glyph_for_char(font_id, ch)
     }
 
-    /// Each glyph's box is as wide as its id says, so which glyph was painted
-    /// shows as well as where.
+    /// Each glyph's box is sized by its id, one size per id, so which glyph
+    /// was painted shows as well as where.
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        let id = params.glyph_id.0 as i32;
         Ok(Bounds {
             origin: point(DevicePixels(0), DevicePixels(-8)),
-            size: size(DevicePixels(2 + (params.glyph_id.0 % 7) as i32), DevicePixels(9)),
+            size: size(DevicePixels(2 + id % 7), DevicePixels(9 + id / 7)),
         })
     }
 

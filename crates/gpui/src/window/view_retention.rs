@@ -522,6 +522,9 @@ impl App {
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.entities.access_log.enabled != enabled {
             self.entities.access_log.enabled = enabled;
+            if !enabled {
+                self.entities.access_log.forget_all();
+            }
             self.refresh_windows();
         }
     }

@@ -7536,6 +7536,7 @@ impl Window {
 
     /// Returns all available actions for the focused element.
     pub fn available_actions(&self, cx: &App) -> Vec<Box<dyn Action>> {
+        self.note_actions_read();
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let mut actions = self.rendered_frame.dispatch_tree.available_actions(node_id);
         for action_type in cx.global_action_listeners.keys() {
@@ -7576,6 +7577,7 @@ impl Window {
         action: &dyn Action,
         context: KeyContext,
     ) -> Vec<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         dispatch_tree.bindings_for_action(action, &[context])
     }
@@ -7587,6 +7589,7 @@ impl Window {
         action: &dyn Action,
         context: KeyContext,
     ) -> Option<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         dispatch_tree.highest_precedence_binding_for_action(action, &[context])
     }
@@ -7599,6 +7602,7 @@ impl Window {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> Vec<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let Some(context_stack) = self.context_stack_for_focus_handle(focus_handle) else {
             return vec![];
@@ -7614,6 +7618,7 @@ impl Window {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> Option<KeyBinding> {
+        self.note_actions_read();
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let context_stack = self.context_stack_for_focus_handle(focus_handle)?;
         dispatch_tree.highest_precedence_binding_for_action(action, &context_stack)
@@ -7621,6 +7626,7 @@ impl Window {
 
     /// Find the bindings that can follow the current input sequence for the current context stack.
     pub fn possible_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
+        self.note_actions_read();
         self.rendered_frame
             .dispatch_tree
             .possible_next_bindings_for_input(input, &self.context_stack())

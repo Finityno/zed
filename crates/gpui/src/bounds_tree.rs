@@ -462,11 +462,19 @@ where
         self.grid
             .entries_shrink
             .shrink_vec_idle(&mut self.grid.entries, rendered_entries);
+        // The fill before this tree was cleared sits in `previous`, kept for
+        // replay; a heavy fill there outlives a quiet frame on screen, so it
+        // counts toward the storage to release, and is dropped when it holds
+        // more than the target (the next fill then orders from scratch).
+        let capacity = self.recorded.capacity().max(self.previous.capacity());
         if let Some(capacity) = self
             .recorded_shrink
-            .idle_target(rendered.recorded.len(), self.recorded.capacity())
+            .idle_target(rendered.recorded.len(), capacity)
         {
             self.recorded.shrink_to(capacity);
+            if self.previous.len() > capacity {
+                self.previous.clear();
+            }
             self.previous.shrink_to(capacity);
         }
     }
@@ -970,6 +978,26 @@ mod tests {
         retired.shrink_idle(&rendered);
         assert!(retired.grid.entries.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
         assert!(retired.recorded.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
+
+        assert_eq!(retired.insert(unit_bounds(0)), 1);
+        assert_eq!(retired.insert(unit_bounds(0)), 2);
+    }
+
+    /// A heavy fill cleared once is kept for replay; going idle on a light
+    /// frame releases it too.
+    #[test]
+    fn idle_release_drops_a_heavy_fill_kept_for_replay() {
+        let mut retired = BoundsTree::<f32>::default();
+        for index in 0..10_000 {
+            retired.insert(unit_bounds(index));
+        }
+        retired.clear();
+        assert!(retired.previous.capacity() >= 10_000);
+
+        let mut rendered = BoundsTree::<f32>::default();
+        rendered.insert(unit_bounds(0));
+        retired.shrink_idle(&rendered);
+        assert!(retired.previous.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
 
         assert_eq!(retired.insert(unit_bounds(0)), 1);
         assert_eq!(retired.insert(unit_bounds(0)), 2);

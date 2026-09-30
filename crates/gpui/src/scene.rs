@@ -2263,9 +2263,13 @@ impl TimeTransition {
     }
 
     /// Whether the transition has landed by `now` and rests where it was
-    /// painted: no offset, full opacity.
+    /// painted: no offset, full opacity. An easing that does not end at 1
+    /// leaves the content short of its endpoints, so it does not rest there.
     pub(crate) fn rests_at_identity_by(&self, now: std::time::Instant) -> bool {
-        self.ends_at() <= now && self.to_offset == Point::default() && self.to_opacity == 1.0
+        self.ends_at() <= now
+            && self.to_offset == Point::default()
+            && self.to_opacity == 1.0
+            && (self.easing)(1.0) == 1.0
     }
 
     /// When the transition lands.

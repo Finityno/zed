@@ -432,8 +432,10 @@ pub struct WrappedLine {
     pub text: SharedString,
     pub(crate) decoration_runs: Vec<DecorationRun>,
     /// What the line layout cache keeps the layout under, for a text element
-    /// that holds the line across frames to keep it there.
-    pub(crate) cache_key: Option<Arc<crate::text_system::CacheKey>>,
+    /// that holds the line across frames to keep it there, and the font
+    /// generation it was shaped in, since a layout shaped before fonts were
+    /// added must not be put back.
+    pub(crate) cache_key: Option<(Arc<crate::text_system::CacheKey>, usize)>,
 }
 
 impl WrappedLine {

@@ -102,18 +102,14 @@ pub(crate) fn global_written_and_read(cx: &mut App, global_type: TypeId) {
 /// to be set where it was not.
 pub(crate) fn note_global_inserted<G: 'static>(cx: &mut App) {
     if cx.entities.access_log.enabled && !cx.globals_by_type.contains_key(&TypeId::of::<G>()) {
-        cx.dependencies
-            .global_changed(TypeId::of::<GlobalPresence<G>>());
+        global_changed(cx, TypeId::of::<GlobalPresence<G>>());
     }
 }
 
 /// Stamps a change to whether a global of type `G` is set, as it is about to
 /// be removed.
 pub(crate) fn note_global_removed<G: 'static>(cx: &mut App) {
-    if cx.entities.access_log.enabled {
-        cx.dependencies
-            .global_changed(TypeId::of::<GlobalPresence<G>>());
-    }
+    global_changed(cx, TypeId::of::<GlobalPresence<G>>());
 }
 
 /// Parts of a window's state a view can read without reading an entity or a
@@ -128,9 +124,9 @@ pub(crate) mod ambient {
     /// The window's appearance: [`crate::Window::appearance`].
     pub(crate) struct Appearance;
     /// Which actions are available and bound where the window is focused:
-    /// [`crate::Window::is_action_available`] and
-    /// [`crate::Window::bindings_for_action`], which answer from the frame
-    /// last drawn and the keymap.
+    /// [`crate::Window::is_action_available`],
+    /// [`crate::Window::available_actions`] and the binding lookups, which
+    /// answer from the frame last drawn and the keymap.
     pub(crate) struct Actions;
 }
 
@@ -320,6 +316,16 @@ impl EntityAccessLog {
     fn stamp_changed(&mut self, entity_id: EntityId) {
         self.update_generation += 1;
         self.changed_at.insert(entity_id, self.update_generation);
+    }
+
+    /// Forgets every stamp, as view retention is turned off: `forget` keeps
+    /// nothing up to date while it is off, so an entity released meanwhile
+    /// would otherwise keep its stamps for the life of the app.
+    pub(crate) fn forget_all(&mut self) {
+        self.updated_at = FxHashMap::default();
+        self.written_at = FxHashMap::default();
+        self.updated_unnotified = FxHashSet::default();
+        self.changed_at = FxHashMap::default();
     }
 
     /// Forgets a released entity.

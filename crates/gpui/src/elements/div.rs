@@ -2004,9 +2004,9 @@ impl Element for Div {
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
-        let content_size = if request_layout.child_layout_ids.is_empty() {
-            bounds.size
-        } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
+        let content_size = if let Some(scroll_handle) =
+            self.interactivity.tracked_scroll_handle.as_ref()
+        {
             let mut state = scroll_handle.0.borrow_mut();
             let mut children = Vec::with_capacity(request_layout.child_layout_ids.len());
             for child_layout_id in &request_layout.child_layout_ids {
@@ -2017,7 +2017,13 @@ impl Element for Div {
             }
             state.version.bump_if(state.child_bounds != children);
             state.child_bounds = children;
-            (child_max - child_min).into()
+            if request_layout.child_layout_ids.is_empty() {
+                bounds.size
+            } else {
+                (child_max - child_min).into()
+            }
+        } else if request_layout.child_layout_ids.is_empty() {
+            bounds.size
         } else {
             for child_layout_id in &request_layout.child_layout_ids {
                 let child_bounds = window.layout_bounds(*child_layout_id);

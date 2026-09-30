@@ -59,9 +59,16 @@ fn a_reused_cached_view_keeps_its_window_control_areas() {
 
     // Only the shell is notified, so the chrome is drawn from last frame.
     window
-        .update(&mut cx, |_, _, cx| cx.notify())
+        .update(&mut cx, |_, window, cx| {
+            window.reset_frame_work_stats(false);
+            cx.notify()
+        })
         .unwrap();
     let reused = controls(&mut cx);
     assert!(window.read_with(&cx, |shell, _| shell.renders).unwrap() >= 2);
+    let views_reused = window
+        .update(&mut cx, |_, window, _| window.frame_work_stats().views_reused)
+        .unwrap();
+    assert!(views_reused > 0, "the chrome was built again, not reused");
     assert_eq!(reused, first);
 }

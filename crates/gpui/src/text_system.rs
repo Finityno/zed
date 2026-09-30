@@ -717,7 +717,10 @@ impl WindowTextSystem {
         self.line_layout_cache.hold_wrapped_lines(
             lines
                 .into_iter()
-                .filter_map(|line| Some((line.cache_key.as_ref()?, &line.layout))),
+                .filter_map(|line| {
+                    let (key, font_generation) = line.cache_key.as_ref()?;
+                    Some((key, &line.layout, *font_generation))
+                }),
         )
     }
 
@@ -934,6 +937,9 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
+            // Read before shaping, so fonts added meanwhile leave the line
+            // stamped older than it is, and it is not held; never newer.
+            let font_generation = self.font_generation();
             let (layout, cache_key) = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
@@ -947,7 +953,7 @@ impl WindowTextSystem {
                 layout,
                 decoration_runs,
                 text: line_text,
-                cache_key: Some(cache_key),
+                cache_key: Some((cache_key, font_generation)),
             });
 
             // Skip `\n` character.

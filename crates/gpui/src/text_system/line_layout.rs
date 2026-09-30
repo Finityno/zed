@@ -821,12 +821,12 @@ impl LineLayoutCache {
     /// text lands on another layout node would have it shaped again.
     pub(crate) fn hold_wrapped_lines<'a>(
         &self,
-        lines: impl IntoIterator<Item = (&'a Arc<CacheKey>, &'a Arc<WrappedLineLayout>)>,
+        lines: impl IntoIterator<Item = (&'a Arc<CacheKey>, &'a Arc<WrappedLineLayout>, usize)>,
     ) {
-        let _font_generation = self.clear_if_font_generation_changed();
+        let font_generation = self.clear_if_font_generation_changed();
         let mut current_frame = self.current_frame.write();
-        for (key, layout) in lines {
-            if !current_frame.wrapped_lines.contains_key(key) {
+        for (key, layout, shaped_in) in lines {
+            if shaped_in == font_generation && !current_frame.wrapped_lines.contains_key(key) {
                 current_frame
                     .wrapped_lines
                     .insert(key.clone(), layout.clone());

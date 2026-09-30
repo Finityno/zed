@@ -68,10 +68,13 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
-        let node_count = self.taffy.total_node_count();
-        self.last_frame_node_count = node_count;
-        self.node_high_water = self.node_high_water.max(node_count);
+        self.node_high_water = self.node_high_water.max(self.taffy.total_node_count());
+        let transient = self.transient_count();
         self.release_unclaimed_nodes();
+        // The tree also held kept nodes this frame did not claim, which were
+        // just released; the frame itself used what is left plus its
+        // transient nodes.
+        self.last_frame_node_count = self.taffy.total_node_count() + transient;
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
@@ -830,6 +833,23 @@ mod tests {
         assert_eq!(engine.taffy.total_node_count(), 300);
         engine.clear();
         assert_eq!(engine.node_high_water(), 300);
+    }
+
+    /// Kept nodes a smaller frame did not claim are released when it ends,
+    /// and do not count toward the frame the idle rebuild sizes to.
+    #[test]
+    fn idle_rebuild_sizes_to_the_nodes_the_last_frame_claimed() {
+        let mut engine = TaffyLayoutEngine::new();
+        for key in 0..10_000u64 {
+            engine.request_keyed_layout(Some(key), &Style::default(), crate::px(16.), 1.0, &[]);
+        }
+        engine.clear();
+        for key in 0..100u64 {
+            engine.request_keyed_layout(Some(key), &Style::default(), crate::px(16.), 1.0, &[]);
+        }
+        engine.clear();
+        assert!(engine.reclaim_idle_capacity());
+        assert_eq!(engine.node_high_water(), 200);
     }
 
     #[test]
