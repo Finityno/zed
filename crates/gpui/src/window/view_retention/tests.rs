@@ -4171,6 +4171,141 @@ fn rows_with_scrollers_scrolled_by_the_wheel_are_not_built_after() {
     }
 }
 
+/// A transcript row styled by its hover, as message rows are.
+struct HoverRow {
+    ix: usize,
+}
+
+impl Render for HoverRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("hover-row", self.ix))
+            .w(px(180.))
+            .h(px(40.))
+            .bg(PALETTE[self.ix % PALETTE.len()])
+            .hover(|style| style.bg(PALETTE[2]))
+            .child(SharedString::from(format!("row {}", self.ix)))
+    }
+}
+
+/// A row's body, styled by whether the row around it, another element, is
+/// hovered.
+struct GroupHoverBody {
+    ix: usize,
+}
+
+impl Render for GroupHoverBody {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(160.))
+            .h(px(30.))
+            .bg(PALETTE[self.ix % PALETTE.len()])
+            .group_hover("hover-row", |style| style.bg(PALETTE[3]))
+            .child(SharedString::from(format!("body {}", self.ix)))
+    }
+}
+
+struct HoverRows {
+    rows: Vec<Entity<HoverRow>>,
+    bodies: Vec<Entity<GroupHoverBody>>,
+    list_state: ListState,
+}
+
+impl Render for HoverRows {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        let bodies = self.bodies.clone();
+        div().size_full().child(
+            list(self.list_state.clone(), move |ix, _, _| {
+                if ix % 2 == 0 {
+                    rows[ix].clone().into_any_element()
+                } else {
+                    div()
+                        .id(("group-row", ix))
+                        .group("hover-row")
+                        .w(px(180.))
+                        .h(px(40.))
+                        .child(bodies[ix].clone())
+                        .into_any_element()
+                }
+            })
+            .w(px(200.))
+            .h(px(300.)),
+        )
+    }
+}
+
+/// Scrolling rows styled by their hover, or by the hover of the row around
+/// them, under a pointer standing still, one wheel event a frame, draws
+/// exactly one frame for each event: no view is left drawn with a hover it
+/// no longer has, to be built on a follow-up frame, and no view is built as
+/// notified when nothing notified it.
+#[test]
+fn a_wheel_scroll_under_the_pointer_draws_one_frame_a_wheel_event() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let window = cx.add_window(|_, cx| HoverRows {
+        rows: (0..40).map(|ix| cx.new(|_| HoverRow { ix })).collect(),
+        bodies: (0..40).map(|ix| cx.new(|_| GroupHoverBody { ix })).collect(),
+        list_state: ListState::new(40, ListAlignment::Top, px(40.)),
+    });
+    let pointer = point(px(100.), px(150.));
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = (window.frame_work_stats(), window.view_rebuild_reasons().to_vec());
+            window.reset_frame_work_stats(false);
+            work
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(
+            crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                position: pointer,
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    frame(&mut cx);
+    frame(&mut cx);
+    let mut moved = 0;
+    for event in 0..12 {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                    position: pointer,
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-15.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: crate::TouchPhase::Moved,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        let (work, reasons) = frame(&mut cx);
+        moved += work.views_moved;
+        assert_eq!(work.frames, 1, "event {event}: {work:?}");
+        assert!(
+            !reasons.iter().any(|(_, reason)| *reason == ViewRebuildReason::Notified),
+            "event {event}: built as notified with nothing notified: {reasons:?}"
+        );
+        let follow_up = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.simulate_next_frame(cx) > 0 || window.invalidator.is_dirty()
+            })
+            .unwrap();
+        assert!(!follow_up, "event {event}: a follow-up frame was asked for");
+    }
+    assert!(moved > 0, "rows were drawn moved");
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,
