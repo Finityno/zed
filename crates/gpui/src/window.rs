@@ -305,6 +305,10 @@ impl WindowInvalidator {
         );
     }
 
+    pub fn is_painting(&self) -> bool {
+        matches!(self.inner.borrow().draw_phase, DrawPhase::Paint)
+    }
+
     #[track_caller]
     pub fn debug_assert_paint_or_prepaint(&self) {
         debug_assert!(
@@ -1361,6 +1365,8 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// The group containers around what is being painted.
+    pub(crate) group_hitboxes: crate::GroupHitboxes,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2323,6 +2329,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            group_hitboxes: Default::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),

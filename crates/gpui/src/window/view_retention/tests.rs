@@ -215,6 +215,13 @@ impl Render for Card {
             .border_1()
             .border_color(PALETTE[self.ix % PALETTE.len()])
             .hover(|style| style.bg(PALETTE[2]))
+            // A group container the inner view's group hover resolves, and
+            // a group hover resolving the shell's: both containers are in
+            // another view than the hover.
+            .group("card")
+            .when(self.ix.is_multiple_of(4), |this| {
+                this.group_hover("shell", |style| style.border_color(PALETTE[0]))
+            })
             .track_focus(&self.focus_handle)
             .when(self.handles, |this| {
                 this.on_action(|_: &probe_actions::Probe, _, _| {})
@@ -258,7 +265,13 @@ impl Render for Inner {
             .flex()
             .flex_row()
             .gap_1()
-            .child(div().w(px(6. + self.count as f32 * 2.)).h(px(6.)).bg(PALETTE[1]))
+            .child(
+                div()
+                    .w(px(6. + self.count as f32 * 2.))
+                    .h(px(6.))
+                    .bg(PALETTE[1])
+                    .group_hover("card", |style| style.bg(PALETTE[3])),
+            )
             .child(word)
             // Paints by whether its hitbox is hovered, and is not notified
             // when that changes: the hover it was painted by is a dependency.
@@ -342,6 +355,7 @@ impl Render for Shell {
             .gap_1()
             .when(self.column, |this| this.flex_col())
             .bg(PALETTE[self.tint % PALETTE.len()])
+            .group("shell")
             .when(self.handles, |this| {
                 this.on_action(|_: &probe_actions::Probe, _, _| {})
             })
@@ -822,6 +836,42 @@ fn notifying_a_view_builds_only_it_and_the_views_around_it() {
     // on every frame.
     assert_eq!(work.view_rebuilds.notified, 3, "{work:?} {reasons:?}");
     assert_eq!(work.view_rebuilds.entity_changed, 0, "{work:?}");
+    assert!(work.views_reused >= CARDS as u64, "{work:?}");
+}
+
+/// A group container built builds the views nested in it that resolved it,
+/// whose hover is by its hitbox, which a container built anew does not
+/// keep; group containers elsewhere build nothing.
+#[test]
+fn group_hover_views_are_built_with_their_group_container_only() {
+    let mut cx = TestAppContext::single();
+    let (window, _) = shell_window(&mut cx);
+    let card = window
+        .read_with(&cx, |shell, _| shell.cards[2].clone())
+        .unwrap();
+    let inner = card.read_with(&cx, |card, _| card.inner.entity_id());
+    let work = work_after(&mut cx, window, |cx| card.update(cx, |_, cx| cx.notify()));
+    let rebuilt: Vec<_> = cx
+        .update_window(window.into(), |_, window, _| window.view_rebuild_reasons().to_vec())
+        .unwrap();
+    assert!(
+        rebuilt.contains(&(inner, ViewRebuildReason::ContextChanged)),
+        "the inner view resolved the card it is in: {rebuilt:?}"
+    );
+    // The card, the shell around it and its inner view; the opted-out
+    // cards are built on every frame, and the cards resolving the shell's
+    // group with it, two of the cards and two of the list's, with the inner
+    // views resolving their groups.
+    let others = rebuilt
+        .iter()
+        .filter(|(_, reason)| {
+            !matches!(
+                reason,
+                ViewRebuildReason::Notified | ViewRebuildReason::OptedOut
+            )
+        })
+        .count();
+    assert!(others <= 1 + 2 * 4, "{work:?} {rebuilt:?}");
     assert!(work.views_reused >= CARDS as u64, "{work:?}");
 }
 

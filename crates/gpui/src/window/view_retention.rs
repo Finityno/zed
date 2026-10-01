@@ -17,7 +17,8 @@
 //!
 //! A view is built instead when it was notified (or a view nested in it was),
 //! when something it read changed, when a hover it was drawn by changed, when
-//! it is drawn somewhere else or inherits something else there, while the
+//! it is drawn somewhere else or inherits something else there (a group it
+//! hovers by, say, whose container was built), while the
 //! window refreshes, while something is dragged, while the inspector picks,
 //! while accessibility is active, and when it opted out
 //! ([`crate::Context::set_view_retainable`]).
@@ -38,9 +39,9 @@ mod tests;
 
 use super::{ArenaClearNeeded, PaintIndex, PrepaintStateIndex, Window};
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, EntityId, GlobalElementId, HitboxId,
-    LayoutId, OpacityCycle, Pixels, Size, Style, StyleRefinement, Task, TextShimmerStyle,
-    TextStyle, view::ViewName,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, EntityId, GlobalElementId,
+    GroupHitboxes, HitboxId, LayoutId, OpacityCycle, Pixels, SharedString, Size, Style,
+    StyleRefinement, Task, TextShimmerStyle, TextStyle, view::ViewName,
 };
 use collections::FxHashMap;
 use dependencies::{AmbientReads, DependencyChange, DependencyRecording, RenderDependencies};
@@ -125,6 +126,20 @@ impl HoverRead {
     }
 }
 
+/// A group a view resolved as it painted (see
+/// [`crate::InteractiveElement::group`]): the hitbox of the innermost group
+/// container of that name around it, if any.
+///
+/// Only groups resolved outside the view are kept: a container inside it is
+/// drawn again with it. Hitbox ids are new whenever a container is built, so
+/// a view drawn again around a container that was built would hover by a
+/// hitbox no longer drawn, and is built instead.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GroupRead {
+    name: SharedString,
+    hitbox: Option<HitboxId>,
+}
+
 /// The retained views drawn in one frame, in the order they began
 /// prepainting, which puts a view's nested views right after it.
 #[derive(Default)]
@@ -151,6 +166,11 @@ struct ViewRecord {
     dependencies: RenderDependencies,
     /// The hovers the view was drawn by, likewise.
     hovers: Rc<[HoverRead]>,
+    /// The groups it, and the views nested in it, resolved outside it.
+    groups: Rc<[GroupRead]>,
+    /// The ids of the hitboxes inserted as it was prepainted this frame,
+    /// built: groups resolved to one of those are inside it.
+    fresh_hitboxes: Range<u64>,
     /// The layout nodes the view claimed while it was prepainted (list items,
     /// say), kept while it is drawn again so that building it again later
     /// finds them.
@@ -239,6 +259,7 @@ struct ViewRecording {
     layout_keys: usize,
     nested_keys: usize,
     hovers_start: usize,
+    hitboxes_start: u64,
 }
 
 /// A retained view being painted.
@@ -246,6 +267,7 @@ struct ViewPaintRecording {
     index: Option<usize>,
     start: PaintIndex,
     hovers_start: usize,
+    groups_start: usize,
     dependencies: DependencyRecording,
 }
 
@@ -265,6 +287,12 @@ pub(crate) struct ViewRetention {
     notified: collections::FxHashSet<EntityId>,
     /// Records reads of the pointer and modifier keys while views are drawn.
     pub(crate) ambient_reads: AmbientReads,
+    /// The group containers around what is being prepainted, which a view
+    /// drawn again must find where it found them as it was painted.
+    pub(crate) prepaint_groups: GroupHitboxes,
+    /// The groups resolved by retained views as they painted this frame, in
+    /// the order resolved.
+    group_reads: Vec<GroupRead>,
     /// Why each view built in the last frame was built.
     rebuilds: Vec<(EntityId, ViewRebuildReason)>,
     /// The earliest time something drawn in this frame said it would look
@@ -314,6 +342,8 @@ impl ViewRetention {
             hover_reads: RefCell::default(),
             notified: Default::default(),
             ambient_reads: cx.ambient_reads(),
+            prepaint_groups: GroupHitboxes::default(),
+            group_reads: Vec::new(),
             rebuilds: Vec::new(),
             deadline: None,
             deadline_frame: None,
@@ -688,6 +718,7 @@ impl Window {
             };
         let retention = &mut self.view_retention;
         retention.hovers.clear();
+        retention.group_reads.clear();
         retention.hover_reads.get_mut().clear();
         retention.notified.clear();
         retention.view_stack.clear();
@@ -797,8 +828,14 @@ impl Window {
     }
 
     fn view_context_matches(&self, previous: usize, bounds: Bounds<Pixels>) -> bool {
-        let context = &self.rendered_frame.retained_views.records[previous].context;
-        context.bounds == bounds
+        let record = &self.rendered_frame.retained_views.records[previous];
+        let context = &record.context;
+        let groups = &self.view_retention.prepaint_groups;
+        record
+            .groups
+            .iter()
+            .all(|read| groups.top(&read.name) == read.hitbox)
+            && context.bounds == bounds
             && context.opacity == self.element_opacity
             && context.rem_size == self.rem_size()
             && context.content_mask == self.content_mask()
@@ -1046,6 +1083,8 @@ impl Window {
                 paint_context: record.paint_context.clone(),
                 dependencies: record.dependencies.written_up_to(writes_now),
                 hovers: record.hovers.clone(),
+                groups: record.groups.clone(),
+                fresh_hitboxes: 0..0,
                 prepaint_layout_keys: record.prepaint_layout_keys.clone(),
                 layout: record.layout.clone(),
             });
@@ -1062,6 +1101,7 @@ impl Window {
         }
         let source = record.paint_range.clone();
         let hovers = record.hovers.clone();
+        let groups = record.groups.clone();
         let recorded = record.paint_context.clone();
         let current = self.paint_context();
 
@@ -1085,6 +1125,7 @@ impl Window {
         }
         self.take_hover_reads();
         self.view_retention.hovers.extend_from_slice(&hovers);
+        self.view_retention.group_reads.extend_from_slice(&groups);
     }
 
     fn paint_context(&self) -> PaintContext {
@@ -1122,6 +1163,8 @@ impl Window {
                 paint_context: PaintContext::default(),
                 dependencies: RenderDependencies::default(),
                 hovers: Rc::new([]),
+                groups: Rc::new([]),
+                fresh_hitboxes: 0..0,
                 prepaint_layout_keys: Rc::new([]),
                 layout: None,
             });
@@ -1142,6 +1185,7 @@ impl Window {
             layout_keys,
             nested_keys: retention.nested_keys.len(),
             hovers_start: retention.hovers.len(),
+            hitboxes_start: self.next_hitbox_id.0,
         }
     }
 
@@ -1160,6 +1204,7 @@ impl Window {
         let index = recording.index?;
         let context = self.view_context(bounds);
         let end = self.prepaint_index();
+        let hitboxes_end = self.next_hitbox_id.0;
         let hovers: Rc<[HoverRead]> = self.view_retention.hovers[recording.hovers_start..].into();
         let views = &mut self.next_frame.retained_views;
         views.open.retain(|open| *open != index);
@@ -1175,6 +1220,7 @@ impl Window {
             None => dependencies,
         };
         record.hovers = hovers;
+        record.fresh_hitboxes = recording.hitboxes_start..hitboxes_end;
         record.prepaint_layout_keys = prepaint_layout_keys.into();
         record.layout = layout;
         Some(index)
@@ -1194,6 +1240,7 @@ impl Window {
             index: Some(index),
             start: self.paint_index(),
             hovers_start: self.view_retention.hovers.len(),
+            groups_start: self.view_retention.group_reads.len(),
             dependencies: cx.begin_recording_dependencies(),
         }
     }
@@ -1208,6 +1255,15 @@ impl Window {
         let end = self.paint_index();
         let painted_hovers = &self.view_retention.hovers[recording.hovers_start..];
         let record = &mut self.next_frame.retained_views.records[index];
+        let fresh = record.fresh_hitboxes.clone();
+        let mut groups: Vec<GroupRead> = Vec::new();
+        for read in &self.view_retention.group_reads[recording.groups_start..] {
+            let outside = read.hitbox.is_none_or(|hitbox| !fresh.contains(&hitbox.0));
+            if outside && !groups.contains(read) {
+                groups.push(read.clone());
+            }
+        }
+        record.groups = groups.into();
         record.paint_range = recording.start..end;
         record.paint = PaintStatus::Painted { source: None };
         if !painted_hovers.is_empty() {
@@ -1705,3 +1761,23 @@ pub(crate) fn note_hover_read(
     Some(hovered)
 }
 
+/// Notes that what is being painted inside a retained view resolved the
+/// group `name` to `hitbox`. Groups are only resolved as views paint; the
+/// lookups made as they prepaint find no container and are not noted.
+pub(crate) fn note_group_read(window: &mut Window, name: &SharedString, hitbox: Option<HitboxId>) {
+    let retention = &mut window.view_retention;
+    if retention.view_stack.is_empty() || !window.invalidator.is_painting() {
+        return;
+    }
+    let reads = &mut retention.group_reads;
+    if reads
+        .last()
+        .is_some_and(|last| last.hitbox == hitbox && last.name == *name)
+    {
+        return;
+    }
+    reads.push(GroupRead {
+        name: name.clone(),
+        hitbox,
+    });
+}
