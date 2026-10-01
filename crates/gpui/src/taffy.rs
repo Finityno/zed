@@ -39,6 +39,11 @@ pub struct TaffyLayoutEngine {
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
+    /// Nodes laid out this frame as the root of a tree while they are a
+    /// child in another, as a view built at its bounds is: Taffy placed
+    /// them at the origin, and the element offset they are prepainted at
+    /// places them, so their bounds do not add their parents' origins.
+    detached_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
     /// Nodes the last cleared frame held, and the most any frame has held
     /// since the tree was last built. `TaffyTree::clear` empties its node
@@ -61,6 +66,7 @@ impl TaffyLayoutEngine {
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
+            detached_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             last_frame_node_count: 0,
             node_high_water: 0,
@@ -78,6 +84,7 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.detached_layouts.clear();
     }
 
     /// Rebuilds the cleared tree at twice the last frame's node count, for a
@@ -218,7 +225,14 @@ impl TaffyLayoutEngine {
         // }
         //
 
-        if !self.computed_layouts.insert(id) {
+        // A node laid out on its own while it is a child in another tree
+        // was, or will be, placed in that tree too: what was worked out of
+        // its bounds there no longer holds, nor do its descendants'.
+        let detached = self.taffy.parent(id.0).is_some();
+        if detached {
+            self.detached_layouts.insert(id);
+        }
+        if !self.computed_layouts.insert(id) || detached {
             let stack = &mut self.layout_bounds_scratch_space;
             stack.push(id);
             while let Some(id) = stack.pop() {
@@ -426,7 +440,14 @@ impl TaffyLayoutEngine {
         let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
         let layout_location = layout.location;
         let layout_size = layout.size;
-        let parent = self.taffy.parent(id.0);
+        // Laid out on its own, it is placed by the element offset it is
+        // prepainted at alone; adding its parents' origins would place it
+        // twice.
+        let parent = if !self.detached_layouts.is_empty() && self.detached_layouts.contains(&id) {
+            None
+        } else {
+            self.taffy.parent(id.0)
+        };
 
         let absolute_outer_origin = match parent {
             Some(parent_id) => {

@@ -3576,6 +3576,101 @@ fn writes_to_an_untracked_entity_do_not_keep_a_view_in_place() {
     assert!(moved >= 3, "the row was drawn moved {moved} times");
 }
 
+/// A view sized by state it does not tell the window about, for a frame to
+/// find it asking for another layout than the one it kept.
+struct UntoldWidth {
+    width: Rc<Cell<f32>>,
+}
+
+impl Render for UntoldWidth {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Built wherever it moves, at the layout it kept.
+        cx.set_view_movable(false);
+        div()
+            .w(px(self.width.get()))
+            .h(px(20.))
+            .bg(PALETTE[0])
+            .child(div().w(px(10.)).h(px(10.)).bg(PALETTE[1]))
+    }
+}
+
+struct UntoldHost {
+    header: f32,
+    child: Entity<UntoldWidth>,
+}
+
+impl Render for UntoldHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(div().pl(px(15.)).child(self.child.clone()))
+    }
+}
+
+/// A view built at the layout it kept that asks for another is laid out on
+/// its own at the bounds it was given, and drawn there once, not offset by
+/// where its kept nodes sit in the tree around it as well.
+#[test]
+fn a_view_laid_out_on_its_own_at_its_bounds_is_drawn_there_once() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let width = Rc::new(Cell::new(40.));
+    let windows = [(); 2].map(|_| {
+        let width = width.clone();
+        cx.add_window(move |_, cx| UntoldHost {
+            header: 30.,
+            child: cx.new(|_| UntoldWidth { width }),
+        })
+    });
+    // Draws both windows, the second from scratch, unless the first drew on
+    // the update's flush since it last drew here.
+    let draw = |cx: &mut TestAppContext| {
+        windows.map(|window| {
+            cx.update_window(window.into(), |_, window, cx| {
+                if window.handle.window_id() == windows[1].window_id() {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                } else if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                window.reset_frame_work_stats(false);
+                describe_frame(window)
+            })
+            .unwrap()
+        })
+    };
+    draw(&mut cx);
+    draw(&mut cx);
+    // The child changes size without telling anyone, and its host moves
+    // it, so it is built at the layout it kept, which it no longer asks for.
+    width.set(60.);
+    for window in windows {
+        window
+            .update(&mut cx, |host, _, cx| {
+                host.header = 50.;
+                cx.notify();
+            })
+            .unwrap();
+    }
+    // This frame it is laid out at the bounds it had, and its kept nodes
+    // laid out as a root of their own: drawn at its origin, once.
+    let [retained, _] = draw(&mut cx);
+    let at = |frame: &[String], x: f32, y: f32| {
+        let origin = format!("origin: Point {{ x: {x}px (scaled), y: {y}px (scaled) }}");
+        frame
+            .iter()
+            .any(|line| line.starts_with("Quad") && line.contains(&origin))
+    };
+    assert!(at(&retained, 30., 100.), "{retained:#?}");
+    assert!(!at(&retained, 60., 200.), "{retained:#?}");
+    // The next frame builds what is around it at the layout it asks for.
+    let [retained, from_scratch] = draw(&mut cx);
+    assert_eq!(first_difference(&retained, &from_scratch), None);
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,
