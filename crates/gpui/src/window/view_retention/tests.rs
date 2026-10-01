@@ -92,6 +92,7 @@ enum CardKind {
     Clock,
     OptedOut,
     Plain,
+    Actions,
 }
 
 impl CardKind {
@@ -103,7 +104,8 @@ impl CardKind {
             CardKind::Clock,
             CardKind::OptedOut,
             CardKind::Plain,
-        ][ix % 6]
+            CardKind::Actions,
+        ][ix % 7]
     }
 }
 
@@ -116,6 +118,10 @@ struct Card {
     /// Asks the list it is in to scroll it into view, which rolls the list's
     /// prepaint back and lays its items out again.
     reveal: bool,
+    /// Handles the probe action, which a card reading the actions shows
+    /// once it is focused.
+    handles: bool,
+    focus_handle: crate::FocusHandle,
     inner: Entity<Inner>,
     shared: Rc<Shared>,
 }
@@ -134,6 +140,8 @@ impl Card {
             popover: false,
             summary,
             reveal: false,
+            handles: false,
+            focus_handle: cx.focus_handle(),
             inner: cx.new(|_| Inner { ix, count: 0, model }),
             shared,
         }
@@ -165,6 +173,11 @@ impl Render for Card {
             }
             CardKind::OptedOut => format!("untracked {}", shared.untracked.get()).into(),
             CardKind::Plain => "plain".into(),
+            CardKind::Actions => {
+                let available = actions_asked_of_last_frame(window)
+                    && window.is_action_available(&probe_actions::Probe, cx);
+                format!("probe {available}").into()
+            }
         };
         let popover = self.popover.then(|| {
             let label = WORDS[shared.model.read(cx).labels[0]];
@@ -202,6 +215,10 @@ impl Render for Card {
             .border_1()
             .border_color(PALETTE[self.ix % PALETTE.len()])
             .hover(|style| style.bg(PALETTE[2]))
+            .track_focus(&self.focus_handle)
+            .when(self.handles, |this| {
+                this.on_action(|_: &probe_actions::Probe, _, _| {})
+            })
             .child(SharedString::from(format!("card {} {}", self.ix, self.count)))
             .child(detail)
             .child(self.inner.clone())
@@ -217,6 +234,12 @@ impl Render for Card {
                 )
             })
     }
+}
+
+/// The actions are asked of the frame before, which the first frame does
+/// not have.
+fn actions_asked_of_last_frame(window: &Window) -> bool {
+    window.rendered_frame.dispatch_tree.len() > 0
 }
 
 /// A view nested in a card, which reads the model as well.
@@ -264,6 +287,9 @@ struct Shell {
     summary: Entity<Summary>,
     column: bool,
     tint: usize,
+    /// Handles the probe action at the root, which every card reading the
+    /// actions shows while nothing is focused.
+    handles: bool,
     /// The index the next inserted card gets: never one a card has had, so
     /// that no two cards share an element id after a removal.
     next_card_ix: usize,
@@ -295,6 +321,7 @@ impl Shell {
             list_cards,
             column: false,
             tint: 0,
+            handles: false,
             next_card_ix: CARDS,
         }
     }
@@ -315,6 +342,9 @@ impl Render for Shell {
             .gap_1()
             .when(self.column, |this| this.flex_col())
             .bg(PALETTE[self.tint % PALETTE.len()])
+            .when(self.handles, |this| {
+                this.on_action(|_: &probe_actions::Probe, _, _| {})
+            })
             .child(items)
             .child(self.list_reader.clone())
             .children(self.cards.iter().enumerate().map(|(ix, card)| {
@@ -351,6 +381,9 @@ enum Change {
     Wheel { delta: f32 },
     Mouse { x: f32, y: f32 },
     Resize { width: f32, height: f32 },
+    ShellHandles,
+    CardHandles { ix: usize },
+    Focus { ix: Option<usize> },
     Redraw,
 }
 
@@ -394,6 +427,11 @@ impl Change {
             92..95 => Change::Resize {
                 width: rng.random_range(300.0..900.0),
                 height: rng.random_range(240.0..700.0),
+            },
+            95..97 => Change::ShellHandles,
+            97..98 => Change::CardHandles { ix },
+            98..99 => Change::Focus {
+                ix: rng.random_bool(0.7).then_some(ix),
             },
             _ => Change::Redraw,
         }
@@ -580,6 +618,27 @@ impl Oracle {
                 for window in self.windows() {
                     self.cx
                         .simulate_window_resize(window.into(), size(px(width), px(height)));
+                }
+            }
+            Change::ShellHandles => self.update_shells(|shell, _| shell.handles = !shell.handles),
+            Change::CardHandles { ix } => self.update_cards(ix, |card, cx| {
+                card.handles = !card.handles;
+                cx.notify();
+            }),
+            Change::Focus { ix } => {
+                for window in self.windows() {
+                    self.cx
+                        .update_window(window.into(), |root, window, cx| {
+                            let shell = root.downcast::<Shell>().unwrap().read(cx);
+                            match ix.and_then(|ix| shell.cards.get(ix)) {
+                                Some(card) => {
+                                    let handle = card.read(cx).focus_handle.clone();
+                                    window.focus(&handle, cx);
+                                }
+                                None => window.blur(cx),
+                            }
+                        })
+                        .unwrap();
                 }
             }
             Change::Redraw => {}
@@ -2160,46 +2219,99 @@ fn a_new_global_action_handler_is_a_dependency() {
     assert_eq!(seen.get(), before + 1, "the view listed the new action");
 }
 
+/// Shows whether the probe action is available, as a key binding hint does.
+struct ActionReader {
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for ActionReader {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let available = actions_asked_of_last_frame(window)
+            && window.is_action_available(&probe_actions::Probe, cx);
+        div().child(SharedString::from(format!("probe {available}")))
+    }
+}
+
+/// A focused host that handles the probe action or not, with rows that come
+/// and go without a focus handle, and maybe a view reading the actions.
+struct ActionHost {
+    focus_handle: crate::FocusHandle,
+    handles: bool,
+    rows: usize,
+    reader: Option<Entity<ActionReader>>,
+}
+
+impl Render for ActionHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .when(self.handles, |this| {
+                this.on_action(|_: &probe_actions::Probe, _, _| {})
+            })
+            .children(self.reader.clone())
+            .children((0..self.rows).map(|row| {
+                div()
+                    .key_context("Row")
+                    .on_action(|_: &probe_actions::Probe, _, _| {})
+                    .child(SharedString::from(format!("row {row}")))
+            }))
+    }
+}
+
+fn action_host_window(
+    cx: &mut TestAppContext,
+    reads: bool,
+) -> (WindowHandle<ActionHost>, Rc<Cell<usize>>) {
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        move |window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            ActionHost {
+            focus_handle,
+            handles: false,
+            rows: 0,
+            reader: reads.then(|| cx.new(|_| ActionReader { renders })),
+            }
+        }
+    });
+    // The first frame has no frame before it to ask the actions of: the
+    // reader is built again once there is one.
+    frames_after_one(cx, window);
+    let reader = window.read_with(cx, |host, _| host.reader.clone()).unwrap();
+    if let Some(reader) = reader {
+        reader.update(cx, |_, cx| cx.notify());
+    }
+    (window, renders)
+}
+
+/// The frames the window drew on its own after one drawn here.
+fn frames_after_one<V: 'static>(cx: &mut TestAppContext, window: WindowHandle<V>) -> u64 {
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.reset_frame_work_stats(false);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, _| window.frame_work_stats().frames)
+        .unwrap()
+}
+
 /// A frame that changes which actions are available asks for a follow-up
 /// frame, in which the views that read them are built again: they were drawn
 /// from the actions of the frame before.
 #[test]
 fn a_frame_changing_the_actions_asks_for_another() {
-    struct Host {
-        handles: bool,
-    }
-    impl Render for Host {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .when(self.handles, |this| {
-                    this.on_action(|_: &probe_actions::Probe, _, _| {})
-                })
-        }
-    }
     let mut cx = TestAppContext::single();
-    cx.update(|cx| cx.set_view_retention(true));
-    let window = cx.add_window(|_, _| Host { handles: false });
-    let frame = |cx: &mut TestAppContext| {
-        cx.update_window(window.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-        })
-        .unwrap()
-    };
-    // The frames the window drew on its own, after one drawn here.
-    let frames_after = |cx: &mut TestAppContext| {
-        cx.update_window(window.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            window.reset_frame_work_stats(false);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, _| window.frame_work_stats().frames)
-            .unwrap()
-    };
-    frame(&mut cx);
-    cx.run_until_parked();
+    let (window, renders) = action_host_window(&mut cx, true);
+    let frames_after = |cx: &mut TestAppContext| frames_after_one(cx, window);
+    frames_after(&mut cx);
     assert_eq!(frames_after(&mut cx), 0, "nothing changed");
+    let before = renders.get();
     window
         .update(&mut cx, |host, _, cx| {
             host.handles = true;
@@ -2207,7 +2319,43 @@ fn a_frame_changing_the_actions_asks_for_another() {
         })
         .unwrap();
     assert_eq!(frames_after(&mut cx), 1, "the actions changed");
+    assert_eq!(renders.get(), before + 1, "the reader was built in the follow-up");
     assert_eq!(frames_after(&mut cx), 0, "the follow-up frame changed nothing");
+}
+
+/// No follow-up frame is asked for when no view drawn read the actions, or
+/// when what changed is off every path a view could have asked about: nodes
+/// without a focusable node below them.
+#[test]
+fn a_frame_changing_actions_nobody_read_asks_for_nothing() {
+    let mut cx = TestAppContext::single();
+    let (window, _) = action_host_window(&mut cx, false);
+    let frames_after = |cx: &mut TestAppContext| frames_after_one(cx, window);
+    frames_after(&mut cx);
+    window
+        .update(&mut cx, |host, _, cx| {
+            host.handles = true;
+            cx.notify();
+        })
+        .unwrap();
+    assert_eq!(frames_after(&mut cx), 0, "no view read the actions");
+
+    let mut cx = TestAppContext::single();
+    let (window, renders) = action_host_window(&mut cx, true);
+    let frames_after = |cx: &mut TestAppContext| frames_after_one(cx, window);
+    frames_after(&mut cx);
+    frames_after(&mut cx);
+    let before = renders.get();
+    for rows in [3, 1, 4] {
+        window
+            .update(&mut cx, |host, _, cx| {
+                host.rows = rows;
+                cx.notify();
+            })
+            .unwrap();
+        assert_eq!(frames_after(&mut cx), 0, "rows without focus handles changed");
+    }
+    assert_eq!(renders.get(), before, "the reader was drawn again throughout");
 }
 
 /// A cached view inside a deferred draw, from a view inside one notified

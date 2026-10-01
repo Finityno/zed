@@ -140,21 +140,69 @@ pub(crate) struct DispatchActionListener {
 }
 
 impl DispatchTree {
-    /// A hash of what decides which actions are available and bound where:
-    /// the tree's shape, its key contexts, focusable nodes and the actions
-    /// each node handles.
+    /// A hash of what decides which actions are available and bound where.
+    ///
+    /// Every question a view can ask about actions (what is available or
+    /// bound where the window is focused, or where a focus handle is, the
+    /// context stack, whether one focus handle contains another) walks the
+    /// path from the root to a focusable node, or to the root when nothing
+    /// is focused. So only those paths count: per focusable node, the key
+    /// contexts, focus ids and handled actions of it and every node above
+    /// it. Nodes no focusable node hangs off (the rows of a list scrolling,
+    /// a label appearing) change nothing a view could have asked.
     pub(crate) fn action_fingerprint(&self) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
-        let mut hasher = collections::FxHasher::default();
-        for node in &self.nodes {
-            node.parent.map(|parent| parent.0).hash(&mut hasher);
+        if self.nodes.is_empty() {
+            return 0;
+        }
+        let mut paths = FxHashMap::default();
+        let mut fingerprint = self.dispatch_path_hash(0, &mut paths);
+        for (focus_id, node_id) in &self.focusable_node_ids {
+            let mut hasher = collections::FxHasher::default();
+            focus_id.hash(&mut hasher);
+            self.dispatch_path_hash(node_id.0, &mut paths)
+                .hash(&mut hasher);
+            // Summed, since the focusable nodes come in no particular order.
+            fingerprint = fingerprint.wrapping_add(hasher.finish());
+        }
+        fingerprint
+    }
+
+    /// A hash of the path from the root to `node`, of each node's key
+    /// context, focus id and handled actions, remembering in `paths` the
+    /// hash of every node it passes.
+    fn dispatch_path_hash(&self, node: usize, paths: &mut FxHashMap<usize, u64>) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut unhashed: SmallVec<[usize; 32]> = SmallVec::new();
+        let mut hash = 0;
+        let mut current = Some(node);
+        while let Some(index) = current {
+            if let Some(&known) = paths.get(&index) {
+                hash = known;
+                break;
+            }
+            unhashed.push(index);
+            current = self
+                .nodes
+                .get(index)
+                .and_then(|node| node.parent)
+                .map(|parent| parent.0);
+        }
+        for &index in unhashed.iter().rev() {
+            let Some(node) = self.nodes.get(index) else {
+                continue;
+            };
+            let mut hasher = collections::FxHasher::default();
+            hash.hash(&mut hasher);
             node.context.hash(&mut hasher);
             node.focus_id.hash(&mut hasher);
             for listener in &node.action_listeners {
                 listener.action_type.hash(&mut hasher);
             }
+            hash = hasher.finish();
+            paths.insert(index, hash);
         }
-        hasher.finish()
+        hash
     }
 
     pub fn new(keymap: Rc<RefCell<Keymap>>, action_registry: Rc<ActionRegistry>) -> Self {

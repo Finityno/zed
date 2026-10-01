@@ -285,8 +285,9 @@ pub(crate) struct ViewRetention {
     /// notified since the last frame; see [`EnclosingViews`].
     deferred_inside_notified: bool,
     /// [`crate::key_dispatch::DispatchTree::action_fingerprint`] of the frame
-    /// last drawn, to tell when which actions are available changed.
-    actions_fingerprint: u64,
+    /// last drawn, to tell when which actions are available changed, if it
+    /// was worked out: only frames with a view that read the actions need it.
+    actions_fingerprint: Option<u64>,
     /// The text system's font generation as the frame last drawn began, and
     /// as the one being drawn began: views recorded before fonts were added
     /// shaped their text without them, so none is drawn again.
@@ -321,7 +322,7 @@ impl ViewRetention {
             nested_states: Vec::new(),
             open_recordings: 0,
             deferred_inside_notified: false,
-            actions_fingerprint: 0,
+            actions_fingerprint: None,
             drawn_font_generation: 0,
             drawing_font_generation: 0,
             deferring_views: SmallVec::new(),
@@ -433,6 +434,27 @@ impl RetainedViews {
         self.by_id.clear();
         self.open.clear();
         self.reused_any = false;
+    }
+
+    /// Whether a view drawn in this frame, built or drawn again, read which
+    /// actions are available or bound (see [`dependencies::ambient::Actions`]).
+    /// A record holds what the records nested in it read, so only the
+    /// outermost ones are looked at.
+    fn read_actions(&self) -> bool {
+        let actions = TypeId::of::<dependencies::ambient::Actions>();
+        let mut index = 0;
+        while let Some(record) = self.records.get(index) {
+            if record
+                .dependencies
+                .globals
+                .binary_search_by_key(&actions, |(global, _)| *global)
+                .is_ok()
+            {
+                return true;
+            }
+            index += record.nested + 1;
+        }
+        false
     }
 
     fn find(&self, id: &GlobalElementId) -> Option<usize> {
@@ -653,21 +675,17 @@ impl Window {
 
     /// Ends the retained bookkeeping of the frame being drawn.
     pub(crate) fn finish_retained_views_frame(&mut self, cx: &mut App) {
-        if cx.view_retention() {
-            let fingerprint = self.next_frame.dispatch_tree.action_fingerprint();
-            if fingerprint != self.view_retention.actions_fingerprint {
-                self.view_retention.actions_fingerprint = fingerprint;
-                dependencies::ambient_changed::<dependencies::ambient::Actions>(cx);
-                // Views drawn in this frame answered from the last frame's
-                // actions; the ones that read them are built again in a
-                // follow-up frame, asked for once this draw has returned.
-                self.spawn(cx, async move |cx| {
-                    cx.update(|window, _| window.invalidator.set_dirty(true))
-                        .log_err();
-                })
-                .detach();
-            }
-        }
+        self.view_retention.actions_fingerprint =
+            if cx.view_retention() && self.next_frame.retained_views.read_actions() {
+                Some(self.note_changed_actions(cx))
+            } else {
+                // No view drawn in this frame read the actions, so none is
+                // drawn again from an answer they gave. A view that reads them
+                // in a later frame is built then, from that frame's actions;
+                // a record lives one frame, so it must have been drawn here to
+                // be drawn again then.
+                None
+            };
         let retention = &mut self.view_retention;
         retention.hovers.clear();
         retention.hover_reads.get_mut().clear();
@@ -676,6 +694,28 @@ impl Window {
         retention.deferred_inside_notified = false;
         self.next_frame.retained_views.finish_frame();
         self.schedule_deadline_frame(cx);
+    }
+
+    /// Stamps a change to the actions when the frame being drawn changed
+    /// them, returning its fingerprint. The views drawn in it answered from
+    /// the frame before's; those that read the actions, of which there is
+    /// one, are built again in a follow-up frame, asked for once this draw
+    /// has returned.
+    fn note_changed_actions(&mut self, cx: &mut App) -> u64 {
+        let fingerprint = self.next_frame.dispatch_tree.action_fingerprint();
+        let previous = match self.view_retention.actions_fingerprint {
+            Some(previous) => previous,
+            None => self.rendered_frame.dispatch_tree.action_fingerprint(),
+        };
+        if fingerprint != previous {
+            dependencies::ambient_changed::<dependencies::ambient::Actions>(cx);
+            self.spawn(cx, async move |cx| {
+                cx.update(|window, _| window.invalidator.set_dirty(true))
+                    .log_err();
+            })
+            .detach();
+        }
+        fingerprint
     }
 
     /// Whether the view being drawn, or one around it, was notified since the
@@ -1664,3 +1704,4 @@ pub(crate) fn note_hover_read(
         });
     Some(hovered)
 }
+
