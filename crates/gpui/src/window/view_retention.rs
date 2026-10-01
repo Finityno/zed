@@ -788,6 +788,20 @@ impl App {
 }
 
 impl Window {
+    /// Shows a change an element made to state it keeps behind a version,
+    /// such as a list scrolled by the wheel. With view retention on, the
+    /// views that read the version are built again on their own, so the
+    /// window only needs a frame, and only if `changed`; notifying `view`
+    /// would also build it and wake its observers. Without retention, `view`
+    /// is notified, as it always was.
+    pub(crate) fn show_state_change(&mut self, changed: bool, view: EntityId, cx: &mut App) {
+        if !cx.view_retention() {
+            cx.notify(view);
+        } else if changed {
+            self.invalidator.set_dirty(true);
+        }
+    }
+
     /// Declares that what is being drawn depends on `dependency`: with view
     /// retention on, the view drawing it is built again, rather than drawn
     /// from the last frame, once [`DrawDependency::changed`] is called.
@@ -1952,12 +1966,22 @@ impl Window {
                     }
                     window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
                 }
-                Err(ViewRebuildReason::Notified) => {
+                // Dirty because a view nested in it was notified, or because
+                // something changed that it or a view nested in it read: it
+                // is spliced when only nested views have to be built.
+                Err(
+                    reason @ (ViewRebuildReason::Notified
+                    | ViewRebuildReason::EntityChanged
+                    | ViewRebuildReason::GlobalChanged
+                    | ViewRebuildReason::StateChanged
+                    | ViewRebuildReason::Deadline
+                    | ViewRebuildReason::HoverChanged),
+                ) => {
                     if let Some((layout_id, splice)) = window.splice_layout(global_id, entity, cx)
                     {
                         return (layout_id, ViewLayout::Spliced(splice));
                     }
-                    window.note_rebuild(entity, ViewRebuildReason::Notified);
+                    window.note_rebuild(entity, reason);
                 }
                 Err(reason) => window.note_rebuild(entity, reason),
             }
@@ -2146,11 +2170,12 @@ impl Window {
         // A kept layout stands if the view asked for the nodes it had, as they
         // were, and they were laid out since they last changed: a tree laid
         // out on its own (a list item) that nothing laid out again this frame
-        // still holds the layout it had then.
+        // still holds the layout it had then. The root of such a tree also
+        // stands if, laid out again, it comes out the size it had.
         let unchanged = layout_id == kept.root
             && (self.layout_engine.as_ref().is_some_and(|engine| {
                 engine.layout_writes() == writes_before && !engine.needs_layout(layout_id)
-            }) || self.lay_out_root_again_at_its_size(layout_id, bounds, cx));
+            }) || self.lay_out_again_in_place(layout_id, bounds, cx));
         if unchanged {
             element.prepaint(self, cx);
         } else if strict {
@@ -2181,35 +2206,33 @@ impl Window {
 
     /// Lays out again, in the space it was last laid out in, the tree rooted
     /// at `root` (a list item) whose nodes changed, and returns whether it
-    /// came out the size it was, filling `bounds` as it did. Whatever laid
-    /// it out last sized and placed it, and nothing else, by that size: a
-    /// tree that kept it lays out the same as before around it, and what
-    /// changed inside is laid out anew.
-    fn lay_out_root_again_at_its_size(
+    /// came out where it was, filling `bounds` as it did. Whatever laid it
+    /// out last placed it, and nothing else, by its size: what was laid out
+    /// around it stands, and what changed inside is laid out anew.
+    ///
+    /// Only a root is laid out again: a node inside a tree is placed by the
+    /// layout of the rest of the tree, which is not laid out again during
+    /// prepaint because views built at their bounds this frame were laid out
+    /// there as roots of their own.
+    fn lay_out_again_in_place(
         &mut self,
         root: LayoutId,
         bounds: Bounds<Pixels>,
         cx: &mut App,
     ) -> bool {
-        let scale_factor = self.scale_factor();
-        let Some(engine) = self.layout_engine.as_mut() else {
+        let Some(mut engine) = self.layout_engine.take() else {
             return false;
         };
-        let Some(available_space) = engine.root_space(root) else {
-            return false;
-        };
-        let size_before = engine.laid_out_size(root);
-        let bounds_before = engine.layout_bounds(root, scale_factor);
-        self.compute_layout(root, available_space, cx);
-        let Some(engine) = self.layout_engine.as_mut() else {
-            return false;
-        };
-        // Laying a root out for the first time in a frame keeps the bounds
-        // worked out for its nodes before, which are the old ones.
-        engine.forget_layout_bounds();
-        engine.laid_out_size(root) == size_before
-            && engine.layout_bounds(root, scale_factor) == bounds_before
-            && bounds_before.size == bounds.size
+        let unchanged = engine.root_space(root).is_some_and(|space| {
+            let before = engine.laid_out_at(root);
+            engine.lay_out_again(root, space, self, cx);
+            self.frame_work.stats.compute_layout_calls += 1;
+            let scale_factor = self.scale_factor();
+            engine.laid_out_at(root) == before
+                && engine.layout_bounds(root, scale_factor).size == bounds.size
+        });
+        self.layout_engine = Some(engine);
+        unchanged
     }
 
     /// Builds a view whose layout was not requested from its content (a

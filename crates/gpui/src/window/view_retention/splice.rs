@@ -2,8 +2,10 @@
 //! that have to be built.
 //!
 //! Notifying a view marks every view around it dirty, because they have to be
-//! walked to reach it. A view that is dirty only for that reason (it was not
-//! notified itself, and nothing it read itself changed) is not built: it is
+//! walked to reach it, and a change to something a view read is a change to
+//! what every view around it depends on. A view that has to be built only for
+//! those reasons (it was not notified itself, and nothing it read itself
+//! changed) is not built: it is
 //! drawn again from the last frame stretch by stretch, with the nested views
 //! that have to be built (notified, or something they read changed) built in
 //! the gaps where they were, at the layout nodes they kept and with what they
@@ -18,10 +20,10 @@
 //!
 //! A view is only spliced where that is what building it would draw:
 //! - its layout is the one it had, so it is drawn where it was, and each gap
-//!   asks for the layout it had, or is the root of a tree laid out on its own
-//!   (a list item) and lays out again, in the space it was given, to the size
-//!   it had; otherwise what was built of the splice is rolled back and the
-//!   view is built instead;
+//!   asks for the layout it had, or for one that, laid out again in its tree
+//!   (the window's, or a list item's), moves nothing outside the gap;
+//!   otherwise what was built of the splice is rolled back and the view is
+//!   built instead;
 //! - it deferred nothing (a deferred draw of a view nested in it is drawn
 //!   after the frame, out of the stretches);
 //! - each gap can be built on its own: it is an entity or an [`AnyView`],
@@ -190,8 +192,8 @@ impl Window {
             && record.paint_context.transition == around.paint_context.transition
     }
 
-    /// Lays out the view `id`, dirty only because views nested in it have to
-    /// be built, as it was laid out last frame, if it can be drawn again
+    /// Lays out the view `id`, to be built only because views nested in it
+    /// have to be, as it was laid out last frame, if it can be drawn again
     /// around them; see the module documentation.
     pub(super) fn splice_layout(
         &mut self,
@@ -231,8 +233,16 @@ impl Window {
         let mut index = previous + 1;
         while index <= previous + record.nested {
             let nested = &records[index];
-            if self.own_rebuild_reason(nested, cx).is_none() {
-                index += 1;
+            // A view with something to build inside it is a gap even when
+            // it has nothing of its own to build: it is spliced in turn.
+            // Copied whole, its record would span a gap built at another
+            // length than the one it had.
+            let subtree = index..=index + nested.nested;
+            if !subtree
+                .into_iter()
+                .any(|inner| self.own_rebuild_reason(&records[inner], cx).is_some())
+            {
+                index += nested.nested + 1;
                 continue;
             }
             if !Self::buildable_on_its_own(nested, record) {

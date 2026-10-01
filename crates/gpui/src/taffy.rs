@@ -230,6 +230,32 @@ impl TaffyLayoutEngine {
             }
         }
 
+        self.run_layout(id, available_space, window, cx);
+    }
+
+    /// Lays the tree rooted at `id` out again in `available_space`, after
+    /// something in it was written to, forgetting every absolute bounds
+    /// worked out this frame rather than walking the tree for its own.
+    pub(crate) fn lay_out_again(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.computed_layouts.insert(id);
+        self.forget_layout_bounds();
+        self.run_layout(id, available_space, window, cx);
+    }
+
+    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
+    fn run_layout(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let scale_factor = window.scale_factor();
 
         let transform = |v: AvailableSpace| match v {
@@ -376,10 +402,16 @@ impl TaffyLayoutEngine {
         self.taffy.dirty(id.into()).unwrap_or(true)
     }
 
-    /// The size Taffy last laid the node out at, in device pixels and
-    /// unrounded.
-    pub(crate) fn laid_out_size(&self, id: LayoutId) -> taffy::geometry::Size<f32> {
-        self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).size
+    /// Where Taffy last placed the node, in device pixels and unrounded:
+    /// its location and size.
+    pub(crate) fn laid_out_at(&self, id: LayoutId) -> [f32; 4] {
+        let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
+        [
+            layout.location.x,
+            layout.location.y,
+            layout.size.width,
+            layout.size.height,
+        ]
     }
 
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {

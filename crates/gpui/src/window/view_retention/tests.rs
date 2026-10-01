@@ -997,7 +997,7 @@ fn group_hover_views_are_built_with_their_group_container_only() {
 }
 
 /// A model updated and notified builds every view that read it (the inner
-/// view of every card, and so every card), and a global written builds the
+/// view of every card), and a global written builds the
 /// views that read it and no other; each is counted under its reason.
 #[test]
 fn changed_models_and_globals_build_the_views_that_read_them() {
@@ -1010,11 +1010,20 @@ fn changed_models_and_globals_build_the_views_that_read_them() {
             cx.notify();
         })
     });
-    assert!(work.view_rebuilds.entity_changed >= 2 * CARDS as u64, "{work:?}");
+    // The inner view of every card is built, and the cards that did not
+    // read the model themselves are drawn again around them.
+    assert!(work.view_rebuilds.entity_changed >= CARDS as u64, "{work:?}");
+    assert!(work.views_spliced >= 1, "{work:?}");
+    // The summary the cards show was written after they were drawn: the
+    // next frame builds them again with it.
+    draw(&mut cx, window);
     let work = work_after(&mut cx, window, |cx| cx.update(|cx| cx.set_global(Theme(4))));
     assert!(work.view_rebuilds.global_changed >= 1, "{work:?}");
     assert_eq!(work.view_rebuilds.entity_changed, 0, "{work:?}");
-    assert!(work.views_reused >= CARDS as u64, "{work:?}");
+    // The views read the global, opted out or moved are built; the shell is
+    // drawn again around them with the rest.
+    assert!(work.views_rendered < CARDS as u64, "{work:?}");
+    assert!(work.views_spliced >= 1, "{work:?}");
 }
 
 /// A declared dependency builds the views that read it once it changes, and
@@ -1840,6 +1849,75 @@ fn a_wheel_scroll_builds_the_views_reading_the_list() {
     assert_eq!(seen.get(), top, "the reader shows where the list is scrolled to");
 }
 
+/// With retention on, the wheel scrolling a list asks for a frame rather
+/// than notifying the view drawing the list: that view depends on the wheel
+/// and is built anyway, and its observers are not woken for every frame of a
+/// scroll.
+#[test]
+fn a_wheel_scroll_does_not_notify_the_view_drawing_the_list() {
+    struct ListHost {
+        list_state: ListState,
+    }
+    impl Render for ListHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                list(self.list_state.clone(), |ix, _, _| {
+                    div()
+                        .h(px(20.))
+                        .child(SharedString::from(format!("row {ix}")))
+                        .into_any_element()
+                })
+                .h(px(60.))
+                .w(px(100.)),
+            )
+        }
+    }
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let list_state = ListState::new(20, ListAlignment::Top, px(0.)).measure_all();
+    let window = cx.add_window({
+        let list_state = list_state.clone();
+        move |_, _| ListHost { list_state }
+    });
+    let host = window.root(&mut cx).unwrap();
+    let notified = Rc::new(Cell::new(0));
+    let _observation = cx.update({
+        let notified = notified.clone();
+        |cx| cx.observe(&host, move |_, _| notified.set(notified.get() + 1))
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            describe_frame(window)
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    let viewport = list_state.viewport_bounds();
+    for _ in 0..3 {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                    position: viewport.center(),
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-30.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: crate::TouchPhase::Moved,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        let scrolled = frame(&mut cx);
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .unwrap();
+        let from_scratch = frame(&mut cx);
+        assert_eq!(first_difference(&scrolled, &from_scratch), None);
+    }
+    assert!(list_state.logical_scroll_top().item_ix > 0, "the wheel scrolled the list");
+    assert_eq!(notified.get(), 0, "the view drawing the list was not notified");
+}
+
 /// A view reading a uniform list's offset is built again once the list
 /// scrolls an item into view as it prepaints.
 #[test]
@@ -2400,7 +2478,12 @@ impl Render for ActionReader {
         self.renders.set(self.renders.get() + 1);
         let available = actions_asked_of_last_frame(window)
             && window.is_action_available(&probe_actions::Probe, cx);
-        div().child(SharedString::from(format!("probe {available}")))
+        // A size of its own, so that the follow-up frame building it draws
+        // the host again around it rather than building the host too.
+        div()
+            .w(px(80.))
+            .h(px(20.))
+            .child(SharedString::from(format!("probe {available}")))
     }
 }
 
@@ -3202,6 +3285,92 @@ fn a_panel_is_built_when_its_live_row_changes_its_layout() {
     // two drawing from scratch, the frame the tick drew and the refreshed
     // one.
     assert_eq!(renders.get(), rendered_before + 4 * 3);
+}
+
+/// A row reading a dependency and a model of its own.
+struct DependentRow {
+    ix: usize,
+    dependency: DrawDependency,
+    model: Entity<usize>,
+}
+
+impl Render for DependentRow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.depend_on(&self.dependency);
+        let count = *self.model.read(cx);
+        div()
+            .w(px(200.))
+            .h(px(20.))
+            .bg(PALETTE[(self.ix + count) % PALETTE.len()])
+            .child(SharedString::from(format!("row {} {count}", self.ix)))
+    }
+}
+
+struct DependentRows {
+    rows: Vec<Entity<DependentRow>>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for DependentRows {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div().flex().flex_col().children(self.rows.iter().cloned())
+    }
+}
+
+/// A host none of whose own reads changed, holding a row whose dependency
+/// or model changed (no view was notified), is drawn again around the row,
+/// not built.
+#[test]
+fn a_host_is_drawn_again_around_a_row_whose_dependencies_changed() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        move |_, cx| DependentRows {
+            rows: (0..6)
+                .map(|ix| {
+                    cx.new(|cx| DependentRow {
+                        ix,
+                        dependency: DrawDependency::new(),
+                        model: cx.new(|_| 0),
+                    })
+                })
+                .collect(),
+            renders,
+        }
+    });
+    // Drawing on the update's flush, if it drew nothing.
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            window.frame_work_stats()
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    let row = window.read_with(&cx, |host, _| host.rows[3].clone()).unwrap();
+    let rendered_before = renders.get();
+    for step in 0..4 {
+        cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false))
+            .unwrap();
+        if step % 2 == 0 {
+            row.update(&mut cx, |row, cx| row.dependency.changed(cx));
+        } else {
+            let model = row.read_with(&cx, |row, _| row.model.clone());
+            model.update(&mut cx, |count, cx| {
+                *count += 1;
+                cx.notify();
+            });
+        }
+        let work = frame(&mut cx);
+        assert_eq!(work.views_rendered, 1, "{work:?}");
+        assert_eq!(work.views_spliced, 1, "{work:?}");
+    }
+    assert_eq!(renders.get(), rendered_before, "the host was not built");
 }
 
 /// A badge in a row, painted by whether the row's group is hovered.

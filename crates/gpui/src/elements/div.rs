@@ -3534,10 +3534,10 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
-            let scroll_version = self
-                .tracked_scroll_handle
-                .as_ref()
-                .map(|handle| handle.0.borrow().version.clone());
+            let scroll_versions = self.tracked_scroll_handle.as_ref().map(|handle| {
+                let state = handle.0.borrow();
+                (state.version.clone(), state.requests.clone())
+            });
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3617,10 +3617,18 @@ impl Interactivity {
 
                     let moved = *scroll_offset != old_scroll_offset;
                     if moved {
-                        if let Some(version) = &scroll_version {
-                            version.bump();
+                        match &scroll_versions {
+                            // The view drawing the element depends on the
+                            // handle's requests, and views reading the
+                            // handle on its version: they are built without
+                            // the view being notified.
+                            Some((version, requests)) => {
+                                version.bump();
+                                requests.bump();
+                                window.show_state_change(true, current_view, cx);
+                            }
+                            None => cx.notify(current_view),
                         }
-                        cx.notify(current_view);
                     }
                     if propagate_scroll_at_bounds_only {
                         // A gesture locked to the horizontal axis stays with a horizontal
