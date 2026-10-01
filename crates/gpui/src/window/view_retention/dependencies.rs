@@ -120,6 +120,7 @@ pub(crate) fn global_changed(cx: &mut App, global_type: TypeId) {
     super::culprits::note_global_change(global_type, drawing);
     if drawing {
         log.write_generation += 1;
+        log.pinning_writes += 1;
         cx.dependencies
             .global_written_at
             .insert(global_type, log.write_generation);
@@ -345,6 +346,11 @@ pub(crate) struct EntityAccessLog {
     /// the window draws.
     write_generation: u64,
     written_at: FxHashMap<EntityId, u64>,
+    /// Counts the writes while the window draws that keep the view drawing
+    /// them in place (see `stays_put`): all of them but writes to an entity
+    /// the views being drawn said they do not depend on, which a view drawn
+    /// again, where it was or elsewhere, leaves out all the same.
+    pinning_writes: u64,
     /// The entity the framework is about to lease to render it, which is not
     /// a write to it.
     rendering: Option<EntityId>,
@@ -438,6 +444,11 @@ impl EntityMap {
     pub(crate) fn write_generation(&self) -> u64 {
         self.access_log.write_generation
     }
+
+    /// See `EntityAccessLog::pinning_writes`.
+    pub(crate) fn pinning_writes(&self) -> u64 {
+        self.access_log.pinning_writes
+    }
 }
 
 /// Records that `entity_id` was accessed.
@@ -511,7 +522,14 @@ pub(crate) fn note_update(entities: &mut EntityMap, entity_id: EntityId) {
                 log.updated_at.insert(entity_id, log.update_generation);
                 log.updated_unnotified.insert(entity_id);
             } else {
-                super::culprits::note_entity_change(entity_id, "written while drawing");
+                let untracked = log
+                    .untracked
+                    .try_borrow()
+                    .is_ok_and(|untracked| untracked.contains(&entity_id));
+                if !untracked {
+                    log.pinning_writes += 1;
+                    super::culprits::note_entity_change(entity_id, "written while drawing");
+                }
                 log.write_generation += 1;
                 log.written_at.insert(entity_id, log.write_generation);
             }

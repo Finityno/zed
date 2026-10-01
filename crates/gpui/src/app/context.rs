@@ -249,7 +249,10 @@ impl<'a, T: 'static> Context<'a, T> {
     ///
     /// Everything else the view reads is still a dependency, as are writes:
     /// a view that updates `entity` as it draws still builds the views that
-    /// read it before the write. A view drawn again from the last frame does
+    /// read it before the write. Such a write does not keep the view in
+    /// place, though (see [`Context::set_view_movable`]): it is taken to be
+    /// bookkeeping of the build, which a view drawn again leaves out whether
+    /// it is drawn where it was or elsewhere. A view drawn again from the last frame does
     /// not read `entity` again, so the window draws again on a notification
     /// of `entity` only if something else in it read it: notify the view.
     ///
@@ -279,7 +282,8 @@ impl<'a, T: 'static> Context<'a, T> {
     /// whose prepaint or paint leaves its position anywhere else (an
     /// `Rc<Cell<Bounds<Pixels>>>` another view reads as it renders, say)
     /// should opt out. Writes to entities, globals and versioned state as it
-    /// draws already keep it in place.
+    /// draws already keep it in place, except writes to an entity it, or a
+    /// view around it, untracks ([`Context::untrack_reads_of`]).
     pub fn set_view_movable(&mut self, movable: bool) {
         let entity_id = self.entity_state.entity_id;
         let changed = if movable {

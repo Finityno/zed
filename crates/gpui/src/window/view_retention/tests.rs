@@ -3463,6 +3463,119 @@ fn rebuilds_of_moved_views_name_what_kept_them_from_moving() {
     assert!(counted("StripRow ContextChanged <- not drawn moved: Outside"), "{counts:#?}");
 }
 
+/// A panel counting how often its rows were built, which its rows write as
+/// they prepaint, and a reader showing the count.
+struct BookkeepingPanel {
+    header: f32,
+    builds: usize,
+    reader: Option<Entity<BuildsReader>>,
+    row: Option<Entity<BookkeepingRow>>,
+}
+
+impl Render for BookkeepingPanel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(self.reader.clone())
+            .child(div().w(px(10.)).h(px(self.header)))
+            .children(self.row.clone())
+    }
+}
+
+struct BuildsReader {
+    panel: crate::WeakEntity<BookkeepingPanel>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for BuildsReader {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let builds = self.panel.upgrade().map_or(0, |panel| panel.read(cx).builds);
+        div()
+            .w(px(100.))
+            .h(px(20.))
+            .child(SharedString::from(format!("built {builds}")))
+    }
+}
+
+/// A row that untracks its panel and writes it as it prepaints, as rows
+/// built through their panel's context do.
+struct BookkeepingRow {
+    panel: crate::WeakEntity<BookkeepingPanel>,
+}
+
+impl Render for BookkeepingRow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(panel) = self.panel.upgrade() {
+            cx.untrack_reads_of(&panel);
+        }
+        let panel = self.panel.clone();
+        div().w(px(100.)).h(px(20.)).bg(PALETTE[0]).child(
+            crate::canvas(
+                move |_, _, cx| {
+                    panel
+                        .update(cx, |panel, _| panel.builds += 1)
+                        .expect("the panel outlives its row");
+                },
+                |_, _, _, _| {},
+            )
+            .size_full(),
+        )
+    }
+}
+
+/// A row writing an entity it untracks as it prepaints is still drawn
+/// moved; the write still builds the views that read the entity before it.
+#[test]
+fn writes_to_an_untracked_entity_do_not_keep_a_view_in_place() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        move |_, cx| {
+            let panel = cx.entity().downgrade();
+            BookkeepingPanel {
+                header: 10.,
+                builds: 0,
+                reader: Some(cx.new(|_| BuildsReader {
+                    panel: panel.clone(),
+                    renders,
+                })),
+                row: Some(cx.new(|_| BookkeepingRow { panel })),
+            }
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = window.frame_work_stats();
+            window.reset_frame_work_stats(false);
+            work
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    // The reader read the count before the row wrote it, and is built again.
+    frame(&mut cx);
+    assert_eq!(renders.get(), 2, "the reader was built again after the write");
+    let mut moved = 0;
+    for header in [30., 25., 60.] {
+        window
+            .update(&mut cx, |panel, _, cx| {
+                panel.header = header;
+                cx.notify();
+            })
+            .unwrap();
+        moved += frame(&mut cx).views_moved;
+    }
+    assert!(moved >= 3, "the row was drawn moved {moved} times");
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,

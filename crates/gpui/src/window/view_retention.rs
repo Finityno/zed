@@ -401,7 +401,7 @@ struct Writes {
 impl Writes {
     fn now(cx: &App) -> Self {
         Writes {
-            entities: cx.entities.write_generation(),
+            entities: cx.entities.pinning_writes(),
         }
     }
 }
