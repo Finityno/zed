@@ -577,6 +577,8 @@ impl PaintIndex {
                 - from.accessed_element_states_index
                 + to.accessed_element_states_index,
             tab_handle_index: self.tab_handle_index - from.tab_handle_index + to.tab_handle_index,
+            painted_positions_index: self.painted_positions_index - from.painted_positions_index
+                + to.painted_positions_index,
             line_layout_index: self
                 .line_layout_index
                 .shifted(&from.line_layout_index, &to.line_layout_index),
@@ -591,6 +593,7 @@ impl PaintIndex {
             && self.cursor_styles_index == other.cursor_styles_index
             && self.accessed_element_states_index == other.accessed_element_states_index
             && self.tab_handle_index == other.tab_handle_index
+            && self.painted_positions_index == other.painted_positions_index
             && self.line_layout_index == other.line_layout_index
     }
 }

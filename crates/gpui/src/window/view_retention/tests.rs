@@ -3135,6 +3135,100 @@ fn a_moved_view_moves_its_scroll_handles_and_settles_once_still() {
     assert_eq!(first_difference(&retained, &from_scratch), None);
 }
 
+/// A view keeping its window position outside the frame, as it prepaints
+/// and as it paints, moved by the window when it is drawn again elsewhere.
+struct Marker {
+    prepainted_at: Rc<Cell<Option<crate::Point<Pixels>>>>,
+    painted_at: Rc<Cell<Option<crate::Point<Pixels>>>>,
+}
+
+impl Render for Marker {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let prepainted_at = self.prepainted_at.clone();
+        let painted_at = self.painted_at.clone();
+        let keep = |at: Rc<Cell<Option<crate::Point<Pixels>>>>, window: &mut Window| {
+            window.on_replayed_at_offset(move |by| at.set(at.get().map(|at| at + by)));
+        };
+        div().w(px(100.)).h(px(20.)).child(
+            crate::canvas(
+                move |bounds, window, _| {
+                    prepainted_at.set(Some(bounds.origin));
+                    keep(prepainted_at, window);
+                },
+                move |bounds, _, window, _| {
+                    painted_at.set(Some(bounds.origin));
+                    keep(painted_at, window);
+                },
+            )
+            .size_full(),
+        )
+    }
+}
+
+struct MarkerHost {
+    header: f32,
+    marker: Entity<Marker>,
+}
+
+impl Render for MarkerHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(self.marker.clone())
+    }
+}
+
+/// What a view registered with `on_replayed_at_offset`, as it prepainted
+/// and as it painted, is moved with it while it is drawn again elsewhere.
+#[test]
+fn positions_kept_outside_the_frame_move_with_a_view_drawn_moved() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let prepainted_at = Rc::new(Cell::new(None));
+    let painted_at = Rc::new(Cell::new(None));
+    let window = cx.add_window({
+        let prepainted_at = prepainted_at.clone();
+        let painted_at = painted_at.clone();
+        move |_, cx| MarkerHost {
+            header: 10.,
+            marker: cx.new(|_| Marker {
+                prepainted_at,
+                painted_at,
+            }),
+        }
+    });
+    // Drawing on the update's flush, if it drew nothing.
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            window.frame_work_stats()
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    let mut moved = 0;
+    for header in [30., 25., 60.] {
+        cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false))
+            .unwrap();
+        window
+            .update(&mut cx, |host, _, cx| {
+                host.header = header;
+                cx.notify();
+            })
+            .unwrap();
+        moved += frame(&mut cx).views_moved;
+        let at = Some(point(px(0.), px(header)));
+        assert_eq!(prepainted_at.get(), at, "prepainted position at {header}");
+        assert_eq!(painted_at.get(), at, "painted position at {header}");
+    }
+    assert!(moved >= 3, "the marker was drawn moved {moved} times");
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,

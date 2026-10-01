@@ -6,7 +6,8 @@
 //! shifted by how far it moved and clipped by the content mask it is drawn
 //! in now, the records nested in it move with it, and so does what its
 //! elements wrote of their position as they prepainted (see
-//! [`PositionedState`]).
+//! [`PositionedState`]) and what was registered to move with it while it
+//! prepainted or painted (see [`Window::on_replayed_at_offset`]).
 //!
 //! The copy is the frame drawn from scratch when:
 //! - the view is the same size, and inherits the same text style, opacity,
@@ -194,7 +195,48 @@ fn whole_device_pixels(delta: f32) -> bool {
     (delta - delta.round()).abs() < 1e-3
 }
 
+/// A callback registered with [`Window::on_replayed_at_offset`].
+struct ReplayedAtOffset(Box<dyn Fn(Point<Pixels>)>);
+
+impl PositionedState for ReplayedAtOffset {
+    fn translate(&self, by: Point<Pixels>) {
+        (self.0)(by)
+    }
+}
+
 impl Window {
+    /// Registers `moved` to be called with how far the view being drawn
+    /// moved, whenever it is drawn again from this frame somewhere else
+    /// rather than built: for state outside the frame that holds window
+    /// positions of what the view draws (a registry of text segments for
+    /// selection, the bounds of an anchor), recorded as the view prepaints
+    /// or paints, to move with it instead of going stale.
+    ///
+    /// Call it while prepainting or painting, next to where the positions
+    /// are recorded. It is called once for each frame the view is drawn
+    /// moved, with how far it moved since the frame before, and called
+    /// again with the opposite offset when a prepaint that moved it is
+    /// rolled back. A view built again is prepainted and painted afresh,
+    /// and registers anew; one drawn again where it was calls nothing.
+    /// Without view retention, or outside an entity view, nothing is
+    /// registered. Mouse listeners are not moved; a view drawn moved is
+    /// built again before the window dispatches input other than a scroll
+    /// wheel or a key.
+    pub fn on_replayed_at_offset(&mut self, moved: impl Fn(Point<Pixels>) + 'static) {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if self.view_retention.view_stack.is_empty() {
+            return;
+        }
+        let state: Rc<dyn PositionedState> = Rc::new(ReplayedAtOffset(Box::new(moved)));
+        if self.invalidator.is_painting() {
+            self.next_frame.painted_positions.push(state);
+        } else {
+            self.next_frame
+                .positioned_states
+                .push((state, Point::default()));
+        }
+    }
+
     /// Notes, as an element prepaints, that `state` holds where it is. Only
     /// kept inside a retained view, which is what can be drawn moved.
     pub(crate) fn note_positioned_state<S: PositionedState + 'static>(

@@ -1055,6 +1055,9 @@ pub(crate) struct Frame {
     /// view retention on, and how far each was moved with the view it was
     /// copied with; see [`view_retention::PositionedState`].
     pub(crate) positioned_states: Vec<(Rc<dyn view_retention::PositionedState>, Point<Pixels>)>,
+    /// What elements registered as they painted to be moved with the view
+    /// they were painted in (see [`Window::on_replayed_at_offset`]).
+    pub(crate) painted_positions: Vec<Rc<dyn view_retention::PositionedState>>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -1115,6 +1118,7 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
+    painted_positions_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1139,6 +1143,7 @@ impl Frame {
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             positioned_states: Vec::new(),
+            painted_positions: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -1178,6 +1183,7 @@ impl Frame {
             .clear_vec(&mut self.window_control_hitboxes);
         shrink.deferred_draws.clear_vec(&mut self.deferred_draws);
         self.positioned_states.clear();
+        self.painted_positions.clear();
         self.tab_stops.clear();
         self.retained_views.clear();
         self.focus = None;
@@ -4661,6 +4667,7 @@ impl Window {
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
+            painted_positions_index: self.next_frame.painted_positions.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -4748,6 +4755,18 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        let moved_by = moved.map_or(Point::default(), |moved| moved.delta);
+        self.next_frame.painted_positions.extend(
+            self.rendered_frame.painted_positions
+                [range.start.painted_positions_index..range.end.painted_positions_index]
+                .iter()
+                .map(|state| {
+                    if moved_by != Point::default() {
+                        state.translate(moved_by);
+                    }
+                    state.clone()
+                }),
+        );
         let moved = moved.map(|moved| moved.scaled(self));
         self.next_frame.scene.replay_inside(
             range.start.scene_index..range.end.scene_index,
