@@ -6153,6 +6153,9 @@ impl Window {
         let layout_started_at = self.draw_clock.begin_layout();
         let started_at = self.frame_work.clock();
         let mut layout_engine = self.layout_engine.take().unwrap();
+        if cx.view_retention() {
+            layout_engine.note_root_space(layout_id, available_space);
+        }
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
         self.frame_work.stats.compute_layout_calls += 1;

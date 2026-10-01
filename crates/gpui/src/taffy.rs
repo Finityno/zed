@@ -376,6 +376,12 @@ impl TaffyLayoutEngine {
         self.taffy.dirty(id.into()).unwrap_or(true)
     }
 
+    /// The size Taffy last laid the node out at, in device pixels and
+    /// unrounded.
+    pub(crate) fn laid_out_size(&self, id: LayoutId) -> taffy::geometry::Size<f32> {
+        self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).size
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;

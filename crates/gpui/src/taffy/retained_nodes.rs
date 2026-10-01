@@ -42,6 +42,11 @@ pub(crate) struct LayoutRetention {
     /// was last stretched in. Compared against the stretched style, every
     /// request would differ and dirty the root.
     unstretched_styles: FxHashMap<LayoutId, (taffy::style::Style, u64)>,
+    /// The space each tree laid out on its own (a list item) was last laid
+    /// out in, while views are retained, for a view built again at the
+    /// layout it kept to lay its tree out again in. See
+    /// [`TaffyLayoutEngine::root_space`].
+    root_spaces: FxHashMap<LayoutId, Size<AvailableSpace>>,
     frame: u64,
     /// Retained nodes claimed this frame. When every retained node was, the
     /// end of the frame has nothing to sweep.
@@ -269,6 +274,7 @@ impl LayoutRetention {
         self.retained = FxHashMap::default();
         self.transient = Vec::new();
         self.unstretched_styles = FxHashMap::default();
+        self.root_spaces = FxHashMap::default();
         self.transaction_claims = Vec::new();
         self.claimed_keys = Vec::new();
         self.claimed_this_frame = 0;
@@ -390,6 +396,20 @@ impl TaffyLayoutEngine {
     pub(crate) fn layout_writes(&self) -> u64 {
         let counts = &self.retention.counts;
         counts.style_writes + counts.children_writes + counts.nodes_created + counts.measured_nodes_dirtied
+    }
+
+    /// Notes that `id` is being laid out as the root of a tree in
+    /// `available_space`.
+    pub(crate) fn note_root_space(&mut self, id: LayoutId, available_space: Size<AvailableSpace>) {
+        self.retention.root_spaces.insert(id, available_space);
+    }
+
+    /// The space the tree rooted at `id` was last laid out in, if `id` is
+    /// still the root of a tree and was laid out as one while views were
+    /// retained.
+    pub(crate) fn root_space(&self, id: LayoutId) -> Option<Size<AvailableSpace>> {
+        let space = *self.retention.root_spaces.get(&id)?;
+        self.taffy.parent(id.into()).is_none().then_some(space)
     }
 
     /// How many nodes made this frame will be released at its end, having no
@@ -847,10 +867,15 @@ impl TaffyLayoutEngine {
             retention.counts.nodes_released += retention.transient.len() as u64;
             retention.transient.clear();
             retention.unstretched_styles.clear();
+            retention.root_spaces.clear();
             self.taffy.clear();
         } else {
+            let forget_spaces = !retention.root_spaces.is_empty();
             for id in retention.transient.drain(..) {
                 retention.unstretched_styles.remove(&id);
+                if forget_spaces {
+                    retention.root_spaces.remove(&id);
+                }
                 remove_node(&mut self.taffy, id);
                 retention.counts.nodes_released += 1;
             }
@@ -858,12 +883,16 @@ impl TaffyLayoutEngine {
                 let frame = retention.frame;
                 let taffy = &mut self.taffy;
                 let unstretched_styles = &mut retention.unstretched_styles;
+                let root_spaces = &mut retention.root_spaces;
                 let released = &mut retention.counts.nodes_released;
                 retention.retained.retain(|_, node| {
                     if node.claimed_in_frame == frame {
                         return true;
                     }
                     unstretched_styles.remove(&node.id);
+                    if forget_spaces {
+                        root_spaces.remove(&node.id);
+                    }
                     remove_node(taffy, node.id);
                     *released += 1;
                     false

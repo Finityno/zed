@@ -2148,9 +2148,9 @@ impl Window {
         // out on its own (a list item) that nothing laid out again this frame
         // still holds the layout it had then.
         let unchanged = layout_id == kept.root
-            && self.layout_engine.as_ref().is_some_and(|engine| {
+            && (self.layout_engine.as_ref().is_some_and(|engine| {
                 engine.layout_writes() == writes_before && !engine.needs_layout(layout_id)
-            });
+            }) || self.lay_out_root_again_at_its_size(layout_id, bounds, cx));
         if unchanged {
             element.prepaint(self, cx);
         } else if strict {
@@ -2177,6 +2177,39 @@ impl Window {
             cx,
         );
         Some(ViewPrepaint::Built { element, record })
+    }
+
+    /// Lays out again, in the space it was last laid out in, the tree rooted
+    /// at `root` (a list item) whose nodes changed, and returns whether it
+    /// came out the size it was, filling `bounds` as it did. Whatever laid
+    /// it out last sized and placed it, and nothing else, by that size: a
+    /// tree that kept it lays out the same as before around it, and what
+    /// changed inside is laid out anew.
+    fn lay_out_root_again_at_its_size(
+        &mut self,
+        root: LayoutId,
+        bounds: Bounds<Pixels>,
+        cx: &mut App,
+    ) -> bool {
+        let scale_factor = self.scale_factor();
+        let Some(engine) = self.layout_engine.as_mut() else {
+            return false;
+        };
+        let Some(available_space) = engine.root_space(root) else {
+            return false;
+        };
+        let size_before = engine.laid_out_size(root);
+        let bounds_before = engine.layout_bounds(root, scale_factor);
+        self.compute_layout(root, available_space, cx);
+        let Some(engine) = self.layout_engine.as_mut() else {
+            return false;
+        };
+        // Laying a root out for the first time in a frame keeps the bounds
+        // worked out for its nodes before, which are the old ones.
+        engine.forget_layout_bounds();
+        engine.laid_out_size(root) == size_before
+            && engine.layout_bounds(root, scale_factor) == bounds_before
+            && bounds_before.size == bounds.size
     }
 
     /// Builds a view whose layout was not requested from its content (a

@@ -3324,3 +3324,275 @@ fn a_view_built_in_a_gap_resolves_the_groups_around_it() {
         assert_eq!(work.views_rendered, 1, "{work:?}");
     }
 }
+
+/// A badge in a transcript row: a count, which ticks as a spinner would.
+struct TranscriptBadge {
+    count: usize,
+}
+
+impl Render for TranscriptBadge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(40.))
+            .h(px(12.))
+            .child(SharedString::from(format!("{:03}", self.count % 1000)))
+    }
+}
+
+/// A transcript row: lines of text and a badge, sized by its content.
+struct TranscriptRow {
+    ix: usize,
+    lines: usize,
+    tail: usize,
+    badge: Entity<TranscriptBadge>,
+}
+
+impl Render for TranscriptRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let ix = self.ix;
+        div()
+            .id(("transcript-row", ix))
+            .flex()
+            .flex_col()
+            .w_full()
+            .p_1()
+            .border_1()
+            .border_color(PALETTE[ix % PALETTE.len()])
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(SharedString::from(format!("message {ix}")))
+                    .child(self.badge.clone()),
+            )
+            .children((0..self.lines).map(move |line| {
+                div().child(SharedString::from(format!(
+                    "{ix}:{line} the quick brown fox jumps over the lazy dog"
+                )))
+            }))
+            .child(SharedString::from("x".repeat(self.tail % 40)))
+    }
+}
+
+/// A transcript: rows in a list, bottom-aligned as a chat is.
+struct Transcript {
+    rows: Vec<Entity<TranscriptRow>>,
+    list_state: ListState,
+}
+
+impl Render for Transcript {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        div().size_full().child(
+            list(self.list_state.clone(), move |ix, _, _| rows[ix].clone().into_any_element())
+                .size_full(),
+        )
+    }
+}
+
+fn transcript_windows(cx: &mut TestAppContext) -> [WindowHandle<Transcript>; 2] {
+    cx.update(|cx| cx.set_view_retention(true));
+    [(); 2].map(|_| {
+        let window = cx.add_window(|_, cx| {
+            let rows: Vec<_> = (0..20)
+                .map(|ix| {
+                    let badge = cx.new(|_| TranscriptBadge { count: 0 });
+                    cx.new(|_| TranscriptRow {
+                        ix,
+                        lines: 1 + ix % 4,
+                        tail: 1,
+                        badge,
+                    })
+                })
+                .collect();
+            Transcript {
+                list_state: ListState::new(rows.len(), ListAlignment::Bottom, px(100.)),
+                rows,
+            }
+        });
+        cx.simulate_window_resize(window.into(), size(px(600.), px(400.)));
+        window
+    })
+}
+
+/// Streams into the last row of both windows, a character or, with
+/// `line`, a line, and draws them, the second from scratch, returning the
+/// first's work.
+fn stream_transcripts(
+    cx: &mut TestAppContext,
+    windows: [WindowHandle<Transcript>; 2],
+    line: bool,
+) -> crate::FrameWorkStats {
+    for window in windows {
+        let last = window
+            .read_with(cx, |transcript, _| transcript.rows[19].clone())
+            .unwrap();
+        last.update(cx, |row, cx| {
+            row.tail += 1;
+            if line {
+                row.lines += 1;
+            }
+            cx.notify();
+        });
+    }
+    let (retained, work) = cx
+        .update_window(windows[0].into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = window.frame_work_stats();
+            window.reset_frame_work_stats(false);
+            (describe_frame(window), work)
+        })
+        .unwrap();
+    let from_scratch = cx
+        .update_window(windows[1].into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            describe_frame(window)
+        })
+        .unwrap();
+    assert_eq!(first_difference(&retained, &from_scratch), None);
+    work
+}
+
+/// A list item whose content changed without changing its size is laid out
+/// again on its own, in the space the list gave it, and the panel holding
+/// the list is drawn again around it; one that grew has the panel built, for
+/// the list to place the items around it again.
+#[test]
+fn a_list_item_laid_out_again_at_its_size_is_drawn_again_in_place() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let windows = transcript_windows(&mut cx);
+    stream_transcripts(&mut cx, windows, false);
+    stream_transcripts(&mut cx, windows, false);
+    for frame in 0..8 {
+        let line = frame % 4 == 3;
+        let work = stream_transcripts(&mut cx, windows, line);
+        if line {
+            assert_eq!(work.views_spliced, 0, "{work:?}");
+        } else {
+            assert_eq!(work.views_spliced, 1, "{work:?}");
+            assert_eq!(work.views_rendered, 1, "{work:?}");
+        }
+    }
+}
+
+/// The work of drawing a 200-row transcript, with views drawn again and
+/// without, while one row's badge ticks, the last row streams (a line every
+/// eighth frame), the list scrolls, and nothing changes but the panel being
+/// notified. Run with `--release --ignored --nocapture`; to profile one,
+/// `GPUI_BENCH_ONLY=Stream:true` and `GPUI_BENCH_FRAMES=20000`.
+#[test]
+#[ignore]
+fn frame_work_transcript() {
+    let only = std::env::var("GPUI_BENCH_ONLY").ok();
+    let iterations: u32 = std::env::var("GPUI_BENCH_FRAMES")
+        .ok()
+        .and_then(|frames| frames.parse().ok())
+        .unwrap_or(240);
+    #[derive(Clone, Copy, Debug)]
+    enum Scenario {
+        Tick,
+        Stream,
+        Scroll,
+        Redraw,
+    }
+    for scenario in [Scenario::Tick, Scenario::Stream, Scenario::Scroll, Scenario::Redraw] {
+        for retained in [false, true] {
+            if only
+                .as_ref()
+                .is_some_and(|only| *only != format!("{scenario:?}:{retained}"))
+            {
+                continue;
+            }
+            let mut cx = super::super::layout_retention_tests::text_system_context(0);
+            cx.update(|cx| cx.set_view_retention(retained));
+            let window = cx.add_window(|_, cx| {
+                let rows: Vec<_> = (0..200)
+                    .map(|ix| {
+                        let badge = cx.new(|_| TranscriptBadge { count: 0 });
+                        cx.new(|_| TranscriptRow {
+                            ix,
+                            lines: 1 + ix % 4,
+                            tail: 0,
+                            badge,
+                        })
+                    })
+                    .collect();
+                Transcript {
+                    list_state: ListState::new(rows.len(), ListAlignment::Bottom, px(200.)),
+                    rows,
+                }
+            });
+            cx.simulate_window_resize(window.into(), size(px(900.), px(1200.)));
+            let frame = |cx: &mut TestAppContext| {
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            };
+            let (rows, list_state) = window
+                .read_with(&cx, |transcript, _| {
+                    (transcript.rows.clone(), transcript.list_state.clone())
+                })
+                .unwrap();
+            if matches!(scenario, Scenario::Scroll) {
+                list_state.scroll_to(ListOffset {
+                    item_ix: 150,
+                    offset_in_item: px(0.),
+                });
+            }
+            for _ in 0..4 {
+                frame(&mut cx);
+            }
+            cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(true))
+                .unwrap();
+            let frames = iterations;
+            let started = Instant::now();
+            for frame_ix in 0..frames as usize {
+                match scenario {
+                    Scenario::Tick => {
+                        let badge = rows[190].read_with(&cx, |row, _| row.badge.clone());
+                        badge.update(&mut cx, |badge, cx| {
+                            badge.count += 1;
+                            cx.notify();
+                        });
+                    }
+                    Scenario::Stream => rows[199].update(&mut cx, |row, cx| {
+                        row.tail += 1;
+                        if frame_ix % 8 == 7 {
+                            row.lines += 1;
+                        }
+                        cx.notify();
+                    }),
+                    Scenario::Scroll => {
+                        let delta = if (frame_ix / 60) % 2 == 0 { 6. } else { -6. };
+                        list_state.scroll_by(px(delta));
+                        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+                    }
+                    Scenario::Redraw => window.update(&mut cx, |_, _, cx| cx.notify()).unwrap(),
+                }
+                frame(&mut cx);
+            }
+            let elapsed = started.elapsed();
+            let work = cx
+                .update_window(window.into(), |_, window, _| window.frame_work_stats())
+                .unwrap();
+            let draws = work.frames as f64 / frames as f64;
+            eprintln!(
+                "{scenario:?} retained {retained}: {:?} per change ({draws:.1} draws); per draw \
+                 rendered {:.1} reused {:.1} moved {:.1} spliced {:.1} elements {:.0}, build \
+                 {:?} prepaint {:?} paint {:?}",
+                elapsed / frames,
+                work.views_rendered as f64 / work.frames as f64,
+                work.views_reused as f64 / work.frames as f64,
+                work.views_moved as f64 / work.frames as f64,
+                work.views_spliced as f64 / work.frames as f64,
+                work.elements as f64 / work.frames as f64,
+                work.build_time / work.frames as u32,
+                work.prepaint_time / work.frames as u32,
+                work.paint_time / work.frames as u32,
+            );
+        }
+    }
+}

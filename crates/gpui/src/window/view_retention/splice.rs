@@ -18,9 +18,10 @@
 //!
 //! A view is only spliced where that is what building it would draw:
 //! - its layout is the one it had, so it is drawn where it was, and each gap
-//!   asks for the layout it had; one that asks for another is laid out on its
-//!   own at the bounds it had for this frame, and the views around it are
-//!   built on the next one;
+//!   asks for the layout it had, or is the root of a tree laid out on its own
+//!   (a list item) and lays out again, in the space it was given, to the size
+//!   it had; otherwise what was built of the splice is rolled back and the
+//!   view is built instead;
 //! - it deferred nothing (a deferred draw of a view nested in it is drawn
 //!   after the frame, out of the stretches);
 //! - each gap can be built on its own: it is an entity or an [`AnyView`],
