@@ -2347,7 +2347,14 @@ impl Window {
             self.finish_view_prepaint(recording, bounds, None, Some(layout_dependencies), cx);
             return None;
         } else {
-            element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), self, cx);
+            // Laid out on its own at the size it was given: what is around it
+            // was laid out with the layout it had, and may have stretched or
+            // grown it.
+            if let Some(mut engine) = self.layout_engine.take() {
+                engine.lay_out_at_size(layout_id, bounds.size, self, cx);
+                self.layout_engine = Some(engine);
+                self.frame_work.stats.compute_layout_calls += 1;
+            }
             element.prepaint_at(bounds.origin, self, cx);
             self.request_animation_frame();
             // The views around it were laid out with the layout it had: they

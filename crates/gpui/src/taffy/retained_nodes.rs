@@ -925,6 +925,40 @@ impl TaffyLayoutEngine {
     /// keeping the style the element asked for aside: a stretched `auto` looks
     /// exactly like an explicit length, and the next frame has to compare its
     /// request against the request, not against the stretch.
+    /// Lays the tree rooted at `id`, which may be a child in another tree,
+    /// out on its own at exactly `size`, the size its parent gave it, and
+    /// gives the node back the style it was asked for. Laid out on its own
+    /// with only the space it had, a node its parent stretched or grew would
+    /// shrink to what it asks for itself.
+    pub(crate) fn lay_out_at_size(
+        &mut self,
+        id: LayoutId,
+        size: Size<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scale_factor = window.scale_factor();
+        let requested = self.taffy.style(id.into()).expect(EXPECT_MESSAGE).clone();
+        let mut fixed = requested.clone();
+        let width = taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
+        let height =
+            taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
+        fixed.size = taffy::geometry::Size { width, height };
+        fixed.min_size = fixed.size;
+        fixed.max_size = fixed.size;
+        self.taffy
+            .set_style(id.into(), fixed)
+            .expect(EXPECT_MESSAGE);
+        self.compute_layout(id, size.map(AvailableSpace::Definite), window, cx);
+        // The node holds the layout worked out at that size until it is next
+        // laid out; its style is what was asked for, so the next request of
+        // it writes nothing, and it is laid out again then.
+        self.taffy
+            .set_style(id.into(), requested)
+            .expect(EXPECT_MESSAGE);
+        dirty_ancestors(&mut self.taffy, id);
+    }
+
     pub(crate) fn stretch_retained_auto_size_to_fill(
         &mut self,
         id: LayoutId,

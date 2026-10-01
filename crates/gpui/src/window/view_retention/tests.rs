@@ -3671,6 +3671,128 @@ fn a_view_laid_out_on_its_own_at_its_bounds_is_drawn_there_once() {
     assert_eq!(first_difference(&retained, &from_scratch), None);
 }
 
+/// Lines read from a model, as a reply's text is.
+struct StretchLines {
+    lines: Entity<usize>,
+}
+
+impl Render for StretchLines {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let lines = *self.lines.read(cx);
+        div()
+            .flex()
+            .flex_col()
+            .children((0..lines).map(|line| {
+                div()
+                    .h(px(20.))
+                    .child(SharedString::from(format!("line {line}")))
+            }))
+    }
+}
+
+/// A panel whose height its row stretches, holding the lines.
+struct StretchedPanel {
+    lines: Entity<StretchLines>,
+}
+
+impl Render for StretchedPanel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(100.))
+            .bg(PALETTE[1])
+            .child(self.lines.clone())
+    }
+}
+
+struct StretchHost {
+    header: f32,
+    panel: Entity<StretchedPanel>,
+}
+
+impl Render for StretchHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(div().w(px(40.)).h(px(162.)).bg(PALETTE[2]))
+                    .child(self.panel.clone()),
+            )
+    }
+}
+
+/// A view whose layout changes in the frame it moves is built at the
+/// layout it kept, asks for another, and still fills the height its row
+/// stretches it to: it is not laid out as if nothing were around it.
+#[test]
+fn a_view_built_at_a_changed_layout_keeps_the_size_its_parent_gives_it() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let windows = [(); 2].map(|_| {
+        cx.add_window(|_, cx| {
+            let model = cx.new(|_| 2usize);
+            let lines = cx.new(|_| StretchLines { lines: model });
+            StretchHost {
+                header: 10.,
+                panel: cx.new(|_| StretchedPanel { lines }),
+            }
+        })
+    });
+    // Draws both windows, the second from scratch, unless the first drew on
+    // the update's flush since it last drew here.
+    let draw = |cx: &mut TestAppContext| {
+        windows.map(|window| {
+            cx.update_window(window.into(), |_, window, cx| {
+                if window.handle.window_id() == windows[1].window_id() {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                } else if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                window.reset_frame_work_stats(false);
+                describe_frame(window)
+            })
+            .unwrap()
+        })
+    };
+    draw(&mut cx);
+    draw(&mut cx);
+    for step in 0..3 {
+        for window in windows {
+            let model = window
+                .read_with(&cx, |host, cx| {
+                    let panel = host.panel.read(cx);
+                    panel.lines.read(cx).lines.clone()
+                })
+                .unwrap();
+            // In one update, so that one frame draws both changes.
+            window
+                .update(&mut cx, |host, _, cx| {
+                    model.update(cx, |lines, cx| {
+                        *lines += 1;
+                        cx.notify();
+                    });
+                    host.header += 10.;
+                    cx.notify();
+                })
+                .unwrap();
+        }
+        let [retained, from_scratch] = draw(&mut cx);
+        assert_eq!(
+            first_difference(&retained, &from_scratch),
+            None,
+            "step {step}"
+        );
+    }
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,
