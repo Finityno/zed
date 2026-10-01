@@ -265,6 +265,34 @@ impl<'a, T: 'static> Context<'a, T> {
         }
     }
 
+    /// Whether this view may be drawn again from the last frame somewhere
+    /// else than where it was drawn, moved with everything it drew, with view
+    /// retention on ([`App::set_view_retention`]). Views are movable unless
+    /// they say otherwise; a view that is not is built wherever it moves, and
+    /// so is every view around it that would carry it along.
+    ///
+    /// A view drawn moved is not prepainted, so state its elements keep of
+    /// where they are is moved with it only where the framework keeps it
+    /// (scroll handles, list states, text layouts), and its mouse listeners
+    /// answer for where it was until it is built again, which the window
+    /// does before dispatching any input but a scroll wheel or a key. A view
+    /// whose prepaint or paint leaves its position anywhere else (an
+    /// `Rc<Cell<Bounds<Pixels>>>` another view reads as it renders, say)
+    /// should opt out. Writes to entities, globals and versioned state as it
+    /// draws already keep it in place.
+    pub fn set_view_movable(&mut self, movable: bool) {
+        let entity_id = self.entity_state.entity_id;
+        let changed = if movable {
+            self.app.fixed_views.remove(&entity_id)
+        } else {
+            self.app.fixed_views.insert(entity_id)
+        };
+        // Recorded as it is built, so it is built again to take effect.
+        if changed && self.app.view_retention() {
+            self.notify();
+        }
+    }
+
     /// Whether this view may be drawn again from the last frame, with view
     /// retention on ([`App::set_view_retention`]). A view that is not is
     /// built on every frame it is drawn in, though the views around and

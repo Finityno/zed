@@ -201,6 +201,7 @@ thread_local! {
     /// while a window draws, one window at a time.
     static STATE_READS: RefCell<Vec<(StateVersion, u64)>> = const { RefCell::new(Vec::new()) };
     static STATE_RECORDINGS: Cell<usize> = const { Cell::new(0) };
+
     /// The times views said they would look different at, while a recording
     /// is open. See [`crate::Window::rebuild_at`].
     static DEADLINES: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };

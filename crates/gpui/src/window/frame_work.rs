@@ -26,6 +26,9 @@ pub struct FrameWorkStats {
     /// any view drawn again from the last frame. A view drawn again counts
     /// once; the views nested in it are copied along without being counted.
     pub views_reused: u64,
+    /// Of the views drawn again from the last frame, those drawn somewhere
+    /// else than they were, moved with what they drew.
+    pub views_moved: u64,
     /// With view retention on, why the views that were built were built
     /// rather than drawn again from the last frame.
     pub view_rebuilds: ViewRebuildCounts,

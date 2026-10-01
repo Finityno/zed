@@ -282,7 +282,9 @@ impl Render for Inner {
                     .w(px(6. + self.count as f32 * 2.))
                     .h(px(6.))
                     .bg(PALETTE[1])
-                    .group_hover("card", |style| style.bg(PALETTE[3])),
+                    .when(self.ix.is_multiple_of(3), |this| {
+                        this.group_hover("card", |style| style.bg(PALETTE[3]))
+                    }),
             )
             .child(word)
             // Paints by whether its hitbox is hovered, and is not notified
@@ -315,6 +317,8 @@ struct Shell {
     /// Handles the probe action at the root, which every card reading the
     /// actions shows while nothing is focused.
     handles: bool,
+    /// The height of a header above everything, in steps.
+    header: usize,
     /// The index the next inserted card gets: never one a card has had, so
     /// that no two cards share an element id after a removal.
     next_card_ix: usize,
@@ -347,6 +351,7 @@ impl Shell {
             column: false,
             tint: 0,
             handles: false,
+            header: 0,
             next_card_ix: CARDS,
         }
     }
@@ -371,6 +376,7 @@ impl Render for Shell {
             .when(self.handles, |this| {
                 this.on_action(|_: &probe_actions::Probe, _, _| {})
             })
+            .child(div().w_full().h(px(self.header as f32 * 7.5)))
             .child(items)
             .child(self.list_reader.clone())
             .children(self.cards.iter().enumerate().map(|(ix, card)| {
@@ -407,6 +413,9 @@ enum Change {
     Wheel { delta: f32 },
     Mouse { x: f32, y: f32 },
     Resize { width: f32, height: f32 },
+    /// Grows or shrinks a header above everything else, which moves what
+    /// follows it, as a streaming reply grows the rows around it.
+    Header { height: usize },
     ShellHandles,
     CardHandles { ix: usize },
     Focus { ix: Option<usize> },
@@ -443,8 +452,14 @@ impl Change {
             75..80 => Change::Scroll {
                 top: rng.random_range(0..CARDS),
             },
+            // Half the time by whole device pixels (the test window's scale
+            // is 2), by which the views in the list can be drawn moved.
             80..84 => Change::Wheel {
-                delta: rng.random_range(-120.0..120.0),
+                delta: if rng.random_bool(0.5) {
+                    (rng.random_range(-240.0f32..240.0)).round() / 2.
+                } else {
+                    rng.random_range(-120.0..120.0)
+                },
             },
             84..92 => Change::Mouse {
                 x: rng.random_range(0.0..700.0),
@@ -454,7 +469,12 @@ impl Change {
                 width: rng.random_range(300.0..900.0),
                 height: rng.random_range(240.0..700.0),
             },
-            95..97 => Change::ShellHandles,
+            95..97 => match rng.random_range(0..3) {
+                0 => Change::ShellHandles,
+                _ => Change::Header {
+                    height: rng.random_range(0..8),
+                },
+            },
             97..98 => Change::CardHandles { ix },
             98..99 => Change::Focus {
                 ix: rng.random_bool(0.7).then_some(ix),
@@ -682,6 +702,7 @@ impl Oracle {
                 }
             }
             Change::ShellHandles => self.update_shells(|shell, _| shell.handles = !shell.handles),
+            Change::Header { height } => self.update_shells(move |shell, _| shell.header = height),
             Change::CardHandles { ix } => self.update_cards(ix, |card, cx| {
                 card.handles = !card.handles;
                 cx.notify();
@@ -706,15 +727,18 @@ impl Oracle {
         }
     }
 
-    fn draw(&mut self) -> (Vec<String>, Vec<String>, usize) {
+    fn draw(&mut self) -> (Vec<String>, Vec<String>, crate::FrameWorkStats) {
         // The window drawing views again draws first, so that what a view
         // writes as it draws reaches the other window's readers no sooner.
-        let (actual, reused) = self
+        let (actual, work) = self
             .cx
             .update_window(self.retaining.into(), |_, window, cx| {
-                window.reset_frame_work_stats(false);
                 window.draw(cx).clear(cx);
-                (describe_frame(window), window.frame_work_stats().views_reused as usize)
+                let work = window.frame_work_stats();
+                // The work of the frames drawn since the last one this drew,
+                // the ones changes drew on their own included.
+                window.reset_frame_work_stats(false);
+                (describe_frame(window), work)
             })
             .unwrap();
         let expected = self
@@ -725,15 +749,22 @@ impl Oracle {
                 describe_frame(window)
             })
             .unwrap();
-        (actual, expected, reused)
+        (actual, expected, work)
     }
 }
 
-fn run(seed: u64, steps: usize) -> usize {
+/// Views drawn again, and of those drawn again moved, over a run.
+#[derive(Default)]
+struct Reuse {
+    reused: u64,
+    moved: u64,
+}
+
+fn run(seed: u64, steps: usize) -> Reuse {
     let mut oracle = Oracle::new();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut history: Vec<Vec<Change>> = Vec::new();
-    let mut reused = 0;
+    let mut reuse = Reuse::default();
     for step in 0..steps {
         let changes: Vec<Change> = if step == 0 {
             Vec::new()
@@ -746,8 +777,9 @@ fn run(seed: u64, steps: usize) -> usize {
             oracle.apply(change);
         }
         history.push(changes);
-        let (actual, expected, reused_now) = oracle.draw();
-        reused += reused_now;
+        let (actual, expected, work) = oracle.draw();
+        reuse.reused += work.views_reused;
+        reuse.moved += work.views_moved;
         if let Some(difference) = first_difference(&actual, &expected) {
             let history = history
                 .iter()
@@ -761,17 +793,21 @@ fn run(seed: u64, steps: usize) -> usize {
             );
         }
     }
-    reused
+    reuse
 }
 
 #[test]
 fn frames_drawing_views_again_match_frames_drawn_from_scratch() {
-    let mut reused = 0;
+    let mut reuse = Reuse::default();
     let seeds = std::env::var("GPUI_RETAINED_VIEWS_ORACLE_SEEDS").ok().and_then(|seeds| seeds.parse().ok()).unwrap_or(16);
     for seed in 0..seeds {
-        reused += run(seed, 50);
+        let run = run(seed, 50);
+        reuse.reused += run.reused;
+        reuse.moved += run.moved;
     }
+    let Reuse { reused, moved } = reuse;
     assert!(reused > 1000, "views were drawn again {reused} times");
+    assert!(moved > 100, "views were drawn again moved {moved} times of {reused}");
 }
 
 /// A shell holding cards, drawn once, for the focused tests below.
@@ -893,8 +929,9 @@ fn notifying_a_view_builds_only_it_and_the_views_around_it() {
 fn group_hover_views_are_built_with_their_group_container_only() {
     let mut cx = TestAppContext::single();
     let (window, _) = shell_window(&mut cx);
+    // The inner view of every third card hovers by its card's group.
     let card = window
-        .read_with(&cx, |shell, _| shell.cards[2].clone())
+        .read_with(&cx, |shell, _| shell.cards[3].clone())
         .unwrap();
     let inner = card.read_with(&cx, |card, _| card.inner.entity_id());
     let work = work_after(&mut cx, window, |cx| card.update(cx, |_, cx| cx.notify()));
@@ -2696,4 +2733,284 @@ fn draw_any<V: 'static>(cx: &mut TestAppContext, window: WindowHandle<V>) -> cra
         window.frame_work_stats()
     })
     .unwrap()
+}
+
+/// A row of a strip scrolled by an offset: a scrolled-sideways bar, two
+/// lines of text, and a listener answering where in the row a press landed.
+struct StripRow {
+    scroll: crate::ScrollHandle,
+    presses: Rc<Cell<Option<crate::Point<Pixels>>>>,
+    /// Writes this model as it prepaints, which keeps it in place.
+    writes: Option<Entity<Summary>>,
+}
+
+impl Render for StripRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let presses = self.presses.clone();
+        let writes = self.writes.clone();
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .w(px(180.))
+            .h(px(80.))
+            .child(
+                div()
+                    .id("bar")
+                    .overflow_x_scroll()
+                    .track_scroll(&self.scroll)
+                    .w(px(100.))
+                    .h(px(4.))
+                    .child(div().w(px(300.)).h(px(4.)).bg(PALETTE[1])),
+            )
+            // The test text system's glyphs hang 19.5 below their lines' tops
+            // and are 13 high: the first line's are 23.5 to 36.5 into the
+            // row, the second's 57.5 to 70.5.
+            .child(div().h(px(14.)).child("line one"))
+            .child(div().h(px(20.)))
+            .child(div().h(px(14.)).child("line two"))
+            .child(
+                crate::canvas(
+                    move |bounds, _, cx| {
+                        if let Some(writes) = &writes {
+                            writes.update(cx, |_, _| {});
+                        }
+                        bounds
+                    },
+                    move |_, bounds, window, _| {
+                        window.on_mouse_event(
+                            move |event: &crate::MouseDownEvent, phase, _, _| {
+                                if phase == crate::DispatchPhase::Bubble
+                                    && bounds.contains(&event.position)
+                                {
+                                    presses.set(Some(event.position - bounds.origin));
+                                }
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+    }
+}
+
+/// Rows in a clipped strip, moved up by `offset`.
+struct Strip {
+    offset: f32,
+    rows: Vec<Entity<StripRow>>,
+}
+
+impl Render for Strip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            div()
+                .absolute()
+                .top(px(20.))
+                .left(px(10.))
+                .w(px(200.))
+                .h(px(285.))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .mt(px(-self.offset))
+                        .flex()
+                        .flex_col()
+                        .children(self.rows.iter().cloned()),
+                ),
+        )
+    }
+}
+
+struct StripRows {
+    presses: Rc<Cell<Option<crate::Point<Pixels>>>>,
+    scrolls: Vec<crate::ScrollHandle>,
+}
+
+/// The same strip in a window drawing views again and one drawn from scratch:
+/// the first row writes a model as it prepaints, the second opted out of
+/// being drawn moved, and the fourth is half out of view, its second line
+/// never drawn.
+fn strip_windows(cx: &mut TestAppContext) -> ([WindowHandle<Strip>; 2], [StripRows; 2]) {
+    cx.update(|cx| cx.set_view_retention(true));
+    let mut rows = Vec::new();
+    let windows = [(); 2].map(|_| {
+        // One per window: a model both wrote would build each window's
+        // readers whenever the other draws.
+        let written = cx.new(|_| Summary(0));
+        let presses = Rc::new(Cell::new(None));
+        let scrolls: Vec<_> = (0..4).map(|_| crate::ScrollHandle::new()).collect();
+        rows.push(StripRows {
+            presses: presses.clone(),
+            scrolls: scrolls.clone(),
+        });
+        cx.add_window(move |_, cx| Strip {
+            offset: 0.,
+            rows: scrolls
+                .into_iter()
+                .enumerate()
+                .map(|(ix, scroll)| {
+                    let presses = presses.clone();
+                    let written = written.clone();
+                    cx.new(move |cx| {
+                        if ix == 1 {
+                            cx.set_view_movable(false);
+                        }
+                        StripRow {
+                            scroll,
+                            presses,
+                            writes: (ix == 0).then_some(written),
+                        }
+                    })
+                })
+                .collect(),
+        })
+    });
+    let rows: [StripRows; 2] = rows.try_into().ok().unwrap();
+    (windows, rows)
+}
+
+/// Draws both strips, the second from scratch, returning their descriptions
+/// and the first's work since the last call. The first is drawn only if a
+/// change did not draw it already, so that its rebuilds are the change's.
+fn draw_strips(
+    cx: &mut TestAppContext,
+    windows: [WindowHandle<Strip>; 2],
+) -> (Vec<String>, Vec<String>, crate::FrameWorkStats) {
+    let (retained, work) = cx
+        .update_window(windows[0].into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = window.frame_work_stats();
+            window.reset_frame_work_stats(false);
+            (describe_frame(window), work)
+        })
+        .unwrap();
+    let from_scratch = cx
+        .update_window(windows[1].into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            describe_frame(window)
+        })
+        .unwrap();
+    (retained, from_scratch, work)
+}
+
+fn scroll_strips(cx: &mut TestAppContext, windows: [WindowHandle<Strip>; 2], offset: f32) {
+    for window in windows {
+        window
+            .update(cx, |strip, _, cx| {
+                strip.offset = offset;
+                cx.notify();
+            })
+            .unwrap();
+    }
+}
+
+/// Rows moved by a scroll are drawn again moved, not built, unless they
+/// write as they draw, opted out, were or are partly out of view (the last
+/// row's second line was never drawn) or moved by part of a device pixel.
+#[test]
+fn moved_views_are_drawn_again_unless_something_of_them_was_out_of_view() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let (windows, _) = strip_windows(&mut cx);
+    draw_strips(&mut cx, windows);
+    let (retained, from_scratch, _) = draw_strips(&mut cx, windows);
+    assert_eq!(first_difference(&retained, &from_scratch), None);
+    let rows = windows[0].read_with(&cx, |strip, _| strip.rows.clone()).unwrap();
+    for offset in [-10., 0., 50., 55.5, 60.25] {
+        scroll_strips(&mut cx, windows, offset);
+        let (retained, from_scratch, work) = draw_strips(&mut cx, windows);
+        assert_eq!(
+            first_difference(&retained, &from_scratch),
+            None,
+            "scrolled to {offset}"
+        );
+        let reasons: Vec<_> = cx
+            .update_window(windows[0].into(), |_, window, _| window.view_rebuild_reasons().to_vec())
+            .unwrap();
+        let rebuilt: Vec<_> = reasons.iter().map(|(view, _)| *view).collect();
+        for (ix, row) in rows.iter().enumerate() {
+            let built = rebuilt.contains(&row.entity_id());
+            // The strip is 285 high, the rows 80: unscrolled, its bottom cuts
+            // between the last row's lines, whose second is never drawn.
+            // Scrolled by 50, the last row comes wholly into view. A
+            // quarter-pixel scroll still moves the rows by whole device
+            // pixels: elements are placed snapped to them.
+            let expected = match (ix, offset) {
+                (0 | 1, _) => true,
+                (3, -10. | 0. | 50.) => true,
+                _ => false,
+            };
+            assert_eq!(built, expected, "row {ix} at offset {offset}: {work:?}");
+        }
+        assert!(work.views_moved >= 1, "{work:?}");
+    }
+}
+
+/// A press on a row drawn moved lands where it does in the row: the window
+/// builds the rows drawn moved before dispatching it.
+#[test]
+fn a_press_on_a_moved_view_settles_it_first() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let (windows, rows) = strip_windows(&mut cx);
+    draw_strips(&mut cx, windows);
+    draw_strips(&mut cx, windows);
+    scroll_strips(&mut cx, windows, 30.);
+    let (_, _, work) = draw_strips(&mut cx, windows);
+    assert!(work.views_moved >= 1, "{work:?}");
+    // In the third row, scrolled: the strip at (10, 20), the row 160 down
+    // it, moved up 30.
+    let position = point(px(10. + 7.), px(20. + 160. - 30. + 15.));
+    cx.update_window(windows[0].into(), |_, window, cx| {
+        assert!(window.rendered_frame.retained_views.unsettled);
+        window.dispatch_event(
+            crate::PlatformInput::MouseDown(crate::MouseDownEvent {
+                button: crate::MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        assert!(!window.rendered_frame.retained_views.unsettled);
+    })
+    .unwrap();
+    assert_eq!(rows[0].presses.get(), Some(point(px(7.), px(15.))));
+}
+
+/// What a moved view's elements wrote of where they are moves with it, and
+/// the views drawn moved are built once they stop moving.
+#[test]
+fn a_moved_view_moves_its_scroll_handles_and_settles_once_still() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let (windows, rows) = strip_windows(&mut cx);
+    draw_strips(&mut cx, windows);
+    draw_strips(&mut cx, windows);
+    for offset in [10., 30., 15.] {
+        scroll_strips(&mut cx, windows, offset);
+        let (_, _, work) = draw_strips(&mut cx, windows);
+        assert!(work.views_moved >= 1, "{work:?}");
+        assert_eq!(
+            rows[0].scrolls[2].bounds(),
+            rows[1].scrolls[2].bounds(),
+            "scrolled to {offset}"
+        );
+    }
+    let unsettled = |cx: &mut TestAppContext| {
+        cx.update_window(windows[0].into(), |_, window, _| {
+            window.rendered_frame.retained_views.unsettled
+        })
+        .unwrap()
+    };
+    assert!(unsettled(&mut cx));
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(!unsettled(&mut cx));
+    let (retained, from_scratch, _) = draw_strips(&mut cx, windows);
+    assert_eq!(first_difference(&retained, &from_scratch), None);
 }

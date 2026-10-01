@@ -77,6 +77,14 @@ impl List {
 #[derive(Clone)]
 pub struct ListState(Rc<RefCell<StateInner>>);
 
+impl crate::window::view_retention::PositionedState for RefCell<StateInner> {
+    fn translate(&self, by: Point<Pixels>) {
+        if let Some(bounds) = self.borrow_mut().last_layout_bounds.as_mut() {
+            bounds.origin += by;
+        }
+    }
+}
+
 impl std::fmt::Debug for ListState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ListState")
@@ -2188,6 +2196,7 @@ impl Element for List {
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
+        window.note_positioned_state(|| self.state.0.clone());
         // Measuring items and following the tail change what the state
         // answers; a prepaint that changed nothing must not mark it changed,
         // or every view reading the list would be built on every frame.

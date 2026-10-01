@@ -2017,6 +2017,8 @@ impl Element for Div {
             }
             state.version.bump_if(state.child_bounds != children);
             state.child_bounds = children;
+            drop(state);
+            window.note_positioned_state(|| scroll_handle.0.clone());
             if request_layout.child_layout_ids.is_empty() {
                 bounds.size
             } else {
@@ -2410,7 +2412,7 @@ impl Interactivity {
                     // bottom) takes effect as this element prepaints, so the
                     // view drawing it depends on the handle.
                     crate::window::view_retention::dependencies::note_state_read(
-                        &scroll_handle_state.version,
+                        &scroll_handle_state.requests,
                     );
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
@@ -4509,6 +4511,13 @@ struct ScrollHandleState {
     /// read it is built again rather than drawn from the last frame, with
     /// view retention on.
     version: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped only when the handle is asked to scroll (to an item, to the
+    /// bottom, to an offset), which the element tracking it carries out as it
+    /// prepaints: the view drawing that element depends on this rather than
+    /// on `version`, which the element's own prepaint bumps whenever it moves
+    /// or resizes, and which would otherwise build the view on the frame
+    /// after every one it was built in somewhere else.
+    requests: crate::window::view_retention::dependencies::StateVersion,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4522,6 +4531,16 @@ enum ScrollStrategy {
     #[default]
     FirstVisible,
     Top,
+}
+
+impl crate::window::view_retention::PositionedState for RefCell<ScrollHandleState> {
+    fn translate(&self, by: Point<Pixels>) {
+        let mut state = self.borrow_mut();
+        state.bounds.origin += by;
+        for child in &mut state.child_bounds {
+            child.origin += by;
+        }
+    }
 }
 
 /// A handle to the scrollable aspects of an element.
@@ -4637,6 +4656,7 @@ impl ScrollHandle {
         });
         state.active_item = Some(item);
         state.version.bump_if(changed);
+        state.requests.bump_if(changed);
     }
 
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
@@ -4708,6 +4728,7 @@ impl ScrollHandle {
         let changed = !state.scroll_to_bottom;
         state.scroll_to_bottom = true;
         state.version.bump_if(changed);
+        state.requests.bump_if(changed);
     }
 
     /// Set the offset explicitly. The offset is the distance from the top left of the
@@ -4718,6 +4739,7 @@ impl ScrollHandle {
         let changed = *state.offset.borrow() != position;
         *state.offset.borrow_mut() = position;
         state.version.bump_if(changed);
+        state.requests.bump_if(changed);
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.

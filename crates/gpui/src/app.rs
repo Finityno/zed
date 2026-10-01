@@ -798,6 +798,9 @@ pub struct App {
     /// Per view, the entities whose reads while it is drawn are not
     /// dependencies. See [`Context::untrack_reads_of`].
     pub(crate) untracked_reads: FxHashMap<EntityId, SmallVec<[EntityId; 1]>>,
+    /// Views that opted out of being drawn again moved. See
+    /// [`Context::set_view_movable`].
+    pub(crate) fixed_views: FxHashSet<EntityId>,
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
@@ -895,6 +898,7 @@ impl App {
                 dependencies: Default::default(),
                 non_retainable_views: FxHashSet::default(),
                 untracked_reads: FxHashMap::default(),
+                fixed_views: FxHashSet::default(),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
@@ -1882,6 +1886,7 @@ impl App {
                 self.current_window_by_entity.remove(&entity_id);
                 self.non_retainable_views.remove(&entity_id);
                 self.untracked_reads.remove(&entity_id);
+                self.fixed_views.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
                     release_callback(entity.as_mut(), self);
                 }

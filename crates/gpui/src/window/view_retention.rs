@@ -17,11 +17,16 @@
 //!
 //! A view is built instead when it was notified (or a view nested in it was),
 //! when something it read changed, when a hover it was drawn by changed, when
-//! it is drawn somewhere else or inherits something else there (a group it
-//! hovers by, say, whose container was built), while the
-//! window refreshes, while something is dragged, while the inspector picks,
-//! while accessibility is active, and when it opted out
-//! ([`crate::Context::set_view_retainable`]).
+//! it inherits something else where it is drawn (a group it hovers by, say,
+//! whose container was built), while the window refreshes, while something is
+//! dragged, while the inspector picks, while accessibility is active, and
+//! when it opted out ([`crate::Context::set_view_retainable`]).
+//!
+//! A view drawn somewhere else than it was (scrolled, or pushed down by
+//! something above it that grew) is drawn again moved, its primitives,
+//! hitboxes and nested records shifted with it, where that is what building
+//! it would draw; otherwise it is built at the layout nodes it kept. See
+//! [`moving`].
 //!
 //! What a view inherits at paint (the text shimmer, the opacity cycle and the
 //! time transition its primitives are stamped with) is only known once the
@@ -31,8 +36,10 @@
 //! view is built.
 
 pub(crate) mod dependencies;
+pub(crate) mod moving;
 
 pub use dependencies::DrawDependency;
+pub(crate) use moving::{PositionedState, ViewMove};
 
 #[cfg(test)]
 mod tests;
@@ -71,6 +78,18 @@ fn verification_interval() -> Option<u64> {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|interval| *interval > 0)
+    })
+}
+
+/// Whether views may be drawn again moved: unless `GPUI_RETAINED_VIEW_MOVES`
+/// is `0` (or `false`).
+fn moves_from_environment() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("GPUI_RETAINED_VIEW_MOVES").as_deref(),
+            Ok("0" | "false")
+        )
     })
 }
 
@@ -150,6 +169,9 @@ pub(crate) struct RetainedViews {
     open: Vec<usize>,
     /// Whether any view was drawn again from the frame before.
     reused_any: bool,
+    /// Whether a view drawn in this frame is unsettled: drawn again moved
+    /// since it was last built. See [`moving`].
+    pub(crate) unsettled: bool,
 }
 
 struct ViewRecord {
@@ -176,6 +198,18 @@ struct ViewRecord {
     /// finds them.
     prepaint_layout_keys: Rc<[u64]>,
     layout: Option<Rc<RetainedLayout>>,
+    /// Drawn again moved since it, or a view nested in it, was last built:
+    /// its mouse listeners still answer for where it was. See [`moving`].
+    unsettled: bool,
+    /// Cannot be drawn again moved: it, or a view nested in it, wrote state
+    /// as it was prepainted or painted, or opted out.
+    stays_put: bool,
+    /// How it moved this frame, drawn again from the last one, for its paint
+    /// to move what it copies.
+    moved: Option<ViewMove>,
+    /// The content mask around it as it was painted, which what it painted
+    /// was clipped by; usually the one around it as it was prepainted.
+    paint_mask: ContentMask<Pixels>,
 }
 
 #[derive(Clone)]
@@ -260,6 +294,27 @@ struct ViewRecording {
     nested_keys: usize,
     hovers_start: usize,
     hitboxes_start: u64,
+    /// The view being prepainted.
+    view: Option<EntityId>,
+    writes_start: Writes,
+}
+
+/// Where the writes to entities and globals stood as a view's prepaint or
+/// paint began: a view that wrote any while it prepainted or painted may
+/// have written where it was, and is not drawn moved. Versioned state the
+/// framework keeps its position in (scroll handles, list states) is moved
+/// with it instead; see [`moving::PositionedState`].
+#[derive(Clone, Copy, PartialEq)]
+struct Writes {
+    entities: u64,
+}
+
+impl Writes {
+    fn now(cx: &App) -> Self {
+        Writes {
+            entities: cx.entities.write_generation(),
+        }
+    }
 }
 
 /// A retained view being painted.
@@ -269,6 +324,7 @@ struct ViewPaintRecording {
     hovers_start: usize,
     groups_start: usize,
     dependencies: DependencyRecording,
+    writes_start: Writes,
 }
 
 /// A window's state for drawing views again, besides the records its frames
@@ -332,6 +388,17 @@ pub(crate) struct ViewRetention {
     /// frame drawn from scratch, and how many to let pass between checks.
     frames_since_verification: u64,
     verification_interval: Option<u64>,
+    /// Whether views may be drawn again moved (off with
+    /// `GPUI_RETAINED_VIEW_MOVES=0`), whether the frame being drawn builds
+    /// every unsettled view instead, whether the next one should, whether
+    /// one was drawn moved in this frame, and the task asking for a frame
+    /// that settles them once they stop moving. See [`moving`].
+    pub(crate) moves_enabled: bool,
+    pub(crate) settling: bool,
+    pub(crate) settle_requested: bool,
+    pub(crate) moved_this_frame: bool,
+    pub(crate) last_moved_at: Instant,
+    pub(crate) settle_frame: Option<Task<()>>,
 }
 
 impl ViewRetention {
@@ -358,6 +425,12 @@ impl ViewRetention {
             deferring_views: SmallVec::new(),
             frames_since_verification: 0,
             verification_interval: verification_interval(),
+            moves_enabled: moves_from_environment(),
+            settling: false,
+            settle_requested: false,
+            moved_this_frame: false,
+            last_moved_at: cx.background_executor().now(),
+            settle_frame: None,
         }
     }
 }
@@ -403,6 +476,9 @@ impl PrepaintStateIndex {
             tooltips_index: self.tooltips_index - from.tooltips_index + to.tooltips_index,
             deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index
                 + to.deferred_draws_index,
+            positioned_states_index: self.positioned_states_index
+                - from.positioned_states_index
+                + to.positioned_states_index,
             dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index
                 + to.dispatch_tree_index,
             accessed_element_states_index: self.accessed_element_states_index
@@ -418,6 +494,7 @@ impl PrepaintStateIndex {
         self.hitboxes_index == other.hitboxes_index
             && self.tooltips_index == other.tooltips_index
             && self.deferred_draws_index == other.deferred_draws_index
+            && self.positioned_states_index == other.positioned_states_index
             && self.dispatch_tree_index == other.dispatch_tree_index
             && self.accessed_element_states_index == other.accessed_element_states_index
             && self.line_layout_index == other.line_layout_index
@@ -468,6 +545,7 @@ impl RetainedViews {
         self.by_id.clear();
         self.open.clear();
         self.reused_any = false;
+        self.unsettled = false;
     }
 
     /// Whether a view drawn in this frame, built or drawn again, read which
@@ -580,7 +658,9 @@ impl App {
     /// With it on, a view depends on every entity and global it read while
     /// it was drawn, on versioned state such as scroll handles and list
     /// states, on the pointer and modifier keys if it read them, on the
-    /// hovers it was drawn by, and on where it is drawn. Anything else its
+    /// hovers it was drawn by, and on what it inherits where it is drawn; a
+    /// view that only moved is drawn again moved (see
+    /// [`crate::Context::set_view_movable`]). Anything else its
     /// render reads (a `Rc<RefCell<..>>`, the clock, a thread-local) it has to
     /// be notified of, or declare: see [`DrawDependency`],
     /// [`Window::rebuild_at`] and [`crate::Context::set_view_retainable`].
@@ -593,7 +673,8 @@ impl App {
     ///
     /// With `GPUI_RETAINED_VIEWS_VERIFY=n`, every `n`th frame that drew a
     /// view again is drawn again from scratch, and where the two differ is
-    /// logged as an error.
+    /// logged as an error. `GPUI_RETAINED_VIEW_MOVES=0` builds every view
+    /// that moved instead of drawing it again moved.
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.entities.access_log.enabled != enabled {
             self.entities.access_log.enabled = enabled;
@@ -721,6 +802,7 @@ impl Window {
         retention.rebuilds.clear();
         retention.notified.clone_from(notified);
         retention.every_frame.bump();
+        retention.settling = std::mem::take(&mut retention.settle_requested);
     }
 
     /// Ends the retained bookkeeping of the frame being drawn.
@@ -745,6 +827,7 @@ impl Window {
         retention.deferred_inside_notified = false;
         self.next_frame.retained_views.finish_frame();
         self.schedule_deadline_frame(cx);
+        self.schedule_settle_frame(cx);
     }
 
     /// Stamps a change to the actions when the frame being drawn changed
@@ -818,6 +901,9 @@ impl Window {
             .find(id)
             .ok_or(ViewRebuildReason::FirstDraw)?;
         let record = &self.rendered_frame.retained_views.records[index];
+        if self.view_retention.settling && record.unsettled {
+            return Err(ViewRebuildReason::ContextChanged);
+        }
         let now = cx.background_executor().now();
         match cx.dependencies_changed(&record.dependencies, self.inside_notified_view(), now) {
             Some(DependencyChange::Entity) => return Err(ViewRebuildReason::EntityChanged),
@@ -850,17 +936,23 @@ impl Window {
     fn view_context_matches(&self, previous: usize, bounds: Bounds<Pixels>) -> bool {
         let record = &self.rendered_frame.retained_views.records[previous];
         let context = &record.context;
-        let groups = &self.view_retention.prepaint_groups;
-        record
-            .groups
-            .iter()
-            .all(|read| groups.top(&read.name) == read.hitbox)
+        self.groups_unchanged(record)
             && context.bounds == bounds
             && context.opacity == self.element_opacity
             && context.rem_size == self.rem_size()
             && context.content_mask == self.content_mask()
             && context.text_style == self.text_style()
             && context.image_cache == self.inherited_image_cache()
+    }
+
+    /// Whether the groups `record` resolved outside its view resolve to the
+    /// same hitboxes where it is being drawn now.
+    fn groups_unchanged(&self, record: &ViewRecord) -> bool {
+        let groups = &self.view_retention.prepaint_groups;
+        record
+            .groups
+            .iter()
+            .all(|read| groups.top(&read.name) == read.hitbox)
     }
 
     /// Lays out the view last frame's record `previous` stands for as it was
@@ -1012,8 +1104,14 @@ impl Window {
     }
 
     /// Draws the view last frame's record `previous` stands for again, as far
-    /// as its prepaint goes, returning its record in this frame.
-    fn reuse_view_prepaint(&mut self, previous: usize, cx: &mut App) -> usize {
+    /// as its prepaint goes, returning its record in this frame: where it was,
+    /// or `moved`.
+    fn reuse_view_prepaint(
+        &mut self,
+        previous: usize,
+        moved: Option<ViewMove>,
+        cx: &mut App,
+    ) -> usize {
         let (prepaint_range, dependencies, hovers) = {
             let records = &self.rendered_frame.retained_views.records;
             let record = &records[previous];
@@ -1041,6 +1139,10 @@ impl Window {
             )
         };
         self.frame_work.stats.views_reused += 1;
+        if moved.is_some() {
+            self.frame_work.stats.views_moved += 1;
+            self.view_retention.moved_this_frame = true;
+        }
         if let Some(deadline) = dependencies.rebuild_at {
             self.rebuild_at(deadline);
         }
@@ -1051,7 +1153,7 @@ impl Window {
         self.view_retention.hovers.extend_from_slice(&hovers);
 
         let start = self.prepaint_index();
-        self.reuse_prepaint(prepaint_range.clone());
+        self.reuse_prepaint_moved(prepaint_range.clone(), moved.as_ref());
         let end = self.prepaint_index();
 
         // The nested records can be shifted into this frame only if the copy
@@ -1066,6 +1168,7 @@ impl Window {
         let target = &mut self.next_frame.retained_views;
         target.reused_any = true;
         let anchor = target.records.len();
+        let mut unsettled = false;
         let nested = if copied_whole {
             source.records[previous].nested
         } else {
@@ -1099,7 +1202,10 @@ impl Window {
                 } else {
                     record.nested
                 },
-                context: record.context.clone(),
+                context: match &moved {
+                    Some(moved) => moved.move_record(record),
+                    None => record.context.clone(),
+                },
                 paint_context: record.paint_context.clone(),
                 dependencies: record.dependencies.written_up_to(writes_now),
                 hovers: record.hovers.clone(),
@@ -1107,8 +1213,17 @@ impl Window {
                 fresh_hitboxes: 0..0,
                 prepaint_layout_keys: record.prepaint_layout_keys.clone(),
                 layout: record.layout.clone(),
+                unsettled: record.unsettled || moved.is_some(),
+                stays_put: record.stays_put,
+                moved: if index == previous { moved } else { None },
+                paint_mask: match &moved {
+                    Some(moved) if index != previous => moved.mask_of(&record.paint_mask),
+                    _ => record.paint_mask,
+                },
             });
+            unsettled |= record.unsettled || moved.is_some();
         }
+        target.unsettled |= unsettled;
         anchor
     }
 
@@ -1124,9 +1239,22 @@ impl Window {
         let groups = record.groups.clone();
         let recorded = record.paint_context.clone();
         let current = self.paint_context();
+        let paint_mask = self.content_mask();
+        // Moved with what it painted from the mask around it then to the one
+        // around it now, which can differ from the ones around its prepaint.
+        let moved = record.moved.as_ref().map(|moved| ViewMove {
+            delta: moved.delta,
+            old_outer: record.paint_mask,
+            new_outer: paint_mask,
+        });
 
         let start = self.paint_index();
-        self.reuse_paint_rebased(source.clone(), recorded.transition, current.transition);
+        self.reuse_paint_moved(
+            source.clone(),
+            recorded.transition,
+            current.transition,
+            moved.as_ref(),
+        );
         let end = self.paint_index();
         let copied_whole = end.same_place(&source.end.shifted(&source.start, &start));
         let record = &mut self.next_frame.retained_views.records[index];
@@ -1135,6 +1263,7 @@ impl Window {
             source: copied_whole.then_some(source.start),
         };
         record.paint_context = current.clone();
+        record.paint_mask = paint_mask;
 
         // The hovers were checked against the last frame's hitboxes, and this
         // frame's may put something over the view; the text effect, opacity
@@ -1187,6 +1316,10 @@ impl Window {
                 fresh_hitboxes: 0..0,
                 prepaint_layout_keys: Rc::new([]),
                 layout: None,
+                unsettled: false,
+                stays_put: false,
+                moved: None,
+                paint_mask: ContentMask::default(),
             });
             views.open.push(index);
             index
@@ -1206,6 +1339,8 @@ impl Window {
             nested_keys: retention.nested_keys.len(),
             hovers_start: retention.hovers.len(),
             hitboxes_start: self.next_hitbox_id.0,
+            view: self.rendered_entity_stack.last().copied(),
+            writes_start: Writes::now(cx),
         }
     }
 
@@ -1229,7 +1364,18 @@ impl Window {
         let views = &mut self.next_frame.retained_views;
         views.open.retain(|open| *open != index);
         let nested = views.records.len() - index - 1;
+        let (unsettled, stays_put) = views.records[index + 1..]
+            .iter()
+            .fold((false, false), |(unsettled, stays_put), record| {
+                (unsettled || record.unsettled, stays_put || record.stays_put)
+            });
         let record = &mut views.records[index];
+        record.unsettled = unsettled;
+        record.stays_put = stays_put
+            || recording.writes_start != Writes::now(cx)
+            || recording
+                .view
+                .is_some_and(|view| cx.fixed_views.contains(&view));
         record.prepaint_range.end = end;
         record.nested = nested;
         record.context = Rc::new(context);
@@ -1255,13 +1401,17 @@ impl Window {
         self.take_hover_reads();
         self.view_retention.view_stack.push(id.clone());
         let paint_context = self.paint_context();
-        self.next_frame.retained_views.records[index].paint_context = paint_context;
+        let paint_mask = self.content_mask();
+        let record = &mut self.next_frame.retained_views.records[index];
+        record.paint_context = paint_context;
+        record.paint_mask = paint_mask;
         ViewPaintRecording {
             index: Some(index),
             start: self.paint_index(),
             hovers_start: self.view_retention.hovers.len(),
             groups_start: self.view_retention.group_reads.len(),
             dependencies: cx.begin_recording_dependencies(),
+            writes_start: Writes::now(cx),
         }
     }
 
@@ -1284,6 +1434,7 @@ impl Window {
             }
         }
         record.groups = groups.into();
+        record.stays_put |= recording.writes_start != Writes::now(cx);
         record.paint_range = recording.start..end;
         record.paint = PaintStatus::Painted { source: None };
         if !painted_hovers.is_empty() {
@@ -1426,54 +1577,132 @@ impl Window {
 /// What a frame shows and where it can be hit, as lines two frames can be
 /// compared by. Atlas tiles are left out, since the same glyph can land in
 /// another tile.
+///
+/// A content mask is described by what it leaves visible of what it clips
+/// (see [`crate::scene::primitive_extent`]), not as it is: masks that cut the
+/// same pixels out of a primitive or a hitbox are the same to whoever looks.
+/// A view drawn again moved clips what it drew with masks moved with it,
+/// which differ from the ones a frame drawn from scratch pushes wherever
+/// they clip nothing. Positions are rounded to 1/64 of a device pixel, the
+/// rounding a moved copy and a fresh layout can differ by.
 pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
+    use crate::scene::{Primitive, primitive_extent};
+    fn round(value: f32) -> f32 {
+        (value * 64.).round() / 64. + 0.
+    }
+    fn rounded(bounds: Bounds<crate::ScaledPixels>) -> Bounds<crate::ScaledPixels> {
+        use crate::ScaledPixels;
+        Bounds {
+            origin: crate::point(
+                ScaledPixels(round(bounds.origin.x.0)),
+                ScaledPixels(round(bounds.origin.y.0)),
+            ),
+            size: crate::size(
+                ScaledPixels(round(bounds.size.width.0)),
+                ScaledPixels(round(bounds.size.height.0)),
+            ),
+        }
+    }
+    let scale_factor = window.scale_factor();
+    let rounded_pixels = |bounds: Bounds<Pixels>| rounded(bounds.scale(scale_factor));
+    fn visible(primitive: impl Into<Primitive>) -> Primitive {
+        let mut primitive = primitive.into();
+        let extent = primitive_extent(&primitive);
+        let clip = rounded(extent.intersect(&primitive.content_mask().bounds));
+        let bounds = rounded(*primitive.bounds());
+        match &mut primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = bounds;
+                shadow.content_mask.bounds = clip;
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = bounds;
+                quad.content_mask.bounds = clip;
+            }
+            Primitive::Underline(underline) => {
+                underline.bounds = bounds;
+                underline.content_mask.bounds = clip;
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = bounds;
+                sprite.content_mask.bounds = clip;
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = bounds;
+                sprite.content_mask.bounds = clip;
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = bounds;
+                sprite.content_mask.bounds = clip;
+            }
+            Primitive::Path(path) => {
+                path.bounds = bounds;
+                path.content_mask.bounds = clip;
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = bounds;
+                surface.content_mask.bounds = clip;
+            }
+        }
+        primitive
+    }
     let scene = &window.rendered_frame.scene;
     let mut lines = Vec::new();
-    lines.extend(scene.shadows.iter().map(|shadow| format!("{shadow:?}")));
-    lines.extend(scene.quads.iter().map(|quad| format!("{quad:?}")));
-    lines.extend(
-        scene
-            .underlines
-            .iter()
-            .map(|underline| format!("{underline:?}")),
-    );
-    lines.extend(scene.monochrome_sprites.iter().map(|sprite| {
-        format!(
-            "monochrome {} {:?} {:?} {:?} {:?}",
-            sprite.order, sprite.bounds, sprite.content_mask, sprite.color, sprite.effect
+    for primitive in scene
+        .shadows
+        .iter()
+        .map(|shadow| visible(*shadow))
+        .chain(scene.quads.iter().map(|quad| visible(*quad)))
+        .chain(scene.underlines.iter().map(|underline| visible(*underline)))
+        .chain(
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| visible(*sprite)),
         )
-    }));
-    lines.extend(scene.subpixel_sprites.iter().map(|sprite| {
-        format!(
-            "subpixel {} {:?} {:?} {:?} {:?}",
-            sprite.order, sprite.bounds, sprite.content_mask, sprite.color, sprite.effect
+        .chain(scene.subpixel_sprites.iter().map(|sprite| visible(*sprite)))
+        .chain(
+            scene
+                .polychrome_sprites
+                .iter()
+                .map(|sprite| visible(*sprite)),
         )
-    }));
-    lines.extend(scene.polychrome_sprites.iter().map(|sprite| {
-        format!(
-            "polychrome {} {:?} {:?}",
-            sprite.order, sprite.bounds, sprite.content_mask
-        )
-    }));
-    lines.extend(
-        scene
-            .paths
-            .iter()
-            .map(|path| format!("path {} {:?}", path.order, path.bounds)),
-    );
+        .chain(scene.paths.iter().map(|path| visible(path.clone())))
+    {
+        lines.push(match primitive {
+            Primitive::Shadow(shadow) => format!("{shadow:?}"),
+            Primitive::Quad(quad) => format!("{quad:?}"),
+            Primitive::Underline(underline) => format!("{underline:?}"),
+            Primitive::MonochromeSprite(sprite) => format!(
+                "monochrome {} {:?} {:?} {:?} {:?}",
+                sprite.order, sprite.bounds, sprite.content_mask, sprite.color, sprite.effect
+            ),
+            Primitive::SubpixelSprite(sprite) => format!(
+                "subpixel {} {:?} {:?} {:?} {:?}",
+                sprite.order, sprite.bounds, sprite.content_mask, sprite.color, sprite.effect
+            ),
+            Primitive::PolychromeSprite(sprite) => format!(
+                "polychrome {} {:?} {:?}",
+                sprite.order, sprite.bounds, sprite.content_mask
+            ),
+            Primitive::Path(path) => {
+                format!("path {} {:?} {:?}", path.order, path.bounds, path.content_mask)
+            }
+            Primitive::Surface(surface) => format!("surface {:?}", surface.bounds),
+        });
+    }
     let frame = &window.rendered_frame;
     lines.extend(frame.hitboxes.iter().map(|hitbox| {
         format!(
             "hitbox {:?} {:?} {:?}",
-            hitbox.bounds, hitbox.content_mask, hitbox.behavior
+            rounded_pixels(hitbox.bounds),
+            rounded_pixels(hitbox.bounds.intersect(&hitbox.content_mask.bounds)),
+            hitbox.behavior
         )
     }));
-    lines.extend(
-        frame
-            .window_control_hitboxes
-            .iter()
-            .map(|(area, hitbox)| format!("window control {area:?} {:?}", hitbox.bounds)),
-    );
+    lines.extend(frame.window_control_hitboxes.iter().map(|(area, hitbox)| {
+        format!("window control {area:?} {:?}", rounded_pixels(hitbox.bounds))
+    }));
     lines.push(format!("overlay starts at {}", frame.overlay_scene_start));
     lines
 }
@@ -1621,7 +1850,16 @@ impl Window {
                 if window.view_context_matches(previous, bounds) {
                     #[cfg(feature = "profiler")]
                     window.draw_clock.count_reuse();
-                    return ViewPrepaint::Reused(window.reuse_view_prepaint(previous, cx));
+                    return ViewPrepaint::Reused(window.reuse_view_prepaint(previous, None, cx));
+                }
+                if let Some(moved) = window.view_move(previous, bounds) {
+                    #[cfg(feature = "profiler")]
+                    window.draw_clock.count_reuse();
+                    return ViewPrepaint::Reused(window.reuse_view_prepaint(
+                        previous,
+                        Some(moved),
+                        cx,
+                    ));
                 }
                 window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
                 #[cfg(feature = "profiler")]
@@ -1633,9 +1871,22 @@ impl Window {
                     Ok(previous) if window.view_context_matches(previous, bounds) => {
                         #[cfg(feature = "profiler")]
                         window.draw_clock.count_reuse();
-                        return ViewPrepaint::Reused(window.reuse_view_prepaint(previous, cx));
+                        return ViewPrepaint::Reused(window.reuse_view_prepaint(
+                            previous, None, cx,
+                        ));
                     }
-                    Ok(_) => window.note_rebuild(entity, ViewRebuildReason::ContextChanged),
+                    Ok(previous) => {
+                        if let Some(moved) = window.view_move(previous, bounds) {
+                            #[cfg(feature = "profiler")]
+                            window.draw_clock.count_reuse();
+                            return ViewPrepaint::Reused(window.reuse_view_prepaint(
+                                previous,
+                                Some(moved),
+                                cx,
+                            ));
+                        }
+                        window.note_rebuild(entity, ViewRebuildReason::ContextChanged)
+                    }
                     Err(reason) => window.note_rebuild(entity, reason),
                 }
                 #[cfg(feature = "profiler")]

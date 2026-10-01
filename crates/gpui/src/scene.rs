@@ -441,7 +441,22 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        self.replay_inside(range, prev_scene, None);
+        self.replay_inside(range, prev_scene, None, None);
+    }
+
+    /// Whether every primitive and layer in `range` that reached past its
+    /// content mask was clipped by a mask other than `outer`, on each side
+    /// it reached past; see [`SceneMove`].
+    pub(crate) fn clipped_only_inside(&self, range: Range<usize>, outer: [f32; 4]) -> bool {
+        use crate::window::view_retention::moving::{clipped_only_inside, scaled_edges};
+        self.paint_operations[range].iter().all(|operation| match operation {
+            PaintOperation::Primitive(primitive) => clipped_only_inside(
+                scaled_edges(&primitive_extent(primitive)),
+                scaled_edges(&primitive.content_mask().bounds),
+                outer,
+            ),
+            PaintOperation::StartLayer(_) | PaintOperation::EndLayer => true,
+        })
     }
 
     /// Replays `range` of `prev_scene`, as [`Self::replay`] does, into a scene
@@ -451,11 +466,15 @@ impl Scene {
     /// transitions pushed inside the range are parented to it, so content
     /// replayed into a transition that started since moves with it rather
     /// than with a copy of the one it was painted in.
+    ///
+    /// With `moved`, the range is replayed moved, as a view drawn again
+    /// elsewhere is: see [`SceneMove`].
     pub(crate) fn replay_inside(
         &mut self,
         range: Range<usize>,
         prev_scene: &Scene,
         rebase: Option<(u32, u32)>,
+        moved: Option<&SceneMove>,
     ) {
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
@@ -470,6 +489,9 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
+                    if let Some(moved) = moved {
+                        moved.move_primitive(&mut primitive);
+                    }
                     let transition = primitive_transition(&primitive);
                     if let Some((from, to)) = rebase
                         && transition == from
@@ -507,7 +529,10 @@ impl Scene {
                     }
                     self.insert_primitive(primitive)
                 }
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::StartLayer(bounds) => self.push_layer(match moved {
+                    Some(moved) => moved.bounds(*bounds),
+                    None => *bounds,
+                }),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
@@ -1539,6 +1564,121 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+}
+
+/// How far primitives replayed from the last frame move, and the content
+/// mask around them then and now: what a view drawn again elsewhere drew
+/// moves with it, the mask edges it pushed itself move with it, and the
+/// edges of the mask around it are the new mask's. See
+/// [`crate::window::view_retention::moving::ViewMove`].
+#[derive(Clone, Debug)]
+pub(crate) struct SceneMove {
+    pub(crate) delta: Point<ScaledPixels>,
+    /// The edges of the mask around what moved, then and now.
+    pub(crate) old_outer: [f32; 4],
+    pub(crate) new_outer: [f32; 4],
+}
+
+impl SceneMove {
+    pub(crate) fn bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: bounds.origin + self.delta,
+            size: bounds.size,
+        }
+    }
+
+    fn mask(&self, mask: &ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        use crate::window::view_retention::moving::{rebase_edges, scaled_edges};
+        let [left, top, right, bottom] = rebase_edges(
+            scaled_edges(&mask.bounds),
+            self.old_outer,
+            self.new_outer,
+            [self.delta.x.0, self.delta.y.0],
+        );
+        ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(left), ScaledPixels(top)),
+                size: crate::size(ScaledPixels(right - left), ScaledPixels(bottom - top)),
+            },
+        }
+    }
+
+    fn move_primitive(&self, primitive: &mut Primitive) {
+        match primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = self.bounds(shadow.bounds);
+                shadow.element_bounds = self.bounds(shadow.element_bounds);
+                shadow.content_mask = self.mask(&shadow.content_mask);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = self.bounds(quad.bounds);
+                quad.content_mask = self.mask(&quad.content_mask);
+            }
+            Primitive::Path(path) => {
+                path.bounds = self.bounds(path.bounds);
+                path.content_mask = self.mask(&path.content_mask);
+                for vertex in &mut path.vertices {
+                    vertex.xy_position = vertex.xy_position + self.delta;
+                    vertex.content_mask = self.mask(&vertex.content_mask);
+                }
+            }
+            Primitive::Underline(underline) => {
+                underline.bounds = self.bounds(underline.bounds);
+                underline.content_mask = self.mask(&underline.content_mask);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.mask(&sprite.content_mask);
+                if sprite.effect.kind != 0 {
+                    sprite.effect.origin = sprite.effect.origin + self.delta;
+                }
+                sprite.transformation = self.transformation(sprite.transformation);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.mask(&sprite.content_mask);
+                if sprite.effect.kind != 0 {
+                    sprite.effect.origin = sprite.effect.origin + self.delta;
+                }
+                sprite.transformation = self.transformation(sprite.transformation);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.mask(&sprite.content_mask);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = self.bounds(surface.bounds);
+                surface.content_mask = self.mask(&surface.content_mask);
+            }
+        }
+    }
+
+    /// A sprite's transformation, which maps scene positions, moved: it is
+    /// conjugated with the move, `T(d) * M * T(-d)`.
+    fn transformation(&self, matrix: TransformationMatrix) -> TransformationMatrix {
+        if matrix == TransformationMatrix::unit() {
+            return matrix;
+        }
+        let [dx, dy] = [self.delta.x.0, self.delta.y.0];
+        let [[a, b], [c, d]] = matrix.rotation_scale;
+        let [tx, ty] = matrix.translation;
+        TransformationMatrix {
+            rotation_scale: matrix.rotation_scale,
+            translation: [tx + dx - (a * dx + b * dy), ty + dy - (c * dx + d * dy)],
+        }
+    }
+}
+
+/// The box a primitive can draw into: its bounds, and for a shadow the blur
+/// around them.
+pub(crate) fn primitive_extent(primitive: &Primitive) -> Bounds<ScaledPixels> {
+    match primitive {
+        Primitive::Shadow(shadow) => {
+            let margin = shadow.blur_radius * 3.;
+            shadow.bounds.dilate(margin)
+        }
+        primitive => *primitive.bounds(),
+    }
 }
 
 pub(crate) enum PaintOperation {
