@@ -360,6 +360,22 @@ impl TaffyLayoutEngine {
     // snapped independently, but the raw content-box origin can carry a
     // 1dp residual into descendants.
 
+    /// Forgets the absolute bounds worked out this frame. A node laid out
+    /// again as a root (a list item) for the first time in a frame keeps
+    /// what was worked out for it before, which is out of date once layout
+    /// requests made since were rolled back and asked again.
+    pub(crate) fn forget_layout_bounds(&mut self) {
+        self.absolute_layout_bounds.clear();
+        self.absolute_outer_origins.clear();
+    }
+
+    /// Whether the node's layout is out of date: something in it changed
+    /// since its layout was last computed, as for a tree laid out on its own
+    /// (a list item) that nothing laid out again since.
+    pub(crate) fn needs_layout(&self, id: LayoutId) -> bool {
+        self.taffy.dirty(id.into()).unwrap_or(true)
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;

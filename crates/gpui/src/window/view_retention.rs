@@ -15,8 +15,8 @@
 //! records nested in it, shifted to where the copy landed, so that each can
 //! be drawn again on its own later, when what is around it has to be built.
 //!
-//! A view is built instead when it was notified (or a view nested in it was),
-//! when something it read changed, when a hover it was drawn by changed, when
+//! A view is built instead when it was notified (a view around one notified
+//! is drawn again around it, see below), when something it read changed, when a hover it was drawn by changed, when
 //! it inherits something else where it is drawn (a group it hovers by, say,
 //! whose container was built), while the window refreshes, while something is
 //! dragged, while the inspector picks, while accessibility is active, and
@@ -28,6 +28,11 @@
 //! it would draw; otherwise it is built at the layout nodes it kept. See
 //! [`moving`].
 //!
+//! A view dirty only because a view nested in it was notified, or has to be
+//! built for something it read, is drawn again from the last frame around
+//! the nested views that are built, rather than built with them. See
+//! [`splice`].
+//!
 //! What a view inherits at paint (the text shimmer, the opacity cycle and the
 //! time transition its primitives are stamped with) is only known once the
 //! frame is painting, too late to build the view instead. A transition is
@@ -37,6 +42,7 @@
 
 pub(crate) mod dependencies;
 pub(crate) mod moving;
+pub(crate) mod splice;
 
 pub use dependencies::DrawDependency;
 pub(crate) use moving::{PositionedState, ViewMove};
@@ -46,12 +52,14 @@ mod tests;
 
 use super::{ArenaClearNeeded, PaintIndex, PrepaintStateIndex, Window};
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, EntityId, GlobalElementId,
+    AnyElement, AnyView, App, AvailableSpace, Bounds, ContentMask, EntityId, GlobalElementId,
     GroupHitboxes, HitboxId, LayoutId, OpacityCycle, Pixels, SharedString, Size, Style,
     StyleRefinement, Task, TextShimmerStyle, TextStyle, view::ViewName,
 };
 use collections::FxHashMap;
-use dependencies::{AmbientReads, DependencyChange, DependencyRecording, RenderDependencies};
+use dependencies::{
+    AmbientReads, DependencyChange, DependencyRecording, Recorded, RenderDependencies,
+};
 use gpui_util::ResultExt;
 use refineable::Refineable;
 use smallvec::SmallVec;
@@ -88,6 +96,18 @@ fn moves_from_environment() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("GPUI_RETAINED_VIEW_MOVES").as_deref(),
+            Ok("0" | "false")
+        )
+    })
+}
+
+/// Whether views dirty only because views nested in them are may be drawn
+/// again around them: unless `GPUI_RETAINED_VIEW_SPLICES` is `0` (or `false`).
+fn splices_from_environment() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("GPUI_RETAINED_VIEW_SPLICES").as_deref(),
             Ok("0" | "false")
         )
     })
@@ -159,6 +179,16 @@ pub(crate) struct GroupRead {
     hitbox: Option<HitboxId>,
 }
 
+/// What a view element knows of its view, for its record to build it again
+/// on its own, inside a view drawn again around it. See [`splice`].
+#[derive(Default)]
+pub(crate) struct ViewSource {
+    /// The view, when it is an entity or an [`AnyView`].
+    pub(crate) any_view: Option<AnyView>,
+    /// Whether it is a cached view, laid out at its style.
+    pub(crate) cached: bool,
+}
+
 /// The retained views drawn in one frame, in the order they began
 /// prepainting, which puts a view's nested views right after it.
 #[derive(Default)]
@@ -186,8 +216,12 @@ struct ViewRecord {
     /// Everything the view read, nested views and what they deferred
     /// included.
     dependencies: RenderDependencies,
-    /// The hovers the view was drawn by, likewise.
+    /// What the view read itself, outside the views nested in it, and what
+    /// it deferred.
+    own_dependencies: RenderDependencies,
+    /// The hovers the view was drawn by, likewise, and its own.
     hovers: Rc<[HoverRead]>,
+    own_hovers: Rc<[HoverRead]>,
     /// The groups it, and the views nested in it, resolved outside it.
     groups: Rc<[GroupRead]>,
     /// The ids of the hitboxes inserted as it was prepainted this frame,
@@ -210,6 +244,17 @@ struct ViewRecord {
     /// The content mask around it as it was painted, which what it painted
     /// was clipped by; usually the one around it as it was prepainted.
     paint_mask: ContentMask<Pixels>,
+    /// How to build it again on its own; see [`splice`].
+    source: Rc<ViewSource>,
+    /// The layout key of its element, which what it lays out hangs off.
+    layout_scope: u64,
+    /// The group containers around it as it was painted, innermost of each
+    /// name, for building it again on its own.
+    inherited_groups: Rc<[(SharedString, HitboxId)]>,
+    /// A view built inside it asked for another layout than the one it was
+    /// laid out at, so its own layout is out of date: it is built on the
+    /// next frame.
+    layout_blocked: bool,
 }
 
 #[derive(Clone)]
@@ -293,6 +338,7 @@ struct ViewRecording {
     layout_keys: usize,
     nested_keys: usize,
     hovers_start: usize,
+    hover_nested: usize,
     hitboxes_start: u64,
     /// The view being prepainted.
     view: Option<EntityId>,
@@ -322,6 +368,7 @@ struct ViewPaintRecording {
     index: Option<usize>,
     start: PaintIndex,
     hovers_start: usize,
+    hover_nested: usize,
     groups_start: usize,
     dependencies: DependencyRecording,
     writes_start: Writes,
@@ -343,6 +390,9 @@ pub(crate) struct ViewRetention {
     notified: collections::FxHashSet<EntityId>,
     /// Records reads of the pointer and modifier keys while views are drawn.
     pub(crate) ambient_reads: AmbientReads,
+    /// The stretches of `hovers` that views nested in the ones being drawn
+    /// took for themselves, in order: a view's own hovers leave them out.
+    hover_nested: Vec<Range<usize>>,
     /// The group containers around what is being prepainted, which a view
     /// drawn again must find where it found them as it was painted.
     pub(crate) prepaint_groups: GroupHitboxes,
@@ -394,6 +444,9 @@ pub(crate) struct ViewRetention {
     /// one was drawn moved in this frame, and the task asking for a frame
     /// that settles them once they stop moving. See [`moving`].
     pub(crate) moves_enabled: bool,
+    /// Whether views dirty only because views nested in them are drawn again
+    /// around them (off with `GPUI_RETAINED_VIEW_SPLICES=0`); see [`splice`].
+    pub(crate) splices_enabled: bool,
     pub(crate) settling: bool,
     pub(crate) settle_requested: bool,
     pub(crate) moved_this_frame: bool,
@@ -409,6 +462,7 @@ impl ViewRetention {
             hover_reads: RefCell::default(),
             notified: Default::default(),
             ambient_reads: cx.ambient_reads(),
+            hover_nested: Vec::new(),
             prepaint_groups: GroupHitboxes::default(),
             group_reads: Vec::new(),
             rebuilds: Vec::new(),
@@ -426,6 +480,7 @@ impl ViewRetention {
             frames_since_verification: 0,
             verification_interval: verification_interval(),
             moves_enabled: moves_from_environment(),
+            splices_enabled: splices_from_environment(),
             settling: false,
             settle_requested: false,
             moved_this_frame: false,
@@ -465,6 +520,7 @@ pub(crate) struct DeferredViewRecording {
 pub(crate) struct RetainedTransaction {
     records: usize,
     hovers: usize,
+    hover_nested: usize,
 }
 
 impl PrepaintStateIndex {
@@ -595,6 +651,7 @@ impl RetainedViews {
         for &index in records {
             let record = &mut self.records[index];
             record.dependencies = record.dependencies.union(dependencies);
+            record.own_dependencies = record.own_dependencies.union(dependencies);
         }
     }
 
@@ -605,6 +662,7 @@ impl RetainedViews {
         for &index in records {
             let record = &mut self.records[index];
             record.hovers = record.hovers.iter().chain(hovers).copied().collect();
+            record.own_hovers = record.own_hovers.iter().chain(hovers).copied().collect();
         }
     }
 
@@ -679,8 +737,10 @@ impl App {
     /// A follow-up frame for a view is asked for by notifying it by id
     /// ([`App::notify`], [`crate::Context::notify`] or
     /// [`Window::request_animation_frame`]), which builds that view again
-    /// and nothing that read it. Updating an entity and notifying it builds
-    /// every view that read it.
+    /// and nothing that read it; the views around it are drawn again around
+    /// it where they can be. Updating an entity and notifying it builds every
+    /// view that read it. `GPUI_RETAINED_VIEW_SPLICES=0` builds the views
+    /// around a notified view instead.
     ///
     /// With `GPUI_RETAINED_VIEWS_VERIFY=n`, every `n`th frame that drew a
     /// view again is drawn again from scratch, and where the two differ is
@@ -831,6 +891,7 @@ impl Window {
             };
         let retention = &mut self.view_retention;
         retention.hovers.clear();
+        retention.hover_nested.clear();
         retention.group_reads.clear();
         retention.hover_reads.get_mut().clear();
         retention.notified.clear();
@@ -912,7 +973,7 @@ impl Window {
             .find(id)
             .ok_or(ViewRebuildReason::FirstDraw)?;
         let record = &self.rendered_frame.retained_views.records[index];
-        if self.view_retention.settling && record.unsettled {
+        if record.layout_blocked || (self.view_retention.settling && record.unsettled) {
             return Err(ViewRebuildReason::ContextChanged);
         }
         let now = cx.background_executor().now();
@@ -1086,7 +1147,7 @@ impl Window {
         recording: LayoutRecording,
         root: LayoutId,
         cx: &mut App,
-    ) -> (Option<Rc<RetainedLayout>>, RenderDependencies) {
+    ) -> (Option<Rc<RetainedLayout>>, Recorded) {
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         let Some(keys) = recording.keys else {
             return (None, dependencies);
@@ -1149,6 +1210,7 @@ impl Window {
                 record.hovers.clone(),
             )
         };
+        let hovers_start = self.view_retention.hovers.len();
         self.frame_work.stats.views_reused += 1;
         if moved.is_some() {
             self.frame_work.stats.views_moved += 1;
@@ -1161,7 +1223,12 @@ impl Window {
         // when one of those entities is notified, and by the views around it.
         cx.replay_dependencies(&dependencies);
         self.take_hover_reads();
+        let hovers_start = hovers_start.max(self.view_retention.hovers.len());
         self.view_retention.hovers.extend_from_slice(&hovers);
+        let hovers_end = self.view_retention.hovers.len();
+        self.view_retention
+            .hover_nested
+            .push(hovers_start..hovers_end);
 
         let start = self.prepaint_index();
         self.reuse_prepaint_moved(prepaint_range.clone(), moved.as_ref());
@@ -1219,7 +1286,9 @@ impl Window {
                 },
                 paint_context: record.paint_context.clone(),
                 dependencies: record.dependencies.written_up_to(writes_now),
+                own_dependencies: record.own_dependencies.written_up_to(writes_now),
                 hovers: record.hovers.clone(),
+                own_hovers: record.own_hovers.clone(),
                 groups: record.groups.clone(),
                 fresh_hitboxes: 0..0,
                 prepaint_layout_keys: record.prepaint_layout_keys.clone(),
@@ -1231,6 +1300,10 @@ impl Window {
                     Some(moved) if index != previous => moved.mask_of(&record.paint_mask),
                     _ => record.paint_mask,
                 },
+                source: record.source.clone(),
+                layout_scope: record.layout_scope,
+                inherited_groups: record.inherited_groups.clone(),
+                layout_blocked: record.layout_blocked,
             });
             unsettled |= record.unsettled || moved.is_some();
         }
@@ -1284,7 +1357,12 @@ impl Window {
             self.request_animation_frame();
         }
         self.take_hover_reads();
+        let hovers_start = self.view_retention.hovers.len();
         self.view_retention.hovers.extend_from_slice(&hovers);
+        let hovers_end = self.view_retention.hovers.len();
+        self.view_retention
+            .hover_nested
+            .push(hovers_start..hovers_end);
         self.view_retention.group_reads.extend_from_slice(&groups);
     }
 
@@ -1300,8 +1378,10 @@ impl Window {
     fn begin_view_prepaint(
         &mut self,
         id: &GlobalElementId,
+        source: ViewSource,
         cx: &mut App,
     ) -> ViewRecording {
+        let layout_scope = self.layout_keys.prepaint_scope();
         self.frame_work.stats.views_rendered += 1;
         let start = self.prepaint_index();
         let views = &mut self.next_frame.retained_views;
@@ -1322,7 +1402,9 @@ impl Window {
                 }),
                 paint_context: PaintContext::default(),
                 dependencies: RenderDependencies::default(),
+                own_dependencies: RenderDependencies::default(),
                 hovers: Rc::new([]),
+                own_hovers: Rc::new([]),
                 groups: Rc::new([]),
                 fresh_hitboxes: 0..0,
                 prepaint_layout_keys: Rc::new([]),
@@ -1331,6 +1413,10 @@ impl Window {
                 stays_put: false,
                 moved: None,
                 paint_mask: ContentMask::default(),
+                source: Rc::new(source),
+                layout_scope,
+                inherited_groups: Rc::new([]),
+                layout_blocked: false,
             });
             views.open.push(index);
             index
@@ -1349,6 +1435,7 @@ impl Window {
             layout_keys,
             nested_keys: retention.nested_keys.len(),
             hovers_start: retention.hovers.len(),
+            hover_nested: retention.hover_nested.len(),
             hitboxes_start: self.next_hitbox_id.0,
             view: self.rendered_entity_stack.last().copied(),
             writes_start: Writes::now(cx),
@@ -1360,7 +1447,7 @@ impl Window {
         recording: ViewRecording,
         bounds: Bounds<Pixels>,
         layout: Option<Rc<RetainedLayout>>,
-        layout_dependencies: Option<RenderDependencies>,
+        layout_dependencies: Option<Recorded>,
         cx: &mut App,
     ) -> Option<usize> {
         let prepaint_layout_keys = self.finish_own_keys(recording.layout_keys, recording.nested_keys);
@@ -1372,6 +1459,9 @@ impl Window {
         let end = self.prepaint_index();
         let hitboxes_end = self.next_hitbox_id.0;
         let hovers: Rc<[HoverRead]> = self.view_retention.hovers[recording.hovers_start..].into();
+        let own_hovers: Rc<[HoverRead]> = self
+            .own_hovers(recording.hovers_start, recording.hover_nested)
+            .into();
         let views = &mut self.next_frame.retained_views;
         views.open.retain(|open| *open != index);
         let nested = views.records.len() - index - 1;
@@ -1392,11 +1482,15 @@ impl Window {
         record.context = Rc::new(context);
         // A recording is as of the generation it began at, so only one that
         // was made counts: an empty one would date everything back to none.
-        record.dependencies = match layout_dependencies {
-            Some(layout_dependencies) => layout_dependencies.union(&dependencies),
-            None => dependencies,
+        (record.dependencies, record.own_dependencies) = match layout_dependencies {
+            Some(layout) => (
+                layout.all.union(&dependencies.all),
+                layout.own.union(&dependencies.own),
+            ),
+            None => (dependencies.all, dependencies.own),
         };
         record.hovers = hovers;
+        record.own_hovers = own_hovers;
         record.fresh_hitboxes = recording.hitboxes_start..hitboxes_end;
         record.prepaint_layout_keys = prepaint_layout_keys.into();
         record.layout = layout;
@@ -1413,13 +1507,18 @@ impl Window {
         self.view_retention.view_stack.push(id.clone());
         let paint_context = self.paint_context();
         let paint_mask = self.content_mask();
+        let inherited_groups = self.group_hitboxes.tops();
         let record = &mut self.next_frame.retained_views.records[index];
         record.paint_context = paint_context;
         record.paint_mask = paint_mask;
+        if !inherited_groups.is_empty() || !record.inherited_groups.is_empty() {
+            record.inherited_groups = inherited_groups.into();
+        }
         ViewPaintRecording {
             index: Some(index),
             start: self.paint_index(),
             hovers_start: self.view_retention.hovers.len(),
+            hover_nested: self.view_retention.hover_nested.len(),
             groups_start: self.view_retention.group_reads.len(),
             dependencies: cx.begin_recording_dependencies(),
             writes_start: Writes::now(cx),
@@ -1434,6 +1533,7 @@ impl Window {
             return;
         };
         let end = self.paint_index();
+        let own_painted_hovers = self.own_hovers(recording.hovers_start, recording.hover_nested);
         let painted_hovers = &self.view_retention.hovers[recording.hovers_start..];
         let record = &mut self.next_frame.retained_views.records[index];
         let fresh = record.fresh_hitboxes.clone();
@@ -1451,7 +1551,38 @@ impl Window {
         if !painted_hovers.is_empty() {
             record.hovers = record.hovers.iter().chain(painted_hovers).copied().collect();
         }
-        record.dependencies = record.dependencies.union(&dependencies);
+        if !own_painted_hovers.is_empty() {
+            record.own_hovers = record
+                .own_hovers
+                .iter()
+                .chain(&own_painted_hovers)
+                .copied()
+                .collect();
+        }
+        record.dependencies = record.dependencies.union(&dependencies.all);
+        record.own_dependencies = record.own_dependencies.union(&dependencies.own);
+    }
+
+    /// The hovers read since `start` outside the stretches views nested in
+    /// the one being finished took from `nested` on, which become one
+    /// stretch, for the view around it to leave out.
+    fn own_hovers(&mut self, start: usize, nested: usize) -> Vec<HoverRead> {
+        let retention = &mut self.view_retention;
+        let end = retention.hovers.len();
+        let mut own = Vec::new();
+        let mut from = start;
+        for range in &retention.hover_nested[nested.min(retention.hover_nested.len())..] {
+            if range.start > from {
+                own.extend_from_slice(&retention.hovers[from..range.start.min(end)]);
+            }
+            from = from.max(range.end);
+        }
+        if from < end {
+            own.extend_from_slice(&retention.hovers[from..end]);
+        }
+        retention.hover_nested.truncate(nested);
+        retention.hover_nested.push(start..end);
+        own
     }
 
     /// Takes the hovers read since the last call into `hovers`.
@@ -1530,7 +1661,8 @@ impl Window {
         self.view_retention.deferring_views = recording.deferring_before;
         let enclosing = &recording.enclosing.views;
         let views = &mut self.next_frame.retained_views;
-        views.add_dependencies(enclosing, &dependencies);
+        // What a view deferred is part of drawing it, so it is its own.
+        views.add_dependencies(enclosing, &dependencies.all);
         views.add_hovers(enclosing, &self.view_retention.hovers[recording.hovers_start..]);
     }
 
@@ -1539,6 +1671,7 @@ impl Window {
         RetainedTransaction {
             records: self.next_frame.retained_views.records.len(),
             hovers: self.view_retention.hovers.len(),
+            hover_nested: self.view_retention.hover_nested.len(),
         }
     }
 
@@ -1547,6 +1680,9 @@ impl Window {
     pub(crate) fn roll_back_retained_transaction(&mut self, transaction: RetainedTransaction) {
         self.next_frame.retained_views.roll_back(&transaction);
         self.view_retention.hovers.truncate(transaction.hovers);
+        self.view_retention
+            .hover_nested
+            .truncate(transaction.hover_nested);
     }
 
     /// Draws the frame just drawn again from scratch, and logs where it
@@ -1595,7 +1731,9 @@ impl Window {
 /// A view drawn again moved clips what it drew with masks moved with it,
 /// which differ from the ones a frame drawn from scratch pushes wherever
 /// they clip nothing. Positions are rounded to 1/64 of a device pixel, the
-/// rounding a moved copy and a fresh layout can differ by.
+/// rounding a moved copy and a fresh layout can differ by. Primitives are
+/// compared as a set, each with its draw order; hitboxes in order, which is
+/// which one is on top.
 pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
     use crate::scene::{Primitive, primitive_extent};
     fn round(value: f32) -> f32 {
@@ -1702,6 +1840,10 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
             Primitive::Surface(surface) => format!("surface {:?}", surface.bounds),
         });
     }
+    // Primitives of one draw order do not overlap, so the order they come in
+    // within it is not seen; sprites of one order are sorted by their atlas
+    // tile, which depends on the order glyphs were first rasterized in.
+    lines.sort_unstable();
     let frame = &window.rendered_frame;
     lines.extend(frame.hitboxes.iter().map(|hitbox| {
         format!(
@@ -1757,11 +1899,14 @@ pub(crate) enum ViewLayout {
     Built {
         element: AnyElement,
         layout: Option<Rc<RetainedLayout>>,
-        dependencies: RenderDependencies,
+        dependencies: Recorded,
     },
     /// Laid out as it was last frame without being built, from the record
     /// at this index, which it is drawn again from if nothing moved it.
     Retained { previous: usize },
+    /// Laid out as it was last frame, to be drawn again around the views
+    /// nested in it that are built; see [`splice`].
+    Spliced(splice::Splice),
 }
 
 pub(crate) enum ViewPrepaint {
@@ -1774,6 +1919,9 @@ pub(crate) enum ViewPrepaint {
     },
     /// Drawn again from the last frame, as the record at this index.
     Reused(usize),
+    /// Drawn again from the last frame around the views nested in it that
+    /// were built.
+    Spliced(splice::SplicedPrepaint),
 }
 
 impl Window {
@@ -1803,6 +1951,13 @@ impl Window {
                         return (layout_id, ViewLayout::Retained { previous });
                     }
                     window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
+                }
+                Err(ViewRebuildReason::Notified) => {
+                    if let Some((layout_id, splice)) = window.splice_layout(global_id, entity, cx)
+                    {
+                        return (layout_id, ViewLayout::Spliced(splice));
+                    }
+                    window.note_rebuild(entity, ViewRebuildReason::Notified);
                 }
                 Err(reason) => window.note_rebuild(entity, reason),
             }
@@ -1834,6 +1989,7 @@ impl Window {
         global_id: &GlobalElementId,
         bounds: Bounds<Pixels>,
         layout: ViewLayout,
+        source: ViewSource,
         render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
         cx: &mut App,
     ) -> ViewPrepaint {
@@ -1851,7 +2007,7 @@ impl Window {
                 layout,
                 dependencies,
             } => {
-                let recording = window.begin_view_prepaint(global_id, cx);
+                let recording = window.begin_view_prepaint(global_id, source, cx);
                 element.prepaint(window, cx);
                 let record =
                     window.finish_view_prepaint(recording, bounds, layout, Some(dependencies), cx);
@@ -1875,7 +2031,19 @@ impl Window {
                 window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
                 #[cfg(feature = "profiler")]
                 window.record_view_render(entity, view_name);
-                window.build_at_kept_layout(previous, bounds, global_id, render, cx)
+                window.build_at_kept_layout(previous, bounds, global_id, source, render, cx)
+            }
+            ViewLayout::Spliced(splice) => {
+                let previous = splice.previous;
+                if window.view_context_matches(previous, bounds)
+                    && let Some(spliced) = window.splice_prepaint(splice, cx)
+                {
+                    return spliced;
+                }
+                window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
+                #[cfg(feature = "profiler")]
+                window.record_view_render(entity, view_name);
+                window.build_at_kept_layout(previous, bounds, global_id, source, render, cx)
             }
             ViewLayout::Cached => {
                 match window.reusable_view(global_id, entity, cx) {
@@ -1902,7 +2070,7 @@ impl Window {
                 }
                 #[cfg(feature = "profiler")]
                 window.record_view_render(entity, view_name);
-                window.build_view_at(bounds, global_id, render, cx)
+                window.build_view_at(bounds, global_id, source, render, cx)
             }
         });
         cx.pop_untracked_reads(untracked);
@@ -1924,14 +2092,33 @@ impl Window {
         previous: usize,
         bounds: Bounds<Pixels>,
         global_id: &GlobalElementId,
+        source: ViewSource,
         render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
         cx: &mut App,
     ) -> ViewPrepaint {
+        self.try_build_at_kept_layout(previous, bounds, global_id, source, render, false, cx)
+            .unwrap_or_else(|| unreachable!("only a strict build gives up"))
+    }
+
+    /// Builds a view at the nodes it kept, as [`Self::build_at_kept_layout`]
+    /// does, unless `strict` and it asks for another layout, or its kept
+    /// layout is out of date: then it gives up, without prepainting it, for
+    /// what is drawn around it to be built instead (see [`splice`]).
+    pub(super) fn try_build_at_kept_layout(
+        &mut self,
+        previous: usize,
+        bounds: Bounds<Pixels>,
+        global_id: &GlobalElementId,
+        source: ViewSource,
+        render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
+        strict: bool,
+        cx: &mut App,
+    ) -> Option<ViewPrepaint> {
         let Some(kept) = self.rendered_frame.retained_views.records[previous]
             .layout
             .clone()
         else {
-            return self.build_view_at(bounds, global_id, render, cx);
+            return Some(self.build_view_at(bounds, global_id, source, render, cx));
         };
         {
             let records = &self.rendered_frame.retained_views.records;
@@ -1948,7 +2135,7 @@ impl Window {
             .layout_engine
             .as_ref()
             .map_or(0, |engine| engine.layout_writes());
-        let recording = self.begin_view_prepaint(global_id, cx);
+        let recording = self.begin_view_prepaint(global_id, source, cx);
         let layout_recording = self.begin_view_layout(cx);
         let view_key = kept.view_key.unwrap_or_else(|| self.layout_keys.prepaint_scope());
         self.layout_keys.push_key(view_key);
@@ -1956,17 +2143,31 @@ impl Window {
         let layout_id = element.request_layout(self, cx);
         let (layout, layout_dependencies) = self.finish_view_layout(layout_recording, layout_id, cx);
         self.layout_keys.pop();
+        // A kept layout stands if the view asked for the nodes it had, as they
+        // were, and they were laid out since they last changed: a tree laid
+        // out on its own (a list item) that nothing laid out again this frame
+        // still holds the layout it had then.
         let unchanged = layout_id == kept.root
-            && self
-                .layout_engine
-                .as_ref()
-                .is_some_and(|engine| engine.layout_writes() == writes_before);
+            && self.layout_engine.as_ref().is_some_and(|engine| {
+                engine.layout_writes() == writes_before && !engine.needs_layout(layout_id)
+            });
         if unchanged {
             element.prepaint(self, cx);
+        } else if strict {
+            // Given up on: what was drawn around it is built instead, which
+            // lays it out again with the rest.
+            self.finish_view_prepaint(recording, bounds, None, Some(layout_dependencies), cx);
+            return None;
         } else {
             element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), self, cx);
             element.prepaint_at(bounds.origin, self, cx);
             self.request_animation_frame();
+            // The views around it were laid out with the layout it had: they
+            // are built on the next frame, at the one it asks for now.
+            let views = &mut self.next_frame.retained_views;
+            for &open in &views.open {
+                views.records[open].layout_blocked = true;
+            }
         }
         let record = self.finish_view_prepaint(
             recording,
@@ -1975,7 +2176,7 @@ impl Window {
             Some(layout_dependencies),
             cx,
         );
-        ViewPrepaint::Built { element, record }
+        Some(ViewPrepaint::Built { element, record })
     }
 
     /// Builds a view whose layout was not requested from its content (a
@@ -1985,10 +2186,11 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         global_id: &GlobalElementId,
+        source: ViewSource,
         render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
         cx: &mut App,
     ) -> ViewPrepaint {
-        let recording = self.begin_view_prepaint(global_id, cx);
+        let recording = self.begin_view_prepaint(global_id, source, cx);
         let mut element = render(self, cx);
         element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), self, cx);
         element.prepaint_at(bounds.origin, self, cx);
@@ -2013,6 +2215,7 @@ impl Window {
                 }
             }
             ViewPrepaint::Reused(index) => window.reuse_view_paint(*index),
+            ViewPrepaint::Spliced(spliced) => window.splice_paint(spliced, cx),
             ViewPrepaint::Built {
                 element,
                 record: None,

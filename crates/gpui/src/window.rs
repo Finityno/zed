@@ -4989,6 +4989,17 @@ impl Window {
             engine.end_transaction(start, result.is_err());
         }
         if result.is_err() {
+            self.truncate_prepaint(&index);
+            // The retained views recorded since point into what was truncated.
+            self.roll_back_retained_transaction(retained_transaction);
+        }
+        result
+    }
+
+    /// Forgets what was prepainted since `index`, as a rolled-back
+    /// transaction does.
+    pub(crate) fn truncate_prepaint(&mut self, index: &PrepaintStateIndex) {
+        {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
             self.next_frame
                 .tooltip_requests
@@ -5013,11 +5024,8 @@ impl Window {
             self.next_frame
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
-            self.text_system.truncate_layouts(index.line_layout_index);
-            // The retained views recorded since point into what was truncated.
-            self.roll_back_retained_transaction(retained_transaction);
+            self.text_system.truncate_layouts(index.line_layout_index.clone());
         }
-        result
     }
 
     /// When you call this method during [`Element::prepaint`], containing elements will attempt to

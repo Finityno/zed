@@ -4309,6 +4309,23 @@ fn handle_tooltip_check_visible_and_update(
 pub(crate) struct GroupHitboxes(HashMap<SharedString, SmallVec<[HitboxId; 1]>>);
 
 impl GroupHitboxes {
+    /// The innermost container of each group around what is being drawn.
+    pub(crate) fn tops(&self) -> Vec<(SharedString, HitboxId)> {
+        self.0
+            .iter()
+            .filter_map(|(name, stack)| Some((name.clone(), *stack.last()?)))
+            .collect()
+    }
+
+    /// Stacks the containers `tops` names, as [`Self::tops`] gave them.
+    pub(crate) fn of_tops(tops: &[(SharedString, HitboxId)]) -> Self {
+        Self(
+            tops.iter()
+                .map(|(name, hitbox)| (name.clone(), smallvec::smallvec![*hitbox]))
+                .collect(),
+        )
+    }
+
     pub(crate) fn top(&self, name: &SharedString) -> Option<HitboxId> {
         self.0
             .get(name)

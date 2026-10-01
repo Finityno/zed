@@ -29,6 +29,9 @@ pub struct FrameWorkStats {
     /// Of the views drawn again from the last frame, those drawn somewhere
     /// else than they were, moved with what they drew.
     pub views_moved: u64,
+    /// Of the views drawn again from the last frame, those drawn again
+    /// around views nested in them that were built.
+    pub views_spliced: u64,
     /// With view retention on, why the views that were built were built
     /// rather than drawn again from the last frame.
     pub view_rebuilds: ViewRebuildCounts,

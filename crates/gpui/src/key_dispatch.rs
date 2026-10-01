@@ -66,7 +66,7 @@ use std::{
 /// ID of a node within `DispatchTree`. Note that these are **not** stable between frames, and so a
 /// `DispatchNodeId` should only be used with the `DispatchTree` that provided it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct DispatchNodeId(usize);
+pub(crate) struct DispatchNodeId(pub(crate) usize);
 
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
@@ -385,6 +385,77 @@ impl DispatchTree {
             old_range,
             new_range,
             contains_focus,
+        }
+    }
+
+    /// Copies the nodes `range` of `source` as [`Self::reuse_subtree`] does,
+    /// as one stretch of several: `open` holds, innermost last, the nodes of
+    /// `source` the copy is inside of, which stay open after it for what
+    /// follows to hang off. Returns whether a node copied holds `focus`.
+    pub(crate) fn copy_stretch(
+        &mut self,
+        range: Range<usize>,
+        source: &Self,
+        open: &mut Vec<DispatchNodeId>,
+        focus: Option<FocusId>,
+    ) -> bool {
+        let mut contains_focus = false;
+        for (source_node_id, source_node) in source
+            .nodes
+            .iter()
+            .enumerate()
+            .skip(range.start)
+            .take(range.len())
+        {
+            while let Some(&ancestor) = open.last() {
+                if source_node.parent == Some(ancestor) {
+                    break;
+                }
+                open.pop();
+                self.pop_node();
+            }
+            open.push(DispatchNodeId(source_node_id));
+            if source_node.focus_id.is_some() && source_node.focus_id == focus {
+                contains_focus = true;
+            }
+            self.copy_node(source_node);
+        }
+        contains_focus
+    }
+
+    /// Pushes a copy of `source`, leaving it as it was: a stretch copied for
+    /// a splice that is rolled back must not have emptied the frame it was
+    /// copied from, which the rest of the frame still reads.
+    fn copy_node(&mut self, source: &DispatchNode) {
+        self.push_node();
+        if let Some(context) = source.context.clone() {
+            self.set_key_context(context);
+        }
+        if let Some(focus_id) = source.focus_id {
+            self.set_focus_id(focus_id);
+        }
+        if let Some(view_id) = source.view_id {
+            self.set_view_id(view_id);
+        }
+        let target = self.active_node();
+        target.key_listeners = source.key_listeners.clone();
+        target.action_listeners = source.action_listeners.clone();
+        target.modifiers_changed_listeners = source.modifiers_changed_listeners.clone();
+    }
+
+    /// Closes the nodes [`Self::copy_stretch`] left open until the innermost
+    /// is `node`, or none is.
+    pub(crate) fn close_copied_to(
+        &mut self,
+        open: &mut Vec<DispatchNodeId>,
+        node: Option<DispatchNodeId>,
+    ) {
+        while let Some(&innermost) = open.last() {
+            if Some(innermost) == node {
+                break;
+            }
+            open.pop();
+            self.pop_node();
         }
     }
 

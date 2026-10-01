@@ -753,11 +753,13 @@ impl Oracle {
     }
 }
 
-/// Views drawn again, and of those drawn again moved, over a run.
+/// Views drawn again, and of those drawn again moved, or around views
+/// nested in them that were built, over a run.
 #[derive(Default)]
 struct Reuse {
     reused: u64,
     moved: u64,
+    spliced: u64,
 }
 
 fn run(seed: u64, steps: usize) -> Reuse {
@@ -780,6 +782,7 @@ fn run(seed: u64, steps: usize) -> Reuse {
         let (actual, expected, work) = oracle.draw();
         reuse.reused += work.views_reused;
         reuse.moved += work.views_moved;
+        reuse.spliced += work.views_spliced;
         if let Some(difference) = first_difference(&actual, &expected) {
             let history = history
                 .iter()
@@ -787,9 +790,21 @@ fn run(seed: u64, steps: usize) -> Reuse {
                 .map(|(step, changes)| format!("  {step}: {changes:?}"))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let only_in = |these: &[String], those: &[String]| {
+                these
+                    .iter()
+                    .filter(|line| !those.contains(line))
+                    .take(8)
+                    .map(|line| format!("    {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             panic!(
                 "seed {seed}, step {step}: the frame drawing views again differs from the frame \
-                 drawn from scratch at {difference}\nchanges so far:\n{history}"
+                 drawn from scratch at {difference}\nonly drawing views again:\n{}\nonly from \
+                 scratch:\n{}\nchanges so far:\n{history}",
+                only_in(&actual, &expected),
+                only_in(&expected, &actual),
             );
         }
     }
@@ -816,10 +831,16 @@ fn frames_drawing_views_again_match_frames_drawn_from_scratch() {
             });
         reuse.reused += run.reused;
         reuse.moved += run.moved;
+        reuse.spliced += run.spliced;
     }
-    let Reuse { reused, moved } = reuse;
+    let Reuse {
+        reused,
+        moved,
+        spliced,
+    } = reuse;
     assert!(reused > 1000, "views were drawn again {reused} times");
     assert!(moved > 100, "views were drawn again moved {moved} times of {reused}");
+    assert!(spliced > 100, "views were drawn again around others {spliced} times of {reused}");
 }
 
 /// A shell holding cards, drawn once, for the focused tests below.
@@ -843,8 +864,10 @@ fn shell_window(cx: &mut TestAppContext) -> (WindowHandle<Shell>, Rc<Shared>) {
         move |_, cx| Shell::new(&shared, cx)
     });
     draw(cx, window);
-    // The first frame sets the window's actions, which asks for another.
     cx.run_until_parked();
+    // The second frame hovers by the first's hitboxes, which the first
+    // could not.
+    draw(cx, window);
     (window, shared)
 }
 
@@ -916,10 +939,10 @@ fn retention_is_off_unless_asked_for() {
     assert!(rebuilds(&mut cx, window).is_empty());
 }
 
-/// Notifying a view by id builds it and the views around it, and draws the
-/// rest, and what read it, again.
+/// Notifying a view by id builds it, and draws the views around it again
+/// around it (see [`super::splice`]), and the rest, and what read it, again.
 #[test]
-fn notifying_a_view_builds_only_it_and_the_views_around_it() {
+fn notifying_a_view_builds_only_it() {
     let mut cx = TestAppContext::single();
     let (window, _) = shell_window(&mut cx);
     let inner = window
@@ -927,10 +950,22 @@ fn notifying_a_view_builds_only_it_and_the_views_around_it() {
         .unwrap();
     let work = work_after(&mut cx, window, |cx| cx.update(|cx| cx.notify(inner.entity_id())));
     let reasons = rebuilds(&mut cx, window);
-    // The inner view, its card and the shell; the opted-out cards are built
-    // on every frame.
-    assert_eq!(work.view_rebuilds.notified, 3, "{work:?} {reasons:?}");
+    // The inner view; its card and the shell are drawn again around it, and
+    // the opted-out cards are built on every frame.
+    assert_eq!(work.view_rebuilds.notified, 1, "{work:?} {reasons:?}");
+    assert_eq!(work.views_spliced, 2, "{work:?} {reasons:?}");
     assert_eq!(work.view_rebuilds.entity_changed, 0, "{work:?}");
+    assert!(work.views_rendered <= 1 + 2, "{work:?} {reasons:?}");
+
+    // With splices off, the card and the shell are built.
+    cx.update_window(window.into(), |_, window, _| {
+        window.view_retention.splices_enabled = false;
+    })
+    .unwrap();
+    let work = work_after(&mut cx, window, |cx| cx.update(|cx| cx.notify(inner.entity_id())));
+    let reasons = rebuilds(&mut cx, window);
+    assert_eq!(work.view_rebuilds.notified, 3, "{work:?} {reasons:?}");
+    assert_eq!(work.views_spliced, 0, "{work:?}");
     assert!(work.views_reused >= CARDS as u64, "{work:?}");
 }
 
@@ -954,21 +989,11 @@ fn group_hover_views_are_built_with_their_group_container_only() {
         rebuilt.contains(&(inner, ViewRebuildReason::ContextChanged)),
         "the inner view resolved the card it is in: {rebuilt:?}"
     );
-    // The card, the shell around it and its inner view; the opted-out
-    // cards are built on every frame, and the cards resolving the shell's
-    // group with it, two of the cards and two of the list's, with the inner
-    // views resolving their groups.
-    let others = rebuilt
-        .iter()
-        .filter(|(_, reason)| {
-            !matches!(
-                reason,
-                ViewRebuildReason::Notified | ViewRebuildReason::OptedOut
-            )
-        })
-        .count();
-    assert!(others <= 1 + 2 * 4, "{work:?} {rebuilt:?}");
-    assert!(work.views_reused >= CARDS as u64, "{work:?}");
+    // The card and its inner view, and the opted-out cards, built on every
+    // frame; the shell is drawn again around them, keeping its group
+    // container, so the cards hovering by its group are drawn again.
+    assert!(work.views_rendered <= 2 + 2, "{work:?} {rebuilt:?}");
+    assert_eq!(work.views_spliced, 1, "{work:?} {rebuilt:?}");
 }
 
 /// A model updated and notified builds every view that read it (the inner
@@ -3036,4 +3061,266 @@ fn a_moved_view_moves_its_scroll_handles_and_settles_once_still() {
 #[test]
 fn views_drawn_again_after_the_layout_tree_was_rebuilt_are_laid_out_afresh() {
     run(418, 50);
+}
+
+/// A row of a feed, which shows how often it ticked; the live one ticks on
+/// every frame, as a streaming reply does.
+struct FeedRow {
+    ix: usize,
+    ticks: usize,
+    /// Grows a line every tick, so that ticking changes its layout.
+    grows: bool,
+}
+
+impl Render for FeedRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let lines = if self.grows { 1 + self.ticks } else { 1 };
+        div()
+            .id(("row", self.ix))
+            .flex()
+            .flex_col()
+            .w(px(160.))
+            .border_1()
+            .border_color(PALETTE[self.ix % PALETTE.len()])
+            .hover(|style| style.bg(PALETTE[2]))
+            .child(SharedString::from(format!("row {} ticked {}", self.ix, self.ticks)))
+            .children((1..lines).map(|line| div().h(px(8.)).child(SharedString::from(format!("{line}")))))
+    }
+}
+
+/// A panel holding many rows, which renders them and nothing that changes.
+struct Feed {
+    rows: Vec<Entity<FeedRow>>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Feed {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(self.rows.iter().cloned())
+    }
+}
+
+fn feed_windows(cx: &mut TestAppContext, grows: bool) -> ([WindowHandle<Feed>; 2], Rc<Cell<usize>>) {
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let windows = [(); 2].map(|_| {
+        let renders = renders.clone();
+        cx.add_window(move |_, cx| Feed {
+            rows: (0..12)
+                .map(|ix| {
+                    cx.new(|_| FeedRow {
+                        ix,
+                        ticks: 0,
+                        grows: grows && ix == 11,
+                    })
+                })
+                .collect(),
+            renders,
+        })
+    });
+    (windows, renders)
+}
+
+/// Ticks the live row in both windows and draws them, the second from
+/// scratch, returning the first's work.
+fn tick_feeds(cx: &mut TestAppContext, windows: [WindowHandle<Feed>; 2]) -> crate::FrameWorkStats {
+    for window in windows {
+        let live = window.read_with(cx, |feed, _| feed.rows[11].clone()).unwrap();
+        live.update(cx, |row, cx| {
+            row.ticks += 1;
+            cx.notify();
+        });
+    }
+    let (retained, work) = cx
+        .update_window(windows[0].into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = window.frame_work_stats();
+            window.reset_frame_work_stats(false);
+            (describe_frame(window), work)
+        })
+        .unwrap();
+    let from_scratch = cx
+        .update_window(windows[1].into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            describe_frame(window)
+        })
+        .unwrap();
+    assert_eq!(first_difference(&retained, &from_scratch), None);
+    work
+}
+
+/// A row notified on every frame builds only itself: the panel around it is
+/// drawn again around it, the other rows copied along, and the panel is not
+/// rendered.
+#[test]
+fn a_panel_is_drawn_again_around_its_live_row() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let (windows, renders) = feed_windows(&mut cx, false);
+    tick_feeds(&mut cx, windows);
+    tick_feeds(&mut cx, windows);
+    let rendered_before = renders.get();
+    for _ in 0..4 {
+        let work = tick_feeds(&mut cx, windows);
+        assert_eq!(work.views_rendered, 1, "{work:?}");
+        assert_eq!(work.views_spliced, 1, "{work:?}");
+    }
+    // Only the window drawing from scratch rendered its panel, once a tick
+    // when refreshed: the frame the tick drew there drew it again around its
+    // row as well.
+    assert_eq!(renders.get(), rendered_before + 4);
+}
+
+/// A live row that grows asks for another layout: the panel is built
+/// instead of drawn again around it, and both frames still match.
+#[test]
+fn a_panel_is_built_when_its_live_row_changes_its_layout() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let (windows, renders) = feed_windows(&mut cx, true);
+    tick_feeds(&mut cx, windows);
+    tick_feeds(&mut cx, windows);
+    let rendered_before = renders.get();
+    for _ in 0..4 {
+        let work = tick_feeds(&mut cx, windows);
+        // Tried and rolled back (counted as a change of context), or not
+        // tried: a panel built at a layout one of its views did not keep is
+        // built again on the next frame.
+        // The panel and the row, and the row once more when the splice was
+        // tried and rolled back.
+        assert_eq!(work.views_spliced, 0, "{work:?}");
+        assert!(work.views_rendered <= 3, "{work:?}");
+    }
+    // Every frame rendered the panel: one per tick drawing views again, and
+    // two drawing from scratch, the frame the tick drew and the refreshed
+    // one.
+    assert_eq!(renders.get(), rendered_before + 4 * 3);
+}
+
+/// A badge in a row, painted by whether the row's group is hovered.
+struct RowBadge {
+    count: usize,
+}
+
+impl Render for RowBadge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // The same size whatever its count, so that building it asks for
+        // the layout it had.
+        div()
+            .w(px(10.))
+            .h(px(10.))
+            .bg(PALETTE[self.count % 3])
+            .group_hover("row", |style| style.border_1().border_color(PALETTE[3]))
+    }
+}
+
+/// A row that is a group container, with a badge view in it.
+struct GroupRow {
+    ix: usize,
+    badge: Entity<RowBadge>,
+}
+
+impl Render for GroupRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("group-row", self.ix))
+            .group("row")
+            .w(px(100.))
+            .h(px(20.))
+            .child(self.badge.clone())
+    }
+}
+
+struct GroupRows {
+    rows: Vec<Entity<GroupRow>>,
+}
+
+impl Render for GroupRows {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(self.rows.iter().cloned())
+    }
+}
+
+/// A view built in a gap of a view drawn again around it resolves the group
+/// containers around it as it did: a badge hovering by its row's group,
+/// rebuilt while the row is hovered and drawn again around it, still paints
+/// hovered.
+#[test]
+fn a_view_built_in_a_gap_resolves_the_groups_around_it() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let windows = [(); 2].map(|_| {
+        cx.add_window(|_, cx| GroupRows {
+            rows: (0..6)
+                .map(|ix| {
+                    let badge = cx.new(|_| RowBadge { count: 0 });
+                    cx.new(|_| GroupRow { ix, badge })
+                })
+                .collect(),
+        })
+    });
+    let draw_both = |cx: &mut TestAppContext| {
+        let (retained, work) = cx
+            .update_window(windows[0].into(), |_, window, cx| {
+                if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                let work = window.frame_work_stats();
+                window.reset_frame_work_stats(false);
+                (describe_frame(window), work)
+            })
+            .unwrap();
+        let from_scratch = cx
+            .update_window(windows[1].into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                describe_frame(window)
+            })
+            .unwrap();
+        assert_eq!(first_difference(&retained, &from_scratch), None);
+        work
+    };
+    draw_both(&mut cx);
+    // Over the fourth row.
+    for window in windows {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                    position: point(px(50.), px(3. * 20. + 10.)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+    draw_both(&mut cx);
+    draw_both(&mut cx);
+    for _ in 0..3 {
+        for window in windows {
+            let badge = window
+                .read_with(&cx, |rows, cx| rows.rows[3].read(cx).badge.clone())
+                .unwrap();
+            badge.update(&mut cx, |badge, cx| {
+                badge.count += 1;
+                cx.notify();
+            });
+        }
+        let work = draw_both(&mut cx);
+        // The rows and the row around the badge, drawn again around it.
+        assert_eq!(work.views_spliced, 2, "{work:?}");
+        assert_eq!(work.views_rendered, 1, "{work:?}");
+    }
 }
