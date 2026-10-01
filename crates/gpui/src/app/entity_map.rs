@@ -511,6 +511,26 @@ impl<T: 'static> Entity<T> {
         cx.update_entity(self, update)
     }
 
+    /// Updates the entity as bookkeeping a view does while it is drawn (a
+    /// list's row callback keeping its owner's caches, say), which, with view
+    /// retention on, does not count as a change to it: the views that read
+    /// it are not built again for it, and a view drawn around the views that
+    /// do it can still be drawn again from the last frame.
+    ///
+    /// # Contract
+    ///
+    /// Nothing another view reads may change in a quiet update. A change
+    /// that something reads must be told: notifying the entity inside the
+    /// update ([`Context::notify`]) makes the update a change again, as it
+    /// is outside. Without retention, it is [`Self::update`].
+    pub fn update_quietly<R>(
+        &self,
+        cx: &mut App,
+        update: impl FnOnce(&mut T, &mut Context<T>) -> R,
+    ) -> R {
+        crate::window::view_retention::dependencies::query(self, cx, update)
+    }
+
     /// Updates the entity referenced by this handle with the given function.
     #[inline]
     pub fn as_mut<'a, C: AppContext>(&self, cx: &'a mut C) -> GpuiBorrow<'a, T> {

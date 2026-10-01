@@ -364,6 +364,20 @@ impl<'a, T: 'static> Context<'a, T> {
         }
     }
 
+    /// [`Self::processor`] for bookkeeping done while drawing: each call
+    /// updates this entity quietly ([`crate::Entity::update_quietly`]), which,
+    /// with view retention on, is not a change to it unless it notifies. The
+    /// contract is that one: nothing another view reads may change in it.
+    pub fn quiet_processor<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut Window, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut Window, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut Window, cx: &mut App| {
+            view.update_quietly(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
+
     /// Run something using this entity and cx, when the returned struct is dropped
     pub fn on_drop(
         &self,

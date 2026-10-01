@@ -2015,7 +2015,17 @@ impl Element for Div {
                 child_max = child_max.max(&child_bounds.bottom_right());
                 children.push(child_bounds);
             }
-            state.version.bump_if(state.child_bounds != children);
+            if state.child_bounds != children {
+                // Moved along with the element, as when it is built
+                // somewhere else, the children say the same of themselves
+                // relative to it.
+                let moved_by = bounds.origin - state.bounds.origin;
+                if translated(&state.child_bounds, &children, moved_by) {
+                    state.placement.bump();
+                } else {
+                    state.version.bump();
+                }
+            }
             state.child_bounds = children;
             drop(state);
             window.note_positioned_state(|| scroll_handle.0.clone());
@@ -2678,11 +2688,13 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 // Views that read the handle are built again only when what
                 // they read changed; see `ScrollHandleState::version`.
-                let changed = scroll_handle_state.bounds != bounds
+                let changed = scroll_handle_state.bounds.size != bounds.size
                     || *scroll_offset != offset_before
                     || max_before != Some(scroll_max);
+                let moved = scroll_handle_state.bounds.origin != bounds.origin;
                 scroll_handle_state.bounds = bounds;
                 scroll_handle_state.version.bump_if(changed);
+                scroll_handle_state.placement.bump_if(moved);
             }
 
             *scroll_offset
@@ -4554,6 +4566,20 @@ struct ScrollHandleState {
     /// or resizes, and which would otherwise build the view on the frame
     /// after every one it was built in somewhere else.
     requests: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped when the element and its children only moved together, which
+    /// changes where the handle says they are in the window and nothing it
+    /// says of them relative to each other: only a view that read where they
+    /// are ([`ScrollHandle::bounds`], [`ScrollHandle::bounds_for_item`])
+    /// depends on it.
+    placement: crate::window::view_retention::dependencies::StateVersion,
+}
+
+/// Whether `now` is `before` moved by `by`, element for element.
+fn translated(before: &[Bounds<Pixels>], now: &[Bounds<Pixels>], by: Point<Pixels>) -> bool {
+    before.len() == now.len()
+        && before.iter().zip(now).all(|(before, now)| {
+            before.size == now.size && before.origin + by == now.origin
+        })
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4605,6 +4631,14 @@ impl ScrollHandle {
 
     pub(crate) fn note_read(&self) {
         crate::window::view_retention::dependencies::note_state_read(&self.0.borrow().version);
+    }
+
+    /// Notes a read of where the element and its children are in the
+    /// window, which depends on where it is drawn as well.
+    fn note_placement_read(&self) {
+        let state = self.0.borrow();
+        crate::window::view_retention::dependencies::note_state_read(&state.version);
+        crate::window::view_retention::dependencies::note_state_read(&state.placement);
     }
 
     /// Marks what the handle answers changed, for state kept beside it (a
@@ -4678,13 +4712,13 @@ impl ScrollHandle {
 
     /// Return the bounds into which this child is painted
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.note_read();
+        self.note_placement_read();
         self.0.borrow().bounds
     }
 
     /// Get the bounds for a specific child.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
-        self.note_read();
+        self.note_placement_read();
         self.0.borrow().child_bounds.get(ix).cloned()
     }
 

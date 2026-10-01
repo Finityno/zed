@@ -4306,6 +4306,252 @@ fn a_wheel_scroll_under_the_pointer_draws_one_frame_a_wheel_event() {
     assert!(moved > 0, "rows were drawn moved");
 }
 
+/// A scrollbar reading where a scroller is scrolled to, and how far it can.
+struct ScrollbarReader {
+    handle: crate::ScrollHandle,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for ScrollbarReader {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let offset = self.handle.offset();
+        let max = self.handle.max_offset();
+        div()
+            .w(px(8.))
+            .h(px(40.))
+            .child(SharedString::from(format!("{:?} {:?}", offset.y, max.y)))
+    }
+}
+
+/// A row holding a scroller and the scrollbar reading it, built wherever it
+/// moves.
+struct PinnedScrollingRow {
+    handle: crate::ScrollHandle,
+    scrollbar: Entity<ScrollbarReader>,
+}
+
+impl Render for PinnedScrollingRow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cx.set_view_movable(false);
+        div()
+            .w(px(140.))
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .id("pinned-scroller")
+                    .w(px(120.))
+                    .h(px(40.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .child(div().h(px(20.)).child("one"))
+                    .child(div().h(px(20.)).child("two"))
+                    .child(div().h(px(20.)).child("three")),
+            )
+            .child(self.scrollbar.clone())
+    }
+}
+
+struct PinnedScrollingRows {
+    header: f32,
+    row: Entity<PinnedScrollingRow>,
+}
+
+impl Render for PinnedScrollingRows {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(self.row.clone())
+    }
+}
+
+/// A scroller built somewhere else, its content unchanged, does not build
+/// the scrollbar reading it on the frame after: moving changes where it is
+/// in the window, not what it says of where it is scrolled to.
+#[test]
+fn a_scroller_built_somewhere_else_does_not_build_its_readers() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        move |_, cx| {
+            let handle = crate::ScrollHandle::new();
+            let scrollbar = cx.new(|_| ScrollbarReader {
+                handle: handle.clone(),
+                renders,
+            });
+            PinnedScrollingRows {
+                header: 10.,
+                row: cx.new(|_| PinnedScrollingRow { handle, scrollbar }),
+            }
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let reasons = window.view_rebuild_reasons().to_vec();
+            window.reset_frame_work_stats(false);
+            reasons
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    frame(&mut cx);
+    for header in [30., 55., 20.] {
+        window
+            .update(&mut cx, |rows, _, cx| {
+                rows.header = header;
+                cx.notify();
+            })
+            .unwrap();
+        frame(&mut cx);
+        let before = renders.get();
+        let reasons = frame(&mut cx);
+        assert_eq!(renders.get(), before, "the scrollbar was built after the move: {reasons:?}");
+        assert!(reasons.is_empty(), "{reasons:?}");
+    }
+}
+
+/// Bookkeeping an entity holds, which a view reads.
+struct Ledger {
+    entries: usize,
+}
+
+struct LedgerReader {
+    ledger: Entity<Ledger>,
+}
+
+impl Render for LedgerReader {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self.ledger.read(cx).entries;
+        div()
+            .w(px(100.))
+            .h(px(20.))
+            .child(SharedString::from(format!("{entries} entries")))
+    }
+}
+
+/// A view that, as it prepaints, updates the ledger the reader drawn before
+/// it read: quietly, or not.
+struct LedgerKeeper {
+    ledger: Entity<Ledger>,
+    quietly: bool,
+    notify: Rc<Cell<bool>>,
+}
+
+impl Render for LedgerKeeper {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let ledger = self.ledger.clone();
+        let quietly = self.quietly;
+        let notify = self.notify.clone();
+        div().w(px(100.)).h(px(20.)).child(
+            crate::canvas(
+                move |_, _, cx| {
+                    let keep = |ledger: &mut Ledger, cx: &mut Context<Ledger>| {
+                        if notify.get() {
+                            ledger.entries += 1;
+                            cx.notify();
+                        }
+                    };
+                    if quietly {
+                        ledger.update_quietly(cx, keep);
+                    } else {
+                        ledger.update(cx, keep);
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .size_full(),
+        )
+    }
+}
+
+struct LedgerHost {
+    reader: Entity<LedgerReader>,
+    keeper: Entity<LedgerKeeper>,
+}
+
+impl Render for LedgerHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.reader.clone())
+            .child(self.keeper.clone())
+    }
+}
+
+/// An update made quietly while drawing is not a change: the view that read
+/// the entity before it is drawn again rather than built, unless the update
+/// notified. Made the usual way, it builds that view.
+#[test]
+fn a_quiet_update_does_not_build_the_views_that_read_the_entity() {
+    for quietly in [true, false] {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| cx.set_view_retention(true));
+        let notify = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let notify = notify.clone();
+            move |_, cx| {
+                let ledger = cx.new(|_| Ledger { entries: 0 });
+                LedgerHost {
+                    reader: cx.new(|_| LedgerReader {
+                        ledger: ledger.clone(),
+                    }),
+                    keeper: cx.new(|_| LedgerKeeper {
+                        ledger,
+                        quietly,
+                        notify,
+                    }),
+                }
+            }
+        });
+        let (reader, keeper) = window
+            .read_with(&cx, |host, _| (host.reader.entity_id(), host.keeper.clone()))
+            .unwrap();
+        let frame = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.view_rebuild_reasons().to_vec()
+            })
+            .unwrap()
+        };
+        frame(&mut cx);
+        frame(&mut cx);
+        // The keeper is built on every frame, and updates the ledger as it
+        // prepaints.
+        let mut reader_built = 0;
+        for _ in 0..3 {
+            keeper.update(&mut cx, |_, cx| cx.notify());
+            let reasons = frame(&mut cx);
+            reader_built += reasons.iter().filter(|(view, _)| *view == reader).count();
+        }
+        if quietly {
+            assert_eq!(reader_built, 0, "a quiet update built the reader");
+        } else {
+            assert!(reader_built > 0, "an update built no reader");
+        }
+        // Notifying inside a quiet update is a change, as anywhere.
+        notify.set(true);
+        keeper.update(&mut cx, |_, cx| cx.notify());
+        frame(&mut cx);
+        let reasons = frame(&mut cx);
+        assert!(
+            reasons.iter().any(|(view, _)| *view == reader),
+            "quietly {quietly}: the reader of a notified change was not built: {reasons:?}"
+        );
+    }
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,
@@ -4838,8 +5084,17 @@ fn frame_work_transcript() {
         Stream,
         Scroll,
         Redraw,
+        /// The window refreshed: nothing is drawn again, and what drawing
+        /// views again costs is all overhead.
+        Rebuild,
     }
-    for scenario in [Scenario::Tick, Scenario::Stream, Scenario::Scroll, Scenario::Redraw] {
+    for scenario in [
+        Scenario::Tick,
+        Scenario::Stream,
+        Scenario::Scroll,
+        Scenario::Redraw,
+        Scenario::Rebuild,
+    ] {
         for retained in [false, true] {
             if only
                 .as_ref()
@@ -4911,6 +5166,9 @@ fn frame_work_transcript() {
                         window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
                     }
                     Scenario::Redraw => window.update(&mut cx, |_, _, cx| cx.notify()).unwrap(),
+                    Scenario::Rebuild => window
+                        .update(&mut cx, |_, window, _| window.refresh())
+                        .unwrap(),
                 }
                 frame(&mut cx);
             }
