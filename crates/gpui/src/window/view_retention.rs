@@ -608,6 +608,17 @@ impl RetainedViews {
         }
     }
 
+    /// Forgets the layout nodes the records name, once the layout engine
+    /// replaced its tree (see [`crate::taffy::TaffyLayoutEngine::reclaim_idle_capacity`]):
+    /// the ids would name nodes of the old tree, or other nodes of the new
+    /// one. The views are laid out afresh when they are next built.
+    pub(crate) fn forget_layouts(&mut self) {
+        for record in &mut self.records {
+            record.layout = None;
+            record.prepaint_layout_keys = Rc::new([]);
+        }
+    }
+
     /// Shifts the paint ranges of records copied along with a view drawn from
     /// the last frame, now that it was painted, and forgets those not painted.
     fn finish_frame(&mut self) {
@@ -981,7 +992,7 @@ impl Window {
             .collect();
         let engine = self.layout_engine.as_mut()?;
         let keys_before = engine.claimed_keys_len();
-        if !engine.try_keep_retained_sets(&key_sets) {
+        if !engine.try_keep_retained_sets(&key_sets, root) {
             return None;
         }
         let keys_after = engine.claimed_keys_len();

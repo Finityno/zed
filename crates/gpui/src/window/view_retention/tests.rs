@@ -800,8 +800,20 @@ fn run(seed: u64, steps: usize) -> Reuse {
 fn frames_drawing_views_again_match_frames_drawn_from_scratch() {
     let mut reuse = Reuse::default();
     let seeds = std::env::var("GPUI_RETAINED_VIEWS_ORACLE_SEEDS").ok().and_then(|seeds| seeds.parse().ok()).unwrap_or(16);
-    for seed in 0..seeds {
-        let run = run(seed, 50);
+    let first = std::env::var("GPUI_RETAINED_VIEWS_ORACLE_FIRST_SEED")
+        .ok()
+        .and_then(|seed| seed.parse().ok())
+        .unwrap_or(0);
+    for seed in first..seeds {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(seed, 50)))
+            .unwrap_or_else(|panic| {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|message| message.to_string()))
+                    .unwrap_or_default();
+                panic!("seed {seed}: {message}")
+            });
         reuse.reused += run.reused;
         reuse.moved += run.moved;
     }
@@ -3013,4 +3025,15 @@ fn a_moved_view_moves_its_scroll_handles_and_settles_once_still() {
     assert!(!unsettled(&mut cx));
     let (retained, from_scratch, _) = draw_strips(&mut cx, windows);
     assert_eq!(first_difference(&retained, &from_scratch), None);
+}
+
+/// A window idle long enough rebuilds its layout tree smaller, and the
+/// views it draws again from the last frame named nodes of the tree that is
+/// gone. In this history a list scrolls an item into view after that,
+/// laying its items out twice: the first time made nodes under the keys of a
+/// card's record, and handed them back, and the second drew the card again
+/// at the root its record named, which had been removed.
+#[test]
+fn views_drawn_again_after_the_layout_tree_was_rebuilt_are_laid_out_afresh() {
+    run(418, 50);
 }

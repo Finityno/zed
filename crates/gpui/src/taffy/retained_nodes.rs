@@ -340,17 +340,27 @@ impl TaffyLayoutEngine {
     /// still kept and not yet claimed this frame; otherwise claims none. For
     /// a view laid out as it was last frame without being built, whose
     /// layout stands only if all of its nodes, and its nested views', do.
-    pub(crate) fn try_keep_retained_sets(&mut self, key_sets: &[&[u64]]) -> bool {
+    ///
+    /// `root` is the node the first set's layout was rooted at: it has to be
+    /// one of that set's nodes still, as it is unless its key was released
+    /// and made again since (the tree was rebuilt while the window was idle,
+    /// or a rolled-back transaction made it and handed it back).
+    pub(crate) fn try_keep_retained_sets(&mut self, key_sets: &[&[u64]], root: LayoutId) -> bool {
         let retention = &self.retention;
         let frame = retention.frame;
-        let all_kept = key_sets.iter().all(|keys| {
-            keys.iter().all(|key| {
-                retention
-                    .retained
-                    .get(key)
-                    .is_some_and(|node| node.claimed_in_frame != frame)
-            })
+        let root_kept = key_sets.first().is_some_and(|keys| {
+            keys.iter()
+                .any(|key| retention.retained.get(key).is_some_and(|node| node.id == root))
         });
+        let all_kept = root_kept
+            && key_sets.iter().all(|keys| {
+                keys.iter().all(|key| {
+                    retention
+                        .retained
+                        .get(key)
+                        .is_some_and(|node| node.claimed_in_frame != frame)
+                })
+            });
         if all_kept {
             for keys in key_sets {
                 self.keep_retained(keys);

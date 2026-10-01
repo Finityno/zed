@@ -4042,8 +4042,13 @@ impl Window {
             return;
         }
         self.next_frame.shrink_idle(&self.rendered_frame);
-        if let Some(layout_engine) = self.layout_engine.as_mut() {
-            layout_engine.reclaim_idle_capacity();
+        if let Some(layout_engine) = self.layout_engine.as_mut()
+            && layout_engine.reclaim_idle_capacity()
+        {
+            // The retained views' records name nodes of the tree just
+            // replaced; drawn again from them, a view would hand its parent
+            // a node that is gone.
+            self.rendered_frame.retained_views.forget_layouts();
         }
         cx.element_arena.borrow_mut().release_idle_chunks(now);
     }
