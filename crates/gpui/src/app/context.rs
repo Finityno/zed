@@ -222,6 +222,49 @@ impl<'a, T: 'static> Context<'a, T> {
         self.app.notify(self.entity_state.entity_id);
     }
 
+    /// Says that this view does not depend on what it reads from `entity`,
+    /// with view retention on ([`App::set_view_retention`]): reads of
+    /// `entity` while this view, a view nested in it, or something deferred
+    /// from it is drawn are left out of what they depend on.
+    ///
+    /// Without it, a view that renders from a large host it holds a handle
+    /// to (a panel, say, that changes on every frame something in it moves)
+    /// is built on every frame the host changes, and so is every view
+    /// around it, whose dependencies include its own. With it, the view is
+    /// drawn again from the last frame however the host changes.
+    ///
+    /// # Contract
+    ///
+    /// The view takes over telling when it looks different: whenever what
+    /// it, or a view nested in it, shows from `entity` changes, the view
+    /// showing it must be notified ([`Context::notify`], or [`App::notify`]
+    /// with its id), or read a [`crate::DrawDependency`] that is marked
+    /// changed. Notifying this view does not build a nested view that is not
+    /// notified itself. It is the
+    /// contract a cached view ([`crate::Entity::cached`]) relies on without
+    /// retention: something that knows exactly when the view's part of
+    /// `entity` changed (a signature of its inputs, compared on every
+    /// render of the host) notifies it. A view that breaks it keeps showing
+    /// what it showed when it was last built.
+    ///
+    /// Everything else the view reads is still a dependency, as are writes:
+    /// a view that updates `entity` as it draws still builds the views that
+    /// read it before the write. A view drawn again from the last frame does
+    /// not read `entity` again, so the window draws again on a notification
+    /// of `entity` only if something else in it read it: notify the view.
+    ///
+    /// Lasts for the life of the view; saying it again for the same entity
+    /// changes nothing. Reads made before the first time it is said, in the
+    /// same render, are still dependencies until the view is next built.
+    /// Without retention it does nothing.
+    pub fn untrack_reads_of<E: 'static>(&mut self, entity: &crate::Entity<E>) {
+        let view = self.entity_state.entity_id;
+        let untracked = self.app.untracked_reads.entry(view).or_default();
+        if !untracked.contains(&entity.entity_id()) {
+            untracked.push(entity.entity_id());
+        }
+    }
+
     /// Whether this view may be drawn again from the last frame, with view
     /// retention on ([`App::set_view_retention`]). A view that is not is
     /// built on every frame it is drawn in, though the views around and

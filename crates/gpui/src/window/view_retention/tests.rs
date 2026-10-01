@@ -93,6 +93,10 @@ enum CardKind {
     OptedOut,
     Plain,
     Actions,
+    /// Reads the model without depending on it, and is notified when what
+    /// it shows from it changes, as the contract of
+    /// [`crate::Context::untrack_reads_of`] asks.
+    Detached,
 }
 
 impl CardKind {
@@ -105,7 +109,8 @@ impl CardKind {
             CardKind::OptedOut,
             CardKind::Plain,
             CardKind::Actions,
-        ][ix % 7]
+            CardKind::Detached,
+        ][ix % 8]
     }
 }
 
@@ -131,6 +136,9 @@ impl Card {
         let kind = CardKind::of(ix);
         if matches!(kind, CardKind::OptedOut) {
             cx.set_view_retainable(false);
+        }
+        if matches!(kind, CardKind::Detached) {
+            cx.untrack_reads_of(&shared.model);
         }
         let model = shared.model.clone();
         Self {
@@ -173,6 +181,10 @@ impl Render for Card {
             }
             CardKind::OptedOut => format!("untracked {}", shared.untracked.get()).into(),
             CardKind::Plain => "plain".into(),
+            CardKind::Detached => {
+                let labels = &shared.model.read(cx).labels;
+                format!("detached {}", WORDS[labels[self.ix % labels.len()]]).into()
+            }
             CardKind::Actions => {
                 let available = actions_asked_of_last_frame(window)
                     && window.is_action_available(&probe_actions::Probe, cx);
@@ -510,6 +522,37 @@ impl Oracle {
         }
     }
 
+    /// Notifies the detached cards, and the views nested in them, that show
+    /// the label at `at`: they do not depend on the model they read it from.
+    fn notify_detached_readers(&mut self, at: usize) {
+        for window in self.windows() {
+            let cards = window
+                .read_with(&self.cx, |shell, _| {
+                    shell
+                        .cards
+                        .iter()
+                        .chain(&shell.list_cards)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap();
+            for card in cards {
+                card.update(&mut self.cx, |card, cx| {
+                    if !matches!(card.kind, CardKind::Detached) {
+                        return;
+                    }
+                    // The popover it defers shows the first label.
+                    if card.ix % CARDS == at || (card.popover && at == 0) {
+                        cx.notify();
+                    }
+                    if (card.ix + 3) % CARDS == at {
+                        card.inner.update(cx, |_, cx| cx.notify());
+                    }
+                });
+            }
+        }
+    }
+
     fn update_shells(&mut self, update: impl Fn(&mut Shell, &mut Context<Shell>)) {
         for window in self.windows() {
             window
@@ -524,13 +567,17 @@ impl Oracle {
     fn apply(&mut self, change: &Change) {
         let model = self.shared.model.clone();
         match *change {
-            Change::Label { at, word } => model.update(&mut self.cx, |model, cx| {
-                model.labels[at] = word;
-                cx.notify();
-            }),
+            Change::Label { at, word } => {
+                model.update(&mut self.cx, |model, cx| {
+                    model.labels[at] = word;
+                    cx.notify();
+                });
+                self.notify_detached_readers(at);
+            }
             Change::QuietLabelThenNotifyShell { at, word } => {
                 model.update(&mut self.cx, |model, _| model.labels[at] = word);
                 self.update_shells(|_, _| {});
+                self.notify_detached_readers(at);
             }
             Change::Theme(theme) => self.cx.update(|cx| cx.set_global(Theme(theme))),
             Change::Registry(value) => {
@@ -2492,4 +2539,161 @@ fn a_deferred_view_inside_a_notified_view_counts_as_inside_it() {
     cx.run_until_parked();
     let after = widths(&mut cx);
     assert_ne!(after, before, "the deferred view shows the model as it is");
+}
+
+/// A panel whose entries render from it through a handle, as a transcript's
+/// rows render from the panel that holds them.
+struct HostPanel {
+    values: Vec<usize>,
+    ticks: usize,
+    entries: Vec<Entity<PanelEntry>>,
+    tracked: Entity<PanelEntry>,
+}
+
+struct PanelEntry {
+    ix: usize,
+    panel: crate::WeakEntity<HostPanel>,
+    badge: Option<Entity<PanelBadge>>,
+    renders: Rc<Cell<usize>>,
+}
+
+/// A view nested in an entry, which reads the panel as well.
+struct PanelBadge {
+    panel: crate::WeakEntity<HostPanel>,
+}
+
+impl Render for PanelBadge {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ticks = self
+            .panel
+            .upgrade()
+            .map_or(0, |panel| panel.read(cx).entries.len());
+        div().child(SharedString::from(format!("of {ticks}")))
+    }
+}
+
+impl Render for PanelEntry {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let Some(panel) = self.panel.upgrade() else {
+            return div();
+        };
+        let value = panel.read(cx).values[self.ix];
+        div()
+            .child(SharedString::from(format!("entry {} {value}", self.ix)))
+            .children(self.badge.clone())
+            // Deferred, it is drawn after the entry, and reads the panel too.
+            .child(deferred(
+                crate::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| {
+                        let ticks = panel.read(cx).ticks;
+                        if ticks > usize::MAX / 2 {
+                            window.paint_quad(crate::fill(bounds, PALETTE[1]));
+                        }
+                    },
+                )
+                .w(px(4.))
+                .h(px(4.)),
+            ))
+    }
+}
+
+impl Render for HostPanel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(SharedString::from(format!("ticks {}", self.ticks)))
+            .children(self.entries.iter().cloned())
+            .child(self.tracked.clone())
+    }
+}
+
+/// An entry that untracks the panel it renders from is drawn again from the
+/// last frame while the panel changes on every frame, with the view nested
+/// in it and what it deferred, and is built when it is notified; an entry
+/// that does not is built on every frame.
+#[test]
+fn a_view_untracking_its_host_is_drawn_again_while_the_host_changes() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let renders = Rc::new(Cell::new(0));
+    let tracked_renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        let tracked_renders = tracked_renders.clone();
+        move |_, cx| {
+            let panel = cx.weak_entity();
+            let entries = (0..3)
+                .map(|ix| {
+                    let panel = panel.clone();
+                    let renders = renders.clone();
+                    cx.new(|cx| {
+                        cx.untrack_reads_of(&panel.upgrade().unwrap());
+                        PanelEntry {
+                            ix,
+                            badge: Some(cx.new(|_| PanelBadge {
+                                panel: panel.clone(),
+                            })),
+                            panel,
+                            renders,
+                        }
+                    })
+                })
+                .collect();
+            HostPanel {
+                values: vec![0, 1, 2],
+                ticks: 0,
+                entries,
+                tracked: cx.new(|_| PanelEntry {
+                    ix: 0,
+                    panel,
+                    badge: None,
+                    renders: tracked_renders,
+                }),
+            }
+        }
+    });
+    draw_any(&mut cx, window);
+    draw_any(&mut cx, window);
+    let tick = |cx: &mut TestAppContext| {
+        work_after(cx, window, |cx| {
+            window
+                .update(cx, |panel, _, cx| {
+                    panel.ticks += 1;
+                    cx.notify();
+                })
+                .unwrap();
+        })
+    };
+    let (entries_before, tracked_before) = (renders.get(), tracked_renders.get());
+    for _ in 0..3 {
+        let work = tick(&mut cx);
+        // The three entries and the badge in each, drawn again whole.
+        assert!(work.views_reused >= 3, "{work:?}");
+    }
+    assert_eq!(renders.get(), entries_before, "the entries were drawn again");
+    assert_eq!(tracked_renders.get(), tracked_before + 3, "the tracked entry was built");
+
+    // What entry 1 shows changed, and it is notified, as the contract asks.
+    work_after(&mut cx, window, |cx| {
+        let entry = window
+            .update(cx, |panel, _, cx| {
+                panel.values[1] = 41;
+                cx.notify();
+                panel.entries[1].clone()
+            })
+            .unwrap();
+        entry.update(cx, |_, cx| cx.notify());
+    });
+    assert_eq!(renders.get(), entries_before + 1, "only entry 1 was built");
+}
+
+fn draw_any<V: 'static>(cx: &mut TestAppContext, window: WindowHandle<V>) -> crate::FrameWorkStats {
+    cx.update_window(window.into(), |_, window, cx| {
+        window.reset_frame_work_stats(false);
+        window.draw(cx).clear(cx);
+        window.frame_work_stats()
+    })
+    .unwrap()
 }

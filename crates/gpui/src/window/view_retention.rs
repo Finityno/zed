@@ -372,6 +372,9 @@ pub(crate) struct EnclosingViews {
     /// frame: drawn later, it has only the view it was deferred from around
     /// it, and would otherwise not know.
     inside_notified: bool,
+    /// The entities whose reads the views around it leave out (see
+    /// [`crate::Context::untrack_reads_of`]), which it leaves out too.
+    untracked: SmallVec<[EntityId; 2]>,
 }
 
 /// Something deferred from retained views, being drawn.
@@ -381,6 +384,7 @@ pub(crate) struct DeferredViewRecording {
     deferring_before: SmallVec<[usize; 4]>,
     dependencies: DependencyRecording,
     hovers_start: usize,
+    untracked: usize,
 }
 
 /// Where a transaction began in the retained records. See
@@ -604,6 +608,22 @@ impl App {
     #[inline]
     pub fn view_retention(&self) -> bool {
         self.entities.access_log.enabled
+    }
+
+    /// Starts leaving out of the dependencies being recorded the reads of the
+    /// entities `view` said it does not depend on (see
+    /// [`crate::Context::untrack_reads_of`]), returning how many to stop
+    /// leaving out once it is drawn.
+    pub(crate) fn push_untracked_reads(&self, view: EntityId) -> usize {
+        match self.untracked_reads.get(&view) {
+            Some(untracked) => self.entities.access_log.push_untracked(untracked),
+            None => 0,
+        }
+    }
+
+    /// Stops leaving out the last `count` entities pushed.
+    pub(crate) fn pop_untracked_reads(&self, count: usize) {
+        self.entities.access_log.pop_untracked(count);
     }
 
     /// Asks every window for a frame without refreshing it, so that the views
@@ -1294,6 +1314,7 @@ impl Window {
         EnclosingViews {
             views,
             inside_notified: self.inside_notified_view(),
+            untracked: self.view_retention.ambient_reads.untracked(),
         }
     }
 
@@ -1308,6 +1329,7 @@ impl Window {
         if enclosing.views.is_empty() {
             return None;
         }
+        let untracked = cx.entities.access_log.push_untracked(&enclosing.untracked);
         let views = &self.next_frame.retained_views;
         let ids: SmallVec<[GlobalElementId; 4]> = enclosing
             .views
@@ -1325,6 +1347,7 @@ impl Window {
             deferring_before,
             dependencies: cx.begin_recording_dependencies(),
             hovers_start: self.view_retention.hovers.len(),
+            untracked,
         })
     }
 
@@ -1340,6 +1363,7 @@ impl Window {
         };
         self.take_hover_reads();
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        cx.entities.access_log.pop_untracked(recording.untracked);
         self.view_retention.view_stack.clear();
         self.view_retention.deferring_views = recording.deferring_before;
         let enclosing = &recording.enclosing.views;
@@ -1523,7 +1547,8 @@ impl Window {
         render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
         cx: &mut App,
     ) -> (LayoutId, ViewLayout) {
-        self.with_named_view(entity, view_name, |window| {
+        let untracked = cx.push_untracked_reads(entity);
+        let layout = self.with_named_view(entity, view_name, |window| {
             if let Some(style) = cached_style
                 && !window.is_inspector_picking(cx)
             {
@@ -1555,7 +1580,9 @@ impl Window {
                     dependencies,
                 },
             )
-        })
+        });
+        cx.pop_untracked_reads(untracked);
+        layout
     }
 
     /// Prepaints an entity view with view retention on, following up on how
@@ -1571,7 +1598,8 @@ impl Window {
         cx: &mut App,
     ) -> ViewPrepaint {
         self.set_view_id(entity);
-        self.with_named_view(entity, view_name, |window| match layout {
+        let untracked = cx.push_untracked_reads(entity);
+        let prepaint = self.with_named_view(entity, view_name, |window| match layout {
             ViewLayout::Unretained(element) => {
                 ViewPrepaint::Unretained(element.map(|mut element| {
                     element.prepaint(window, cx);
@@ -1614,7 +1642,9 @@ impl Window {
                 window.record_view_render(entity, view_name);
                 window.build_view_at(bounds, global_id, render, cx)
             }
-        })
+        });
+        cx.pop_untracked_reads(untracked);
+        prepaint
     }
 
     /// Builds a view whose layout was taken from the last frame, at the
@@ -1713,6 +1743,7 @@ impl Window {
         prepaint: &mut ViewPrepaint,
         cx: &mut App,
     ) {
+        let untracked = cx.push_untracked_reads(entity);
         self.with_named_view(entity, view_name, |window| match prepaint {
             ViewPrepaint::Unretained(element) => {
                 if let Some(element) = element {
@@ -1733,6 +1764,7 @@ impl Window {
                 window.finish_view_paint(recording, cx);
             }
         });
+        cx.pop_untracked_reads(untracked);
     }
 }
 

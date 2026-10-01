@@ -144,6 +144,7 @@ pub(crate) fn ambient_changed<T: 'static>(cx: &mut App) {
 pub(crate) struct AmbientReads {
     globals: Rc<RefCell<Vec<(TypeId, u64)>>>,
     recordings: Rc<Cell<usize>>,
+    untracked: Rc<RefCell<Vec<EntityId>>>,
 }
 
 impl AmbientReads {
@@ -154,6 +155,11 @@ impl AmbientReads {
         if self.recordings.get() > 0 {
             self.globals.borrow_mut().push((TypeId::of::<T>(), 0));
         }
+    }
+
+    /// The entities whose reads are left out of the recordings now.
+    pub(crate) fn untracked(&self) -> smallvec::SmallVec<[EntityId; 2]> {
+        self.untracked.borrow().iter().copied().collect()
     }
 }
 
@@ -279,6 +285,10 @@ pub(crate) struct EntityAccessLog {
     /// Whether view retention is on in the app, which is what these stamps
     /// and logs are for.
     pub(crate) enabled: bool,
+    /// Entities whose reads are left out of every recording while the views
+    /// that said so (see [`crate::Context::untrack_reads_of`]) are drawn,
+    /// innermost last.
+    untracked: Rc<RefCell<Vec<EntityId>>>,
     /// Every entity accessed while a recording is open, in order and with
     /// repeats, with the write generation it was accessed at.
     access_log: RefCell<Vec<(EntityId, u64)>>,
@@ -312,6 +322,24 @@ impl EntityAccessLog {
     #[inline]
     pub(crate) fn recording(&self) -> bool {
         self.recordings.get() > 0
+    }
+
+    /// Leaves reads of `entities` out of the recordings until popped,
+    /// returning how many to pop.
+    pub(crate) fn push_untracked(&self, entities: &[EntityId]) -> usize {
+        if !self.enabled || entities.is_empty() {
+            return 0;
+        }
+        self.untracked.borrow_mut().extend_from_slice(entities);
+        entities.len()
+    }
+
+    pub(crate) fn pop_untracked(&self, count: usize) {
+        if count > 0 {
+            let mut untracked = self.untracked.borrow_mut();
+            let keep = untracked.len().saturating_sub(count);
+            untracked.truncate(keep);
+        }
     }
 
     fn stamp_changed(&mut self, entity_id: EntityId) {
@@ -376,6 +404,13 @@ impl EntityMap {
 pub(crate) fn note_access(entities: &EntityMap, entity_id: EntityId) {
     let log = &entities.access_log;
     if log.recordings.get() > 0 {
+        if log
+            .untracked
+            .try_borrow()
+            .is_ok_and(|untracked| !untracked.is_empty() && untracked.contains(&entity_id))
+        {
+            return;
+        }
         let mut accesses = log.access_log.borrow_mut();
         // A view reads the same entity many times in a row as it renders.
         if accesses.len() > log.boundary.get()
@@ -587,6 +622,7 @@ impl App {
         AmbientReads {
             globals: self.dependencies.global_read_log.clone(),
             recordings: self.entities.access_log.recordings.clone(),
+            untracked: self.entities.access_log.untracked.clone(),
         }
     }
 
