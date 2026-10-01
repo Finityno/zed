@@ -4603,8 +4603,23 @@ impl ScrollHandle {
         *self.0.borrow().offset.borrow()
     }
 
-    fn note_read(&self) {
+    pub(crate) fn note_read(&self) {
         crate::window::view_retention::dependencies::note_state_read(&self.0.borrow().version);
+    }
+
+    /// Marks what the handle answers changed, for state kept beside it (a
+    /// uniform list's item size) that its readers read through it.
+    pub(crate) fn mark_changed(&self) {
+        self.0.borrow().version.bump();
+    }
+
+    /// Marks the handle asked to scroll, as a uniform list asked to scroll
+    /// to an item is, which the element tracking it carries out as it
+    /// prepaints: the view drawing that element is built again.
+    pub(crate) fn note_scroll_request(&self) {
+        let state = self.0.borrow();
+        state.version.bump();
+        state.requests.bump();
     }
 
     /// Marks the handle changed if its offset is no longer `before`, for an

@@ -121,7 +121,7 @@ pub struct UniformListScrollState {
     pub y_flipped: bool,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 /// The size of the item and its contents.
 pub struct ItemSize {
     /// The size of the item.
@@ -148,7 +148,7 @@ impl UniformListScrollHandle {
     /// If the item is out of view, it scrolls the minimum amount to bring it into view according
     /// to the strategy.
     pub fn scroll_to_item(&self, ix: usize, strategy: ScrollStrategy) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.defer_scroll(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset: 0,
@@ -161,7 +161,7 @@ impl UniformListScrollHandle {
     /// This uses strict scrolling: the item will always be scrolled to match the strategy position,
     /// even if it's already visible. Use this when you need precise positioning.
     pub fn scroll_to_item_strict(&self, ix: usize, strategy: ScrollStrategy) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.defer_scroll(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset: 0,
@@ -180,7 +180,7 @@ impl UniformListScrollHandle {
     /// - `ScrollStrategy::Center`: Shrinks from top, centers item in the reduced viewport
     /// - `ScrollStrategy::Bottom`: Shrinks from bottom, positions item at the new bottom
     pub fn scroll_to_item_with_offset(&self, ix: usize, strategy: ScrollStrategy, offset: usize) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.defer_scroll(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset,
@@ -204,7 +204,7 @@ impl UniformListScrollHandle {
         strategy: ScrollStrategy,
         offset: usize,
     ) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.defer_scroll(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset,
@@ -212,9 +212,19 @@ impl UniformListScrollHandle {
         });
     }
 
+    /// Asks for `deferred` as the list next prepaints, building the view
+    /// drawing it again with view retention on.
+    fn defer_scroll(&self, deferred: DeferredScrollToItem) {
+        let mut state = self.0.borrow_mut();
+        state.deferred_scroll_to_item = Some(deferred);
+        state.base_handle.note_scroll_request();
+    }
+
     /// Check if the list is flipped vertically.
     pub fn y_flipped(&self) -> bool {
-        self.0.borrow().y_flipped
+        let state = self.0.borrow();
+        state.base_handle.note_read();
+        state.y_flipped
     }
 
     /// Get the index of the topmost visible child.
@@ -229,7 +239,9 @@ impl UniformListScrollHandle {
 
     /// Checks if the list can be scrolled vertically.
     pub fn is_scrollable(&self) -> bool {
-        if let Some(size) = self.0.borrow().last_item_size {
+        let state = self.0.borrow();
+        state.base_handle.note_read();
+        if let Some(size) = state.last_item_size {
             size.contents.height > size.item.height
         } else {
             false
@@ -376,10 +388,15 @@ impl Element for UniformList {
         let item_height = longest_item_size.height;
         let shared_scroll_to_item = self.scroll_handle.as_mut().and_then(|handle| {
             let mut handle = handle.0.borrow_mut();
-            handle.last_item_size = Some(ItemSize {
+            let item_size = Some(ItemSize {
                 item: padded_bounds.size,
                 contents: content_size,
             });
+            // Read through the base handle, whose version stands for it.
+            if handle.last_item_size != item_size {
+                handle.last_item_size = item_size;
+                handle.base_handle.mark_changed();
+            }
             handle.deferred_scroll_to_item.take()
         });
 
@@ -734,11 +751,13 @@ impl UniformList {
                     let new_y_offset =
                         -(offset.y + last_size.contents.height - last_size.item.height);
                     base_handle.set_offset(point(offset.x, new_y_offset));
+                    base_handle.mark_changed();
                     scroll_state.y_flipped = y_flipped;
                 }
                 // Handle case where list is initially flipped.
                 None if y_flipped => {
                     base_handle.set_offset(point(offset.x, Pixels::MIN));
+                    base_handle.mark_changed();
                     scroll_state.y_flipped = y_flipped;
                 }
                 _ => {}

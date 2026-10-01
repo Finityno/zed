@@ -2024,6 +2024,15 @@ fn a_uniform_list_scrolling_to_an_item_builds_the_views_reading_it() {
     let offset = handle.0.borrow().base_handle.offset().y;
     assert!(offset < px(0.), "the list scrolled");
     assert_eq!(seen.get(), offset, "the reader shows the list's offset");
+
+    // Asked to scroll by someone who notifies no view, the list scrolls on
+    // the next frame drawn: the view drawing it depends on what it is asked.
+    handle.scroll_to_item(2, crate::ScrollStrategy::Top);
+    frame(&mut cx);
+    frame(&mut cx);
+    let scrolled_back = handle.0.borrow().base_handle.offset().y;
+    assert_eq!(scrolled_back, px(-40.), "the list scrolled back");
+    assert_eq!(seen.get(), scrolled_back);
 }
 
 struct Setting(usize);
