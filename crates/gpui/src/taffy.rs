@@ -123,6 +123,10 @@ impl TaffyLayoutEngine {
         self.retention.counts
     }
 
+    pub(crate) fn restore_retention_counts(&mut self, counts: RetentionCounts) {
+        self.retention.counts = counts;
+    }
+
     pub(crate) fn reset_retention_counts(&mut self) {
         self.retention.counts = RetentionCounts::default();
     }

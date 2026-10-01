@@ -40,6 +40,7 @@
 //! a different shimmer or opacity cycle asks for the next frame, on which the
 //! view is built.
 
+pub(crate) mod culprits;
 pub(crate) mod dependencies;
 pub(crate) mod moving;
 pub(crate) mod splice;
@@ -257,6 +258,45 @@ struct ViewRecord {
     layout_blocked: bool,
 }
 
+impl ViewRecord {
+    /// This record copied into the next frame along with the stretch of
+    /// prepaint it was made in, drawn again from `from` to `to`.
+    fn copied(
+        &self,
+        from: &PrepaintStateIndex,
+        to: &PrepaintStateIndex,
+        paint: PaintStatus,
+        writes_now: u64,
+    ) -> ViewRecord {
+        ViewRecord {
+            id: self.id.clone(),
+            prepaint_range: self.prepaint_range.start.shifted(from, to)
+                ..self.prepaint_range.end.shifted(from, to),
+            paint_range: self.paint_range.clone(),
+            paint,
+            nested: self.nested,
+            context: self.context.clone(),
+            paint_context: self.paint_context.clone(),
+            dependencies: self.dependencies.written_up_to(writes_now),
+            own_dependencies: self.own_dependencies.written_up_to(writes_now),
+            hovers: self.hovers.clone(),
+            own_hovers: self.own_hovers.clone(),
+            groups: self.groups.clone(),
+            fresh_hitboxes: 0..0,
+            prepaint_layout_keys: self.prepaint_layout_keys.clone(),
+            layout: self.layout.clone(),
+            unsettled: self.unsettled,
+            stays_put: self.stays_put,
+            moved: None,
+            paint_mask: self.paint_mask,
+            source: self.source.clone(),
+            layout_scope: self.layout_scope,
+            inherited_groups: self.inherited_groups.clone(),
+            layout_blocked: self.layout_blocked,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum PaintStatus {
     /// Not painted, so `paint_range` means nothing.
@@ -281,6 +321,9 @@ struct ViewContext {
     rem_size: Pixels,
     /// The image cache images without their own load through.
     image_cache: Option<EntityId>,
+    /// Whether it is inside a glass surface, which its quads are stamped
+    /// with as they paint.
+    glass_content: bool,
 }
 
 /// What a view's paint inherited that turns into what its primitives hold:
@@ -747,7 +790,11 @@ impl App {
     ///
     /// With `GPUI_RETAINED_VIEWS_VERIFY=n`, every `n`th frame that drew a
     /// view again is drawn again from scratch, and where the two differ is
-    /// logged as an error. `GPUI_RETAINED_VIEW_MOVES=0` builds every view
+    /// logged as an error. The frame drawn from scratch is the one kept and
+    /// shown; the work counted ([`Window::frame_work_stats`], the rebuild
+    /// reasons) is the first draw's. Every view is rendered a second time
+    /// in such a frame, so whatever a render does besides describing the
+    /// view (writing a model, asking for an animation frame) is done twice. `GPUI_RETAINED_VIEW_MOVES=0` builds every view
     /// that moved instead of drawing it again moved.
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.entities.access_log.enabled != enabled {
@@ -860,6 +907,7 @@ impl Window {
     }
 
     fn note_rebuild(&mut self, entity: EntityId, reason: ViewRebuildReason) {
+        culprits::rebuilt(entity, reason);
         self.view_retention.rebuilds.push((entity, reason));
         let counts = &mut self.frame_work.stats.view_rebuilds;
         let count = match reason {
@@ -895,6 +943,7 @@ impl Window {
 
     /// Ends the retained bookkeeping of the frame being drawn.
     pub(crate) fn finish_retained_views_frame(&mut self, cx: &mut App) {
+        culprits::frame_finished();
         self.view_retention.actions_fingerprint =
             if cx.view_retention() && self.next_frame.retained_views.read_actions() {
                 Some(self.note_changed_actions(cx))
@@ -1015,6 +1064,7 @@ impl Window {
             opacity: self.element_opacity,
             rem_size: self.rem_size(),
             image_cache: self.inherited_image_cache(),
+            glass_content: self.glass_content,
         }
     }
 
@@ -1032,6 +1082,7 @@ impl Window {
             && context.content_mask == self.content_mask()
             && context.text_style == self.text_style()
             && context.image_cache == self.inherited_image_cache()
+            && context.glass_content == self.glass_content
     }
 
     /// Whether the groups `record` resolved outside its view resolve to the
@@ -1416,6 +1467,7 @@ impl Window {
                     opacity: 1.,
                     rem_size: Pixels::ZERO,
                     image_cache: None,
+                    glass_content: false,
                 }),
                 paint_context: PaintContext::default(),
                 dependencies: RenderDependencies::default(),
@@ -1683,6 +1735,71 @@ impl Window {
         views.add_hovers(enclosing, &self.view_retention.hovers[recording.hovers_start..]);
     }
 
+    /// The records made from here on, for a deferred draw to note which
+    /// views it drew.
+    pub(crate) fn retained_records_len(&self) -> usize {
+        self.next_frame.retained_views.records.len()
+    }
+
+    /// Copies the records of the views a deferred draw drew last frame,
+    /// `records` there, along with its prepaint drawn again from `from` to
+    /// `to`, returning where they landed. Without them, the views it drew
+    /// would be built afresh once the views around them are built again.
+    pub(crate) fn copy_deferred_records(
+        &mut self,
+        records: Range<usize>,
+        from: &PrepaintStateIndex,
+        to: &PrepaintStateIndex,
+        cx: &App,
+    ) -> Range<usize> {
+        let writes_now = cx.entities.write_generation();
+        let source = &self.rendered_frame.retained_views;
+        let Some(records) = source.records.get(records) else {
+            return 0..0;
+        };
+        if let Some(engine) = self.layout_engine.as_mut() {
+            for record in records {
+                engine.keep_retained(&record.prepaint_layout_keys);
+                if let Some(layout) = record.layout.as_deref() {
+                    engine.keep_retained(&layout.keys);
+                }
+            }
+        }
+        let target = &mut self.next_frame.retained_views;
+        let start = target.records.len();
+        for record in records {
+            let index = target.records.len();
+            let paint = match record.paint {
+                // Shifted once the deferred draw is painted again; see
+                // [`Self::paint_deferred_records`].
+                PaintStatus::Painted { .. } => PaintStatus::Pending { anchor: index },
+                _ => PaintStatus::Unpainted,
+            };
+            target.unsettled |= record.unsettled;
+            target.push(record.copied(from, to, paint, writes_now));
+        }
+        start..target.records.len()
+    }
+
+    /// Shifts the paint ranges of the records [`Self::copy_deferred_records`]
+    /// copied, now that their deferred draw's paint was drawn again from
+    /// `from` to `to`.
+    pub(crate) fn paint_deferred_records(
+        &mut self,
+        records: Range<usize>,
+        from: &PaintIndex,
+        to: &PaintIndex,
+    ) {
+        let target = &mut self.next_frame.retained_views;
+        for record in target.records.get_mut(records).into_iter().flatten() {
+            if let PaintStatus::Pending { .. } = record.paint {
+                record.paint_range =
+                    record.paint_range.start.shifted(from, to)..record.paint_range.end.shifted(from, to);
+                record.paint = PaintStatus::Painted { source: None };
+            }
+        }
+    }
+
     /// Where a transaction begins, for its records to be rolled back.
     pub(crate) fn begin_retained_transaction(&self) -> RetainedTransaction {
         RetainedTransaction {
@@ -1725,8 +1842,25 @@ impl Window {
         retention.frames_since_verification = 0;
         arena_clear_needed.clear(cx);
         let retained = describe_frame(self);
+        // The work counted is the frame's that drew views again, which is
+        // what verifying is meant to leave as it is.
+        let stats = self.frame_work.stats;
+        let shaping = self.text_system().shaping_stats();
+        let layout_counts = self
+            .layout_engine
+            .as_ref()
+            .map(|engine| engine.retention_counts());
+        let rebuilds = std::mem::take(&mut self.view_retention.rebuilds);
+        culprits::suspend(true);
         self.refreshing = true;
         let arena_clear_needed = self.draw_frame(cx);
+        culprits::suspend(false);
+        self.frame_work.stats = stats;
+        self.text_system().restore_shaping_stats(shaping);
+        if let Some((engine, counts)) = self.layout_engine.as_mut().zip(layout_counts) {
+            engine.restore_retention_counts(counts);
+        }
+        self.view_retention.rebuilds = rebuilds;
         let from_scratch = describe_frame(self);
         if let Some(difference) = first_difference(&retained, &from_scratch) {
             log::error!(

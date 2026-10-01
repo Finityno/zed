@@ -1035,6 +1035,8 @@ pub(crate) struct DeferredDraw {
     /// The retained views it was deferred from, whose dependencies what it
     /// reads while it is drawn are.
     enclosing_views: view_retention::EnclosingViews,
+    /// The records of the retained views it drew, in its frame's records.
+    retained_records: Range<usize>,
 }
 
 pub(crate) struct Frame {
@@ -4473,7 +4475,8 @@ impl Window {
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
-                if let Some(mut element) = element {
+                let records_start = self.retained_records_len();
+                let retained_records = if let Some(mut element) = element {
                     self.prepainting_deferred_draw_beneath_native_surfaces =
                         Some(beneath_native_surfaces);
                     let recording = self.begin_deferred_view(&enclosing_views, cx);
@@ -4487,12 +4490,18 @@ impl Window {
                     self.finish_deferred_view(recording, cx);
                     self.prepainting_deferred_draw_beneath_native_surfaces = None;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
+                    records_start..self.retained_records_len()
                 } else {
-                    self.reuse_prepaint(prepaint_range);
-                }
+                    self.reuse_prepaint(prepaint_range.clone());
+                    let records = self.next_frame.deferred_draws[deferred_draw_ix]
+                        .retained_records
+                        .clone();
+                    self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
+                };
                 let prepaint_end = self.prepaint_index();
-                self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
-                    prepaint_start..prepaint_end;
+                let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
+                deferred_draw.prepaint_range = prepaint_start..prepaint_end;
+                deferred_draw.retained_records = retained_records;
             }
 
             self.element_id_stack.clear();
@@ -4541,6 +4550,10 @@ impl Window {
                 self.finish_deferred_view(recording, cx);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
+                let records = deferred_draw.retained_records.clone();
+                let painted_from = deferred_draw.paint_range.start.clone();
+                self.paint_deferred_records(records, &painted_from, &paint_start);
+                deferred_draw = &mut deferred_draws[deferred_draw_ix];
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -4652,6 +4665,7 @@ impl Window {
                     // Drawn from the last frame: what it read is part of the
                     // records copied along with the views it came from.
                     enclosing_views: Default::default(),
+                    retained_records: deferred_draw.retained_records.clone(),
                 }),
         );
     }
@@ -5357,6 +5371,7 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             enclosing_views: self.enclosing_views(),
+            retained_records: 0..0,
         });
     }
 

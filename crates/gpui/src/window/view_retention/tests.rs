@@ -1026,6 +1026,31 @@ fn changed_models_and_globals_build_the_views_that_read_them() {
     assert!(work.views_spliced >= 1, "{work:?}");
 }
 
+/// With rebuild culprits on, a view built because a model it read changed
+/// is counted under the model's type and where it was changed.
+#[test]
+fn rebuilds_name_the_entity_and_global_behind_them() {
+    super::culprits::force_on();
+    let mut cx = TestAppContext::single();
+    let (window, shared) = shell_window(&mut cx);
+    let model = shared.model.clone();
+    work_after(&mut cx, window, |cx| {
+        model.update(cx, |model, cx| {
+            model.labels[0] = 7;
+            cx.notify();
+        })
+    });
+    work_after(&mut cx, window, |cx| cx.update(|cx| cx.set_global(Theme(4))));
+    let counts = super::culprits::counts();
+    let blamed = |what: &str| {
+        counts
+            .iter()
+            .any(|(line, _)| line.contains(what) && line.contains("rebuilds_name_the_entity"))
+    };
+    assert!(blamed("EntityChanged <- entity gpui::window::view_retention::tests::Model"), "{counts:#?}");
+    assert!(blamed("GlobalChanged <- global gpui::window::view_retention::tests::Theme"), "{counts:#?}");
+}
+
 /// A declared dependency builds the views that read it once it changes, and
 /// a view that opted out is built on every frame.
 #[test]
@@ -1095,8 +1120,9 @@ fn accessibility_builds_every_view() {
     assert!(work.view_rebuilds.accessibility >= CARDS as u64, "{work:?}");
 }
 
-/// Verification draws a frame that drew views again once more from scratch
-/// and finds nothing to report when the two agree.
+/// Verification draws a frame that drew views again once more from scratch,
+/// keeps that one, counts the work of the first, and finds nothing to report
+/// when the two agree.
 #[test]
 fn verification_draws_the_frame_again_from_scratch() {
     let mut cx = TestAppContext::single();
@@ -1108,7 +1134,24 @@ fn verification_draws_the_frame_again_from_scratch() {
     let work = work_after(&mut cx, window, |cx| {
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
     });
-    assert_eq!(work.frames, 2, "the frame was drawn again: {work:?}");
+    assert_eq!(work.frames, 1, "{work:?}");
+    assert!(work.views_spliced + work.views_reused > 0, "{work:?}");
+    assert_eq!(work.view_rebuilds.window_refresh, 0, "{work:?}");
+    let (kept_reused, reasons) = cx
+        .update_window(window.into(), |_, window, _| {
+            (
+                window.rendered_frame.retained_views.reused_any,
+                window.view_rebuild_reasons().to_vec(),
+            )
+        })
+        .unwrap();
+    assert!(!kept_reused, "the frame kept was drawn from scratch");
+    assert!(
+        !reasons
+            .iter()
+            .any(|(_, reason)| *reason == ViewRebuildReason::WindowRefresh),
+        "{reasons:?}"
+    );
     assert_eq!(first_difference(&["a".into()], &["a".into()]), None);
     assert!(first_difference(&["a".into()], &["b".into()]).is_some());
 }
@@ -1414,10 +1457,11 @@ fn a_view_drawn_again_into_another_opacity_cycle_is_built_on_the_next_frame() {
     assert_eq!(cycled(&mut cx, windows[0]), cycled(&mut cx, windows[1]));
 }
 
-/// A view drawn again inside glass mode it was not painted in asks for the
-/// next frame, on which it is built inside it.
+/// A view whose host turned glass mode on around it is built inside it in
+/// the same frame: glass mode is applied while the host prepaints too, where
+/// the view finds it differs from the last frame's.
 #[test]
-fn a_view_drawn_again_into_glass_mode_is_built_on_the_next_frame() {
+fn a_view_drawn_into_glass_mode_is_built_inside_it() {
     let mut cx = TestAppContext::single();
     let windows = mover_windows(&mut cx);
     draw_pair(&mut cx, windows);
@@ -1429,7 +1473,8 @@ fn a_view_drawn_again_into_glass_mode_is_built_on_the_next_frame() {
             })
             .unwrap();
     }
-    draw_pair(&mut cx, windows);
+    let [retained, from_scratch] = draw_pair(&mut cx, windows);
+    assert_eq!(first_difference(&retained, &from_scratch), None);
     let glass = |cx: &mut TestAppContext, window: WindowHandle<Mover>| {
         cx.update_window(window.into(), |_, window, _| {
             window
@@ -1442,13 +1487,12 @@ fn a_view_drawn_again_into_glass_mode_is_built_on_the_next_frame() {
         })
         .unwrap()
     };
-    assert_ne!(glass(&mut cx, windows[0]), glass(&mut cx, windows[1]));
+    assert_eq!(glass(&mut cx, windows[0]), glass(&mut cx, windows[1]));
+    assert!(glass(&mut cx, windows[0]).iter().any(|glass| *glass));
     let asked = cx
         .update_window(windows[0].into(), |_, window, cx| window.simulate_next_frame(cx))
         .unwrap();
-    assert!(asked >= 1, "the reused leaf asks for the next frame");
-    draw_pair(&mut cx, windows);
-    assert_eq!(glass(&mut cx, windows[0]), glass(&mut cx, windows[1]));
+    assert_eq!(asked, 0, "nothing was drawn in the wrong mode");
 }
 
 /// A view whose host swapped the image cache it inherits for another is
@@ -3227,6 +3271,161 @@ fn positions_kept_outside_the_frame_move_with_a_view_drawn_moved() {
         assert_eq!(painted_at.get(), at, "painted position at {header}");
     }
     assert!(moved >= 3, "the marker was drawn moved {moved} times");
+}
+
+struct Popover;
+
+impl Render for Popover {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(60.)).h(px(30.)).bg(PALETTE[2]).child("popover")
+    }
+}
+
+struct PopoverHost {
+    popover: Entity<Popover>,
+    ticks: usize,
+}
+
+impl Render for PopoverHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(SharedString::from(format!("ticked {}", self.ticks)))
+            .child(crate::deferred(self.popover.clone()))
+    }
+}
+
+/// A view drawn inside something deferred keeps its record while what
+/// deferred it is drawn again from the last frame, so that once that is
+/// built again, the view is drawn again rather than built afresh.
+#[test]
+fn views_drawn_inside_a_deferred_draw_keep_their_records() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let windows = [(); 2].map(|_| {
+        cx.add_window(|_, cx| PopoverHost {
+            popover: cx.new(|_| Popover),
+            ticks: 0,
+        })
+    });
+    // Draws both windows, the second from scratch, unless the first drew on
+    // the update's flush since its counts were reset.
+    let draw = |cx: &mut TestAppContext| {
+        windows.map(|window| {
+            cx.update_window(window.into(), |_, window, cx| {
+                if window.handle.window_id() == windows[1].window_id() {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                } else if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                let frame = (describe_frame(window), window.frame_work_stats());
+                window.reset_frame_work_stats(false);
+                frame
+            })
+            .unwrap()
+        })
+    };
+    draw(&mut cx);
+    // Nothing changed: the host is drawn again, its deferred draw with it.
+    let [(retained, work), (from_scratch, _)] = draw(&mut cx);
+    assert_eq!(first_difference(&retained, &from_scratch), None);
+    assert_eq!(work.views_rendered, 0, "{work:?}");
+    for _ in 0..2 {
+        for window in windows {
+            window
+                .update(&mut cx, |host, _, cx| {
+                    host.ticks += 1;
+                    cx.notify();
+                })
+                .unwrap();
+        }
+        let [(retained, work), (from_scratch, _)] = draw(&mut cx);
+        assert_eq!(first_difference(&retained, &from_scratch), None);
+        assert_eq!(work.views_rendered, 1, "only the host is built: {work:?}");
+        assert_eq!(work.view_rebuilds.first_draw, 0, "{work:?}");
+        let [(retained, work), (from_scratch, _)] = draw(&mut cx);
+        assert_eq!(first_difference(&retained, &from_scratch), None);
+        assert_eq!(work.views_rendered, 0, "{work:?}");
+    }
+}
+
+/// A view showing an admitted line of text, keeping the line's geometry
+/// handle as a caller resolving positions against it would. The line is
+/// shaped by hand: the test text system has no admitted shaping.
+struct AdmittedRow {
+    layout: Rc<std::cell::RefCell<Option<crate::AdmittedTextLayout>>>,
+}
+
+impl Render for AdmittedRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let text = crate::text_allocation::tests::hand_shaped_admitted_text();
+        *self.layout.borrow_mut() = Some(text.layout().clone());
+        div().w(px(120.)).h(px(20.)).child(text)
+    }
+}
+
+struct AdmittedHost {
+    header: f32,
+    row: Entity<AdmittedRow>,
+}
+
+impl Render for AdmittedHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(self.row.clone())
+    }
+}
+
+/// An admitted text layout drawn again moved answers positions where it is
+/// now, as a text layout does.
+#[test]
+fn an_admitted_text_layout_moves_with_a_view_drawn_moved() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let layout = Rc::new(std::cell::RefCell::new(None));
+    let window = cx.add_window({
+        let layout = layout.clone();
+        move |_, cx| AdmittedHost {
+            header: 10.,
+            row: cx.new(|_| AdmittedRow { layout }),
+        }
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            window.frame_work_stats()
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    let mut moved = 0;
+    for header in [30., 25., 60.] {
+        cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false))
+            .unwrap();
+        window
+            .update(&mut cx, |host, _, cx| {
+                host.header = header;
+                cx.notify();
+            })
+            .unwrap();
+        moved += frame(&mut cx).views_moved;
+        let layout = layout.borrow().clone().expect("the row was drawn");
+        let origin = point(px(0.), px(header));
+        assert_eq!(layout.bounds().map(|bounds| bounds.origin), Some(origin));
+        assert_eq!(layout.position_for_index(1), Some(origin + point(px(10.), px(0.))));
+        assert_eq!(
+            layout.closest_index_for_position(origin + point(px(19.), px(5.))),
+            Some(2)
+        );
+    }
+    assert!(moved >= 3, "the row was drawn moved {moved} times");
 }
 
 /// A window idle long enough rebuilds its layout tree smaller, and the

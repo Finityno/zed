@@ -100,6 +100,9 @@ struct Inherited {
     element_offset_stack: Vec<Point<Pixels>>,
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     element_opacity: f32,
+    /// Restored after a gap's prepaint; its paint sets glass mode with the
+    /// rest of what it painted inside.
+    glass_content: Option<bool>,
     groups: GroupHitboxes,
 }
 
@@ -325,32 +328,7 @@ impl Window {
                 _ => PaintStatus::Unpainted,
             };
             target.unsettled |= record.unsettled;
-            let copy = target.push(ViewRecord {
-                id: record.id.clone(),
-                prepaint_range: record.prepaint_range.start.shifted(from, to)
-                    ..record.prepaint_range.end.shifted(from, to),
-                paint_range: record.paint_range.clone(),
-                paint,
-                nested: record.nested,
-                context: record.context.clone(),
-                paint_context: record.paint_context.clone(),
-                dependencies: record.dependencies.written_up_to(writes_now),
-                own_dependencies: record.own_dependencies.written_up_to(writes_now),
-                hovers: record.hovers.clone(),
-                own_hovers: record.own_hovers.clone(),
-                groups: record.groups.clone(),
-                fresh_hitboxes: 0..0,
-                prepaint_layout_keys: record.prepaint_layout_keys.clone(),
-                layout: record.layout.clone(),
-                unsettled: record.unsettled,
-                stays_put: record.stays_put,
-                moved: None,
-                paint_mask: record.paint_mask,
-                source: record.source.clone(),
-                layout_scope: record.layout_scope,
-                inherited_groups: record.inherited_groups.clone(),
-                layout_blocked: record.layout_blocked,
-            });
+            let copy = target.push(record.copied(from, to, paint, writes_now));
             copied.push((copy, gap));
         }
     }
@@ -383,6 +361,8 @@ impl Window {
                 SmallVec::from_slice(&[context.rem_size]),
             ),
             element_opacity: mem::replace(&mut self.element_opacity, context.opacity),
+            glass_content: (!painting)
+                .then(|| mem::replace(&mut self.glass_content, context.glass_content)),
             groups: if painting {
                 mem::replace(&mut self.group_hitboxes, groups)
             } else {
@@ -399,6 +379,9 @@ impl Window {
         self.element_offset_stack = inherited.element_offset_stack;
         self.rem_size_override_stack = inherited.rem_size_override_stack;
         self.element_opacity = inherited.element_opacity;
+        if let Some(glass_content) = inherited.glass_content {
+            self.glass_content = glass_content;
+        }
         if painting {
             self.group_hitboxes = inherited.groups;
         } else {

@@ -2564,7 +2564,18 @@ impl Interactivity {
 
                                 let scroll_offset =
                                     self.clamp_scroll_position(bounds, &style, window, cx);
+                                // Glass mode, like opacity, is applied as the
+                                // element paints, and with view retention on
+                                // also while it prepaints, for a view nested
+                                // inside to compare with the last frame's.
+                                let glass_content = window.glass_content;
+                                if let Some(glass) = style.glass_content
+                                    && cx.view_retention()
+                                {
+                                    window.glass_content = glass;
+                                }
                                 let result = f(&style, scroll_offset, hitbox, window, cx);
+                                window.glass_content = glass_content;
                                 if let Some(group) = prepaint_group {
                                     window.view_retention.prepaint_groups.pop_group(group);
                                 }

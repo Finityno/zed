@@ -116,7 +116,9 @@ pub(crate) fn global_changed(cx: &mut App, global_type: TypeId) {
     if !log.enabled {
         return;
     }
-    if log.recording() {
+    let drawing = log.recording();
+    super::culprits::note_global_change(global_type, drawing);
+    if drawing {
         log.write_generation += 1;
         cx.dependencies
             .global_written_at
@@ -397,6 +399,7 @@ impl EntityAccessLog {
 
     /// Forgets a released entity.
     pub(crate) fn forget(&mut self, entity_id: EntityId) {
+        super::culprits::forget(entity_id);
         if self.enabled {
             self.updated_at.remove(&entity_id);
             self.written_at.remove(&entity_id);
@@ -478,6 +481,7 @@ pub(crate) fn note_notify(entities: &mut EntityMap, entity_id: EntityId) {
         || log.recordings.get() > 0
         || log.queried.is_some()
     {
+        super::culprits::note_entity_change(entity_id, "notified");
         log.stamp_changed(entity_id);
     }
 }
@@ -502,10 +506,12 @@ pub(crate) fn note_update(entities: &mut EntityMap, entity_id: EntityId) {
             log.rendering = None;
         } else if log.queried != Some(entity_id) {
             if log.recordings.get() == 0 {
+                super::culprits::note_entity_change(entity_id, "updated");
                 log.update_generation += 1;
                 log.updated_at.insert(entity_id, log.update_generation);
                 log.updated_unnotified.insert(entity_id);
             } else {
+                super::culprits::note_entity_change(entity_id, "written while drawing");
                 log.write_generation += 1;
                 log.written_at.insert(entity_id, log.write_generation);
             }
@@ -870,10 +876,19 @@ impl App {
         if log.changed_since(&dependencies.entities, dependencies.updates, inside_notified)
             || log.written_since(&dependencies.entities, dependencies.floor)
         {
+            if super::culprits::enabled()
+                && let Some(entity) = dependencies.entities.iter().find(|entity| {
+                    let entity = std::slice::from_ref(*entity);
+                    log.changed_since(entity, dependencies.updates, inside_notified)
+                        || log.written_since(entity, dependencies.floor)
+                })
+            {
+                super::culprits::blame_entity(entity.0);
+            }
             return Some(DependencyChange::Entity);
         }
         let floor = dependencies.floor;
-        if dependencies.globals.iter().any(|(global, read_at)| {
+        if let Some((global, _)) = dependencies.globals.iter().find(|(global, read_at)| {
             self.dependencies
                 .global_changed_at
                 .get(global)
@@ -884,6 +899,9 @@ impl App {
                     .get(global)
                     .is_some_and(|written_at| *written_at > (*read_at).max(floor))
         }) {
+            if super::culprits::enabled() {
+                super::culprits::blame_global(*global);
+            }
             return Some(DependencyChange::Global);
         }
         if dependencies

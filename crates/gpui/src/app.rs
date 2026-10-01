@@ -2170,6 +2170,7 @@ impl App {
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
@@ -2182,6 +2183,7 @@ impl App {
     /// yet been assigned.
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
         crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         crate::window::view_retention::dependencies::note_global_presence_read::<G>(self);
@@ -2196,6 +2198,7 @@ impl App {
     /// Sets the value of the global of the given type.
     pub fn set_global<G: Global>(&mut self, global: G) {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
         crate::window::view_retention::dependencies::global_changed(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
@@ -2211,6 +2214,7 @@ impl App {
     /// Remove the global of the given type from the app context. Does not notify global observers.
     pub fn remove_global<G: Global>(&mut self) -> G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::note_global_removed::<G>(self);
         crate::window::view_retention::dependencies::global_changed(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
@@ -2252,6 +2256,7 @@ impl App {
     /// Restore the global of the given type after it is moved to the stack.
     pub(crate) fn end_global_lease<G: Global>(&mut self, lease: GlobalLease<G>) {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
 
         crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });

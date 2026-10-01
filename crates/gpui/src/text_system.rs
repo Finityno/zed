@@ -730,6 +730,10 @@ impl WindowTextSystem {
         self.line_layout_cache.shaping_stats()
     }
 
+    pub(crate) fn restore_shaping_stats(&self, stats: (u64, std::time::Duration)) {
+        self.line_layout_cache.restore_shaping_stats(stats)
+    }
+
     pub(crate) fn reset_shaping_stats(&self, timed: bool) {
         self.line_layout_cache.reset_shaping_stats(timed)
     }

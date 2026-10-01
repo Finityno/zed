@@ -285,6 +285,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// An admitted line of three glyphs ten pixels apart, shaped by hand, for
+    /// a test to draw where the test text system cannot shape one.
+    #[cfg(test)]
+    pub(crate) fn hand_shaped_admitted_text() -> AdmittedStyledText {
+        use crate::{point, px, FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, TextAlign};
+        let admission = Arc::new(Counter::default());
+        let source = AdmittedTextSource::new("abc", admission).expect("source");
+        let allocation = TextAllocationReservation::for_line(&source, 1024).expect("glyph reservation");
+        let raw = LineLayout {
+            width: px(30.0), len: 3,
+            runs: vec![ShapedRun { font_id: FontId(0), glyphs: (0..3).map(|index| ShapedGlyph {
+                id: GlyphId(index as u32), position: point(px(index as f32 * 10.0), px(0.0)), index, is_emoji: false,
+            }).collect() }], ..Default::default()
+        };
+        let line = Arc::new(AdmittedLineLayout::from_native(source, raw, allocation).expect("line"));
+        let element = TextAllocationReservation::reserve(line.source().admission(), TextAllocationClass::Element,
+            std::mem::size_of::<AdmittedTextLayoutInner>() + 2 * std::mem::size_of::<usize>()).expect("geometry reservation");
+        let layout = AdmittedTextLayout(std::rc::Rc::new(AdmittedTextLayoutInner {
+            text_align: TextAlign::Left, line, bounds: std::cell::Cell::new(None), _allocation: element.publish(),
+        }));
+        AdmittedStyledText {
+            layout,
+            style: AdmittedTextStyle {
+                font_id: FontId(0), font_size: px(14.0), line_height: px(20.0), color: crate::black(),
+                background_color: None, underline: None, strikethrough: None, text_align: TextAlign::Left,
+            },
+        }
+    }
+
     #[cfg_attr(test, test)]
     pub(crate) fn admitted_single_line_alignment_preserves_utf8_geometry() {
         use crate::{point, px, size, Bounds, FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, TextAlign};
@@ -485,6 +514,15 @@ struct AdmittedTextLayoutInner {
     _allocation: TextAllocationLease,
 }
 
+impl crate::window::view_retention::PositionedState for AdmittedTextLayoutInner {
+    fn translate(&self, by: crate::Point<crate::Pixels>) {
+        if let Some(mut bounds) = self.bounds.get() {
+            bounds.origin += by;
+            self.bounds.set(Some(bounds));
+        }
+    }
+}
+
 fn admitted_line_origin(bounds: crate::Bounds<crate::Pixels>, line_width: crate::Pixels, align: crate::TextAlign) -> crate::Point<crate::Pixels> {
     let offset = match align {
         crate::TextAlign::Left => crate::Pixels::ZERO,
@@ -586,9 +624,12 @@ impl crate::Element for AdmittedStyledText {
 
     fn prepaint(
         &mut self, _: Option<&crate::GlobalElementId>, _: Option<&crate::InspectorElementId>,
-        bounds: crate::Bounds<crate::Pixels>, _: &mut (), _: &mut crate::Window, _: &mut crate::App,
+        bounds: crate::Bounds<crate::Pixels>, _: &mut (), window: &mut crate::Window, _: &mut crate::App,
     ) {
         self.layout.0.bounds.set(Some(bounds));
+        // A view drawn again elsewhere from the last frame is not prepainted:
+        // the bounds move with it.
+        window.note_positioned_state(|| self.layout.0.clone());
     }
 
     fn paint(

@@ -123,6 +123,7 @@ impl ViewMove {
             opacity: context.opacity,
             rem_size: context.rem_size,
             image_cache: context.image_cache,
+            glass_content: context.glass_content,
         }
     }
 
@@ -265,6 +266,7 @@ impl Window {
             || context.opacity != self.element_opacity
             || context.rem_size != self.rem_size()
             || context.image_cache != self.inherited_image_cache()
+            || context.glass_content != self.glass_content
             || context.text_style != self.text_style()
             || !self.groups_unchanged(record)
         {

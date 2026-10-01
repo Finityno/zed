@@ -129,6 +129,10 @@ impl EntityMap {
     {
         let mut accessed_entities = self.accessed_entities.get_mut();
         accessed_entities.insert(slot.entity_id);
+        crate::window::view_retention::culprits::note_entity_type(
+            slot.entity_id,
+            std::any::type_name::<T>(),
+        );
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
