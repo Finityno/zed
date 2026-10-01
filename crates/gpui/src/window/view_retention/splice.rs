@@ -128,7 +128,7 @@ fn text_style_refinement(style: &TextStyle) -> TextStyleRefinement {
 }
 
 /// The entity of the view whose element has the id `id`.
-fn view_entity(id: &GlobalElementId) -> Option<EntityId> {
+pub(super) fn view_entity(id: &GlobalElementId) -> Option<EntityId> {
     match id.0.last()? {
         ElementId::View(entity) => Some(*entity),
         _ => None,

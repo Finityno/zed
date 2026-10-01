@@ -3437,6 +3437,32 @@ fn an_admitted_text_layout_moves_with_a_view_drawn_moved() {
     assert!(moved >= 3, "the row was drawn moved {moved} times");
 }
 
+/// With rebuild culprits on, a moved view that was built rather than drawn
+/// again moved is counted under what kept it in place.
+#[test]
+fn rebuilds_of_moved_views_name_what_kept_them_from_moving() {
+    super::culprits::force_on();
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let (windows, _rows) = strip_windows(&mut cx);
+    draw_strips(&mut cx, windows);
+    draw_strips(&mut cx, windows);
+    for offset in [10., 30.] {
+        scroll_strips(&mut cx, windows, offset);
+        draw_strips(&mut cx, windows);
+    }
+    let counts = super::culprits::counts();
+    let counted = |what: &str| counts.iter().any(|(line, _)| line.contains(what));
+    assert!(
+        counted("StripRow ContextChanged <- not drawn moved: StaysPut: wrote entity gpui::window::view_retention::tests::Summary while prepainting"),
+        "{counts:#?}"
+    );
+    assert!(
+        counted("StripRow ContextChanged <- not drawn moved: StaysPut: set_view_movable(false)"),
+        "{counts:#?}"
+    );
+    assert!(counted("StripRow ContextChanged <- not drawn moved: Outside"), "{counts:#?}");
+}
+
 /// A window idle long enough rebuilds its layout tree smaller, and the
 /// views it draws again from the last frame named nodes of the tree that is
 /// gone. In this history a list scrolls an item into view after that,

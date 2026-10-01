@@ -196,6 +196,42 @@ fn whole_device_pixels(delta: f32) -> bool {
     (delta - delta.round()).abs() < 1e-3
 }
 
+/// Why a view whose record did not match where it is drawn now was not
+/// drawn again moved, for [`super::culprits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoveRefusal {
+    /// The frame builds every view drawn moved since it was last built.
+    Settling,
+    /// `GPUI_RETAINED_VIEW_MOVES=0`.
+    MovesOff,
+    /// It said so, wrote state as it was drawn, or a view nested in it did.
+    StaysPut,
+    /// It was painted inside a text shimmer from around it.
+    InheritedShimmer,
+    SizeChanged,
+    OpacityChanged,
+    RemSizeChanged,
+    ImageCacheChanged,
+    GlassModeChanged,
+    TextStyleChanged,
+    /// A group it resolved outside it resolves to another hitbox.
+    GroupsChanged,
+    /// It moved by a fraction of a device pixel.
+    NotWholeDevicePixels,
+    /// It reached past the content mask around it in the last frame.
+    OutsideMaskBefore,
+    /// It reaches past the content mask around it now.
+    OutsideMaskNow,
+    DeferredDraw,
+    InputHandler,
+    /// A hitbox of it was clipped by the mask around it.
+    HitboxClippedByOuterMask,
+    /// It reached past the mask it was painted in.
+    OutsidePaintMask,
+    /// A primitive of it was clipped by the mask around it.
+    PrimitiveClippedByOuterMask,
+}
+
 /// A callback registered with [`Window::on_replayed_at_offset`].
 struct ReplayedAtOffset(Box<dyn Fn(Point<Pixels>)>);
 
@@ -253,44 +289,65 @@ impl Window {
 
     /// How the view last frame's record `previous` stands for can be drawn
     /// again at `bounds` from that record, moved, if it can.
-    pub(super) fn view_move(&self, previous: usize, bounds: Bounds<Pixels>) -> Option<ViewMove> {
+    pub(super) fn view_move(
+        &self,
+        previous: usize,
+        bounds: Bounds<Pixels>,
+    ) -> Result<ViewMove, MoveRefusal> {
         let retention = &self.view_retention;
-        if retention.settling || !retention.moves_enabled {
-            return None;
+        if retention.settling {
+            return Err(MoveRefusal::Settling);
+        }
+        if !retention.moves_enabled {
+            return Err(MoveRefusal::MovesOff);
         }
         let record = &self.rendered_frame.retained_views.records[previous];
         let context = &record.context;
-        if record.stays_put
-            || record.paint_context.shimmer.is_some()
-            || context.bounds.size != bounds.size
-            || context.opacity != self.element_opacity
-            || context.rem_size != self.rem_size()
-            || context.image_cache != self.inherited_image_cache()
-            || context.glass_content != self.glass_content
-            || context.text_style != self.text_style()
-            || !self.groups_unchanged(record)
-        {
-            return None;
+        let refusal = if record.stays_put {
+            Some(MoveRefusal::StaysPut)
+        } else if record.paint_context.shimmer.is_some() {
+            Some(MoveRefusal::InheritedShimmer)
+        } else if context.bounds.size != bounds.size {
+            Some(MoveRefusal::SizeChanged)
+        } else if context.opacity != self.element_opacity {
+            Some(MoveRefusal::OpacityChanged)
+        } else if context.rem_size != self.rem_size() {
+            Some(MoveRefusal::RemSizeChanged)
+        } else if context.image_cache != self.inherited_image_cache() {
+            Some(MoveRefusal::ImageCacheChanged)
+        } else if context.glass_content != self.glass_content {
+            Some(MoveRefusal::GlassModeChanged)
+        } else if context.text_style != self.text_style() {
+            Some(MoveRefusal::TextStyleChanged)
+        } else if !self.groups_unchanged(record) {
+            Some(MoveRefusal::GroupsChanged)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
         let delta = bounds.origin - context.bounds.origin;
         let scale_factor = self.scale_factor();
         let scaled = delta.scale(scale_factor);
         if !whole_device_pixels(scaled.x.0) || !whole_device_pixels(scaled.y.0) {
-            return None;
+            return Err(MoveRefusal::NotWholeDevicePixels);
         }
         let mask = self.content_mask();
         let outer = edges(&context.content_mask.bounds);
-        if !inside(edges(&context.bounds), outer)
-            || !inside(edges(&bounds), edges(&mask.bounds))
-        {
-            return None;
+        if !inside(edges(&context.bounds), outer) {
+            return Err(MoveRefusal::OutsideMaskBefore);
+        }
+        if !inside(edges(&bounds), edges(&mask.bounds)) {
+            return Err(MoveRefusal::OutsideMaskNow);
         }
         let prepaint = &record.prepaint_range;
         let paint = &record.paint_range;
-        if prepaint.start.deferred_draws_index != prepaint.end.deferred_draws_index
-            || paint.start.input_handlers_index != paint.end.input_handlers_index
-        {
-            return None;
+        if prepaint.start.deferred_draws_index != prepaint.end.deferred_draws_index {
+            return Err(MoveRefusal::DeferredDraw);
+        }
+        if paint.start.input_handlers_index != paint.end.input_handlers_index {
+            return Err(MoveRefusal::InputHandler);
         }
         let frame = &self.rendered_frame;
         let hitboxes_clipped_inside = frame.hitboxes
@@ -303,16 +360,19 @@ impl Window {
                     outer,
                 )
             });
-        if !hitboxes_clipped_inside
-            || !inside(edges(&context.bounds), edges(&record.paint_mask.bounds))
-            || !frame.scene.clipped_only_inside(
-                paint.start.scene_index..paint.end.scene_index,
-                scaled_edges(&self.cover_bounds(record.paint_mask.bounds)),
-            )
-        {
-            return None;
+        if !hitboxes_clipped_inside {
+            return Err(MoveRefusal::HitboxClippedByOuterMask);
         }
-        Some(ViewMove {
+        if !inside(edges(&context.bounds), edges(&record.paint_mask.bounds)) {
+            return Err(MoveRefusal::OutsidePaintMask);
+        }
+        if !frame.scene.clipped_only_inside(
+            paint.start.scene_index..paint.end.scene_index,
+            scaled_edges(&self.cover_bounds(record.paint_mask.bounds)),
+        ) {
+            return Err(MoveRefusal::PrimitiveClippedByOuterMask);
+        }
+        Ok(ViewMove {
             delta,
             old_outer: context.content_mask,
             new_outer: mask,

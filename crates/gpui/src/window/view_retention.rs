@@ -1539,13 +1539,18 @@ impl Window {
             .fold((false, false), |(unsettled, stays_put), record| {
                 (unsettled || record.unsettled, stays_put || record.stays_put)
             });
+        let wrote = recording.writes_start != Writes::now(cx);
+        let fixed = recording
+            .view
+            .is_some_and(|view| cx.fixed_views.contains(&view));
+        if culprits::enabled()
+            && let Some(view) = recording.view
+        {
+            culprits::note_stays_put(view, fixed, wrote.then_some("prepainting"), stays_put);
+        }
         let record = &mut views.records[index];
         record.unsettled = unsettled;
-        record.stays_put = stays_put
-            || recording.writes_start != Writes::now(cx)
-            || recording
-                .view
-                .is_some_and(|view| cx.fixed_views.contains(&view));
+        record.stays_put = stays_put || wrote || fixed;
         record.prepaint_range.end = end;
         record.nested = nested;
         record.context = Rc::new(context);
@@ -1614,7 +1619,14 @@ impl Window {
             }
         }
         record.groups = groups.into();
-        record.stays_put |= recording.writes_start != Writes::now(cx);
+        let wrote = recording.writes_start != Writes::now(cx);
+        if wrote
+            && culprits::enabled()
+            && let Some(view) = splice::view_entity(&record.id)
+        {
+            culprits::note_stays_put(view, false, Some("painting"), false);
+        }
+        record.stays_put |= wrote;
         record.paint_range = recording.start..end;
         record.paint = PaintStatus::Painted { source: None };
         if !painted_hovers.is_empty() {
@@ -2180,14 +2192,17 @@ impl Window {
                     window.draw_clock.count_reuse();
                     return ViewPrepaint::Reused(window.reuse_view_prepaint(previous, None, cx));
                 }
-                if let Some(moved) = window.view_move(previous, bounds) {
-                    #[cfg(feature = "profiler")]
-                    window.draw_clock.count_reuse();
-                    return ViewPrepaint::Reused(window.reuse_view_prepaint(
-                        previous,
-                        Some(moved),
-                        cx,
-                    ));
+                match window.view_move(previous, bounds) {
+                    Ok(moved) => {
+                        #[cfg(feature = "profiler")]
+                        window.draw_clock.count_reuse();
+                        return ViewPrepaint::Reused(window.reuse_view_prepaint(
+                            previous,
+                            Some(moved),
+                            cx,
+                        ));
+                    }
+                    Err(refusal) => culprits::blame_refused_move(entity, refusal),
                 }
                 window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
                 #[cfg(feature = "profiler")]
@@ -2196,10 +2211,18 @@ impl Window {
             }
             ViewLayout::Spliced(splice) => {
                 let previous = splice.previous;
-                if window.view_context_matches(previous, bounds)
-                    && let Some(spliced) = window.splice_prepaint(splice, cx)
-                {
+                let context_matches = window.view_context_matches(previous, bounds);
+                if context_matches && let Some(spliced) = window.splice_prepaint(splice, cx) {
                     return spliced;
+                }
+                if culprits::enabled() {
+                    if context_matches {
+                        culprits::blame("not drawn again around its nested views: one asked for \
+                                         another layout"
+                            .into());
+                    } else if let Err(refusal) = window.view_move(previous, bounds) {
+                        culprits::blame_refused_move(entity, refusal);
+                    }
                 }
                 window.note_rebuild(entity, ViewRebuildReason::ContextChanged);
                 #[cfg(feature = "profiler")]
@@ -2216,14 +2239,17 @@ impl Window {
                         ));
                     }
                     Ok(previous) => {
-                        if let Some(moved) = window.view_move(previous, bounds) {
-                            #[cfg(feature = "profiler")]
-                            window.draw_clock.count_reuse();
-                            return ViewPrepaint::Reused(window.reuse_view_prepaint(
-                                previous,
-                                Some(moved),
-                                cx,
-                            ));
+                        match window.view_move(previous, bounds) {
+                            Ok(moved) => {
+                                #[cfg(feature = "profiler")]
+                                window.draw_clock.count_reuse();
+                                return ViewPrepaint::Reused(window.reuse_view_prepaint(
+                                    previous,
+                                    Some(moved),
+                                    cx,
+                                ));
+                            }
+                            Err(refusal) => culprits::blame_refused_move(entity, refusal),
                         }
                         window.note_rebuild(entity, ViewRebuildReason::ContextChanged)
                     }

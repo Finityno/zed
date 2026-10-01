@@ -4,12 +4,15 @@
 //! With `GPUI_REBUILD_CULPRITS=1`, every view built is counted under its
 //! type and the reason it was built, and one built because an entity or a
 //! global it read changed is counted under that entity's or global's type
-//! too, with the stack that last changed it. The most frequent are logged
+//! too, with the stack that last changed it. A view built because it moved
+//! or what it inherits changed is counted under the condition that kept it
+//! from being drawn again moved, and one that stays put under why: it said
+//! so, or what it wrote while drawn. The most frequent are logged
 //! every 300 frames as `[rebuild-culprit]` lines. Capturing a stack on
 //! every change is slow; this is for diagnosis, not for shipping. Off, each
 //! hook costs one load of a cached flag.
 
-use super::ViewRebuildReason;
+use super::{ViewRebuildReason, moving::MoveRefusal};
 use crate::EntityId;
 use collections::FxHashMap;
 use std::{any::TypeId, backtrace::Backtrace, cell::RefCell, sync::OnceLock};
@@ -67,6 +70,10 @@ struct Culprits {
     /// What the last dependency check that found a change blamed, for the
     /// rebuild it causes to name.
     blamed: Option<String>,
+    /// What was last written while a view was drawn.
+    last_write: Option<String>,
+    /// Why each view that stays put does.
+    stays_put: FxHashMap<EntityId, String>,
     counts: FxHashMap<String, u64>,
     frames: u64,
 }
@@ -108,7 +115,13 @@ pub(crate) fn note_global_type(global: TypeId, name: &'static str) {
 pub(crate) fn note_entity_change(entity: EntityId, how: &'static str) {
     if enabled() {
         let stack = Backtrace::force_capture();
-        with(|culprits| culprits.entity_changes.insert(entity, (how, stack)));
+        with(|culprits| {
+            if how == "written while drawing" {
+                let name = culprits.entity_types.get(&entity).copied().unwrap_or("?");
+                culprits.last_write = Some(format!("entity {name}"));
+            }
+            culprits.entity_changes.insert(entity, (how, stack))
+        });
     }
 }
 
@@ -122,7 +135,13 @@ pub(crate) fn note_global_change(global: TypeId, drawing: bool) {
             "written"
         };
         let stack = Backtrace::force_capture();
-        with(|culprits| culprits.global_changes.insert(global, (how, stack)));
+        with(|culprits| {
+            if drawing {
+                let name = culprits.global_types.get(&global).copied().unwrap_or("?");
+                culprits.last_write = Some(format!("global {name}"));
+            }
+            culprits.global_changes.insert(global, (how, stack))
+        });
     }
 }
 
@@ -177,6 +196,65 @@ pub(crate) fn blame_global(global: TypeId) {
     });
 }
 
+/// Blames the rebuild about to be noted on `blamed`.
+pub(crate) fn blame(blamed: String) {
+    if enabled() {
+        with(|culprits| culprits.blamed = Some(blamed));
+    }
+}
+
+/// Blames the rebuild about to be noted for `view` on what kept it from
+/// being drawn again moved.
+pub(crate) fn blame_refused_move(view: EntityId, refusal: MoveRefusal) {
+    if !enabled() {
+        return;
+    }
+    with(|culprits| {
+        let detail = match refusal {
+            MoveRefusal::StaysPut => {
+                let why = culprits
+                    .stays_put
+                    .get(&view)
+                    .map_or("?", String::as_str);
+                format!(": {why}")
+            }
+            _ => String::new(),
+        };
+        culprits.blamed = Some(format!("not drawn moved: {refusal:?}{detail}"));
+    });
+}
+
+/// Notes why `view` stays put, as it finishes prepainting or painting: it
+/// said so (`fixed`), it wrote something while `wrote_while`, or a view
+/// nested in it stays put.
+pub(crate) fn note_stays_put(
+    view: EntityId,
+    fixed: bool,
+    wrote_while: Option<&str>,
+    nested: bool,
+) {
+    with(|culprits| {
+        let why = if fixed {
+            Some("set_view_movable(false)".to_string())
+        } else if let Some(phase) = wrote_while {
+            let what = culprits.last_write.as_deref().unwrap_or("something");
+            Some(format!("wrote {what} while {phase}"))
+        } else if nested {
+            Some("a view nested in it stays put".to_string())
+        } else {
+            None
+        };
+        match why {
+            Some(why) => {
+                culprits.stays_put.insert(view, why);
+            }
+            None => {
+                culprits.stays_put.remove(&view);
+            }
+        }
+    });
+}
+
 /// Counts a view built, under its type and why, and what was blamed.
 pub(crate) fn rebuilt(view: EntityId, reason: ViewRebuildReason) {
     if !enabled() || SUSPENDED.get() {
@@ -186,9 +264,12 @@ pub(crate) fn rebuilt(view: EntityId, reason: ViewRebuildReason) {
         let name = culprits.entity_types.get(&view).copied().unwrap_or("?");
         let blamed = culprits.blamed.take();
         let line = match (reason, blamed) {
-            (ViewRebuildReason::EntityChanged | ViewRebuildReason::GlobalChanged, Some(blamed)) => {
-                format!("{name} {reason:?} <- {blamed}")
-            }
+            (
+                ViewRebuildReason::EntityChanged
+                | ViewRebuildReason::GlobalChanged
+                | ViewRebuildReason::ContextChanged,
+                Some(blamed),
+            ) => format!("{name} {reason:?} <- {blamed}"),
             _ => format!("{name} {reason:?}"),
         };
         *culprits.counts.entry(line).or_default() += 1;
@@ -222,6 +303,7 @@ pub(crate) fn forget(entity: EntityId) {
         with(|culprits| {
             culprits.entity_types.remove(&entity);
             culprits.entity_changes.remove(&entity);
+            culprits.stays_put.remove(&entity);
         });
     }
 }
