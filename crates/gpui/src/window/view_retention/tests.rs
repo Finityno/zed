@@ -819,19 +819,39 @@ fn frames_drawing_views_again_match_frames_drawn_from_scratch() {
         .ok()
         .and_then(|seed| seed.parse().ok())
         .unwrap_or(0);
-    for seed in first..seeds {
-        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(seed, 50)))
-            .unwrap_or_else(|panic| {
+    // With GPUI_RETAINED_VIEWS_ORACLE_ALL=1, every seed runs and the ones
+    // that failed are listed together at the end.
+    let all = std::env::var("GPUI_RETAINED_VIEWS_ORACLE_ALL").is_ok_and(|value| value == "1");
+    let mut failures = Vec::new();
+    // GPUI_RETAINED_VIEWS_ORACLE_LIST=594,606 runs only those seeds.
+    let listed: Option<Vec<u64>> = std::env::var("GPUI_RETAINED_VIEWS_ORACLE_LIST")
+        .ok()
+        .map(|list| list.split(',').filter_map(|seed| seed.trim().parse().ok()).collect());
+    let listed_any = listed.is_some();
+    for seed in listed.unwrap_or_else(|| (first..seeds).collect()) {
+        let run = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(seed, 50))) {
+            Ok(run) => run,
+            Err(panic) => {
                 let message = panic
                     .downcast_ref::<String>()
                     .cloned()
                     .or_else(|| panic.downcast_ref::<&str>().map(|message| message.to_string()))
                     .unwrap_or_default();
-                panic!("seed {seed}: {message}")
-            });
+                if !all {
+                    panic!("seed {seed}: {message}");
+                }
+                let first_line: String = message.lines().next().unwrap_or_default().chars().take(400).collect();
+                failures.push(format!("seed {seed}: {first_line}"));
+                continue;
+            }
+        };
         reuse.reused += run.reused;
         reuse.moved += run.moved;
         reuse.spliced += run.spliced;
+    }
+    assert!(failures.is_empty(), "{} seeds failed:\n{}", failures.len(), failures.join("\n"));
+    if listed_any {
+        return;
     }
     let Reuse {
         reused,
@@ -3790,6 +3810,364 @@ fn a_view_built_at_a_changed_layout_keeps_the_size_its_parent_gives_it() {
             None,
             "step {step}"
         );
+    }
+}
+
+/// Seeds of the random histories that once drew a frame unlike the one drawn
+/// from scratch: a view drawn moved under the pointer with the hover it had
+/// where it was, a view drawn again or around whose content asked to be
+/// scrolled into view (several rows of a list revealing themselves, which a
+/// list answers one a frame), and a layer of text drawn moved past the mask
+/// around it.
+#[test]
+fn histories_that_once_differed_from_scratch_match() {
+    for seed in [
+        594, 606, 644, 674, 1338, 1708, 1851, 1900, 2009, 2598, 2965, 3187, 3337, 3441, 3452,
+        3802, 3822, 4043,
+    ] {
+        run(seed, 50);
+    }
+}
+
+/// Two windows of the same root described together: the first as it drew
+/// since it was last described (drawing now only if it did not), the second
+/// drawn now from scratch.
+fn draw_both<V: 'static>(
+    cx: &mut TestAppContext,
+    windows: [WindowHandle<V>; 2],
+) -> [Vec<String>; 2] {
+    windows.map(|window| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.handle.window_id() == windows[1].window_id() {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            } else if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            window.reset_frame_work_stats(false);
+            let mut lines = describe_frame(window);
+            // Layers order what is drawn over them, and are compared too.
+            let mut layers: Vec<String> = window
+                .rendered_frame
+                .scene
+                .paint_operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    crate::scene::PaintOperation::StartLayer(layer) => Some(format!("{layer:?}")),
+                    _ => None,
+                })
+                .collect();
+            layers.sort();
+            lines.extend(layers);
+            lines
+        })
+        .unwrap()
+    })
+}
+
+fn move_mouse_in<V: 'static>(cx: &mut TestAppContext, windows: [WindowHandle<V>; 2], x: f32, y: f32) {
+    for window in windows {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                    position: point(px(x), px(y)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+}
+
+struct HoverBox;
+
+impl Render for HoverBox {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("hover-box")
+            .w(px(100.))
+            .h(px(40.))
+            .bg(PALETTE[0])
+            .hover(|style| style.bg(PALETTE[1]))
+    }
+}
+
+struct HoverHost {
+    header: f32,
+    child: Entity<HoverBox>,
+}
+
+impl Render for HoverHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(self.child.clone())
+    }
+}
+
+/// A view styled by its hover that moves under a pointer standing still is
+/// drawn hovered at once, not with the hover it had where it was.
+#[test]
+fn a_view_moved_under_the_pointer_is_drawn_with_its_hover_there() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let windows = [(); 2].map(|_| {
+        cx.add_window(|_, cx| HoverHost {
+            header: 10.,
+            child: cx.new(|_| HoverBox),
+        })
+    });
+    draw_both(&mut cx, windows);
+    move_mouse_in(&mut cx, windows, 50., 70.);
+    draw_both(&mut cx, windows);
+    for header in [40., 10., 45.] {
+        for window in windows {
+            window
+                .update(&mut cx, |host, _, cx| {
+                    host.header = header;
+                    cx.notify();
+                })
+                .unwrap();
+        }
+        let [retained, from_scratch] = draw_both(&mut cx, windows);
+        assert_eq!(first_difference(&retained, &from_scratch), None, "header {header}");
+    }
+}
+
+/// A view whose text reaches past it, into what clips it from around.
+struct WideText;
+
+impl Render for WideText {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(40.))
+            .h(px(20.))
+            .child(div().w(px(200.)).child("a line far wider than its view"))
+    }
+}
+
+struct ClippingHost {
+    header: f32,
+    child: Entity<WideText>,
+}
+
+impl Render for ClippingHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            div()
+                .id("clip")
+                .w(px(100.))
+                .h(px(200.))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(div().w(px(10.)).h(px(self.header)))
+                .child(self.child.clone()),
+        )
+    }
+}
+
+/// A view whose line of text the mask around it clipped is drawn again
+/// moved only with its layer clipped where it lands, as painting it there
+/// would clip it.
+#[test]
+fn a_moved_view_keeps_its_text_layers_clipped_as_painted_there() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let windows = [(); 2].map(|_| {
+        cx.add_window(|_, cx| ClippingHost {
+            header: 10.,
+            child: cx.new(|_| WideText),
+        })
+    });
+    draw_both(&mut cx, windows);
+    draw_both(&mut cx, windows);
+    for header in [30., 190., 20.] {
+        for window in windows {
+            window
+                .update(&mut cx, |host, _, cx| {
+                    host.header = header;
+                    cx.notify();
+                })
+                .unwrap();
+        }
+        let [retained, from_scratch] = draw_both(&mut cx, windows);
+        assert_eq!(first_difference(&retained, &from_scratch), None, "header {header}");
+    }
+}
+
+/// A row holding a scroller tracked by a handle, and a list of its own.
+struct ScrollingRow {
+    handle: crate::ScrollHandle,
+    list_state: ListState,
+}
+
+impl Render for ScrollingRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(120.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("scroller")
+                    .h(px(40.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .child(div().h(px(120.)).bg(PALETTE[0])),
+            )
+            .child(
+                list(self.list_state.clone(), |ix, _, _| {
+                    div()
+                        .h(px(20.))
+                        .child(SharedString::from(format!("item {ix}")))
+                        .into_any_element()
+                })
+                .h(px(40.)),
+            )
+    }
+}
+
+struct ScrollingRows {
+    header: f32,
+    row: Entity<ScrollingRow>,
+}
+
+impl Render for ScrollingRows {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().w(px(10.)).h(px(self.header)))
+            .child(self.row.clone())
+    }
+}
+
+/// A view holding a tracked scroller and a list, drawn moved, is drawn again
+/// on the frame after, not built: the positions moved with it are not a
+/// change to what it read.
+#[test]
+fn a_view_drawn_moved_with_scrollers_in_it_is_drawn_again_after() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let window = cx.add_window(|_, cx| ScrollingRows {
+        header: 10.,
+        row: cx.new(|_| ScrollingRow {
+            handle: crate::ScrollHandle::new(),
+            list_state: ListState::new(6, ListAlignment::Top, px(20.)),
+        }),
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = (window.frame_work_stats(), window.view_rebuild_reasons().to_vec());
+            window.reset_frame_work_stats(false);
+            work
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    let row = window.read_with(&cx, |rows, _| rows.row.entity_id()).unwrap();
+    for header in [30., 50., 20.] {
+        window
+            .update(&mut cx, |rows, _, cx| {
+                rows.header = header;
+                cx.notify();
+            })
+            .unwrap();
+        let (work, reasons) = frame(&mut cx);
+        assert_eq!(work.views_moved, 1, "{work:?} {reasons:?}");
+        let (work, reasons) = frame(&mut cx);
+        assert!(
+            !reasons.iter().any(|(view, _)| *view == row),
+            "the row was built on the frame after it moved: {reasons:?} {work:?}"
+        );
+    }
+}
+
+struct ScrollingRowList {
+    rows: Vec<Entity<ScrollingRow>>,
+    list_state: ListState,
+}
+
+impl Render for ScrollingRowList {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        div().size_full().child(
+            list(self.list_state.clone(), move |ix, _, _| rows[ix].clone().into_any_element())
+                .w(px(200.))
+                .h(px(300.)),
+        )
+    }
+}
+
+/// Rows holding scrollers and lists of their own, scrolled by the wheel in
+/// the list holding them, are drawn moved and then drawn again, not built
+/// once each scroll has passed.
+#[test]
+fn rows_with_scrollers_scrolled_by_the_wheel_are_not_built_after() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let window = cx.add_window(|_, cx| ScrollingRowList {
+        rows: (0..12)
+            .map(|_| {
+                cx.new(|_| ScrollingRow {
+                    handle: crate::ScrollHandle::new(),
+                    list_state: ListState::new(6, ListAlignment::Top, px(20.)),
+                })
+            })
+            .collect(),
+        list_state: ListState::new(12, ListAlignment::Top, px(80.)),
+    });
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            if window.frame_work_stats().frames == 0 {
+                window.draw(cx).clear(cx);
+            }
+            let work = (window.frame_work_stats(), window.view_rebuild_reasons().to_vec());
+            window.reset_frame_work_stats(false);
+            work
+        })
+        .unwrap()
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    frame(&mut cx);
+    for _ in 0..4 {
+        let viewport = window
+            .read_with(&cx, |rows, _| rows.list_state.viewport_bounds())
+            .unwrap();
+        // Over the list, beside the rows: the wheel scrolls the list, not a
+        // scroller in a row.
+        let position = point(viewport.origin.x + px(160.), viewport.center().y);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                    position,
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-10.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: crate::TouchPhase::Moved,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        let (work, reasons) = frame(&mut cx);
+        assert!(work.views_moved >= 1, "{work:?} {reasons:?}");
+        // Only the list's view read the wheel; the rows read nothing that
+        // moving them changed.
+        assert_eq!(work.view_rebuilds.state_changed, 1, "{reasons:?}");
+        let (work, reasons) = frame(&mut cx);
+        assert_eq!(work.views_rendered, 0, "{reasons:?}");
     }
 }
 

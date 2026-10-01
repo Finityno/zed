@@ -14,6 +14,9 @@
 //!   rem size, image cache and groups;
 //! - it moved by a whole number of device pixels, so that glyphs land on the
 //!   same subpixel offsets and pixel snapping comes out the same;
+//! - if it drew anything by whether a hitbox was hovered, the pointer is
+//!   over neither where it was nor where it is, so moving it hovers nothing
+//!   anew;
 //! - it lies wholly inside the content mask around it, in the last frame and
 //!   in this one. Whatever was culled against the mask, or laid out by how
 //!   much of it was visible (lines of a long text, a sticky header), would
@@ -218,6 +221,8 @@ pub(crate) enum MoveRefusal {
     GroupsChanged,
     /// It moved by a fraction of a device pixel.
     NotWholeDevicePixels,
+    /// It drew by hovers, and the pointer is over where it was or is.
+    UnderPointer,
     /// It reached past the content mask around it in the last frame.
     OutsideMaskBefore,
     /// It reaches past the content mask around it now.
@@ -340,6 +345,25 @@ impl Window {
         }
         if !inside(edges(&bounds), edges(&mask.bounds)) {
             return Err(MoveRefusal::OutsideMaskNow);
+        }
+        // What it drew by whether its hitboxes were hovered was checked
+        // against where they were; moved under the pointer, or out from
+        // under it, they may be hovered otherwise.
+        if !record.hovers.is_empty() {
+            let pointer = self.mouse_position;
+            let under_pointer = self.rendered_frame.hitboxes
+                [record.prepaint_range.start.hitboxes_index..record.prepaint_range.end.hitboxes_index]
+                .iter()
+                .any(|hitbox| {
+                    let moved = Bounds {
+                        origin: hitbox.bounds.origin + delta,
+                        size: hitbox.bounds.size,
+                    };
+                    hitbox.bounds.contains(&pointer) || moved.contains(&pointer)
+                });
+            if under_pointer {
+                return Err(MoveRefusal::UnderPointer);
+            }
         }
         let prepaint = &record.prepaint_range;
         let paint = &record.paint_range;

@@ -162,6 +162,7 @@ impl Window {
         if record.layout_blocked
             || (self.view_retention.settling && record.unsettled)
             || !matches!(record.paint, PaintStatus::Painted { .. })
+            || record.asked_for_autoscroll()
         {
             return Some(ViewRebuildReason::ContextChanged);
         }
@@ -284,6 +285,10 @@ impl Window {
                 ..range.end.accessed_element_states_index]
                 .iter()
                 .cloned(),
+        );
+        next.autoscroll_requests.extend_from_slice(
+            &rendered.autoscroll_requests
+                [range.start.autoscroll_requests_index..range.end.autoscroll_requests_index],
         );
         next.positioned_states.extend(
             rendered.positioned_states

@@ -248,10 +248,24 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.push_clipped_layer(bounds, bounds, bounds);
+    }
+
+    /// Pushes a layer of `bounds`, what is left of `extent` once `mask`
+    /// clipped it, covered to whole device pixels.
+    pub(crate) fn push_clipped_layer(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        extent: Bounds<ScaledPixels>,
+        mask: Bounds<ScaledPixels>,
+    ) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
+        self.paint_operations.push(PaintOperation::StartLayer(Layer {
+            bounds,
+            extent,
+            mask,
+        }));
     }
 
     pub fn pop_layer(&mut self) {
@@ -455,6 +469,8 @@ impl Scene {
                 scaled_edges(&primitive.content_mask().bounds),
                 outer,
             ),
+            // A layer is clipped again where it is drawn moved (see
+            // `replay_inside`).
             PaintOperation::StartLayer(_) | PaintOperation::EndLayer => true,
         })
     }
@@ -485,6 +501,9 @@ impl Scene {
         let landed_before = rebase.map(|_| std::time::Instant::now());
         let rebase = rebase.filter(|(from, to)| from != to);
         remapped_transitions.extend(rebase);
+        // Layers moved out from under the mask around them are left out, as
+        // painting them there would have; so is the end of each.
+        let mut layers_left_out: Vec<bool> = Vec::new();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
@@ -529,11 +548,39 @@ impl Scene {
                     }
                     self.insert_primitive(primitive)
                 }
-                PaintOperation::StartLayer(bounds) => self.push_layer(match moved {
-                    Some(moved) => moved.bounds(*bounds),
-                    None => *bounds,
-                }),
-                PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartLayer(layer) => match moved {
+                    Some(moved) => {
+                        // Clipped again by the mask it is in now, as painting
+                        // it there would.
+                        let extent = moved.bounds(layer.extent);
+                        let mask = moved.mask(&ContentMask { bounds: layer.mask }).bounds;
+                        let clipped = extent.intersect(&mask);
+                        let left_out = clipped.is_empty();
+                        if !left_out {
+                            let bounds = Bounds::from_corners(
+                                point(
+                                    ScaledPixels(clipped.origin.x.0.floor()),
+                                    ScaledPixels(clipped.origin.y.0.floor()),
+                                ),
+                                point(
+                                    ScaledPixels(clipped.bottom_right().x.0.ceil()),
+                                    ScaledPixels(clipped.bottom_right().y.0.ceil()),
+                                ),
+                            );
+                            self.push_clipped_layer(bounds, extent, mask);
+                        }
+                        layers_left_out.push(left_out);
+                    }
+                    None => {
+                        self.push_clipped_layer(layer.bounds, layer.extent, layer.mask);
+                        layers_left_out.push(false);
+                    }
+                },
+                PaintOperation::EndLayer => {
+                    if !layers_left_out.pop().unwrap_or(false) {
+                        self.pop_layer();
+                    }
+                }
             }
         }
     }
@@ -1681,9 +1728,18 @@ pub(crate) fn primitive_extent(primitive: &Primitive) -> Bounds<ScaledPixels> {
     }
 }
 
+/// A layer a paint operation starts: the bounds it orders what is in it by,
+/// and the extent and content mask they were clipped from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layer {
+    bounds: Bounds<ScaledPixels>,
+    extent: Bounds<ScaledPixels>,
+    mask: Bounds<ScaledPixels>,
+}
+
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
-    StartLayer(Bounds<ScaledPixels>),
+    StartLayer(Layer),
     EndLayer,
 }
 

@@ -1057,6 +1057,11 @@ pub(crate) struct Frame {
     /// view retention on, and how far each was moved with the view it was
     /// copied with; see [`view_retention::PositionedState`].
     pub(crate) positioned_states: Vec<(Rc<dyn view_retention::PositionedState>, Point<Pixels>)>,
+    /// The bounds elements inside retained views asked to be scrolled into
+    /// view as they prepainted (see [`Window::request_autoscroll`]). A
+    /// request is for the frame it is made in, and whatever scrolls answers
+    /// it as it prepaints, so a view that made one is built again.
+    pub(crate) autoscroll_requests: Vec<Bounds<Pixels>>,
     /// What elements registered as they painted to be moved with the view
     /// they were painted in (see [`Window::on_replayed_at_offset`]).
     pub(crate) painted_positions: Vec<Rc<dyn view_retention::PositionedState>>,
@@ -1104,6 +1109,7 @@ pub(crate) struct PrepaintStateIndex {
     tooltips_index: usize,
     deferred_draws_index: usize,
     positioned_states_index: usize,
+    autoscroll_requests_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1145,6 +1151,7 @@ impl Frame {
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             positioned_states: Vec::new(),
+            autoscroll_requests: Vec::new(),
             painted_positions: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
@@ -1185,6 +1192,7 @@ impl Frame {
             .clear_vec(&mut self.window_control_hitboxes);
         shrink.deferred_draws.clear_vec(&mut self.deferred_draws);
         self.positioned_states.clear();
+        self.autoscroll_requests.clear();
         self.painted_positions.clear();
         self.tab_stops.clear();
         self.retained_views.clear();
@@ -4581,6 +4589,7 @@ impl Window {
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             positioned_states_index: self.next_frame.positioned_states.len(),
+            autoscroll_requests_index: self.next_frame.autoscroll_requests.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
@@ -4622,6 +4631,12 @@ impl Window {
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        // Copied so the ranges of the records copied along stay in step; a
+        // view that asked to be scrolled into view is not drawn again.
+        self.next_frame.autoscroll_requests.extend_from_slice(
+            &self.rendered_frame.autoscroll_requests
+                [range.start.autoscroll_requests_index..range.end.autoscroll_requests_index],
+        );
         let moved_by = moved.map_or(Point::default(), |moved| moved.delta);
         self.next_frame.positioned_states.extend(
             self.rendered_frame.positioned_states
@@ -5040,6 +5055,9 @@ impl Window {
             self.next_frame
                 .deferred_draws
                 .truncate(index.deferred_draws_index);
+            self.next_frame
+                .autoscroll_requests
+                .truncate(index.autoscroll_requests_index);
             // Positions moved with a view drawn again elsewhere are moved
             // back: the prepaint tried again may move it by another amount.
             for (state, moved_by) in self
@@ -5069,6 +5087,9 @@ impl Window {
     pub fn request_autoscroll(&mut self, bounds: Bounds<Pixels>) {
         self.invalidator.debug_assert_prepaint();
         self.requested_autoscroll = Some(bounds);
+        if !self.view_retention.view_stack_is_empty() {
+            self.next_frame.autoscroll_requests.push(bounds);
+        }
     }
 
     /// This method can be called from a containing element such as [`crate::List`] to support the autoscroll behavior
@@ -5386,9 +5407,14 @@ impl Window {
         let content_mask = self.content_mask();
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
+            let scale_factor = self.scale_factor();
+            let covered = self.cover_bounds(clipped_bounds);
+            // The mask as primitives keep theirs, so that a move tells the
+            // mask around what moved from the masks inside it alike.
+            let mask = self.snapped_content_mask().bounds;
             self.next_frame
                 .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+                .push_clipped_layer(covered, bounds.scale(scale_factor), mask);
         }
 
         let result = f(self);

@@ -259,6 +259,15 @@ struct ViewRecord {
 }
 
 impl ViewRecord {
+    /// Whether something drawn in the view, or in a view nested in it,
+    /// asked to be scrolled into view as it prepainted. The request is for
+    /// that frame; drawn again, the view would not make it, and what scrolls
+    /// around it would not answer it.
+    fn asked_for_autoscroll(&self) -> bool {
+        self.prepaint_range.start.autoscroll_requests_index
+            != self.prepaint_range.end.autoscroll_requests_index
+    }
+
     /// This record copied into the next frame along with the stretch of
     /// prepaint it was made in, drawn again from `from` to `to`.
     fn copied(
@@ -498,6 +507,11 @@ pub(crate) struct ViewRetention {
 }
 
 impl ViewRetention {
+    /// Whether no retained view is being drawn.
+    pub(crate) fn view_stack_is_empty(&self) -> bool {
+        self.view_stack.is_empty()
+    }
+
     pub(crate) fn new(cx: &App) -> Self {
         Self {
             view_stack: Vec::new(),
@@ -578,6 +592,9 @@ impl PrepaintStateIndex {
             positioned_states_index: self.positioned_states_index
                 - from.positioned_states_index
                 + to.positioned_states_index,
+            autoscroll_requests_index: self.autoscroll_requests_index
+                - from.autoscroll_requests_index
+                + to.autoscroll_requests_index,
             dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index
                 + to.dispatch_tree_index,
             accessed_element_states_index: self.accessed_element_states_index
@@ -594,6 +611,7 @@ impl PrepaintStateIndex {
             && self.tooltips_index == other.tooltips_index
             && self.deferred_draws_index == other.deferred_draws_index
             && self.positioned_states_index == other.positioned_states_index
+            && self.autoscroll_requests_index == other.autoscroll_requests_index
             && self.dispatch_tree_index == other.dispatch_tree_index
             && self.accessed_element_states_index == other.accessed_element_states_index
             && self.line_layout_index == other.line_layout_index
@@ -1039,7 +1057,10 @@ impl Window {
             .find(id)
             .ok_or(ViewRebuildReason::FirstDraw)?;
         let record = &self.rendered_frame.retained_views.records[index];
-        if record.layout_blocked || (self.view_retention.settling && record.unsettled) {
+        if record.layout_blocked
+            || (self.view_retention.settling && record.unsettled)
+            || record.asked_for_autoscroll()
+        {
             return Err(ViewRebuildReason::ContextChanged);
         }
         let now = cx.background_executor().now();
