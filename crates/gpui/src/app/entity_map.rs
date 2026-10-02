@@ -129,6 +129,10 @@ impl EntityMap {
     {
         let mut accessed_entities = self.accessed_entities.get_mut();
         accessed_entities.insert(slot.entity_id);
+        crate::window::view_retention::culprits::note_entity_type(
+            slot.entity_id,
+            std::any::type_name::<T>(),
+        );
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -505,6 +509,26 @@ impl<T: 'static> Entity<T> {
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
     ) -> R {
         cx.update_entity(self, update)
+    }
+
+    /// Updates the entity as bookkeeping a view does while it is drawn (a
+    /// list's row callback keeping its owner's caches, say), which, with view
+    /// retention on, does not count as a change to it: the views that read
+    /// it are not built again for it, and a view drawn around the views that
+    /// do it can still be drawn again from the last frame.
+    ///
+    /// # Contract
+    ///
+    /// Nothing another view reads may change in a quiet update. A change
+    /// that something reads must be told: notifying the entity inside the
+    /// update ([`Context::notify`]) makes the update a change again, as it
+    /// is outside. Without retention, it is [`Self::update`].
+    pub fn update_quietly<R>(
+        &self,
+        cx: &mut App,
+        update: impl FnOnce(&mut T, &mut Context<T>) -> R,
+    ) -> R {
+        crate::window::view_retention::dependencies::query(self, cx, update)
     }
 
     /// Updates the entity referenced by this handle with the given function.

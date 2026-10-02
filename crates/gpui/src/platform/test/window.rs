@@ -159,6 +159,8 @@ impl TestWindow {
             start_external_drag_result: false,
         })))
     }
+    /// Runs the frame callback for a frame the window asked for, as the
+    /// platform's display link would, returning whether one was asked for.
     pub fn simulate_scheduled_frame(&self) -> bool {
         let callback = {
             let mut state = self.0.lock();
@@ -178,6 +180,7 @@ impl TestWindow {
         true
     }
 
+    /// Whether the window asked for a frame not yet run.
     pub fn frame_scheduled(&self) -> bool {
         self.0.lock().frame_scheduled
     }
@@ -190,6 +193,8 @@ impl TestWindow {
         self.0.lock().queued_present_outcomes.extend(outcomes);
     }
 
+    /// Changes whether the window is visible and tells it, as the platform
+    /// would.
     pub fn simulate_visibility_change(&self, visibility: WindowVisibility) {
         let callback = {
             let mut state = self.0.lock();
@@ -202,6 +207,8 @@ impl TestWindow {
         }
     }
 
+    /// Changes the window's visual viewport and tells it, as the platform
+    /// would.
     pub fn simulate_visual_viewport_change(&self, bounds: Bounds<Pixels>) {
         let callback = {
             let mut state = self.0.lock();
@@ -214,6 +221,7 @@ impl TestWindow {
         }
     }
 
+    /// Changes the window's insets and tells it, as the platform would.
     pub fn simulate_insets_change(&self, insets: WindowInsets) {
         let callback = {
             let mut state = self.0.lock();
@@ -226,10 +234,12 @@ impl TestWindow {
         }
     }
 
+    /// How many times the window asked for the virtual keyboard.
     pub fn virtual_keyboard_requests(&self) -> usize {
         self.0.lock().virtual_keyboard_requests
     }
 
+    /// How many times the window dismissed the virtual keyboard.
     pub fn virtual_keyboard_dismissals(&self) -> usize {
         self.0.lock().virtual_keyboard_dismissals
     }
@@ -239,6 +249,7 @@ impl TestWindow {
         self.0.lock().text_input_configurations.clone()
     }
 
+    /// Every text input state change the window reported, in order.
     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
         self.0.lock().text_input_state_changes.clone()
     }

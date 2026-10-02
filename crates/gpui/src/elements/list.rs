@@ -77,6 +77,14 @@ impl List {
 #[derive(Clone)]
 pub struct ListState(Rc<RefCell<StateInner>>);
 
+impl crate::window::view_retention::PositionedState for RefCell<StateInner> {
+    fn translate(&self, by: Point<Pixels>) {
+        if let Some(bounds) = self.borrow_mut().last_layout_bounds.as_mut() {
+            bounds.origin += by;
+        }
+    }
+}
+
 impl std::fmt::Debug for ListState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ListState")
@@ -108,6 +116,12 @@ struct StateInner {
     /// per-item readers answer from and `version` does not cover: items can
     /// be measured without the total height changing.
     item_version: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped when the wheel scrolls the list, which the list element carries
+    /// out as it prepaints: the view drawing the list depends on this rather
+    /// than on `version`, which that prepaint bumps whenever it measures or
+    /// moves anything, and which would build the view on the frame after
+    /// every one it was built in.
+    wheel_scrolls: crate::window::view_retention::dependencies::StateVersion,
 }
 
 /// What can be read of a list's state, compared before and after a change.
@@ -536,6 +550,7 @@ impl ListState {
             height_hint_measurements: HeightHintMeasurements::default(),
             version: Default::default(),
             item_version: Default::default(),
+            wheel_scrolls: Default::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -1479,7 +1494,9 @@ impl StateInner {
         if delta.y > px(0.) {
             self.follow_state.stop_following();
         }
-        self.version.bump_if(self.observed() != observed_before);
+        let changed = self.observed() != observed_before;
+        self.version.bump_if(changed);
+        self.wheel_scrolls.bump_if(changed);
 
         if let Some(handler) = self.scroll_handler.as_mut() {
             let visible_range = Self::visible_range(&self.items, height, scroll_top);
@@ -1498,7 +1515,7 @@ impl StateInner {
             );
         }
 
-        cx.notify(current_view);
+        window.show_state_change(changed, current_view, cx);
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -2043,6 +2060,11 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
+        // A wheel scroll takes effect as the list prepaints, so the view
+        // drawing it depends on the wheel.
+        crate::window::view_retention::dependencies::note_state_read(
+            &self.state.0.borrow().wheel_scrolls,
+        );
         let layout_id = match self.sizing_behavior {
             ListSizingBehavior::Infer => {
                 let mut style = Style::default();
@@ -2188,6 +2210,7 @@ impl Element for List {
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
+        window.note_positioned_state(|| self.state.0.clone());
         // Measuring items and following the tail change what the state
         // answers; a prepaint that changed nothing must not mark it changed,
         // or every view reading the list would be built on every frame.

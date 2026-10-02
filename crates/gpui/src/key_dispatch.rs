@@ -66,7 +66,7 @@ use std::{
 /// ID of a node within `DispatchTree`. Note that these are **not** stable between frames, and so a
 /// `DispatchNodeId` should only be used with the `DispatchTree` that provided it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct DispatchNodeId(usize);
+pub(crate) struct DispatchNodeId(pub(crate) usize);
 
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
@@ -140,21 +140,69 @@ pub(crate) struct DispatchActionListener {
 }
 
 impl DispatchTree {
-    /// A hash of what decides which actions are available and bound where:
-    /// the tree's shape, its key contexts, focusable nodes and the actions
-    /// each node handles.
+    /// A hash of what decides which actions are available and bound where.
+    ///
+    /// Every question a view can ask about actions (what is available or
+    /// bound where the window is focused, or where a focus handle is, the
+    /// context stack, whether one focus handle contains another) walks the
+    /// path from the root to a focusable node, or to the root when nothing
+    /// is focused. So only those paths count: per focusable node, the key
+    /// contexts, focus ids and handled actions of it and every node above
+    /// it. Nodes no focusable node hangs off (the rows of a list scrolling,
+    /// a label appearing) change nothing a view could have asked.
     pub(crate) fn action_fingerprint(&self) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
-        let mut hasher = collections::FxHasher::default();
-        for node in &self.nodes {
-            node.parent.map(|parent| parent.0).hash(&mut hasher);
+        if self.nodes.is_empty() {
+            return 0;
+        }
+        let mut paths = FxHashMap::default();
+        let mut fingerprint = self.dispatch_path_hash(0, &mut paths);
+        for (focus_id, node_id) in &self.focusable_node_ids {
+            let mut hasher = collections::FxHasher::default();
+            focus_id.hash(&mut hasher);
+            self.dispatch_path_hash(node_id.0, &mut paths)
+                .hash(&mut hasher);
+            // Summed, since the focusable nodes come in no particular order.
+            fingerprint = fingerprint.wrapping_add(hasher.finish());
+        }
+        fingerprint
+    }
+
+    /// A hash of the path from the root to `node`, of each node's key
+    /// context, focus id and handled actions, remembering in `paths` the
+    /// hash of every node it passes.
+    fn dispatch_path_hash(&self, node: usize, paths: &mut FxHashMap<usize, u64>) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut unhashed: SmallVec<[usize; 32]> = SmallVec::new();
+        let mut hash = 0;
+        let mut current = Some(node);
+        while let Some(index) = current {
+            if let Some(&known) = paths.get(&index) {
+                hash = known;
+                break;
+            }
+            unhashed.push(index);
+            current = self
+                .nodes
+                .get(index)
+                .and_then(|node| node.parent)
+                .map(|parent| parent.0);
+        }
+        for &index in unhashed.iter().rev() {
+            let Some(node) = self.nodes.get(index) else {
+                continue;
+            };
+            let mut hasher = collections::FxHasher::default();
+            hash.hash(&mut hasher);
             node.context.hash(&mut hasher);
             node.focus_id.hash(&mut hasher);
             for listener in &node.action_listeners {
                 listener.action_type.hash(&mut hasher);
             }
+            hash = hasher.finish();
+            paths.insert(index, hash);
         }
-        hasher.finish()
+        hash
     }
 
     pub fn new(keymap: Rc<RefCell<Keymap>>, action_registry: Rc<ActionRegistry>) -> Self {
@@ -337,6 +385,77 @@ impl DispatchTree {
             old_range,
             new_range,
             contains_focus,
+        }
+    }
+
+    /// Copies the nodes `range` of `source` as [`Self::reuse_subtree`] does,
+    /// as one stretch of several: `open` holds, innermost last, the nodes of
+    /// `source` the copy is inside of, which stay open after it for what
+    /// follows to hang off. Returns whether a node copied holds `focus`.
+    pub(crate) fn copy_stretch(
+        &mut self,
+        range: Range<usize>,
+        source: &Self,
+        open: &mut Vec<DispatchNodeId>,
+        focus: Option<FocusId>,
+    ) -> bool {
+        let mut contains_focus = false;
+        for (source_node_id, source_node) in source
+            .nodes
+            .iter()
+            .enumerate()
+            .skip(range.start)
+            .take(range.len())
+        {
+            while let Some(&ancestor) = open.last() {
+                if source_node.parent == Some(ancestor) {
+                    break;
+                }
+                open.pop();
+                self.pop_node();
+            }
+            open.push(DispatchNodeId(source_node_id));
+            if source_node.focus_id.is_some() && source_node.focus_id == focus {
+                contains_focus = true;
+            }
+            self.copy_node(source_node);
+        }
+        contains_focus
+    }
+
+    /// Pushes a copy of `source`, leaving it as it was: a stretch copied for
+    /// a splice that is rolled back must not have emptied the frame it was
+    /// copied from, which the rest of the frame still reads.
+    fn copy_node(&mut self, source: &DispatchNode) {
+        self.push_node();
+        if let Some(context) = source.context.clone() {
+            self.set_key_context(context);
+        }
+        if let Some(focus_id) = source.focus_id {
+            self.set_focus_id(focus_id);
+        }
+        if let Some(view_id) = source.view_id {
+            self.set_view_id(view_id);
+        }
+        let target = self.active_node();
+        target.key_listeners = source.key_listeners.clone();
+        target.action_listeners = source.action_listeners.clone();
+        target.modifiers_changed_listeners = source.modifiers_changed_listeners.clone();
+    }
+
+    /// Closes the nodes [`Self::copy_stretch`] left open until the innermost
+    /// is `node`, or none is.
+    pub(crate) fn close_copied_to(
+        &mut self,
+        open: &mut Vec<DispatchNodeId>,
+        node: Option<DispatchNodeId>,
+    ) {
+        while let Some(&innermost) = open.last() {
+            if Some(innermost) == node {
+                break;
+            }
+            open.pop();
+            self.pop_node();
         }
     }
 

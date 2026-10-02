@@ -403,6 +403,7 @@ impl Element for &'static str {
     ) {
         measurement::fit_to_width(text_layout, bounds.size.width, window, cx);
         text_layout.prepaint(bounds, self, window.text_style().text_align);
+        text_layout.note_position(window);
         text_layout.hold_carried_lines(window);
     }
 
@@ -479,6 +480,7 @@ impl Element for SharedString {
     ) {
         measurement::fit_to_width(text_layout, bounds.size.width, window, cx);
         text_layout.prepaint(bounds, self.as_ref(), window.text_style().text_align);
+        text_layout.note_position(window);
         text_layout.hold_carried_lines(window);
     }
 
@@ -708,6 +710,7 @@ impl Element for StyledText {
         measurement::fit_to_width(&self.layout, bounds.size.width, window, cx);
         self.layout
             .prepaint(bounds, &self.text, window.text_style().text_align);
+        self.layout.note_position(window);
         self.layout.hold_carried_lines(window);
     }
 
@@ -883,6 +886,7 @@ impl Element for ShimmerText {
         measurement::fit_to_width(&self.layout, bounds.size.width, window, cx);
         self.layout
             .prepaint(bounds, &self.text, window.text_style().text_align);
+        self.layout.note_position(window);
         self.layout.hold_carried_lines(window);
     }
 
@@ -916,6 +920,16 @@ impl IntoElement for ShimmerText {
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+
+impl crate::window::view_retention::PositionedState for RefCell<Option<TextLayoutInner>> {
+    fn translate(&self, by: Point<Pixels>) {
+        if let Some(inner) = self.borrow_mut().as_mut()
+            && let Some(bounds) = inner.bounds.as_mut()
+        {
+            bounds.origin += by;
+        }
+    }
+}
 
 struct TextLayoutInner {
     text_align: TextAlign,
@@ -951,6 +965,12 @@ impl TextLayout {
         {
             window.text_system().hold_lines(&inner.lines);
         }
+    }
+
+    /// Notes that the layout holds where it was prepainted, for a view drawn
+    /// again elsewhere from the last frame to move it along.
+    fn note_position(&self, window: &mut Window) {
+        window.note_positioned_state(|| self.0.clone());
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, text_align: TextAlign) {

@@ -18,7 +18,7 @@
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
-    FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
+    FileDropEvent, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
     InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, LayoutId, LongPressEvent, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
@@ -2015,8 +2015,20 @@ impl Element for Div {
                 child_max = child_max.max(&child_bounds.bottom_right());
                 children.push(child_bounds);
             }
-            state.version.bump_if(state.child_bounds != children);
+            if state.child_bounds != children {
+                // Moved along with the element, as when it is built
+                // somewhere else, the children say the same of themselves
+                // relative to it.
+                let moved_by = bounds.origin - state.bounds.origin;
+                if translated(&state.child_bounds, &children, moved_by) {
+                    state.placement.bump();
+                } else {
+                    state.version.bump();
+                }
+            }
             state.child_bounds = children;
+            drop(state);
+            window.note_positioned_state(|| scroll_handle.0.clone());
             if request_layout.child_layout_ids.is_empty() {
                 bounds.size
             } else {
@@ -2410,7 +2422,7 @@ impl Interactivity {
                     // bottom) takes effect as this element prepaints, so the
                     // view drawing it depends on the handle.
                     crate::window::view_retention::dependencies::note_state_read(
-                        &scroll_handle_state.version,
+                        &scroll_handle_state.requests,
                     );
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
@@ -2545,10 +2557,38 @@ impl Interactivity {
                                 } else {
                                     None
                                 };
+                                // With view retention on, the group is also
+                                // found while what is inside it prepaints,
+                                // where a view nested inside compares the
+                                // groups it resolved with the last frame's.
+                                let prepaint_group = match (&self.group, &hitbox) {
+                                    (Some(group), Some(hitbox)) if cx.view_retention() => {
+                                        window
+                                            .view_retention
+                                            .prepaint_groups
+                                            .push_group(group.clone(), hitbox.id);
+                                        Some(group)
+                                    }
+                                    _ => None,
+                                };
 
                                 let scroll_offset =
                                     self.clamp_scroll_position(bounds, &style, window, cx);
+                                // Glass mode, like opacity, is applied as the
+                                // element paints, and with view retention on
+                                // also while it prepaints, for a view nested
+                                // inside to compare with the last frame's.
+                                let glass_content = window.glass_content;
+                                if let Some(glass) = style.glass_content
+                                    && cx.view_retention()
+                                {
+                                    window.glass_content = glass;
+                                }
                                 let result = f(&style, scroll_offset, hitbox, window, cx);
+                                window.glass_content = glass_content;
+                                if let Some(group) = prepaint_group {
+                                    window.view_retention.prepaint_groups.pop_group(group);
+                                }
                                 (result, element_state)
                             },
                         )
@@ -2648,11 +2688,13 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 // Views that read the handle are built again only when what
                 // they read changed; see `ScrollHandleState::version`.
-                let changed = scroll_handle_state.bounds != bounds
+                let changed = scroll_handle_state.bounds.size != bounds.size
                     || *scroll_offset != offset_before
                     || max_before != Some(scroll_max);
+                let moved = scroll_handle_state.bounds.origin != bounds.origin;
                 scroll_handle_state.bounds = bounds;
                 scroll_handle_state.version.bump_if(changed);
+                scroll_handle_state.placement.bump_if(moved);
             }
 
             *scroll_offset
@@ -2739,7 +2781,7 @@ impl Interactivity {
                                             }
 
                                             if let Some(group) = self.group.clone() {
-                                                GroupHitboxes::push(group, hitbox.id, cx);
+                                                GroupHitboxes::push(group, hitbox.id, window);
                                             }
 
                                             if let Some(area) = self.window_control {
@@ -2804,7 +2846,7 @@ impl Interactivity {
                                             );
 
                                             if let Some(group) = self.group.as_ref() {
-                                                GroupHitboxes::pop(group, cx);
+                                                GroupHitboxes::pop(group, window);
                                             }
                                         }
                                     })
@@ -3061,7 +3103,7 @@ impl Interactivity {
         }
 
         if let Some(group_hover) = self.group_hover_style.as_ref() {
-            if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
+            if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, window) {
                 let hover_state = element_state
                     .as_ref()
                     .and_then(|element| element.hover_state.as_ref())
@@ -3445,7 +3487,7 @@ impl Interactivity {
                 let active_group_hitbox = self
                     .group_active_style
                     .as_ref()
-                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
+                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, window));
                 let hitbox = hitbox.clone();
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
@@ -3515,10 +3557,10 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
-            let scroll_version = self
-                .tracked_scroll_handle
-                .as_ref()
-                .map(|handle| handle.0.borrow().version.clone());
+            let scroll_versions = self.tracked_scroll_handle.as_ref().map(|handle| {
+                let state = handle.0.borrow();
+                (state.version.clone(), state.requests.clone())
+            });
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3598,10 +3640,18 @@ impl Interactivity {
 
                     let moved = *scroll_offset != old_scroll_offset;
                     if moved {
-                        if let Some(version) = &scroll_version {
-                            version.bump();
+                        match &scroll_versions {
+                            // The view drawing the element depends on the
+                            // handle's requests, and views reading the
+                            // handle on its version: they are built without
+                            // the view being notified.
+                            Some((version, requests)) => {
+                                version.bump();
+                                requests.bump();
+                                window.show_state_change(true, current_view, cx);
+                            }
+                            None => cx.notify(current_view),
                         }
-                        cx.notify(current_view);
                     }
                     if propagate_scroll_at_bounds_only {
                         // A gesture locked to the horizontal axis stays with a horizontal
@@ -3676,7 +3726,7 @@ impl Interactivity {
         if !cx.has_active_drag() {
             if let Some(group_hover) = self.group_hover_style.as_ref() {
                 let is_group_hovered =
-                    if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
+                    if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, window) {
                         !window.last_input_was_touch() && group_hitbox_id.is_hovered(window)
                     } else if let Some(element_state) = element_state.as_ref() {
                         !window.last_input_was_touch()
@@ -3724,7 +3774,7 @@ impl Interactivity {
                 if can_drop {
                     for (state_type, group_drag_style) in &self.group_drag_over_styles {
                         if let Some(group_hitbox_id) =
-                            GroupHitboxes::get(&group_drag_style.group, cx)
+                            GroupHitboxes::get(&group_drag_style.group, window)
                             && *state_type == drag.value.as_ref().type_id()
                             && group_hitbox_id.is_hovered(window)
                         {
@@ -4276,30 +4326,66 @@ fn handle_tooltip_check_visible_and_update(
     active_tooltip.borrow().is_some()
 }
 
+/// The group containers (see [`InteractiveElement::group`]) around what is
+/// being painted, innermost last per name, which `group_hover`,
+/// `group_active` and `group_drag_over` find a group's hitbox in.
+///
+/// A scratch stack each paint fills and empties, kept by the window. It was
+/// an app global, but every push, pop and lookup of a global counts as a
+/// write to it with view retention on, which built every view with a group
+/// style again whenever any group container was painted after it. What a
+/// view resolved a group to is recorded instead; see
+/// [`crate::window::view_retention`].
 #[derive(Default)]
 pub(crate) struct GroupHitboxes(HashMap<SharedString, SmallVec<[HitboxId; 1]>>);
 
-impl Global for GroupHitboxes {}
-
 impl GroupHitboxes {
-    pub fn get(name: &SharedString, cx: &mut App) -> Option<HitboxId> {
-        cx.default_global::<Self>()
-            .0
+    /// The innermost container of each group around what is being drawn.
+    pub(crate) fn tops(&self) -> Vec<(SharedString, HitboxId)> {
+        self.0
+            .iter()
+            .filter_map(|(name, stack)| Some((name.clone(), *stack.last()?)))
+            .collect()
+    }
+
+    /// Stacks the containers `tops` names, as [`Self::tops`] gave them.
+    pub(crate) fn of_tops(tops: &[(SharedString, HitboxId)]) -> Self {
+        Self(
+            tops.iter()
+                .map(|(name, hitbox)| (name.clone(), smallvec::smallvec![*hitbox]))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn top(&self, name: &SharedString) -> Option<HitboxId> {
+        self.0
             .get(name)
             .and_then(|bounds_stack| bounds_stack.last())
-            .cloned()
+            .copied()
     }
 
-    pub fn push(name: SharedString, hitbox_id: HitboxId, cx: &mut App) {
-        cx.default_global::<Self>()
-            .0
-            .entry(name)
-            .or_default()
-            .push(hitbox_id);
+    pub(crate) fn push_group(&mut self, name: SharedString, hitbox_id: HitboxId) {
+        self.0.entry(name).or_default().push(hitbox_id);
     }
 
-    pub fn pop(name: &SharedString, cx: &mut App) {
-        cx.default_global::<Self>().0.get_mut(name).unwrap().pop();
+    pub(crate) fn pop_group(&mut self, name: &SharedString) {
+        if let Some(stack) = self.0.get_mut(name) {
+            stack.pop();
+        }
+    }
+
+    pub fn get(name: &SharedString, window: &mut Window) -> Option<HitboxId> {
+        let hitbox = window.group_hitboxes.top(name);
+        crate::window::view_retention::note_group_read(window, name, hitbox);
+        hitbox
+    }
+
+    pub fn push(name: SharedString, hitbox_id: HitboxId, window: &mut Window) {
+        window.group_hitboxes.push_group(name, hitbox_id);
+    }
+
+    pub fn pop(name: &SharedString, window: &mut Window) {
+        window.group_hitboxes.pop_group(name);
     }
 }
 
@@ -4473,6 +4559,27 @@ struct ScrollHandleState {
     /// read it is built again rather than drawn from the last frame, with
     /// view retention on.
     version: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped only when the handle is asked to scroll (to an item, to the
+    /// bottom, to an offset), which the element tracking it carries out as it
+    /// prepaints: the view drawing that element depends on this rather than
+    /// on `version`, which the element's own prepaint bumps whenever it moves
+    /// or resizes, and which would otherwise build the view on the frame
+    /// after every one it was built in somewhere else.
+    requests: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped when the element and its children only moved together, which
+    /// changes where the handle says they are in the window and nothing it
+    /// says of them relative to each other: only a view that read where they
+    /// are ([`ScrollHandle::bounds`], [`ScrollHandle::bounds_for_item`])
+    /// depends on it.
+    placement: crate::window::view_retention::dependencies::StateVersion,
+}
+
+/// Whether `now` is `before` moved by `by`, element for element.
+fn translated(before: &[Bounds<Pixels>], now: &[Bounds<Pixels>], by: Point<Pixels>) -> bool {
+    before.len() == now.len()
+        && before.iter().zip(now).all(|(before, now)| {
+            before.size == now.size && before.origin + by == now.origin
+        })
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4486,6 +4593,16 @@ enum ScrollStrategy {
     #[default]
     FirstVisible,
     Top,
+}
+
+impl crate::window::view_retention::PositionedState for RefCell<ScrollHandleState> {
+    fn translate(&self, by: Point<Pixels>) {
+        let mut state = self.borrow_mut();
+        state.bounds.origin += by;
+        for child in &mut state.child_bounds {
+            child.origin += by;
+        }
+    }
 }
 
 /// A handle to the scrollable aspects of an element.
@@ -4512,8 +4629,31 @@ impl ScrollHandle {
         *self.0.borrow().offset.borrow()
     }
 
-    fn note_read(&self) {
+    pub(crate) fn note_read(&self) {
         crate::window::view_retention::dependencies::note_state_read(&self.0.borrow().version);
+    }
+
+    /// Notes a read of where the element and its children are in the
+    /// window, which depends on where it is drawn as well.
+    fn note_placement_read(&self) {
+        let state = self.0.borrow();
+        crate::window::view_retention::dependencies::note_state_read(&state.version);
+        crate::window::view_retention::dependencies::note_state_read(&state.placement);
+    }
+
+    /// Marks what the handle answers changed, for state kept beside it (a
+    /// uniform list's item size) that its readers read through it.
+    pub(crate) fn mark_changed(&self) {
+        self.0.borrow().version.bump();
+    }
+
+    /// Marks the handle asked to scroll, as a uniform list asked to scroll
+    /// to an item is, which the element tracking it carries out as it
+    /// prepaints: the view drawing that element is built again.
+    pub(crate) fn note_scroll_request(&self) {
+        let state = self.0.borrow();
+        state.version.bump();
+        state.requests.bump();
     }
 
     /// Marks the handle changed if its offset is no longer `before`, for an
@@ -4570,15 +4710,24 @@ impl ScrollHandle {
         }
     }
 
+    /// The size of the viewport the content scrolls in. Unlike
+    /// [`Self::bounds`], it does not say where the viewport is in the window,
+    /// so with view retention on a view that read it is not built again
+    /// because the scroller moved, only when the viewport changed size.
+    pub fn viewport_size(&self) -> Size<Pixels> {
+        self.note_read();
+        self.0.borrow().bounds.size
+    }
+
     /// Return the bounds into which this child is painted
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.note_read();
+        self.note_placement_read();
         self.0.borrow().bounds
     }
 
     /// Get the bounds for a specific child.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
-        self.note_read();
+        self.note_placement_read();
         self.0.borrow().child_bounds.get(ix).cloned()
     }
 
@@ -4601,6 +4750,7 @@ impl ScrollHandle {
         });
         state.active_item = Some(item);
         state.version.bump_if(changed);
+        state.requests.bump_if(changed);
     }
 
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
@@ -4672,6 +4822,7 @@ impl ScrollHandle {
         let changed = !state.scroll_to_bottom;
         state.scroll_to_bottom = true;
         state.version.bump_if(changed);
+        state.requests.bump_if(changed);
     }
 
     /// Set the offset explicitly. The offset is the distance from the top left of the
@@ -4682,6 +4833,7 @@ impl ScrollHandle {
         let changed = *state.offset.borrow() != position;
         *state.offset.borrow_mut() = position;
         state.version.bump_if(changed);
+        state.requests.bump_if(changed);
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.

@@ -111,6 +111,17 @@ impl View for AnyView {
     fn view_type_name(&self) -> &'static str {
         (self.type_name)()
     }
+
+    fn any_view(&self) -> Option<AnyView> {
+        Some(self.clone())
+    }
+}
+
+impl AnyView {
+    /// Renders the view, as drawing it as an element does.
+    pub(crate) fn render_any(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.render)(self, window, cx)
+    }
 }
 
 impl<V: 'static + Render> IntoElement for Entity<V> {
@@ -232,6 +243,14 @@ pub trait View: 'static + Sized {
     fn view_type_name(&self) -> &'static str {
         type_name::<Self>()
     }
+
+    /// The view as an [`AnyView`], for it to be built on its own inside a
+    /// view drawn again from the last frame around it, with view retention
+    /// on. `None` for a view that can only be built by what it is in.
+    #[doc(hidden)]
+    fn any_view(&self) -> Option<AnyView> {
+        None
+    }
 }
 
 /// A stateless component (`RenderOnce`) is a `View` with no identity.
@@ -264,6 +283,10 @@ impl<T: Render> View for Entity<T> {
     fn view_type_name(&self) -> &'static str {
         type_name::<T>()
     }
+
+    fn any_view(&self) -> Option<AnyView> {
+        Some(AnyView::from(self.clone()))
+    }
 }
 
 impl<T: Render> Entity<T> {
@@ -288,6 +311,9 @@ pub struct ViewElement<V: View> {
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
     view_name: ViewName,
+    /// The view, kept as it is rendered with view retention on, for its
+    /// record to build it on its own later.
+    any_view: Option<AnyView>,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -316,6 +342,7 @@ impl<V: View> ViewElement<V> {
             entity_id,
             cached_style: None,
             view_name: ViewName::of(&view),
+            any_view: None,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -387,6 +414,9 @@ impl<V: View> Element for ViewElement<V> {
     ) -> (LayoutId, Self::RequestLayoutState) {
         if let Some(entity_id) = self.entity_id {
             // Stateful path: create a reactive boundary.
+            if cx.view_retention() {
+                self.any_view = self.view.as_ref().and_then(View::any_view);
+            }
             let view = &mut self.view;
             let mut render = |window: &mut Window, cx: &mut App| {
                 view.take().unwrap().render(window, cx).into_any_element()
@@ -472,6 +502,10 @@ impl<V: View> Element for ViewElement<V> {
                 global_id,
                 bounds,
                 layout,
+                crate::window::view_retention::ViewSource {
+                    any_view: self.any_view.take(),
+                    cached: self.cached_style.is_some(),
+                },
                 &mut render,
                 cx,
             )),

@@ -222,6 +222,81 @@ impl<'a, T: 'static> Context<'a, T> {
         self.app.notify(self.entity_state.entity_id);
     }
 
+    /// Says that this view does not depend on what it reads from `entity`,
+    /// with view retention on ([`App::set_view_retention`]): reads of
+    /// `entity` while this view, a view nested in it, or something deferred
+    /// from it is drawn are left out of what they depend on.
+    ///
+    /// Without it, a view that renders from a large host it holds a handle
+    /// to (a panel, say, that changes on every frame something in it moves)
+    /// is built on every frame the host changes, and so is every view
+    /// around it, whose dependencies include its own. With it, the view is
+    /// drawn again from the last frame however the host changes.
+    ///
+    /// # Contract
+    ///
+    /// The view takes over telling when it looks different: whenever what
+    /// it, or a view nested in it, shows from `entity` changes, the view
+    /// showing it must be notified ([`Context::notify`], or [`App::notify`]
+    /// with its id), or read a [`crate::DrawDependency`] that is marked
+    /// changed. Notifying this view does not build a nested view that is not
+    /// notified itself. It is the
+    /// contract a cached view ([`crate::Entity::cached`]) relies on without
+    /// retention: something that knows exactly when the view's part of
+    /// `entity` changed (a signature of its inputs, compared on every
+    /// render of the host) notifies it. A view that breaks it keeps showing
+    /// what it showed when it was last built.
+    ///
+    /// Everything else the view reads is still a dependency, as are writes:
+    /// a view that updates `entity` as it draws still builds the views that
+    /// read it before the write. Such a write does not keep the view in
+    /// place, though (see [`Context::set_view_movable`]): it is taken to be
+    /// bookkeeping of the build, which a view drawn again leaves out whether
+    /// it is drawn where it was or elsewhere. A view drawn again from the last frame does
+    /// not read `entity` again, so the window draws again on a notification
+    /// of `entity` only if something else in it read it: notify the view.
+    ///
+    /// Lasts for the life of the view; saying it again for the same entity
+    /// changes nothing. Reads made before the first time it is said, in the
+    /// same render, are still dependencies until the view is next built.
+    /// Without retention it does nothing.
+    pub fn untrack_reads_of<E: 'static>(&mut self, entity: &crate::Entity<E>) {
+        let view = self.entity_state.entity_id;
+        let untracked = self.app.untracked_reads.entry(view).or_default();
+        if !untracked.contains(&entity.entity_id()) {
+            untracked.push(entity.entity_id());
+        }
+    }
+
+    /// Whether this view may be drawn again from the last frame somewhere
+    /// else than where it was drawn, moved with everything it drew, with view
+    /// retention on ([`App::set_view_retention`]). Views are movable unless
+    /// they say otherwise; a view that is not is built wherever it moves, and
+    /// so is every view around it that would carry it along.
+    ///
+    /// A view drawn moved is not prepainted, so state its elements keep of
+    /// where they are is moved with it only where the framework keeps it
+    /// (scroll handles, list states, text layouts), and its mouse listeners
+    /// answer for where it was until it is built again, which the window
+    /// does before dispatching any input but a scroll wheel or a key. A view
+    /// whose prepaint or paint leaves its position anywhere else (an
+    /// `Rc<Cell<Bounds<Pixels>>>` another view reads as it renders, say)
+    /// should opt out. Writes to entities, globals and versioned state as it
+    /// draws already keep it in place, except writes to an entity it, or a
+    /// view around it, untracks ([`Context::untrack_reads_of`]).
+    pub fn set_view_movable(&mut self, movable: bool) {
+        let entity_id = self.entity_state.entity_id;
+        let changed = if movable {
+            self.app.fixed_views.remove(&entity_id)
+        } else {
+            self.app.fixed_views.insert(entity_id)
+        };
+        // Recorded as it is built, so it is built again to take effect.
+        if changed && self.app.view_retention() {
+            self.notify();
+        }
+    }
+
     /// Whether this view may be drawn again from the last frame, with view
     /// retention on ([`App::set_view_retention`]). A view that is not is
     /// built on every frame it is drawn in, though the views around and
@@ -286,6 +361,20 @@ impl<'a, T: 'static> Context<'a, T> {
         let view = self.entity();
         move |e: E, window: &mut Window, cx: &mut App| {
             view.update(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
+
+    /// [`Self::processor`] for bookkeeping done while drawing: each call
+    /// updates this entity quietly ([`crate::Entity::update_quietly`]), which,
+    /// with view retention on, is not a change to it unless it notifies. The
+    /// contract is that one: nothing another view reads may change in it.
+    pub fn quiet_processor<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut Window, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut Window, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut Window, cx: &mut App| {
+            view.update_quietly(cx, |view, cx| f(view, e, window, cx))
         }
     }
 

@@ -795,6 +795,12 @@ pub struct App {
     /// Views that opted out of being drawn again from the last frame. See
     /// [`Context::set_view_retainable`].
     pub(crate) non_retainable_views: FxHashSet<EntityId>,
+    /// Per view, the entities whose reads while it is drawn are not
+    /// dependencies. See [`Context::untrack_reads_of`].
+    pub(crate) untracked_reads: FxHashMap<EntityId, SmallVec<[EntityId; 1]>>,
+    /// Views that opted out of being drawn again moved. See
+    /// [`Context::set_view_movable`].
+    pub(crate) fixed_views: FxHashSet<EntityId>,
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
@@ -891,6 +897,8 @@ impl App {
                 globals_by_type: Default::default(),
                 dependencies: Default::default(),
                 non_retainable_views: FxHashSet::default(),
+                untracked_reads: FxHashMap::default(),
+                fixed_views: FxHashSet::default(),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
@@ -1877,6 +1885,8 @@ impl App {
                 self.window_invalidators_by_entity.remove(&entity_id);
                 self.current_window_by_entity.remove(&entity_id);
                 self.non_retainable_views.remove(&entity_id);
+                self.untracked_reads.remove(&entity_id);
+                self.fixed_views.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
                     release_callback(entity.as_mut(), self);
                 }
@@ -2160,6 +2170,7 @@ impl App {
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         self.globals_by_type
@@ -2172,6 +2183,7 @@ impl App {
     /// yet been assigned.
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
         crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         crate::window::view_retention::dependencies::note_global_presence_read::<G>(self);
@@ -2186,6 +2198,7 @@ impl App {
     /// Sets the value of the global of the given type.
     pub fn set_global<G: Global>(&mut self, global: G) {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::note_global_inserted::<G>(self);
         crate::window::view_retention::dependencies::global_changed(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
@@ -2201,6 +2214,7 @@ impl App {
     /// Remove the global of the given type from the app context. Does not notify global observers.
     pub fn remove_global<G: Global>(&mut self) -> G {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
         crate::window::view_retention::dependencies::note_global_removed::<G>(self);
         crate::window::view_retention::dependencies::global_changed(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
@@ -2242,6 +2256,7 @@ impl App {
     /// Restore the global of the given type after it is moved to the stack.
     pub(crate) fn end_global_lease<G: Global>(&mut self, lease: GlobalLease<G>) {
         let global_type = TypeId::of::<G>();
+        crate::window::view_retention::culprits::note_global_type(global_type, std::any::type_name::<G>());
 
         crate::window::view_retention::dependencies::global_written_and_read(self, global_type);
         self.push_effect(Effect::NotifyGlobalObservers { global_type });

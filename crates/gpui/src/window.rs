@@ -305,6 +305,10 @@ impl WindowInvalidator {
         );
     }
 
+    pub fn is_painting(&self) -> bool {
+        matches!(self.inner.borrow().draw_phase, DrawPhase::Paint)
+    }
+
     #[track_caller]
     pub fn debug_assert_paint_or_prepaint(&self) {
         debug_assert!(
@@ -1031,6 +1035,8 @@ pub(crate) struct DeferredDraw {
     /// The retained views it was deferred from, whose dependencies what it
     /// reads while it is drawn are.
     enclosing_views: view_retention::EnclosingViews,
+    /// The records of the retained views it drew, in its frame's records.
+    retained_records: Range<usize>,
 }
 
 pub(crate) struct Frame {
@@ -1046,6 +1052,19 @@ pub(crate) struct Frame {
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
+    /// State outside the frame that elements wrote their position into as
+    /// they prepainted (a scroll handle's bounds, a text layout's), with
+    /// view retention on, and how far each was moved with the view it was
+    /// copied with; see [`view_retention::PositionedState`].
+    pub(crate) positioned_states: Vec<(Rc<dyn view_retention::PositionedState>, Point<Pixels>)>,
+    /// The bounds elements inside retained views asked to be scrolled into
+    /// view as they prepainted (see [`Window::request_autoscroll`]). A
+    /// request is for the frame it is made in, and whatever scrolls answers
+    /// it as it prepaints, so a view that made one is built again.
+    pub(crate) autoscroll_requests: Vec<Bounds<Pixels>>,
+    /// What elements registered as they painted to be moved with the view
+    /// they were painted in (see [`Window::on_replayed_at_offset`]).
+    pub(crate) painted_positions: Vec<Rc<dyn view_retention::PositionedState>>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -1089,6 +1108,8 @@ pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
+    positioned_states_index: usize,
+    autoscroll_requests_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1105,6 +1126,7 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
+    painted_positions_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1128,6 +1150,9 @@ impl Frame {
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
+            positioned_states: Vec::new(),
+            autoscroll_requests: Vec::new(),
+            painted_positions: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -1166,6 +1191,9 @@ impl Frame {
             .window_control_hitboxes
             .clear_vec(&mut self.window_control_hitboxes);
         shrink.deferred_draws.clear_vec(&mut self.deferred_draws);
+        self.positioned_states.clear();
+        self.autoscroll_requests.clear();
+        self.painted_positions.clear();
         self.tab_stops.clear();
         self.retained_views.clear();
         self.focus = None;
@@ -1361,6 +1389,8 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// The group containers around what is being painted.
+    pub(crate) group_hitboxes: crate::GroupHitboxes,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2323,6 +2353,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            group_hitboxes: Default::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
@@ -4027,8 +4058,13 @@ impl Window {
             return;
         }
         self.next_frame.shrink_idle(&self.rendered_frame);
-        if let Some(layout_engine) = self.layout_engine.as_mut() {
-            layout_engine.reclaim_idle_capacity();
+        if let Some(layout_engine) = self.layout_engine.as_mut()
+            && layout_engine.reclaim_idle_capacity()
+        {
+            // The retained views' records name nodes of the tree just
+            // replaced; drawn again from them, a view would hand its parent
+            // a node that is gone.
+            self.rendered_frame.retained_views.forget_layouts();
         }
         cx.element_arena.borrow_mut().release_idle_chunks(now);
     }
@@ -4447,7 +4483,8 @@ impl Window {
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
-                if let Some(mut element) = element {
+                let records_start = self.retained_records_len();
+                let retained_records = if let Some(mut element) = element {
                     self.prepainting_deferred_draw_beneath_native_surfaces =
                         Some(beneath_native_surfaces);
                     let recording = self.begin_deferred_view(&enclosing_views, cx);
@@ -4461,12 +4498,18 @@ impl Window {
                     self.finish_deferred_view(recording, cx);
                     self.prepainting_deferred_draw_beneath_native_surfaces = None;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
+                    records_start..self.retained_records_len()
                 } else {
-                    self.reuse_prepaint(prepaint_range);
-                }
+                    self.reuse_prepaint(prepaint_range.clone());
+                    let records = self.next_frame.deferred_draws[deferred_draw_ix]
+                        .retained_records
+                        .clone();
+                    self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
+                };
                 let prepaint_end = self.prepaint_index();
-                self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
-                    prepaint_start..prepaint_end;
+                let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
+                deferred_draw.prepaint_range = prepaint_start..prepaint_end;
+                deferred_draw.retained_records = retained_records;
             }
 
             self.element_id_stack.clear();
@@ -4515,6 +4558,10 @@ impl Window {
                 self.finish_deferred_view(recording, cx);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
+                let records = deferred_draw.retained_records.clone();
+                let painted_from = deferred_draw.paint_range.start.clone();
+                self.paint_deferred_records(records, &painted_from, &paint_start);
+                deferred_draw = &mut deferred_draws[deferred_draw_ix];
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -4541,6 +4588,8 @@ impl Window {
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
+            positioned_states_index: self.next_frame.positioned_states.len(),
+            autoscroll_requests_index: self.next_frame.autoscroll_requests.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
@@ -4548,11 +4597,26 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .cloned(),
-        );
+        self.reuse_prepaint_moved(range, None);
+    }
+
+    /// Reuses `range` of the last frame's prepaint, as
+    /// [`Self::reuse_prepaint`] does, `moved` as a view drawn again elsewhere
+    /// is: see [`view_retention::moving`]. A range moved defers nothing.
+    pub(crate) fn reuse_prepaint_moved(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        moved: Option<&view_retention::ViewMove>,
+    ) {
+        let hitboxes =
+            &self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index];
+        match moved {
+            Some(moved) => self
+                .next_frame
+                .hitboxes
+                .extend(hitboxes.iter().map(|hitbox| moved.hitbox(hitbox))),
+            None => self.next_frame.hitboxes.extend(hitboxes.iter().cloned()),
+        }
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -4567,6 +4631,24 @@ impl Window {
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        // Copied so the ranges of the records copied along stay in step; a
+        // view that asked to be scrolled into view is not drawn again.
+        self.next_frame.autoscroll_requests.extend_from_slice(
+            &self.rendered_frame.autoscroll_requests
+                [range.start.autoscroll_requests_index..range.end.autoscroll_requests_index],
+        );
+        let moved_by = moved.map_or(Point::default(), |moved| moved.delta);
+        self.next_frame.positioned_states.extend(
+            self.rendered_frame.positioned_states
+                [range.start.positioned_states_index..range.end.positioned_states_index]
+                .iter()
+                .map(|(state, _)| {
+                    if moved_by != Point::default() {
+                        state.translate(moved_by);
+                    }
+                    (state.clone(), moved_by)
+                }),
+        );
 
         let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
             range.start.dispatch_tree_index..range.end.dispatch_tree_index,
@@ -4598,6 +4680,7 @@ impl Window {
                     // Drawn from the last frame: what it read is part of the
                     // records copied along with the views it came from.
                     enclosing_views: Default::default(),
+                    retained_records: deferred_draw.retained_records.clone(),
                 }),
         );
     }
@@ -4613,34 +4696,50 @@ impl Window {
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
+            painted_positions_index: self.next_frame.painted_positions.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
-        self.reuse_paint_inside(range, None);
+        self.reuse_paint_inside(range, None, None);
     }
 
     /// Reuses `range` of the last frame's paint, as [`Self::reuse_paint`]
     /// does, rebasing its primitives from the time transition they were
-    /// painted inside to the one current now; see [`Scene::replay_inside`].
-    pub(crate) fn reuse_paint_rebased(
+    /// painted inside to the one current now (see [`Scene::replay_inside`]),
+    /// and `moved` as a view drawn again elsewhere is (see
+    /// [`view_retention::moving`]). Mouse listeners are copied as they are; a
+    /// range moved holds no input handler.
+    pub(crate) fn reuse_paint_moved(
         &mut self,
         range: Range<PaintIndex>,
         painted_inside: u32,
         replayed_inside: u32,
+        moved: Option<&view_retention::ViewMove>,
     ) {
-        self.reuse_paint_inside(range, Some((painted_inside, replayed_inside)));
+        self.reuse_paint_inside(range, Some((painted_inside, replayed_inside)), moved);
     }
 
-    fn reuse_paint_inside(&mut self, range: Range<PaintIndex>, rebase: Option<(u32, u32)>) {
+    fn reuse_paint_inside(
+        &mut self,
+        range: Range<PaintIndex>,
+        rebase: Option<(u32, u32)>,
+        moved: Option<&view_retention::ViewMove>,
+    ) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
             [range.start.debug_bounds_index..range.end.debug_bounds_index]
         {
-            self.next_frame
-                .record_debug_bounds(selector.clone(), *bounds);
+            let bounds = match moved {
+                Some(moved) => Bounds {
+                    origin: bounds.origin + moved.delta,
+                    size: bounds.size,
+                },
+                None => *bounds,
+            };
+            self.next_frame.record_debug_bounds(selector.clone(), bounds);
         }
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -4655,7 +4754,10 @@ impl Window {
             self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
                 ..range.end.window_control_hitboxes_index]
                 .iter()
-                .cloned(),
+                .map(|(area, hitbox)| match moved {
+                    Some(moved) => (*area, moved.hitbox(hitbox)),
+                    None => (*area, hitbox.clone()),
+                }),
         );
         self.next_frame.input_handlers.extend(
             self.rendered_frame.input_handlers
@@ -4682,10 +4784,24 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        let moved_by = moved.map_or(Point::default(), |moved| moved.delta);
+        self.next_frame.painted_positions.extend(
+            self.rendered_frame.painted_positions
+                [range.start.painted_positions_index..range.end.painted_positions_index]
+                .iter()
+                .map(|state| {
+                    if moved_by != Point::default() {
+                        state.translate(moved_by);
+                    }
+                    state.clone()
+                }),
+        );
+        let moved = moved.map(|moved| moved.scaled(self));
         self.next_frame.scene.replay_inside(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
             rebase,
+            moved.as_ref(),
         );
     }
 
@@ -4921,6 +5037,17 @@ impl Window {
             engine.end_transaction(start, result.is_err());
         }
         if result.is_err() {
+            self.truncate_prepaint(&index);
+            // The retained views recorded since point into what was truncated.
+            self.roll_back_retained_transaction(retained_transaction);
+        }
+        result
+    }
+
+    /// Forgets what was prepainted since `index`, as a rolled-back
+    /// transaction does.
+    pub(crate) fn truncate_prepaint(&mut self, index: &PrepaintStateIndex) {
+        {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
             self.next_frame
                 .tooltip_requests
@@ -4929,16 +5056,27 @@ impl Window {
                 .deferred_draws
                 .truncate(index.deferred_draws_index);
             self.next_frame
+                .autoscroll_requests
+                .truncate(index.autoscroll_requests_index);
+            // Positions moved with a view drawn again elsewhere are moved
+            // back: the prepaint tried again may move it by another amount.
+            for (state, moved_by) in self
+                .next_frame
+                .positioned_states
+                .drain(index.positioned_states_index..)
+            {
+                if moved_by != Point::default() {
+                    state.translate(-moved_by);
+                }
+            }
+            self.next_frame
                 .dispatch_tree
                 .truncate(index.dispatch_tree_index);
             self.next_frame
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
-            self.text_system.truncate_layouts(index.line_layout_index);
-            // The retained views recorded since point into what was truncated.
-            self.roll_back_retained_transaction(retained_transaction);
+            self.text_system.truncate_layouts(index.line_layout_index.clone());
         }
-        result
     }
 
     /// When you call this method during [`Element::prepaint`], containing elements will attempt to
@@ -4949,6 +5087,9 @@ impl Window {
     pub fn request_autoscroll(&mut self, bounds: Bounds<Pixels>) {
         self.invalidator.debug_assert_prepaint();
         self.requested_autoscroll = Some(bounds);
+        if !self.view_retention.view_stack_is_empty() {
+            self.next_frame.autoscroll_requests.push(bounds);
+        }
     }
 
     /// This method can be called from a containing element such as [`crate::List`] to support the autoscroll behavior
@@ -5251,6 +5392,7 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             enclosing_views: self.enclosing_views(),
+            retained_records: 0..0,
         });
     }
 
@@ -5265,9 +5407,14 @@ impl Window {
         let content_mask = self.content_mask();
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
+            let scale_factor = self.scale_factor();
+            let covered = self.cover_bounds(clipped_bounds);
+            // The mask as primitives keep theirs, so that a move tells the
+            // mask around what moved from the masks inside it alike.
+            let mask = self.snapped_content_mask().bounds;
             self.next_frame
                 .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+                .push_clipped_layer(covered, bounds.scale(scale_factor), mask);
         }
 
         let result = f(self);
@@ -6066,6 +6213,9 @@ impl Window {
         let layout_started_at = self.draw_clock.begin_layout();
         let started_at = self.frame_work.clock();
         let mut layout_engine = self.layout_engine.take().unwrap();
+        if cx.view_retention() {
+            layout_engine.note_root_space(layout_id, available_space);
+        }
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
         self.frame_work.stats.compute_layout_calls += 1;
@@ -6547,6 +6697,16 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
         ambient_before.stamp_changes(self, cx);
+
+        // Views drawn again moved since they were built still have their
+        // mouse listeners answer for where they were: they are built before
+        // anything but a wheel or a key reaches them.
+        if !matches!(
+            event,
+            PlatformInput::ScrollWheel(_) | PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_)
+        ) {
+            self.settle_moved_views(cx);
+        }
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);

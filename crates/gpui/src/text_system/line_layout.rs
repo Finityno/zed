@@ -645,6 +645,13 @@ impl LineLayoutCache {
         )
     }
 
+    /// Puts back counts [`Self::shaping_stats`] gave earlier.
+    pub(crate) fn restore_shaping_stats(&self, (lines, time): (u64, Duration)) {
+        self.lines_shaped.store(lines, Ordering::Relaxed);
+        self.shape_nanos
+            .store(time.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn reset_shaping_stats(&self, timed: bool) {
         self.lines_shaped.store(0, Ordering::Relaxed);
         self.shape_nanos.store(0, Ordering::Relaxed);

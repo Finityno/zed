@@ -42,6 +42,11 @@ pub(crate) struct LayoutRetention {
     /// was last stretched in. Compared against the stretched style, every
     /// request would differ and dirty the root.
     unstretched_styles: FxHashMap<LayoutId, (taffy::style::Style, u64)>,
+    /// The space each tree laid out on its own (a list item) was last laid
+    /// out in, while views are retained, for a view built again at the
+    /// layout it kept to lay its tree out again in. See
+    /// [`TaffyLayoutEngine::root_space`].
+    root_spaces: FxHashMap<LayoutId, Size<AvailableSpace>>,
     frame: u64,
     /// Retained nodes claimed this frame. When every retained node was, the
     /// end of the frame has nothing to sweep.
@@ -269,6 +274,7 @@ impl LayoutRetention {
         self.retained = FxHashMap::default();
         self.transient = Vec::new();
         self.unstretched_styles = FxHashMap::default();
+        self.root_spaces = FxHashMap::default();
         self.transaction_claims = Vec::new();
         self.claimed_keys = Vec::new();
         self.claimed_this_frame = 0;
@@ -340,17 +346,27 @@ impl TaffyLayoutEngine {
     /// still kept and not yet claimed this frame; otherwise claims none. For
     /// a view laid out as it was last frame without being built, whose
     /// layout stands only if all of its nodes, and its nested views', do.
-    pub(crate) fn try_keep_retained_sets(&mut self, key_sets: &[&[u64]]) -> bool {
+    ///
+    /// `root` is the node the first set's layout was rooted at: it has to be
+    /// one of that set's nodes still, as it is unless its key was released
+    /// and made again since (the tree was rebuilt while the window was idle,
+    /// or a rolled-back transaction made it and handed it back).
+    pub(crate) fn try_keep_retained_sets(&mut self, key_sets: &[&[u64]], root: LayoutId) -> bool {
         let retention = &self.retention;
         let frame = retention.frame;
-        let all_kept = key_sets.iter().all(|keys| {
-            keys.iter().all(|key| {
-                retention
-                    .retained
-                    .get(key)
-                    .is_some_and(|node| node.claimed_in_frame != frame)
-            })
+        let root_kept = key_sets.first().is_some_and(|keys| {
+            keys.iter()
+                .any(|key| retention.retained.get(key).is_some_and(|node| node.id == root))
         });
+        let all_kept = root_kept
+            && key_sets.iter().all(|keys| {
+                keys.iter().all(|key| {
+                    retention
+                        .retained
+                        .get(key)
+                        .is_some_and(|node| node.claimed_in_frame != frame)
+                })
+            });
         if all_kept {
             for keys in key_sets {
                 self.keep_retained(keys);
@@ -380,6 +396,20 @@ impl TaffyLayoutEngine {
     pub(crate) fn layout_writes(&self) -> u64 {
         let counts = &self.retention.counts;
         counts.style_writes + counts.children_writes + counts.nodes_created + counts.measured_nodes_dirtied
+    }
+
+    /// Notes that `id` is being laid out as the root of a tree in
+    /// `available_space`.
+    pub(crate) fn note_root_space(&mut self, id: LayoutId, available_space: Size<AvailableSpace>) {
+        self.retention.root_spaces.insert(id, available_space);
+    }
+
+    /// The space the tree rooted at `id` was last laid out in, if `id` is
+    /// still the root of a tree and was laid out as one while views were
+    /// retained.
+    pub(crate) fn root_space(&self, id: LayoutId) -> Option<Size<AvailableSpace>> {
+        let space = *self.retention.root_spaces.get(&id)?;
+        self.taffy.parent(id.into()).is_none().then_some(space)
     }
 
     /// How many nodes made this frame will be released at its end, having no
@@ -837,10 +867,15 @@ impl TaffyLayoutEngine {
             retention.counts.nodes_released += retention.transient.len() as u64;
             retention.transient.clear();
             retention.unstretched_styles.clear();
+            retention.root_spaces.clear();
             self.taffy.clear();
         } else {
+            let forget_spaces = !retention.root_spaces.is_empty();
             for id in retention.transient.drain(..) {
                 retention.unstretched_styles.remove(&id);
+                if forget_spaces {
+                    retention.root_spaces.remove(&id);
+                }
                 remove_node(&mut self.taffy, id);
                 retention.counts.nodes_released += 1;
             }
@@ -848,12 +883,16 @@ impl TaffyLayoutEngine {
                 let frame = retention.frame;
                 let taffy = &mut self.taffy;
                 let unstretched_styles = &mut retention.unstretched_styles;
+                let root_spaces = &mut retention.root_spaces;
                 let released = &mut retention.counts.nodes_released;
                 retention.retained.retain(|_, node| {
                     if node.claimed_in_frame == frame {
                         return true;
                     }
                     unstretched_styles.remove(&node.id);
+                    if forget_spaces {
+                        root_spaces.remove(&node.id);
+                    }
                     remove_node(taffy, node.id);
                     *released += 1;
                     false
@@ -886,6 +925,40 @@ impl TaffyLayoutEngine {
     /// keeping the style the element asked for aside: a stretched `auto` looks
     /// exactly like an explicit length, and the next frame has to compare its
     /// request against the request, not against the stretch.
+    /// Lays the tree rooted at `id`, which may be a child in another tree,
+    /// out on its own at exactly `size`, the size its parent gave it, and
+    /// gives the node back the style it was asked for. Laid out on its own
+    /// with only the space it had, a node its parent stretched or grew would
+    /// shrink to what it asks for itself.
+    pub(crate) fn lay_out_at_size(
+        &mut self,
+        id: LayoutId,
+        size: Size<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scale_factor = window.scale_factor();
+        let requested = self.taffy.style(id.into()).expect(EXPECT_MESSAGE).clone();
+        let mut fixed = requested.clone();
+        let width = taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
+        let height =
+            taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
+        fixed.size = taffy::geometry::Size { width, height };
+        fixed.min_size = fixed.size;
+        fixed.max_size = fixed.size;
+        self.taffy
+            .set_style(id.into(), fixed)
+            .expect(EXPECT_MESSAGE);
+        self.compute_layout(id, size.map(AvailableSpace::Definite), window, cx);
+        // The node holds the layout worked out at that size until it is next
+        // laid out; its style is what was asked for, so the next request of
+        // it writes nothing, and it is laid out again then.
+        self.taffy
+            .set_style(id.into(), requested)
+            .expect(EXPECT_MESSAGE);
+        dirty_ancestors(&mut self.taffy, id);
+    }
+
     pub(crate) fn stretch_retained_auto_size_to_fill(
         &mut self,
         id: LayoutId,

@@ -39,6 +39,11 @@ pub struct TaffyLayoutEngine {
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
+    /// Nodes laid out this frame as the root of a tree while they are a
+    /// child in another, as a view built at its bounds is: Taffy placed
+    /// them at the origin, and the element offset they are prepainted at
+    /// places them, so their bounds do not add their parents' origins.
+    detached_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
     /// Nodes the last cleared frame held, and the most any frame has held
     /// since the tree was last built. `TaffyTree::clear` empties its node
@@ -61,6 +66,7 @@ impl TaffyLayoutEngine {
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
+            detached_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             last_frame_node_count: 0,
             node_high_water: 0,
@@ -78,6 +84,7 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.detached_layouts.clear();
     }
 
     /// Rebuilds the cleared tree at twice the last frame's node count, for a
@@ -121,6 +128,10 @@ impl TaffyLayoutEngine {
     /// The retained layout work done since the last [`Self::reset_retention_counts`].
     pub(crate) fn retention_counts(&self) -> RetentionCounts {
         self.retention.counts
+    }
+
+    pub(crate) fn restore_retention_counts(&mut self, counts: RetentionCounts) {
+        self.retention.counts = counts;
     }
 
     pub(crate) fn reset_retention_counts(&mut self) {
@@ -214,7 +225,14 @@ impl TaffyLayoutEngine {
         // }
         //
 
-        if !self.computed_layouts.insert(id) {
+        // A node laid out on its own while it is a child in another tree
+        // was, or will be, placed in that tree too: what was worked out of
+        // its bounds there no longer holds, nor do its descendants'.
+        let detached = self.taffy.parent(id.0).is_some();
+        if detached {
+            self.detached_layouts.insert(id);
+        }
+        if !self.computed_layouts.insert(id) || detached {
             let stack = &mut self.layout_bounds_scratch_space;
             stack.push(id);
             while let Some(id) = stack.pop() {
@@ -230,6 +248,32 @@ impl TaffyLayoutEngine {
             }
         }
 
+        self.run_layout(id, available_space, window, cx);
+    }
+
+    /// Lays the tree rooted at `id` out again in `available_space`, after
+    /// something in it was written to, forgetting every absolute bounds
+    /// worked out this frame rather than walking the tree for its own.
+    pub(crate) fn lay_out_again(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.computed_layouts.insert(id);
+        self.forget_layout_bounds();
+        self.run_layout(id, available_space, window, cx);
+    }
+
+    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
+    fn run_layout(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let scale_factor = window.scale_factor();
 
         let transform = |v: AvailableSpace| match v {
@@ -360,6 +404,34 @@ impl TaffyLayoutEngine {
     // snapped independently, but the raw content-box origin can carry a
     // 1dp residual into descendants.
 
+    /// Forgets the absolute bounds worked out this frame. A node laid out
+    /// again as a root (a list item) for the first time in a frame keeps
+    /// what was worked out for it before, which is out of date once layout
+    /// requests made since were rolled back and asked again.
+    pub(crate) fn forget_layout_bounds(&mut self) {
+        self.absolute_layout_bounds.clear();
+        self.absolute_outer_origins.clear();
+    }
+
+    /// Whether the node's layout is out of date: something in it changed
+    /// since its layout was last computed, as for a tree laid out on its own
+    /// (a list item) that nothing laid out again since.
+    pub(crate) fn needs_layout(&self, id: LayoutId) -> bool {
+        self.taffy.dirty(id.into()).unwrap_or(true)
+    }
+
+    /// Where Taffy last placed the node, in device pixels and unrounded:
+    /// its location and size.
+    pub(crate) fn laid_out_at(&self, id: LayoutId) -> [f32; 4] {
+        let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
+        [
+            layout.location.x,
+            layout.location.y,
+            layout.size.width,
+            layout.size.height,
+        ]
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;
@@ -368,7 +440,14 @@ impl TaffyLayoutEngine {
         let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
         let layout_location = layout.location;
         let layout_size = layout.size;
-        let parent = self.taffy.parent(id.0);
+        // Laid out on its own, it is placed by the element offset it is
+        // prepainted at alone; adding its parents' origins would place it
+        // twice.
+        let parent = if !self.detached_layouts.is_empty() && self.detached_layouts.contains(&id) {
+            None
+        } else {
+            self.taffy.parent(id.0)
+        };
 
         let absolute_outer_origin = match parent {
             Some(parent_id) => {

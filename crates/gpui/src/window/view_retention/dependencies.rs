@@ -14,6 +14,7 @@ use collections::{FxHashMap, FxHashSet, TypeIdHashMap};
 use std::{
     any::TypeId,
     cell::{Cell, RefCell},
+    ops::Range,
     rc::Rc,
     time::Instant,
 };
@@ -33,6 +34,42 @@ pub(crate) struct AppDependencies {
     /// generation it was read at, pointer and modifier reads included (see
     /// [`ambient`]).
     global_read_log: Rc<RefCell<Vec<(TypeId, u64)>>>,
+    /// Where the recordings nested in the ones open, and the dependencies
+    /// replayed inside them, put their reads in the logs, in order: what a
+    /// view read itself leaves them out.
+    nested: Vec<Stretch>,
+}
+
+/// Where a recording, or a replay, put its reads in the logs.
+#[derive(Clone)]
+struct Stretch {
+    entities: Range<usize>,
+    globals: Range<usize>,
+    states: Range<usize>,
+    deadlines: Range<usize>,
+}
+
+/// The entries of `log[range]` outside the `nested` stretches of it that
+/// `of` picks, which follow one another.
+fn outside<T: Clone>(
+    log: &[T],
+    range: Range<usize>,
+    nested: &[Stretch],
+    of: impl Fn(&Stretch) -> Range<usize>,
+) -> Vec<T> {
+    let mut own = Vec::new();
+    let mut from = range.start;
+    for stretch in nested {
+        let stretch = of(stretch);
+        if stretch.start > from {
+            own.extend_from_slice(&log[from..stretch.start.min(range.end)]);
+        }
+        from = from.max(stretch.end);
+    }
+    if from < range.end {
+        own.extend_from_slice(&log[from..range.end]);
+    }
+    own
 }
 
 impl AppDependencies {
@@ -79,8 +116,11 @@ pub(crate) fn global_changed(cx: &mut App, global_type: TypeId) {
     if !log.enabled {
         return;
     }
-    if log.recording() {
+    let drawing = log.recording();
+    super::culprits::note_global_change(global_type, drawing);
+    if drawing {
         log.write_generation += 1;
+        log.pinning_writes += 1;
         cx.dependencies
             .global_written_at
             .insert(global_type, log.write_generation);
@@ -144,6 +184,7 @@ pub(crate) fn ambient_changed<T: 'static>(cx: &mut App) {
 pub(crate) struct AmbientReads {
     globals: Rc<RefCell<Vec<(TypeId, u64)>>>,
     recordings: Rc<Cell<usize>>,
+    untracked: Rc<RefCell<Vec<EntityId>>>,
 }
 
 impl AmbientReads {
@@ -154,6 +195,11 @@ impl AmbientReads {
         if self.recordings.get() > 0 {
             self.globals.borrow_mut().push((TypeId::of::<T>(), 0));
         }
+    }
+
+    /// The entities whose reads are left out of the recordings now.
+    pub(crate) fn untracked(&self) -> smallvec::SmallVec<[EntityId; 2]> {
+        self.untracked.borrow().iter().copied().collect()
     }
 }
 
@@ -195,6 +241,7 @@ thread_local! {
     /// while a window draws, one window at a time.
     static STATE_READS: RefCell<Vec<(StateVersion, u64)>> = const { RefCell::new(Vec::new()) };
     static STATE_RECORDINGS: Cell<usize> = const { Cell::new(0) };
+
     /// The times views said they would look different at, while a recording
     /// is open. See [`crate::Window::rebuild_at`].
     static DEADLINES: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
@@ -279,6 +326,10 @@ pub(crate) struct EntityAccessLog {
     /// Whether view retention is on in the app, which is what these stamps
     /// and logs are for.
     pub(crate) enabled: bool,
+    /// Entities whose reads are left out of every recording while the views
+    /// that said so (see [`crate::Context::untrack_reads_of`]) are drawn,
+    /// innermost last.
+    untracked: Rc<RefCell<Vec<EntityId>>>,
     /// Every entity accessed while a recording is open, in order and with
     /// repeats, with the write generation it was accessed at.
     access_log: RefCell<Vec<(EntityId, u64)>>,
@@ -295,6 +346,11 @@ pub(crate) struct EntityAccessLog {
     /// the window draws.
     write_generation: u64,
     written_at: FxHashMap<EntityId, u64>,
+    /// Counts the writes while the window draws that keep the view drawing
+    /// them in place (see `stays_put`): all of them but writes to an entity
+    /// the views being drawn said they do not depend on, which a view drawn
+    /// again, where it was or elsewhere, leaves out all the same.
+    pinning_writes: u64,
     /// The entity the framework is about to lease to render it, which is not
     /// a write to it.
     rendering: Option<EntityId>,
@@ -314,6 +370,24 @@ impl EntityAccessLog {
         self.recordings.get() > 0
     }
 
+    /// Leaves reads of `entities` out of the recordings until popped,
+    /// returning how many to pop.
+    pub(crate) fn push_untracked(&self, entities: &[EntityId]) -> usize {
+        if !self.enabled || entities.is_empty() {
+            return 0;
+        }
+        self.untracked.borrow_mut().extend_from_slice(entities);
+        entities.len()
+    }
+
+    pub(crate) fn pop_untracked(&self, count: usize) {
+        if count > 0 {
+            let mut untracked = self.untracked.borrow_mut();
+            let keep = untracked.len().saturating_sub(count);
+            untracked.truncate(keep);
+        }
+    }
+
     fn stamp_changed(&mut self, entity_id: EntityId) {
         self.update_generation += 1;
         self.changed_at.insert(entity_id, self.update_generation);
@@ -331,6 +405,7 @@ impl EntityAccessLog {
 
     /// Forgets a released entity.
     pub(crate) fn forget(&mut self, entity_id: EntityId) {
+        super::culprits::forget(entity_id);
         if self.enabled {
             self.updated_at.remove(&entity_id);
             self.written_at.remove(&entity_id);
@@ -369,6 +444,11 @@ impl EntityMap {
     pub(crate) fn write_generation(&self) -> u64 {
         self.access_log.write_generation
     }
+
+    /// See `EntityAccessLog::pinning_writes`.
+    pub(crate) fn pinning_writes(&self) -> u64 {
+        self.access_log.pinning_writes
+    }
 }
 
 /// Records that `entity_id` was accessed.
@@ -376,6 +456,13 @@ impl EntityMap {
 pub(crate) fn note_access(entities: &EntityMap, entity_id: EntityId) {
     let log = &entities.access_log;
     if log.recordings.get() > 0 {
+        if log
+            .untracked
+            .try_borrow()
+            .is_ok_and(|untracked| !untracked.is_empty() && untracked.contains(&entity_id))
+        {
+            return;
+        }
         let mut accesses = log.access_log.borrow_mut();
         // A view reads the same entity many times in a row as it renders.
         if accesses.len() > log.boundary.get()
@@ -405,6 +492,7 @@ pub(crate) fn note_notify(entities: &mut EntityMap, entity_id: EntityId) {
         || log.recordings.get() > 0
         || log.queried.is_some()
     {
+        super::culprits::note_entity_change(entity_id, "notified");
         log.stamp_changed(entity_id);
     }
 }
@@ -429,10 +517,19 @@ pub(crate) fn note_update(entities: &mut EntityMap, entity_id: EntityId) {
             log.rendering = None;
         } else if log.queried != Some(entity_id) {
             if log.recordings.get() == 0 {
+                super::culprits::note_entity_change(entity_id, "updated");
                 log.update_generation += 1;
                 log.updated_at.insert(entity_id, log.update_generation);
                 log.updated_unnotified.insert(entity_id);
             } else {
+                let untracked = log
+                    .untracked
+                    .try_borrow()
+                    .is_ok_and(|untracked| untracked.contains(&entity_id));
+                if !untracked {
+                    log.pinning_writes += 1;
+                    super::culprits::note_entity_change(entity_id, "written while drawing");
+                }
                 log.write_generation += 1;
                 log.written_at.insert(entity_id, log.write_generation);
             }
@@ -479,6 +576,16 @@ pub(crate) struct DependencyRecording {
     deadlines: usize,
     generation: u64,
     updates: u64,
+    /// Where its nested stretches begin in [`AppDependencies::nested`].
+    nested: usize,
+}
+
+/// What a recording saw: everything read while it was open, and what was
+/// read outside the recordings nested in it and the dependencies replayed
+/// in it, which is what the view it recorded read itself.
+pub(crate) struct Recorded {
+    pub(crate) all: RenderDependencies,
+    pub(crate) own: RenderDependencies,
 }
 
 /// What a view read while it was drawn.
@@ -587,6 +694,7 @@ impl App {
         AmbientReads {
             globals: self.dependencies.global_read_log.clone(),
             recordings: self.entities.access_log.recordings.clone(),
+            untracked: self.entities.access_log.untracked.clone(),
         }
     }
 
@@ -605,6 +713,7 @@ impl App {
             deadlines: DEADLINES.with_borrow(Vec::len),
             generation: self.dependencies.global_generation,
             updates: log.update_generation,
+            nested: self.dependencies.nested.len(),
         }
     }
 
@@ -612,46 +721,87 @@ impl App {
     pub(crate) fn finish_recording_dependencies(
         &mut self,
         recording: DependencyRecording,
-    ) -> RenderDependencies {
-        let entities = {
-            let mut accesses = self.entities.access_log.access_log.borrow()[recording.entities..]
-                .to_vec();
-            earliest_reads(&mut accesses);
-            accesses.into()
+    ) -> Recorded {
+        let entity_log = self.entities.access_log.access_log.borrow();
+        let global_log = self.dependencies.global_read_log.borrow();
+        let stretch = Stretch {
+            entities: recording.entities..entity_log.len(),
+            globals: recording.globals..global_log.len(),
+            states: recording.states..STATE_READS.with_borrow(Vec::len),
+            deadlines: recording.deadlines..DEADLINES.with_borrow(Vec::len),
         };
-        let globals = {
-            let mut reads = self.dependencies.global_read_log.borrow()[recording.globals..].to_vec();
-            earliest_reads(&mut reads);
-            reads.into()
+        let nested = &self.dependencies.nested[recording.nested.min(self.dependencies.nested.len())..];
+        let reads = |entities: Vec<(EntityId, u64)>,
+                     globals: Vec<(TypeId, u64)>,
+                     states: &[(StateVersion, u64)],
+                     deadlines: &[Instant]| {
+            let mut entities = entities;
+            earliest_reads(&mut entities);
+            let mut globals = globals;
+            earliest_reads(&mut globals);
+            RenderDependencies {
+                entities: entities.into(),
+                globals: globals.into(),
+                states: unique_states(states),
+                rebuild_at: deadlines.iter().copied().min(),
+                // As of when the recording began, so that a global written
+                // while it was open, after being read, counts as changed.
+                generation: recording.generation,
+                updates: recording.updates,
+                floor: 0,
+            }
         };
-        let states = STATE_READS.with_borrow(|reads| unique_states(&reads[recording.states..]));
-        let rebuild_at = DEADLINES.with_borrow(|deadlines| {
-            deadlines[recording.deadlines..].iter().copied().min()
+        let all = STATE_READS.with_borrow(|states| {
+            DEADLINES.with_borrow(|deadlines| {
+                reads(
+                    entity_log[stretch.entities.clone()].to_vec(),
+                    global_log[stretch.globals.clone()].to_vec(),
+                    &states[stretch.states.clone()],
+                    &deadlines[stretch.deadlines.clone()],
+                )
+            })
         });
+        let own = if nested.is_empty() {
+            all.clone()
+        } else {
+            STATE_READS.with_borrow(|states| {
+                DEADLINES.with_borrow(|deadlines| {
+                    reads(
+                        outside(&entity_log, stretch.entities.clone(), nested, |s| {
+                            s.entities.clone()
+                        }),
+                        outside(&global_log, stretch.globals.clone(), nested, |s| {
+                            s.globals.clone()
+                        }),
+                        &outside(states, stretch.states.clone(), nested, |s| s.states.clone()),
+                        &outside(deadlines, stretch.deadlines.clone(), nested, |s| {
+                            s.deadlines.clone()
+                        }),
+                    )
+                })
+            })
+        };
+        drop(entity_log);
+        drop(global_log);
 
         let log = &mut self.entities.access_log;
         let open = log.recordings.get() - 1;
         log.recordings.set(open);
         STATE_RECORDINGS.with(|recordings| recordings.set(recordings.get() - 1));
+        let nested = &mut self.dependencies.nested;
+        nested.truncate(recording.nested);
         if open == 0 {
             log.access_log.get_mut().clear();
             self.dependencies.global_read_log.borrow_mut().clear();
             STATE_READS.with_borrow_mut(Vec::clear);
             DEADLINES.with_borrow_mut(Vec::clear);
+            nested.clear();
+        } else {
+            nested.push(stretch);
         }
         self.entities.mark_access_boundary();
 
-        RenderDependencies {
-            entities,
-            globals,
-            states,
-            rebuild_at,
-            // As of when the recording began, so that a global written while
-            // it was open, after being read, counts as changed.
-            generation: recording.generation,
-            updates: recording.updates,
-            floor: 0,
-        }
+        Recorded { all, own }
     }
 
     /// Reads `dependencies` again, as a view drawn again from them does: the
@@ -665,6 +815,12 @@ impl App {
         }
         if recording {
             let floor = dependencies.floor;
+            let start = Stretch {
+                entities: self.entities.access_log.access_log.get_mut().len()..0,
+                globals: self.dependencies.global_read_log.borrow().len()..0,
+                states: STATE_READS.with_borrow(Vec::len)..0,
+                deadlines: DEADLINES.with_borrow(Vec::len)..0,
+            };
             self.entities.access_log.access_log.get_mut().extend(
                 dependencies
                     .entities
@@ -681,8 +837,42 @@ impl App {
             if let Some(deadline) = dependencies.rebuild_at {
                 DEADLINES.with_borrow_mut(|deadlines| deadlines.push(deadline));
             }
+            // What a view drawn again read is its own, not the recording's
+            // around it.
+            self.dependencies.nested.push(Stretch {
+                entities: start.entities.start..self.entities.access_log.access_log.get_mut().len(),
+                globals: start.globals.start..self.dependencies.global_read_log.borrow().len(),
+                states: start.states.start..STATE_READS.with_borrow(Vec::len),
+                deadlines: start.deadlines.start..DEADLINES.with_borrow(Vec::len),
+            });
         }
         self.entities.mark_access_boundary();
+    }
+
+    /// Whether anything in `dependencies` but `except` may have changed, as
+    /// [`Self::dependencies_changed`] answers.
+    pub(crate) fn dependencies_changed_except(
+        &self,
+        dependencies: &RenderDependencies,
+        inside_notified: bool,
+        now: Instant,
+        except: &StateVersion,
+    ) -> Option<DependencyChange> {
+        if dependencies
+            .states
+            .iter()
+            .any(|(version, _)| version.same_state(except))
+        {
+            let mut without = dependencies.clone();
+            without.states = without
+                .states
+                .iter()
+                .filter(|(version, _)| !version.same_state(except))
+                .cloned()
+                .collect();
+            return self.dependencies_changed(&without, inside_notified, now);
+        }
+        self.dependencies_changed(dependencies, inside_notified, now)
     }
 
     /// Whether anything in `dependencies` may have changed since it was
@@ -704,10 +894,19 @@ impl App {
         if log.changed_since(&dependencies.entities, dependencies.updates, inside_notified)
             || log.written_since(&dependencies.entities, dependencies.floor)
         {
+            if super::culprits::enabled()
+                && let Some(entity) = dependencies.entities.iter().find(|entity| {
+                    let entity = std::slice::from_ref(*entity);
+                    log.changed_since(entity, dependencies.updates, inside_notified)
+                        || log.written_since(entity, dependencies.floor)
+                })
+            {
+                super::culprits::blame_entity(entity.0);
+            }
             return Some(DependencyChange::Entity);
         }
         let floor = dependencies.floor;
-        if dependencies.globals.iter().any(|(global, read_at)| {
+        if let Some((global, _)) = dependencies.globals.iter().find(|(global, read_at)| {
             self.dependencies
                 .global_changed_at
                 .get(global)
@@ -718,6 +917,9 @@ impl App {
                     .get(global)
                     .is_some_and(|written_at| *written_at > (*read_at).max(floor))
         }) {
+            if super::culprits::enabled() {
+                super::culprits::blame_global(*global);
+            }
             return Some(DependencyChange::Global);
         }
         if dependencies
