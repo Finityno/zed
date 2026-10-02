@@ -70,6 +70,33 @@ const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 /// one that stopped drawing paths gives back its 4 bytes per pixel.
 const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 120;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+// A drawable may be reused while Metal's completion callbacks are delayed.
+// When targets are replaced, each unfinished submission can retain another full-size
+// target, so the layer's three drawables do not bound resource retention.
+const MAX_UNFINISHED_SUBMISSIONS: u32 = 3;
+
+struct InFlightSubmission {
+    unfinished: Arc<AtomicU32>,
+}
+
+impl InFlightSubmission {
+    fn try_acquire(unfinished: &Arc<AtomicU32>) -> Option<Self> {
+        unfinished
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_UNFINISHED_SUBMISSIONS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Self {
+            unfinished: Arc::clone(unfinished),
+        })
+    }
+}
+
+impl Drop for InFlightSubmission {
+    fn drop(&mut self) {
+        self.unfinished.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -218,6 +245,7 @@ pub struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
+    unfinished_submissions: Arc<AtomicU32>,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
@@ -665,6 +693,7 @@ impl MetalRenderer {
             is_unified_memory,
             opaque,
             command_queue,
+            unfinished_submissions: Arc::new(AtomicU32::new(0)),
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
             shadows_pipeline_state,
@@ -1111,6 +1140,20 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    fn can_draw(&self) -> bool {
+        self.unfinished_submissions.load(Ordering::Relaxed) < MAX_UNFINISHED_SUBMISSIONS
+    }
+
+    pub fn submission_queue_full_outcome(&mut self) -> Option<PresentOutcome> {
+        if self.can_draw() {
+            return None;
+        }
+        // Lost completion callbacks must not cause perpetual refresh retries.
+        // Dropping the owed frame ends retries without forgetting permits for
+        // resources Metal may still retain.
+        Some(self.deferred_present_outcome(true))
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> PresentReport {
         // `nextDrawable` hands back an autoreleased drawable, and the command
         // buffer and pass descriptors are autoreleased too. Without a pool of
@@ -1164,6 +1207,12 @@ impl MetalRenderer {
             self.consecutive_deferred_presents = 0;
             return dropped(breakdown);
         }
+        let Some(submission) = InFlightSubmission::try_acquire(&self.unfinished_submissions) else {
+            return PresentReport {
+                outcome: self.deferred_present_outcome(true),
+                breakdown,
+            };
+        };
         let (drawables_in_flight, drawables_in_flight_clamped) =
             self.read_drawables_in_flight(&layer);
         breakdown.drawables_in_flight = drawables_in_flight;
@@ -1203,7 +1252,9 @@ impl MetalRenderer {
         }
 
         let encode_start = Instant::now();
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size);
+        let command_buffer = self.render_frame(
+            scene, drawable.texture(), viewport_size, Some(submission),
+        );
         breakdown.encode = encode_start.elapsed();
         let command_buffer = match command_buffer {
             Ok(command_buffer) => command_buffer,
@@ -1241,7 +1292,11 @@ impl MetalRenderer {
     /// refills costs one dropped frame per invalidation rather than a
     /// present attempt per refresh.
     fn missing_drawable_outcome(&mut self, layer_allows_timeout: bool) -> PresentOutcome {
-        if layer_allows_timeout
+        self.deferred_present_outcome(layer_allows_timeout)
+    }
+
+    fn deferred_present_outcome(&mut self, can_retry: bool) -> PresentOutcome {
+        if can_retry
             && self.consecutive_deferred_presents < MAX_CONSECUTIVE_DEFERRED_PRESENTS
         {
             self.consecutive_deferred_presents += 1;
@@ -1363,6 +1418,7 @@ impl MetalRenderer {
         scene: &Scene,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        submission: Option<InFlightSubmission>,
     ) -> Result<metal::CommandBuffer> {
         // A window that lives through display, backing-scale, or backing-view
         // changes can be left with renderer textures sized for a stale
@@ -1437,10 +1493,12 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
+        let submission = Cell::new(submission);
         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            drop(submission.take());
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
@@ -1482,7 +1540,7 @@ impl MetalRenderer {
             .next_drawable()
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
 
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size)?;
+        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size, None)?;
 
         // Commit and wait for completion without presenting
         command_buffer.commit();
@@ -1522,7 +1580,7 @@ impl MetalRenderer {
             texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
             let target_texture = self.device.new_texture(&texture_descriptor);
 
-            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+            let command_buffer = self.render_frame(scene, &target_texture, size, None)?;
 
             // On discrete GPUs (non-unified memory), Managed textures require an
             // explicit blit synchronize before the CPU can read back the rendered
@@ -1576,7 +1634,7 @@ impl MetalRenderer {
                 .clone()
                 .expect("just ensured the render target exists");
 
-            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+            let command_buffer = self.render_frame(scene, &target_texture, size, None)?;
 
             // Commit without waiting, mirroring presentation to a real window where
             // the CPU doesn't block on the GPU.
@@ -2884,6 +2942,92 @@ mod alpha_blend_tests {
 }
 
 #[cfg(test)]
+mod submission_retention_tests {
+    use super::{InFlightSubmission, InstanceBufferPool, MAX_UNFINISHED_SUBMISSIONS, MetalRenderer};
+    use gpui::{PlatformAtlas, PresentOutcome, Scene};
+    use parking_lot::Mutex;
+    use std::{
+        cell::Cell,
+        sync::{Arc, atomic::{AtomicU32, Ordering}},
+    };
+
+    #[test]
+    fn unfinished_callbacks_hold_capacity_until_they_return_resources() {
+        let unfinished = Arc::new(AtomicU32::new(0));
+        let mut submissions = Vec::new();
+        for _ in 0..MAX_UNFINISHED_SUBMISSIONS {
+            submissions.push(InFlightSubmission::try_acquire(&unfinished).expect("capacity"));
+        }
+        assert!(InFlightSubmission::try_acquire(&unfinished).is_none());
+        let callback = Cell::new(submissions.pop());
+        assert!(InFlightSubmission::try_acquire(&unfinished).is_none());
+        drop(callback.take());
+        let replacement = InFlightSubmission::try_acquire(&unfinished).expect("returned capacity");
+        drop(callback.take());
+        assert_eq!(unfinished.load(Ordering::Relaxed), MAX_UNFINISHED_SUBMISSIONS);
+        drop(replacement);
+        drop(submissions);
+        assert_eq!(unfinished.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn abandoned_submission_and_callback_return_capacity() {
+        let unfinished = Arc::new(AtomicU32::new(0));
+        let abandoned = InFlightSubmission::try_acquire(&unfinished);
+        drop(abandoned);
+        assert_eq!(unfinished.load(Ordering::Relaxed), 0);
+        let callback = Cell::new(InFlightSubmission::try_acquire(&unfinished));
+        drop(callback);
+        assert_eq!(unfinished.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn full_submission_queue_defers_before_acquiring_a_drawable_or_rendering() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new(Arc::clone(&pool), false);
+        renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
+        let submissions: Vec<_> = (0..MAX_UNFINISHED_SUBMISSIONS)
+            .map(|_| InFlightSubmission::try_acquire(&renderer.unfinished_submissions))
+            .collect();
+        let atlas_frame = renderer.sprite_atlas.frame_index();
+        assert!(!renderer.can_draw());
+        assert_eq!(renderer.draw(&Scene::default()).outcome, PresentOutcome::Deferred);
+        assert!(pool.lock().buffers.is_empty());
+        assert_eq!(renderer.sprite_atlas.frame_index(), atlas_frame);
+        for _ in 1..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
+            assert_eq!(renderer.draw(&Scene::default()).outcome, PresentOutcome::Deferred);
+        }
+        assert_eq!(renderer.draw(&Scene::default()).outcome, PresentOutcome::Dropped);
+        assert!(!renderer.can_draw(), "dropping the frame must not retire retained resources");
+        drop(submissions);
+        assert!(renderer.can_draw());
+    }
+
+    #[test]
+    fn layered_preflight_bounds_retries_without_retiring_unfinished_submissions() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let submissions: Vec<_> = (0..MAX_UNFINISHED_SUBMISSIONS)
+            .map(|_| InFlightSubmission::try_acquire(&renderer.unfinished_submissions))
+            .collect();
+        for _ in 0..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
+            assert_eq!(renderer.submission_queue_full_outcome(), Some(PresentOutcome::Deferred));
+        }
+        assert_eq!(renderer.submission_queue_full_outcome(), Some(PresentOutcome::Dropped));
+        assert!(!renderer.can_draw());
+        drop(submissions);
+        assert_eq!(renderer.submission_queue_full_outcome(), None);
+        assert!(renderer.can_draw());
+    }
+}
+
+#[cfg(test)]
 mod instance_buffer_pool_tests {
     use super::{
         INSTANCE_BUFFER_FLOOR_SIZE, INSTANCE_BUFFER_SHRINK_AFTER_FRAMES, InstanceBufferPool,
@@ -3165,7 +3309,7 @@ mod stale_texture_healing_tests {
         let target = renderer.device.new_texture(&descriptor);
 
         let command_buffer = renderer
-            .render_frame(&scene, &target, large)
+            .render_frame(&scene, &target, large, None)
             .expect("stale-texture render heals and succeeds");
         if !renderer.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
