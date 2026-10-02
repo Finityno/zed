@@ -4710,6 +4710,15 @@ impl ScrollHandle {
         }
     }
 
+    /// The size of the viewport the content scrolls in. Unlike
+    /// [`Self::bounds`], it does not say where the viewport is in the window,
+    /// so with view retention on a view that read it is not built again
+    /// because the scroller moved, only when the viewport changed size.
+    pub fn viewport_size(&self) -> Size<Pixels> {
+        self.note_read();
+        self.0.borrow().bounds.size
+    }
+
     /// Return the bounds into which this child is painted
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.note_placement_read();

@@ -4317,16 +4317,18 @@ impl Render for ScrollbarReader {
         self.renders.set(self.renders.get() + 1);
         let offset = self.handle.offset();
         let max = self.handle.max_offset();
-        div()
-            .w(px(8.))
-            .h(px(40.))
-            .child(SharedString::from(format!("{:?} {:?}", offset.y, max.y)))
+        let viewport = self.handle.viewport_size();
+        div().w(px(8.)).h(px(40.)).child(SharedString::from(format!(
+            "{:?} {:?} {:?}",
+            offset.y, max.y, viewport.height
+        )))
     }
 }
 
 /// A row holding a scroller and the scrollbar reading it, built wherever it
 /// moves.
 struct PinnedScrollingRow {
+    viewport_height: f32,
     handle: crate::ScrollHandle,
     scrollbar: Entity<ScrollbarReader>,
 }
@@ -4342,7 +4344,7 @@ impl Render for PinnedScrollingRow {
                 div()
                     .id("pinned-scroller")
                     .w(px(120.))
-                    .h(px(40.))
+                    .h(px(self.viewport_height))
                     .overflow_y_scroll()
                     .track_scroll(&self.handle)
                     .child(div().h(px(20.)).child("one"))
@@ -4387,7 +4389,7 @@ fn a_scroller_built_somewhere_else_does_not_build_its_readers() {
             });
             PinnedScrollingRows {
                 header: 10.,
-                row: cx.new(|_| PinnedScrollingRow { handle, scrollbar }),
+                row: cx.new(|_| PinnedScrollingRow { viewport_height: 40., handle, scrollbar }),
             }
         }
     });
@@ -4418,6 +4420,23 @@ fn a_scroller_built_somewhere_else_does_not_build_its_readers() {
         assert_eq!(renders.get(), before, "the scrollbar was built after the move: {reasons:?}");
         assert!(reasons.is_empty(), "{reasons:?}");
     }
+    let before_resize = renders.get();
+    window
+        .update(&mut cx, |rows, _, cx| {
+            rows.row.update(cx, |row, cx| {
+                row.viewport_height = 55.;
+                cx.notify();
+            });
+        })
+        .unwrap();
+    frame(&mut cx);
+    frame(&mut cx);
+    assert!(renders.get() > before_resize, "the scrollbar must rebuild when its viewport resizes");
+    window
+        .read_with(&cx, |rows, cx| {
+            assert_eq!(rows.row.read(cx).handle.viewport_size().height, px(55.));
+        })
+        .unwrap();
 }
 
 /// Bookkeeping an entity holds, which a view reads.
