@@ -2662,13 +2662,13 @@ impl PlatformWindow for MacWindow {
         // Both planes must have capacity before either is presented. Once
         // drawing starts, only completion callbacks can change these counts,
         // and they only return capacity.
-        if !this.renderer.can_draw()
-            || this.overlay_renderer.as_ref()
-                .is_some_and(|renderer| !renderer.can_draw())
+        if let Some(outcome) = this.renderer.submission_queue_full_outcome()
+            .or_else(|| this.overlay_renderer.as_mut()
+                .and_then(|renderer| renderer.submission_queue_full_outcome()))
         {
             this.release_intermediates_if_occluded();
             return PresentReport {
-                outcome: PresentOutcome::Deferred,
+                outcome,
                 breakdown: gpui::PresentBreakdown {
                     layers: 2,
                     ..Default::default()

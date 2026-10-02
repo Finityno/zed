@@ -71,7 +71,7 @@ const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 120;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 // A drawable may be reused while Metal's completion callbacks are delayed.
-// During resizing, each unfinished submission can retain another full-size
+// When targets are replaced, each unfinished submission can retain another full-size
 // target, so the layer's three drawables do not bound resource retention.
 const MAX_UNFINISHED_SUBMISSIONS: u32 = 3;
 
@@ -1140,8 +1140,18 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn can_draw(&self) -> bool {
+    fn can_draw(&self) -> bool {
         self.unfinished_submissions.load(Ordering::Relaxed) < MAX_UNFINISHED_SUBMISSIONS
+    }
+
+    pub fn submission_queue_full_outcome(&mut self) -> Option<PresentOutcome> {
+        if self.can_draw() {
+            return None;
+        }
+        // Lost completion callbacks must not cause perpetual refresh retries.
+        // Dropping the owed frame ends retries without forgetting permits for
+        // resources Metal may still retain.
+        Some(self.deferred_present_outcome(true))
     }
 
     pub fn draw(&mut self, scene: &Scene) -> PresentReport {
@@ -1199,7 +1209,7 @@ impl MetalRenderer {
         }
         let Some(submission) = InFlightSubmission::try_acquire(&self.unfinished_submissions) else {
             return PresentReport {
-                outcome: PresentOutcome::Deferred,
+                outcome: self.deferred_present_outcome(true),
                 breakdown,
             };
         };
@@ -1282,7 +1292,11 @@ impl MetalRenderer {
     /// refills costs one dropped frame per invalidation rather than a
     /// present attempt per refresh.
     fn missing_drawable_outcome(&mut self, layer_allows_timeout: bool) -> PresentOutcome {
-        if layer_allows_timeout
+        self.deferred_present_outcome(layer_allows_timeout)
+    }
+
+    fn deferred_present_outcome(&mut self, can_retry: bool) -> PresentOutcome {
+        if can_retry
             && self.consecutive_deferred_presents < MAX_CONSECUTIVE_DEFERRED_PRESENTS
         {
             self.consecutive_deferred_presents += 1;
@@ -2983,7 +2997,32 @@ mod submission_retention_tests {
         assert_eq!(renderer.draw(&Scene::default()).outcome, PresentOutcome::Deferred);
         assert!(pool.lock().buffers.is_empty());
         assert_eq!(renderer.sprite_atlas.frame_index(), atlas_frame);
+        for _ in 1..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
+            assert_eq!(renderer.draw(&Scene::default()).outcome, PresentOutcome::Deferred);
+        }
+        assert_eq!(renderer.draw(&Scene::default()).outcome, PresentOutcome::Dropped);
+        assert!(!renderer.can_draw(), "dropping the frame must not retire retained resources");
         drop(submissions);
+        assert!(renderer.can_draw());
+    }
+
+    #[test]
+    fn layered_preflight_bounds_retries_without_retiring_unfinished_submissions() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let submissions: Vec<_> = (0..MAX_UNFINISHED_SUBMISSIONS)
+            .map(|_| InFlightSubmission::try_acquire(&renderer.unfinished_submissions))
+            .collect();
+        for _ in 0..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
+            assert_eq!(renderer.submission_queue_full_outcome(), Some(PresentOutcome::Deferred));
+        }
+        assert_eq!(renderer.submission_queue_full_outcome(), Some(PresentOutcome::Dropped));
+        assert!(!renderer.can_draw());
+        drop(submissions);
+        assert_eq!(renderer.submission_queue_full_outcome(), None);
         assert!(renderer.can_draw());
     }
 }
