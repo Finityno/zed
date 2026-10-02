@@ -2659,6 +2659,17 @@ impl PlatformWindow for MacWindow {
             return report;
         }
 
+        // Both planes must have capacity before either is presented. Once
+        // drawing starts, only completion callbacks can change these counts,
+        // and they only return capacity.
+        if !this.renderer.can_draw()
+            || this.overlay_renderer.as_ref().is_some_and(|renderer| !renderer.can_draw())
+        {
+            return PresentReport {
+                outcome: PresentOutcome::Deferred,
+                breakdown: gpui::PresentBreakdown { layers: 2, ..Default::default() },
+            };
+        }
         let this = &mut *this;
         let split_start = Instant::now();
         let split = overlay_start.min(scene.len());
