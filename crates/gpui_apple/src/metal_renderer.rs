@@ -86,7 +86,9 @@ impl InFlightSubmission {
                 (count < MAX_UNFINISHED_SUBMISSIONS).then_some(count + 1)
             })
             .ok()?;
-        Some(Self { unfinished: Arc::clone(unfinished) })
+        Some(Self {
+            unfinished: Arc::clone(unfinished),
+        })
     }
 }
 
@@ -1196,7 +1198,10 @@ impl MetalRenderer {
             return dropped(breakdown);
         }
         let Some(submission) = InFlightSubmission::try_acquire(&self.unfinished_submissions) else {
-            return PresentReport { outcome: PresentOutcome::Deferred, breakdown };
+            return PresentReport {
+                outcome: PresentOutcome::Deferred,
+                breakdown,
+            };
         };
         let (drawables_in_flight, drawables_in_flight_clamped) =
             self.read_drawables_in_flight(&layer);
@@ -1237,7 +1242,9 @@ impl MetalRenderer {
         }
 
         let encode_start = Instant::now();
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size, Some(submission));
+        let command_buffer = self.render_frame(
+            scene, drawable.texture(), viewport_size, Some(submission),
+        );
         breakdown.encode = encode_start.elapsed();
         let command_buffer = match command_buffer {
             Ok(command_buffer) => command_buffer,
@@ -2923,9 +2930,12 @@ mod alpha_blend_tests {
 #[cfg(test)]
 mod submission_retention_tests {
     use super::{InFlightSubmission, InstanceBufferPool, MAX_UNFINISHED_SUBMISSIONS, MetalRenderer};
-    use gpui::{PresentOutcome, Scene, SpriteAtlas};
+    use gpui::{PlatformAtlas, PresentOutcome, Scene};
     use parking_lot::Mutex;
-    use std::{cell::Cell, sync::{Arc, atomic::{AtomicU32, Ordering}}};
+    use std::{
+        cell::Cell,
+        sync::{Arc, atomic::{AtomicU32, Ordering}},
+    };
 
     #[test]
     fn unfinished_callbacks_hold_capacity_until_they_return_resources() {

@@ -2663,11 +2663,16 @@ impl PlatformWindow for MacWindow {
         // drawing starts, only completion callbacks can change these counts,
         // and they only return capacity.
         if !this.renderer.can_draw()
-            || this.overlay_renderer.as_ref().is_some_and(|renderer| !renderer.can_draw())
+            || this.overlay_renderer.as_ref()
+                .is_some_and(|renderer| !renderer.can_draw())
         {
+            this.release_intermediates_if_occluded();
             return PresentReport {
                 outcome: PresentOutcome::Deferred,
-                breakdown: gpui::PresentBreakdown { layers: 2, ..Default::default() },
+                breakdown: gpui::PresentBreakdown {
+                    layers: 2,
+                    ..Default::default()
+                },
             };
         }
         let this = &mut *this;
