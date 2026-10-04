@@ -3087,13 +3087,20 @@ impl Interactivity {
             // each transition rather than comparing every event against the
             // state at paint time.
             let mut was_hovered = hitbox.is_hovered(window);
-            // Layout used the previous flag, but a click can move the hitbox
-            // without a mouse move. Notify after paint: invalidation during
-            // drawing does not request another frame to settle that layout.
-            if let Some(hover_state) = &hover_state {
-                let mut hover_state = hover_state.borrow_mut();
-                if hover_state.element != was_hovered {
+            // Shaped text keeps its layout-time color. A click can move the
+            // hitbox without another mouse event, so settle that color after
+            // paint. Layout-changing hover styles can move their own hitbox
+            // away and must not drive a corrective redraw loop.
+            if self.hover_style.as_ref().is_some_and(|style| hover_changes_only_text_color(style))
+                && let Some(hover_state) = &hover_state
+            {
+                let changed = {
+                    let mut hover_state = hover_state.borrow_mut();
+                    let changed = hover_state.element != was_hovered;
                     hover_state.element = was_hovered;
+                    changed
+                };
+                if changed {
                     cx.defer(move |cx| cx.notify(current_view));
                 }
             }
@@ -3118,17 +3125,24 @@ impl Interactivity {
                 .as_ref()
                 .and_then(|element| element.hover_state.as_ref())
                 .cloned();
-            let current_view = window.current_view();
             let mut was_group_hovered =
                 group_hitbox_id.is_some_and(|hitbox| hitbox.is_hovered(window));
-            if let Some(hover_state) = &hover_state {
-                let mut hover_state = hover_state.borrow_mut();
-                if hover_state.group != was_group_hovered {
+            if hover_changes_only_text_color(&group_hover.style)
+                && let Some(hover_state) = &hover_state
+            {
+                let changed = {
+                    let mut hover_state = hover_state.borrow_mut();
+                    let changed = hover_state.group != was_group_hovered;
                     hover_state.group = was_group_hovered;
+                    changed
+                };
+                if changed {
+                    let current_view = window.current_view();
                     cx.defer(move |cx| cx.notify(current_view));
                 }
             }
             if let Some(group_hitbox_id) = group_hitbox_id {
+                let current_view = window.current_view();
                 // Paint-time snapshot, updated per observed transition; see
                 // the element-hover listener above.
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
@@ -3907,6 +3921,16 @@ impl Interactivity {
         for (action, _) in &self.a11y_action_listeners {
             node.add_action(*action);
         }
+    }
+}
+
+fn hover_changes_only_text_color(style: &StyleRefinement) -> bool {
+    *style == StyleRefinement {
+        text: crate::TextStyleRefinement {
+            color: style.text.color,
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -6196,27 +6220,90 @@ mod tests {
         assert_hover_state_tracks_enter_and_leave_between_draws(true, cx);
     }
 
+    struct TextColorProbe {
+        child: AnyElement,
+        measured_color: Rc<Cell<u32>>,
+    }
+
+    impl IntoElement for TextColorProbe {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for TextColorProbe {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            self.measured_color.set(u32::from(crate::Rgba::from(window.text_style().color)));
+            (self.child.request_layout(window, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            self.child.prepaint(window, cx);
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            self.child.paint(window, cx);
+        }
+    }
+
     struct ClickRelocatedHoverView {
         group_hover: bool,
         activate_on_mouse_down: bool,
         relocated: bool,
-        measured_width: Rc<Cell<Pixels>>,
+        measured_color: Rc<Cell<u32>>,
         renders: Rc<Cell<usize>>,
     }
 
     impl Render for ClickRelocatedHoverView {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.renders.set(self.renders.get() + 1);
-            let measured_width = Rc::clone(&self.measured_width);
+            let measured_color = Rc::clone(&self.measured_color);
             let target = div()
+                .text_color(crate::black())
                 .id("click-relocated-hover-target")
                 .w(px(50.))
                 .h(px(40.))
                 .when(!self.group_hover, |target| {
-                    target.hover(|style| style.w(px(60.)))
+                    target.hover(|style| style.text_color(crate::white()))
                 })
                 .when(self.group_hover, |target| {
-                    target.group_hover("click-relocated-hover-group", |style| style.w(px(60.)))
+                    target.group_hover("click-relocated-hover-group", |style| style.text_color(crate::white()))
                 })
                 .when(!self.activate_on_mouse_down, |target| {
                     target.on_click(cx.listener(|this, _, _, cx| {
@@ -6230,18 +6317,16 @@ mod tests {
                         cx.notify();
                     }))
                 })
-                .child("Show more");
+                .child(TextColorProbe {
+                    child: "Show more".into_any_element(),
+                    measured_color,
+                });
             div().size_full().child(
                 div()
                     .absolute()
                     .left(px(100.))
                     .top(px(if self.relocated { 250. } else { 100. }))
                     .group("click-relocated-hover-group")
-                    .on_children_prepainted(move |bounds, _, _| {
-                        if let Some(first) = bounds.first() {
-                            measured_width.set(first.size.width);
-                        }
-                    })
                     .child(target),
             )
         }
@@ -6252,23 +6337,25 @@ mod tests {
         activate_on_mouse_down: bool,
         cx: &mut TestAppContext,
     ) {
+        let normal_color = u32::from(crate::Rgba::from(crate::black()));
+        let hover_color = u32::from(crate::Rgba::from(crate::white()));
         for retained in [false, true] {
             cx.update(|cx| cx.set_view_retention(retained));
-            let measured_width = Rc::new(Cell::new(px(0.)));
+            let measured_color = Rc::new(Cell::new(0));
             let renders = Rc::new(Cell::new(0));
             let window = cx.open_window(size(px(400.), px(400.)), {
-                let measured_width = Rc::clone(&measured_width);
+                let measured_color = Rc::clone(&measured_color);
                 let renders = Rc::clone(&renders);
                 move |_, _| ClickRelocatedHoverView {
                     group_hover,
                     activate_on_mouse_down,
                     relocated: false,
-                    measured_width,
+                    measured_color,
                     renders,
                 }
             });
             cx.run_until_parked();
-            assert_eq!(measured_width.get(), px(50.));
+            assert_eq!(measured_color.get(), normal_color);
 
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
@@ -6278,7 +6365,7 @@ mod tests {
                 }), cx);
             }).unwrap_or_else(|error| panic!("window should accept hover: {error}"));
             cx.run_until_parked();
-            assert_eq!(measured_width.get(), px(60.));
+            assert_eq!(measured_color.get(), hover_color);
 
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
@@ -6301,7 +6388,7 @@ mod tests {
             cx.run_until_parked();
             assert!(window.read_with(cx, |view, _| view.relocated)
                 .unwrap_or_else(|error| panic!("window should remain open: {error}")));
-            assert_eq!(measured_width.get(), px(50.),
+            assert_eq!(measured_color.get(), normal_color,
                 "a control moved by its activation must settle without another mouse event (retained={retained})");
 
             cx.update_window(window.into(), |_, window, cx| {
@@ -6312,7 +6399,7 @@ mod tests {
                 }), cx);
             }).unwrap_or_else(|error| panic!("window should accept pointer leave: {error}"));
             cx.run_until_parked();
-            assert_eq!(measured_width.get(), px(50.),
+            assert_eq!(measured_color.get(), normal_color,
                 "a move outside the relocated control must keep its normal style (retained={retained})");
 
             cx.update_window(window.into(), |_, window, cx| {
@@ -6323,7 +6410,7 @@ mod tests {
                 }), cx);
             }).unwrap_or_else(|error| panic!("window should accept pointer re-entry: {error}"));
             cx.run_until_parked();
-            assert_eq!(measured_width.get(), px(60.));
+            assert_eq!(measured_color.get(), hover_color);
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
                     position: point(px(110.), px(270.)),
@@ -6343,7 +6430,7 @@ mod tests {
                 }), cx);
             }).unwrap_or_else(|error| panic!("window should accept another release: {error}"));
             cx.run_until_parked();
-            assert_eq!(measured_width.get(), px(60.),
+            assert_eq!(measured_color.get(), hover_color,
                 "releasing over a control that stayed under the pointer must preserve its hover style (retained={retained})");
 
             cx.update_window(window.into(), |_, window, cx| {
@@ -6354,7 +6441,7 @@ mod tests {
                 }), cx);
             }).unwrap_or_else(|error| panic!("window should accept another pointer leave: {error}"));
             cx.run_until_parked();
-            assert_eq!(measured_width.get(), px(50.));
+            assert_eq!(measured_color.get(), normal_color);
             let settled_renders = renders.get();
             for x in [20., 30., 40.] {
                 cx.update_window(window.into(), |_, window, cx| {
@@ -6366,7 +6453,7 @@ mod tests {
                 }).unwrap_or_else(|error| panic!("window should accept an outside pointer move: {error}"));
                 cx.run_until_parked();
             }
-            assert_eq!(measured_width.get(), px(50.));
+            assert_eq!(measured_color.get(), normal_color);
             assert_eq!(renders.get(), settled_renders,
                 "unchanged outside hover must not schedule more redraws (retained={retained})");
         }
@@ -6390,6 +6477,158 @@ mod tests {
     #[gpui::test]
     fn group_relocated_hover_clears_after_mouse_down(cx: &mut TestAppContext) {
         assert_relocated_hover_clears_after_activation(true, true, cx);
+    }
+
+    struct ShrinkingHoverView {
+        group_hover: bool,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for ShrinkingHoverView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            assert!(self.renders.get() < 8,
+                "hover reconciliation must settle when hover styling moves the hitbox away");
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(100.))
+                    .group("shrinking-hover-group")
+                    .child(
+                        div()
+                            .id("shrinking-hover-target")
+                            .w(px(50.))
+                            .h(px(40.))
+                            .when(!self.group_hover, |target| {
+                                target.hover(|style| style.w(px(20.)))
+                            })
+                            .when(self.group_hover, |target| {
+                                target.group_hover("shrinking-hover-group", |style| style.w(px(20.)))
+                            }),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn hover_reconciliation_settles_when_hover_shrinks_hitbox(cx: &mut TestAppContext) {
+        for retained in [false, true] {
+            for group_hover in [false, true] {
+                cx.update(|cx| cx.set_view_retention(retained));
+                let renders = Rc::new(Cell::new(0));
+                let window = cx.open_window(size(px(400.), px(400.)), {
+                    let renders = Rc::clone(&renders);
+                    move |_, _| ShrinkingHoverView { group_hover, renders }
+                });
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(140.), px(120.)),
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }), cx);
+                }).unwrap_or_else(|error| panic!("window should accept hover: {error}"));
+                cx.run_until_parked();
+                let settled_renders = renders.get();
+                cx.run_until_parked();
+                assert_eq!(renders.get(), settled_renders,
+                    "a stationary pointer must not sustain redraws (retained={retained}, group_hover={group_hover})");
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap_or_else(|error| panic!("window should close: {error}"));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn hover_reconciliation_survives_repeated_clicks_and_window_close(cx: &mut TestAppContext) {
+        let normal_color = u32::from(crate::Rgba::from(crate::black()));
+        let hover_color = u32::from(crate::Rgba::from(crate::white()));
+        for retained in [false, true] {
+            for group_hover in [false, true] {
+                for activate_on_mouse_down in [false, true] {
+                    cx.update(|cx| cx.set_view_retention(retained));
+                    let measured_color = Rc::new(Cell::new(0));
+                    let window = cx.open_window(size(px(400.), px(400.)), {
+                        let measured_color = Rc::clone(&measured_color);
+                        move |_, _| ClickRelocatedHoverView {
+                            group_hover,
+                            activate_on_mouse_down,
+                            relocated: false,
+                            measured_color,
+                            renders: Rc::new(Cell::new(0)),
+                        }
+                    });
+                    cx.run_until_parked();
+                    for _ in 0..32 {
+                        window.update(cx, |view, _, cx| {
+                            view.relocated = false;
+                            cx.notify();
+                        }).unwrap_or_else(|error| panic!("window should reset its control: {error}"));
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                                position: point(px(110.), px(120.)),
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }), cx);
+                        }).unwrap_or_else(|error| panic!("window should accept hover: {error}"));
+                        cx.run_until_parked();
+                        assert_eq!(measured_color.get(), hover_color);
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
+                                position: point(px(110.), px(120.)),
+                                button: MouseButton::Left,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }), cx);
+                            window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent {
+                                position: point(px(110.), px(120.)),
+                                button: MouseButton::Left,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                            }), cx);
+                        }).unwrap_or_else(|error| panic!("window should accept a click: {error}"));
+                        cx.run_until_parked();
+                        assert_eq!(measured_color.get(), normal_color);
+                    }
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                            position: point(px(110.), px(270.)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }), cx);
+                    }).unwrap_or_else(|error| panic!("window should accept hover before closing: {error}"));
+                    cx.run_until_parked();
+                    assert_eq!(measured_color.get(), hover_color);
+                    cx.update(|cx| {
+                        window.update(cx, |view, _, cx| {
+                            view.relocated = false;
+                            cx.notify();
+                        }).unwrap_or_else(|error| panic!("window should relocate before closing: {error}"));
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.draw(cx).clear(cx);
+                            window.remove_window();
+                        }).unwrap_or_else(|error| panic!("window should close with a queued hover redraw: {error}"));
+                    });
+                    cx.run_until_parked();
+                    assert!(window.read_with(cx, |_, _| ()).is_err());
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn hover_reconciliation_without_group_owner_can_draw_directly(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.draw(Point::default(), size(px(50.), px(40.)), |_, _| {
+            div()
+                .id("missing-hover-group-target")
+                .w(px(50.))
+                .h(px(40.))
+                .group_hover("missing-hover-group", |style| style.text_color(crate::white()))
+                .child("Show more")
+        });
     }
 
     /// Two sibling tab groups, each a focusable container that is *not* itself a
