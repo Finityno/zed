@@ -3087,6 +3087,16 @@ impl Interactivity {
             // each transition rather than comparing every event against the
             // state at paint time.
             let mut was_hovered = hitbox.is_hovered(window);
+            // Layout used the previous flag, but a click can move the hitbox
+            // without a mouse move. Notify after paint: invalidation during
+            // drawing does not request another frame to settle that layout.
+            if let Some(hover_state) = &hover_state {
+                let mut hover_state = hover_state.borrow_mut();
+                if hover_state.element != was_hovered {
+                    hover_state.element = was_hovered;
+                    cx.defer(move |cx| cx.notify(current_view));
+                }
+            }
 
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture {
@@ -3103,16 +3113,24 @@ impl Interactivity {
         }
 
         if let Some(group_hover) = self.group_hover_style.as_ref() {
-            if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, window) {
-                let hover_state = element_state
-                    .as_ref()
-                    .and_then(|element| element.hover_state.as_ref())
-                    .cloned();
-                let current_view = window.current_view();
+            let group_hitbox_id = GroupHitboxes::get(&group_hover.group, window);
+            let hover_state = element_state
+                .as_ref()
+                .and_then(|element| element.hover_state.as_ref())
+                .cloned();
+            let current_view = window.current_view();
+            let mut was_group_hovered =
+                group_hitbox_id.is_some_and(|hitbox| hitbox.is_hovered(window));
+            if let Some(hover_state) = &hover_state {
+                let mut hover_state = hover_state.borrow_mut();
+                if hover_state.group != was_group_hovered {
+                    hover_state.group = was_group_hovered;
+                    cx.defer(move |cx| cx.notify(current_view));
+                }
+            }
+            if let Some(group_hitbox_id) = group_hitbox_id {
                 // Paint-time snapshot, updated per observed transition; see
                 // the element-hover listener above.
-                let mut was_group_hovered = group_hitbox_id.is_hovered(window);
-
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     if phase == DispatchPhase::Capture {
                         let group_hovered = group_hitbox_id.is_hovered(window);
@@ -6178,6 +6196,202 @@ mod tests {
         assert_hover_state_tracks_enter_and_leave_between_draws(true, cx);
     }
 
+    struct ClickRelocatedHoverView {
+        group_hover: bool,
+        activate_on_mouse_down: bool,
+        relocated: bool,
+        measured_width: Rc<Cell<Pixels>>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for ClickRelocatedHoverView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let measured_width = Rc::clone(&self.measured_width);
+            let target = div()
+                .id("click-relocated-hover-target")
+                .w(px(50.))
+                .h(px(40.))
+                .when(!self.group_hover, |target| {
+                    target.hover(|style| style.w(px(60.)))
+                })
+                .when(self.group_hover, |target| {
+                    target.group_hover("click-relocated-hover-group", |style| style.w(px(60.)))
+                })
+                .when(!self.activate_on_mouse_down, |target| {
+                    target.on_click(cx.listener(|this, _, _, cx| {
+                        this.relocated = true;
+                        cx.notify();
+                    }))
+                })
+                .when(self.activate_on_mouse_down, |target| {
+                    target.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.relocated = true;
+                        cx.notify();
+                    }))
+                })
+                .child("Show more");
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(if self.relocated { 250. } else { 100. }))
+                    .group("click-relocated-hover-group")
+                    .on_children_prepainted(move |bounds, _, _| {
+                        if let Some(first) = bounds.first() {
+                            measured_width.set(first.size.width);
+                        }
+                    })
+                    .child(target),
+            )
+        }
+    }
+
+    fn assert_relocated_hover_clears_after_activation(
+        group_hover: bool,
+        activate_on_mouse_down: bool,
+        cx: &mut TestAppContext,
+    ) {
+        for retained in [false, true] {
+            cx.update(|cx| cx.set_view_retention(retained));
+            let measured_width = Rc::new(Cell::new(px(0.)));
+            let renders = Rc::new(Cell::new(0));
+            let window = cx.open_window(size(px(400.), px(400.)), {
+                let measured_width = Rc::clone(&measured_width);
+                let renders = Rc::clone(&renders);
+                move |_, _| ClickRelocatedHoverView {
+                    group_hover,
+                    activate_on_mouse_down,
+                    relocated: false,
+                    measured_width,
+                    renders,
+                }
+            });
+            cx.run_until_parked();
+            assert_eq!(measured_width.get(), px(50.));
+
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(110.), px(120.)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept hover: {error}"));
+            cx.run_until_parked();
+            assert_eq!(measured_width.get(), px(60.));
+
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
+                    position: point(px(110.), px(120.)),
+                    button: MouseButton::Left,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept press: {error}"));
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent {
+                    position: point(px(110.), px(120.)),
+                    button: MouseButton::Left,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept release: {error}"));
+            cx.run_until_parked();
+            assert!(window.read_with(cx, |view, _| view.relocated)
+                .unwrap_or_else(|error| panic!("window should remain open: {error}")));
+            assert_eq!(measured_width.get(), px(50.),
+                "a control moved by its activation must settle without another mouse event (retained={retained})");
+
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(10.), px(10.)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept pointer leave: {error}"));
+            cx.run_until_parked();
+            assert_eq!(measured_width.get(), px(50.),
+                "a move outside the relocated control must keep its normal style (retained={retained})");
+
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(110.), px(270.)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept pointer re-entry: {error}"));
+            cx.run_until_parked();
+            assert_eq!(measured_width.get(), px(60.));
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
+                    position: point(px(110.), px(270.)),
+                    button: MouseButton::Left,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept another press: {error}"));
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent {
+                    position: point(px(110.), px(270.)),
+                    button: MouseButton::Left,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept another release: {error}"));
+            cx.run_until_parked();
+            assert_eq!(measured_width.get(), px(60.),
+                "releasing over a control that stayed under the pointer must preserve its hover style (retained={retained})");
+
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(10.), px(10.)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }), cx);
+            }).unwrap_or_else(|error| panic!("window should accept another pointer leave: {error}"));
+            cx.run_until_parked();
+            assert_eq!(measured_width.get(), px(50.));
+            let settled_renders = renders.get();
+            for x in [20., 30., 40.] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(x), px(10.)),
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }), cx);
+                }).unwrap_or_else(|error| panic!("window should accept an outside pointer move: {error}"));
+                cx.run_until_parked();
+            }
+            assert_eq!(measured_width.get(), px(50.));
+            assert_eq!(renders.get(), settled_renders,
+                "unchanged outside hover must not schedule more redraws (retained={retained})");
+        }
+    }
+
+    #[gpui::test]
+    fn element_relocated_hover_clears_after_click(cx: &mut TestAppContext) {
+        assert_relocated_hover_clears_after_activation(false, false, cx);
+    }
+
+    #[gpui::test]
+    fn group_relocated_hover_clears_after_click(cx: &mut TestAppContext) {
+        assert_relocated_hover_clears_after_activation(true, false, cx);
+    }
+
+    #[gpui::test]
+    fn element_relocated_hover_clears_after_mouse_down(cx: &mut TestAppContext) {
+        assert_relocated_hover_clears_after_activation(false, true, cx);
+    }
+
+    #[gpui::test]
+    fn group_relocated_hover_clears_after_mouse_down(cx: &mut TestAppContext) {
+        assert_relocated_hover_clears_after_activation(true, true, cx);
+    }
+
     /// Two sibling tab groups, each a focusable container that is *not* itself a
     /// tab stop and holds a single tab stop. Mirrors how the title bar and
     /// status bar expose their controls as ARIA toolbars.
@@ -6774,4 +6988,3 @@ mod tests {
         );
     }
 }
-
