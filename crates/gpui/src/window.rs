@@ -511,7 +511,12 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+#[derive(Default, Deref)]
+pub(crate) struct FocusMap {
+    #[deref]
+    handles: RwLock<SlotMap<FocusId, FocusRef>>,
+    pub(crate) has_dropped_handles: AtomicBool,
+}
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -678,12 +683,17 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
-            .read()
+        let handles = self.handles.read();
+        if handles
             .get(self.id)
             .unwrap()
             .ref_count
-            .fetch_sub(1, SeqCst);
+            .fetch_sub(1, SeqCst) == 1
+        {
+            // Publish while retaining the read lock: a sweep takes the write
+            // lock before clearing this flag, so it cannot miss this last drop.
+            self.handles.has_dropped_handles.store(true, SeqCst);
+        }
     }
 }
 
@@ -10208,6 +10218,42 @@ mod tests {
     struct FocusForwarder {
         a: FocusHandle,
         b: FocusHandle,
+    }
+
+    #[gpui::test]
+    fn last_focus_owner_drop_blurs_window_and_preserves_live_handles(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let (focused, retained) = cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
+        let focused_weak = focused.downgrade();
+        let retained_weak = retained.downgrade();
+        let last_owner = focused.clone();
+        window.update(cx, |_, window, cx| window.focus(&focused, cx)).expect("focus window");
+        drop(focused);
+        window.update(cx, |_, window, _| {
+            assert!(focused_weak.upgrade().expect("clone still owns focus").is_focused(window));
+        }).expect("remaining clone stays focused");
+        drop(last_owner);
+        cx.update(|_| {});
+        window.update(cx, |_, window, cx| {
+            assert!(window.focused(cx).is_none());
+            assert!(focused_weak.upgrade().is_none());
+            assert!(retained_weak.upgrade().is_some());
+        }).expect("last owner blurs only its window");
+    }
+
+    #[gpui::test]
+    fn focus_owner_drops_on_another_thread_are_reclaimed(cx: &mut TestAppContext) {
+        let handles = cx.update(|cx| (0..1024).map(|_| cx.focus_handle()).collect::<Vec<_>>());
+        let weak_handles = handles.iter().map(FocusHandle::downgrade).collect::<Vec<_>>();
+        let retained = cx.update(|cx| cx.focus_handle());
+        let retained_weak = retained.downgrade();
+        let dropped = std::thread::spawn(move || drop(handles));
+        for _ in 0..32 { cx.update(|_| {}); }
+        dropped.join().expect("background drops finish");
+        cx.update(|_| {});
+        assert!(weak_handles.iter().all(|handle| handle.upgrade().is_none()));
+        assert!(retained_weak.upgrade().is_some());
+        cx.update(|cx| assert_eq!(cx.focus_handles.read().len(), 1));
     }
 
     impl Render for FocusForwarder {

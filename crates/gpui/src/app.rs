@@ -904,7 +904,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::new(FocusMap::default()),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -1896,9 +1896,13 @@ impl App {
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
     fn release_dropped_focus_handles(&mut self) {
-        self.focus_handles
-            .clone()
-            .write()
+        if !self.focus_handles.has_dropped_handles.load(SeqCst) {
+            return;
+        }
+        let focus_handles = self.focus_handles.clone();
+        let mut handles = focus_handles.write();
+        focus_handles.has_dropped_handles.store(false, SeqCst);
+        handles
             .retain(|handle_id, focus| {
                 if focus.ref_count.load(SeqCst) == 0 {
                     for window_handle in self.windows() {
