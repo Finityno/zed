@@ -16,6 +16,7 @@ use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
+#[cfg(any(test, feature = "leak-detection"))]
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 

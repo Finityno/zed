@@ -1,14 +1,12 @@
 name: Focus cleanup tests
 on:
-  pull_request:
-    paths:
-      - crates/gpui/src/app.rs
-      - crates/gpui/src/window.rs
-      - .github/workflows/focus-cleanup-tests.yml
   push:
     branches:
       - perf/skip-unchanged-focus-sweeps
   workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -27,7 +25,7 @@ jobs:
       - name: Install GPUI Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld cmake pkg-config libfontconfig-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libssl-dev libasound2-dev libvulkan1 fonts-dejavu-core
+          sudo apt-get install -y clang lld cmake pkg-config libfontconfig-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libssl-dev libasound2-dev libvulkan1 fonts-dejavu-core ripgrep
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Build only the GPUI library test target
