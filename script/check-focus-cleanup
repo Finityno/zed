@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Run these focused checks directly in an OpenAI cloud Linux checkout.
+set -euo pipefail
+
+task_focus_results="${1:?Supply an absolute, fresh output directory}"
+case "$task_focus_results" in
+    /*) ;;
+    *) printf 'The output directory must be absolute.\n' >&2; exit 2 ;;
+esac
+mkdir "$task_focus_results"
+command -v rg > /dev/null
+git rev-parse HEAD > "$task_focus_results/source-commit.txt"
+rustc --version > "$task_focus_results/rust-version.txt"
+export CARGO_INCREMENTAL=0
+export CARGO_BUILD_JOBS=2
+export CARGO_PROFILE_TEST_OPT_LEVEL=0
+export CARGO_PROFILE_TEST_DEBUG=0
+export RUST_BACKTRACE=1
+task_focus_build_code=0
+timeout -k 10 1200 cargo test -p gpui --lib --locked --no-run -q \
+    > "$task_focus_results/build.log" 2>&1 || task_focus_build_code=$?
+printf '%s\n' "$task_focus_build_code" > "$task_focus_results/build.exit-code.txt"
+cat "$task_focus_results/build.log"
+if [ "$task_focus_build_code" -ne 0 ]; then exit "$task_focus_build_code"; fi
+
+for task_focus_filter in last_focus_owner_drop_blurs_window_and_preserves_live_handles focus_owner_drops_on_another_thread_are_reclaimed; do
+    task_focus_code=0
+    timeout -k 10 120 cargo test -p gpui --lib --locked "$task_focus_filter" -- --nocapture \
+        > "$task_focus_results/$task_focus_filter.log" 2>&1 || task_focus_code=$?
+    printf '%s\n' "$task_focus_code" > "$task_focus_results/$task_focus_filter.exit-code.txt"
+    cat "$task_focus_results/$task_focus_filter.log"
+    if [ "$task_focus_code" -ne 0 ]; then exit "$task_focus_code"; fi
+    rg -q 'test result: ok\. 1 passed; 0 failed' "$task_focus_results/$task_focus_filter.log"
+done
