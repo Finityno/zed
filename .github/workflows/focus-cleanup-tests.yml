@@ -1,0 +1,52 @@
+name: Focus cleanup tests
+on:
+  pull_request:
+    paths:
+      - crates/gpui/src/app.rs
+      - crates/gpui/src/window.rs
+      - .github/workflows/focus-cleanup-tests.yml
+  push:
+    branches:
+      - perf/skip-unchanged-focus-sweeps
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  focused-gpui-tests:
+    if: github.repository == 'Finityno/zed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_OPT_LEVEL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Install GPUI Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld cmake pkg-config libfontconfig-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libssl-dev libasound2-dev libvulkan1 fonts-dejavu-core
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Build only the GPUI library test target
+        run: timeout -k 10 1200 cargo test -p gpui --lib --locked --no-run -q
+      - name: Verify last-owner blur and retained handles
+        shell: bash
+        run: |
+          set +e
+          timeout -k 10 120 cargo test -p gpui --lib --locked last_focus_owner_drop_blurs_window_and_preserves_live_handles -- --nocapture > focus-last-owner.log 2>&1
+          result=$?
+          cat focus-last-owner.log
+          if [ "$result" -ne 0 ]; then exit "$result"; fi
+          rg -q 'test result: ok\. 1 passed; 0 failed' focus-last-owner.log
+      - name: Verify concurrent final-owner drops
+        shell: bash
+        run: |
+          set +e
+          timeout -k 10 120 cargo test -p gpui --lib --locked focus_owner_drops_on_another_thread_are_reclaimed -- --nocapture > focus-concurrent-drops.log 2>&1
+          result=$?
+          cat focus-concurrent-drops.log
+          if [ "$result" -ne 0 ]; then exit "$result"; fi
+          rg -q 'test result: ok\. 1 passed; 0 failed' focus-concurrent-drops.log
