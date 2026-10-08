@@ -21,6 +21,12 @@ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
+/// Consecutive frames whose instance data fits in a quarter of the instance
+/// buffer after which it is reallocated smaller. The buffer only grew before,
+/// so one large frame (a huge scroll, a burst of paths) kept up to 256 MiB for
+/// the life of the window.
+const INSTANCE_SHRINK_FRAMES: u32 = 120;
+
 /// Consecutive path-free frames after which the window-sized path targets are
 /// released, the Metal renderer's count (DirectX uses 300). Frames, not time:
 /// GPUI only draws on activity and the renderer has no clock, so a window that
@@ -537,12 +543,44 @@ fn path_tiles(
         .collect()
 }
 
+/// The instance usage of the frames since the last frame that used a quarter
+/// or more of the instance buffer.
+#[derive(Debug, Default)]
+struct InstanceUsageWindow {
+    low_frames: u32,
+    peak: u64,
+}
+
+impl InstanceUsageWindow {
+    /// Records a frame that used `usage` bytes of a `capacity`-byte instance
+    /// buffer and returns the capacity to reallocate to, once usage has stayed
+    /// under a quarter of the capacity for `INSTANCE_SHRINK_FRAMES` frames:
+    /// twice the window's peak, rounded up to a power of two so the next growth
+    /// step lands where it started, and never below `initial`.
+    fn record_frame(&mut self, usage: u64, capacity: u64, initial: u64) -> Option<u64> {
+        if usage.saturating_mul(4) >= capacity {
+            *self = Self::default();
+            return None;
+        }
+        self.low_frames += 1;
+        self.peak = self.peak.max(usage);
+        if self.low_frames < INSTANCE_SHRINK_FRAMES {
+            return None;
+        }
+        let target = self.peak.saturating_mul(2).next_power_of_two().max(initial);
+        *self = Self::default();
+        (target < capacity).then_some(target)
+    }
+}
+
 struct WgpuRendererCore {
     resources: WgpuResources,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_data_capacity: u64,
+    initial_instance_data_capacity: u64,
+    instance_usage: InstanceUsageWindow,
     max_instance_data_size: u64,
     instance_data_alignment: u64,
     uses_webgl_instance_data: bool,
@@ -1631,6 +1669,8 @@ impl WgpuRendererCore {
             path_globals_offset,
             gamma_offset,
             instance_data_capacity,
+            initial_instance_data_capacity: instance_data_capacity,
+            instance_usage: InstanceUsageWindow::default(),
             max_instance_data_size,
             instance_data_alignment,
             uses_webgl_instance_data,
@@ -1804,6 +1844,7 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset: u64 = 0;
+        let starting_capacity = self.instance_data_capacity;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
@@ -1987,6 +2028,27 @@ impl WgpuRendererCore {
             .resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
+
+        // A frame that grew the buffer restarted its offsets in the new one,
+        // so its final offset understates its usage; it counts as a full frame.
+        let usage = if self.instance_data_capacity == starting_capacity {
+            instance_offset
+        } else {
+            self.instance_data_capacity
+        };
+        if let Some(capacity) = self.instance_usage.record_frame(
+            usage,
+            self.instance_data_capacity,
+            self.initial_instance_data_capacity,
+        ) {
+            log::debug!(
+                "instance data shrunk from {} to {capacity}",
+                self.instance_data_capacity
+            );
+            // The submitted frame's bind groups keep the old allocation alive
+            // until the GPU has finished with it.
+            self.reallocate_instance_data(capacity);
+        }
         Ok(submission)
     }
 
@@ -2580,6 +2642,11 @@ impl WgpuRendererCore {
         // Bind groups created earlier in the frame keep the previous buffer or
         // texture alive, so allocations written before the grow remain valid;
         // only subsequent writes land in the new allocation.
+        self.reallocate_instance_data(capacity);
+        Ok(())
+    }
+
+    fn reallocate_instance_data(&mut self, capacity: u64) {
         let uses_webgl_instance_data = self.uses_webgl_instance_data;
         let resources = self.resources_mut();
         if uses_webgl_instance_data {
@@ -2602,7 +2669,6 @@ impl WgpuRendererCore {
             RenderMemoryGauge::InstanceBuffers,
             self.instance_data_capacity,
         );
-        Ok(())
     }
 }
 
@@ -3481,6 +3547,46 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn instance_buffer_returns_to_its_initial_size_after_a_large_frame() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let initial = renderer.core.instance_data_capacity;
+        let quad_count = initial as usize / std::mem::size_of::<Quad>() + 1;
+        let mut large_scene = Scene::default();
+        for _ in 0..quad_count {
+            large_scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::red()));
+        }
+        large_scene.finish();
+        let image = renderer.render_scene_to_image(&large_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, RED);
+        let grown = renderer.core.instance_data_capacity;
+        assert!(grown > initial);
+
+        let mut small_scene = Scene::default();
+        small_scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::blue()));
+        small_scene.finish();
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            renderer.render_scene(&small_scene, device_size(32, 32))?;
+        }
+        assert_eq!(renderer.core.instance_data_capacity, grown);
+        renderer.render_scene(&small_scene, device_size(32, 32))?;
+        assert_eq!(renderer.core.instance_data_capacity, initial);
+        assert_eq!(
+            renderer
+                .core
+                .resources
+                .render_memory
+                .published(RenderMemoryGauge::InstanceBuffers),
+            initial
+        );
+
+        let image = renderer.render_scene_to_image(&small_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, BLUE);
+        assert_pixel(&image, 24, 24, BLACK);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn rare_pipelines_are_compiled_on_first_draw() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
         let compiled = |renderer: &WgpuHeadlessRenderer| {
@@ -3664,6 +3770,41 @@ mod tests {
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
         Ok(())
+    }
+
+    #[test]
+    fn instance_buffer_shrinks_after_a_window_of_low_usage() {
+        const MIB: u64 = 1024 * 1024;
+        let initial = 2 * MIB;
+        let mut window = InstanceUsageWindow::default();
+
+        // Usage at a quarter of the capacity or more never shrinks it.
+        for _ in 0..INSTANCE_SHRINK_FRAMES * 2 {
+            assert_eq!(window.record_frame(16 * MIB, 64 * MIB, initial), None);
+        }
+
+        // A frame back at a quarter restarts the window.
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            assert_eq!(window.record_frame(3 * MIB, 64 * MIB, initial), None);
+        }
+        assert_eq!(window.record_frame(16 * MIB, 64 * MIB, initial), None);
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            assert_eq!(window.record_frame(MIB, 64 * MIB, initial), None);
+        }
+        // Twice the window's peak (3 MiB), rounded up to a power of two.
+        assert_eq!(
+            window.record_frame(3 * MIB, 64 * MIB, initial),
+            Some(8 * MIB)
+        );
+
+        // Never below the initial capacity, and no reallocation to the same size.
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            assert_eq!(window.record_frame(1024, 16 * MIB, initial), None);
+        }
+        assert_eq!(window.record_frame(1024, 16 * MIB, initial), Some(initial));
+        for _ in 0..INSTANCE_SHRINK_FRAMES * 2 {
+            assert_eq!(window.record_frame(1024, initial, initial), None);
+        }
     }
 
     #[test]
