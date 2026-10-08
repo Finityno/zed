@@ -1,0 +1,103 @@
+{
+  "status": "HELD, unmerged. Never resample this design unchanged or weaken frozen gates.",
+  "baseline": "6e95c2810a67625903fb5ebfae4f11ddbe0fcabf",
+  "source": "12fdb142f4db5be22b8c5ffbcd0e871ef836011f",
+  "policy_sha256": "6ca6213bf3697ab224669bf23a800c0f235ec4f88dcb6c544b84785ec1a48666",
+  "valid_children": 560,
+  "diagnostic_children": 60,
+  "invalid_preserved_children": 560,
+  "qualified": false,
+  "failures": [
+    [
+      "bare",
+      "keep-32",
+      "cpu_ns",
+      "control",
+      184655,
+      60120
+    ],
+    [
+      "bare",
+      "keep-32",
+      "elapsed_ns",
+      "control",
+      184394,
+      57134
+    ],
+    [
+      "bare",
+      "keep-256",
+      "cpu_ns",
+      "control",
+      1162194,
+      1137426
+    ],
+    [
+      "bare",
+      "keep-256",
+      "elapsed_ns",
+      "control",
+      1161964,
+      1137514
+    ],
+    [
+      "bare",
+      "state-keep-256",
+      "cpu_ns",
+      "control",
+      1329343,
+      728137
+    ],
+    [
+      "bare",
+      "state-keep-256",
+      "elapsed_ns",
+      "control",
+      1329332,
+      732302
+    ],
+    [
+      "bare",
+      "state-keep-256",
+      "child_cpu_ns",
+      "control",
+      1583000,
+      853000
+    ],
+    [
+      "census",
+      "grow-256",
+      "peak_rss_kib",
+      "control",
+      268,
+      192
+    ],
+    [
+      "census",
+      "state-remove-32",
+      "peak_rss_kib",
+      "control",
+      68,
+      64
+    ]
+  ],
+  "observed_primary_thread_cpu_reduction_percent": [
+    13.127582777840285,
+    11.422875475105432,
+    11.817221164540603,
+    12.788009021279635
+  ],
+  "requested_heap_and_churn": "Every held/peak/requested byte/allocation-call median is identical between lanes across all20 cases.",
+  "correctness": "All11 native contract invocations have expected exits;219024 floor/read multiset comparisons preserve the old result; counted-key regression fails before with25711 comparisons and passes after below2049; retained frame/oracle/scrolling/dependency/layout/nested contracts pass.",
+  "not_run": "Owning strictClippy and adoption are not run: the candidate fails performance gates and cannot be merged. No PR opened.",
+  "protocol_rejection": "An earlier CPU/census cohort overlapped12.0381524563 seconds. All560 raw children retained, no gain/gate selection from invalid data. Driver repaired before the first valid cohort, all source/method/gain/control gates unchanged. Completed receipts prove valid phases do not overlap. No valid failed cohort was resampled.",
+  "coverage_limits": [
+    "Linux native complete App/Window fake-platform component; no app/GPU/macOS/Windows/shipped-allocator percentage.",
+    "Census includes App/setup/4warmups/live retained output; timer excludes setup and owner/hash audit.",
+    "NativeRust1.99 exact59 immutable externs/shared runtime; diagnostic private counter/clock overhead included; unused renderer source is not GPU validation.",
+    "Independent main3466c9a and latest consumer changes are preserved; held source was tested on6e95."
+  ],
+  "archive_sha256": "4bf7e3f18434d4b3e53ba2578bcc9f19ad6362e0ae896955b885dd9c040f856f",
+  "archive_bytes": 629014,
+  "members": 1292
+}

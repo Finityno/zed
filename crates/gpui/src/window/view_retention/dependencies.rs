@@ -658,12 +658,38 @@ fn merge_reads<T: Ord + Copy>(
     if a.is_empty() && b_floor == 0 {
         return b.clone();
     }
-    let mut merged: Vec<(T, u64)> = a
-        .iter()
-        .map(|(key, read_at)| (*key, (*read_at).max(a_floor)))
-        .chain(b.iter().map(|(key, read_at)| (*key, (*read_at).max(b_floor))))
-        .collect();
-    earliest_reads(&mut merged);
+    let mut merged = Vec::with_capacity(a.len() + b.len());
+    let mut left = a.iter();
+    let mut right = b.iter();
+    let mut left_read = left.next();
+    let mut right_read = right.next();
+    while let (Some((left_key, left_at)), Some((right_key, right_at))) = (left_read, right_read) {
+        match left_key.cmp(right_key) {
+            std::cmp::Ordering::Less => {
+                merged.push((*left_key, (*left_at).max(a_floor)));
+                left_read = left.next();
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push((*right_key, (*right_at).max(b_floor)));
+                right_read = right.next();
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push((*left_key, (*left_at).max(a_floor).min((*right_at).max(b_floor))));
+                left_read = left.next();
+                right_read = right.next();
+            }
+        }
+    }
+    merged.extend(left_read.into_iter().chain(left).map(|(key, read_at)| (*key, (*read_at).max(a_floor))));
+    merged.extend(right_read.into_iter().chain(right).map(|(key, read_at)| (*key, (*read_at).max(b_floor))));
+    merged.dedup_by(|current, previous| {
+        if current.0 == previous.0 {
+            previous.1 = previous.1.min(current.1);
+            true
+        } else {
+            false
+        }
+    });
     merged.into()
 }
 
@@ -964,6 +990,89 @@ pub(crate) enum DependencyChange {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "dependency_profile.rs"]
 mod dependency_profile;
+
+#[cfg(test)]
+mod read_union_tests {
+    use super::*;
+
+    #[test]
+    fn sorted_read_unions_preserve_earliest_floor_lifted_versions() {
+        let choices = [(0, 2), (0, 8), (1, 5), (2, 1), (2, 9)];
+        let mut inputs = vec![Vec::new()];
+        let mut level = vec![Vec::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for prefix in &level {
+                for choice in choices {
+                    let mut input = prefix.clone();
+                    input.push(choice);
+                    input.sort_by_key(|(key, _)| *key);
+                    inputs.push(input.clone());
+                    next.push(input);
+                }
+            }
+            level = next;
+        }
+        for left in &inputs {
+            for right in &inputs {
+                for left_floor in [0, 3, 12] {
+                    for right_floor in [0, 5, 10] {
+                        let left: Rc<[(u32, u64)]> = left.clone().into();
+                        let right: Rc<[(u32, u64)]> = right.clone().into();
+                        let actual = merge_reads(&left, left_floor, &right, right_floor);
+                        let expected = if right.is_empty() && left_floor == 0 {
+                            assert!(Rc::ptr_eq(&actual, &left));
+                            left.to_vec()
+                        } else if left.is_empty() && right_floor == 0 {
+                            assert!(Rc::ptr_eq(&actual, &right));
+                            right.to_vec()
+                        } else {
+                            let mut reads: Vec<_> = left.iter().map(|(key, read)| (*key, (*read).max(left_floor)))
+                                .chain(right.iter().map(|(key, read)| (*key, (*read).max(right_floor))))
+                                .collect();
+                            reads.sort_unstable();
+                            reads.dedup_by_key(|(key, _)| *key);
+                            reads
+                        };
+                        assert_eq!(actual.as_ref(), expected.as_slice(), "left={left:?} right={right:?} floors={left_floor}/{right_floor}");
+                    }
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct CountedKey(u32);
+
+    impl Ord for CountedKey {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            COMPARISONS.with(|count| count.set(count.get() + 1));
+            self.0.cmp(&other.0)
+        }
+    }
+
+    impl PartialOrd for CountedKey {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    #[test]
+    fn sorted_read_union_uses_linear_key_comparisons() {
+        let left: Rc<[(CountedKey, u64)]> = (0..1024).map(|key| (CountedKey(key), 2)).collect();
+        let right: Rc<[(CountedKey, u64)]> = (0..1024).map(|key| (CountedKey(key), 4)).collect();
+        COMPARISONS.with(|count| count.set(0));
+        let merged = merge_reads(&left, 3, &right, 5);
+        let comparisons = COMPARISONS.with(Cell::get);
+        assert_eq!(merged.len(), left.len());
+        assert!(merged.iter().all(|(_, read)| *read == 3));
+        assert!(comparisons <= left.len() + right.len(), "{comparisons} comparisons");
+    }
+}
 
 #[cfg(test)]
 mod empty_nested_tests {
