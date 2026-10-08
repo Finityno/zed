@@ -26,6 +26,7 @@ use crate::{
     ScrollAxisLock, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
     TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
+use crate::window::{ActiveListener, HoverListener};
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
@@ -2297,7 +2298,7 @@ pub struct Interactivity {
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
-    pub base_style: Box<StyleRefinement>,
+    pub base_style: StyleRefinement,
     pub(crate) focus_style: Option<Box<StyleRefinement>>,
     pub(crate) in_focus_style: Option<Box<StyleRefinement>>,
     pub(crate) focus_visible_style: Option<Box<StyleRefinement>>,
@@ -2367,10 +2368,10 @@ impl Interactivity {
             cx,
             |inspector_state: &mut Option<DivInspectorState>, _window| {
                 if let Some(inspector_state) = inspector_state {
-                    self.base_style = inspector_state.base_style.clone();
+                    self.base_style = (*inspector_state.base_style).clone();
                 } else {
                     *inspector_state = Some(DivInspectorState {
-                        base_style: self.base_style.clone(),
+                        base_style: Box::new(self.base_style.clone()),
                         bounds: Default::default(),
                         content_size: Default::default(),
                     })
@@ -3069,7 +3070,6 @@ impl Interactivity {
             || self.base_style.mouse_cursor.is_some()
             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
         {
-            let hitbox = hitbox.clone();
             let hover_state = self.hover_style.as_ref().and_then(|_| {
                 element_state
                     .as_ref()
@@ -3086,19 +3086,14 @@ impl Interactivity {
             // dispatch against the same frame, so update the snapshot after
             // each transition rather than comparing every event against the
             // state at paint time.
-            let mut was_hovered = hitbox.is_hovered(window);
+            let was_hovered = hitbox.is_hovered(window);
 
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    let hovered = hitbox.is_hovered(window);
-                    if hovered != was_hovered {
-                        was_hovered = hovered;
-                        if let Some(hover_state) = &hover_state {
-                            hover_state.borrow_mut().element = hovered;
-                        }
-                        cx.notify(current_view);
-                    }
-                }
+            window.on_hover_transition(HoverListener {
+                hitbox: hitbox.id,
+                was_hovered,
+                hover_state,
+                group: false,
+                view: current_view,
             });
         }
 
@@ -3111,24 +3106,19 @@ impl Interactivity {
                 let current_view = window.current_view();
                 // Paint-time snapshot, updated per observed transition; see
                 // the element-hover listener above.
-                let mut was_group_hovered = group_hitbox_id.is_hovered(window);
+                let was_group_hovered = group_hitbox_id.is_hovered(window);
 
-                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture {
-                        let group_hovered = group_hitbox_id.is_hovered(window);
-                        if group_hovered != was_group_hovered {
-                            was_group_hovered = group_hovered;
-                            if let Some(hover_state) = &hover_state {
-                                hover_state.borrow_mut().group = group_hovered;
-                            }
-                            cx.notify(current_view);
-                        }
-                    }
+                window.on_hover_transition(HoverListener {
+                    hitbox: group_hitbox_id,
+                    was_hovered: was_group_hovered,
+                    hover_state,
+                    group: true,
+                    view: current_view,
                 });
             }
         }
 
-        let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
+        let drag_cursor_style = self.base_style.mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
         let drop_listeners = mem::take(&mut self.drop_listeners);
@@ -3473,37 +3463,15 @@ impl Interactivity {
                 .get_or_insert_with(Default::default)
                 .clone();
 
-            {
-                let active_state = active_state.clone();
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
-                        *active_state.borrow_mut() = ElementClickedState::default();
-                        window.refresh();
-                    }
-                });
-            }
-
-            {
-                let active_group_hitbox = self
-                    .group_active_style
-                    .as_ref()
-                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, window));
-                let hitbox = hitbox.clone();
-                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Bubble && !window.default_prevented() {
-                        let group_hovered = active_group_hitbox
-                            .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
-                        let element_hovered = hitbox.is_hovered(window);
-                        if group_hovered || element_hovered {
-                            *active_state.borrow_mut() = ElementClickedState {
-                                group: group_hovered,
-                                element: element_hovered,
-                            };
-                            window.refresh();
-                        }
-                    }
-                });
-            }
+            let active_group_hitbox = self
+                .group_active_style
+                .as_ref()
+                .and_then(|group_active| GroupHitboxes::get(&group_active.group, window));
+            window.on_press_transition(ActiveListener {
+                clicked_state: active_state,
+                hitbox: hitbox.id,
+                group_hitbox: active_group_hitbox,
+            });
         }
     }
 
@@ -3927,7 +3895,7 @@ pub struct ElementClickedState {
 }
 
 impl ElementClickedState {
-    fn is_clicked(&self) -> bool {
+    pub(crate) fn is_clicked(&self) -> bool {
         self.group || self.element
     }
 }
@@ -5816,6 +5784,112 @@ mod tests {
             window.draw(cx).clear(cx);
         })
         .unwrap();
+    }
+
+    struct PressStateTestView;
+
+    impl Render for PressStateTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("press-target")
+                    .size(px(20.))
+                    .bg(crate::black())
+                    .hover(|style| style.bg(crate::green()))
+                    .active(|style| style.bg(crate::yellow())),
+            )
+        }
+    }
+
+    /// Draws the window and returns the background the press target was painted with.
+    fn press_target_background(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+    ) -> crate::Background {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let scene = &window.rendered_frame.scene;
+            let mut painted = crate::Scene::default();
+            painted.replay(0..scene.len(), scene);
+            painted.finish();
+            let width = crate::ScaledPixels::from(20. * window.scale_factor());
+            let targets = painted
+                .quads
+                .iter()
+                .filter(|quad| quad.bounds.size.width == width)
+                .map(|quad| quad.background)
+                .collect::<Vec<_>>();
+            assert_eq!(targets.len(), 1, "one quad paints the press target");
+            targets[0]
+        })
+        .unwrap()
+    }
+
+    /// Entering an element with hover styling notifies its view, a press on it
+    /// marks it active, and a mouse up clears that, through the listeners such
+    /// elements register every frame.
+    #[gpui::test]
+    fn hover_and_press_listeners_drive_hover_and_active_styles(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| PressStateTestView);
+        let window = AnyWindowHandle::from(window);
+        let inside = point(px(10.), px(10.));
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(point(px(100.), px(100.)), cx);
+        })
+        .unwrap();
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::black())
+        );
+
+        let notified = cx
+            .update_window(window, |_, window, cx| {
+                window.simulate_mouse_move(inside, cx);
+                window.invalidator.is_dirty()
+            })
+            .unwrap();
+        assert!(notified, "entering the element notifies its view");
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::green())
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: inside,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::yellow())
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: inside,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::green())
+        );
     }
 
     fn key_down(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {

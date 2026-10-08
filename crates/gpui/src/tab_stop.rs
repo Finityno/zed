@@ -101,11 +101,14 @@ impl TabStopMap {
     }
 
     pub fn clear(&mut self) {
-        *self = Self::default();
+        // Runs every frame: clearing in place keeps the buffers' capacity, and
+        // an empty tree is left alone rather than replaced by a fresh empty one.
         self.current_path.0.clear();
         self.insertion_history.clear();
         self.by_id.clear();
-        self.order = SumTree::new(());
+        if !self.order.is_empty() {
+            self.order = SumTree::new(());
+        }
     }
 
     pub fn next(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {

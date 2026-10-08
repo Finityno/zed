@@ -749,6 +749,97 @@ type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
+/// A mouse listener registered for the next frame.
+pub(crate) enum MouseListener {
+    Any(AnyMouseListener),
+    Hover(HoverListener),
+    Active(ActiveListener),
+}
+
+/// Notifies `view` when a mouse move changes whether `hitbox` is hovered.
+///
+/// Every element with hover styling registers one of these each frame, so it
+/// is kept as plain data next to the boxed listeners, in the same order, rather
+/// than as one more boxed closure.
+pub(crate) struct HoverListener {
+    pub(crate) hitbox: HitboxId,
+    /// Whether `hitbox` was hovered in the frame the listener belongs to,
+    /// updated on each transition the listener observes.
+    pub(crate) was_hovered: bool,
+    pub(crate) hover_state: Option<Rc<RefCell<crate::ElementHoverState>>>,
+    /// Whether this tracks the element's group, rather than the element.
+    pub(crate) group: bool,
+    pub(crate) view: EntityId,
+}
+
+/// Tracks whether an element is pressed: a mouse down on its hitbox (or its
+/// active group's) marks it clicked, and any mouse up clears that.
+///
+/// Every element with an id registers this each frame, so like
+/// [`HoverListener`] it is plain data. It stands in for two adjacent closures,
+/// one for each event type, so every event still meets it at the same place
+/// among the other listeners.
+pub(crate) struct ActiveListener {
+    pub(crate) clicked_state: Rc<RefCell<crate::ElementClickedState>>,
+    pub(crate) hitbox: HitboxId,
+    pub(crate) group_hitbox: Option<HitboxId>,
+}
+
+impl MouseListener {
+    fn dispatch(
+        &mut self,
+        event: &dyn Any,
+        phase: DispatchPhase,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match self {
+            MouseListener::Any(listener) => listener(event, phase, window, cx),
+            MouseListener::Hover(listener) => {
+                if phase == DispatchPhase::Capture && event.is::<MouseMoveEvent>() {
+                    let hovered = listener.hitbox.is_hovered(window);
+                    if hovered != listener.was_hovered {
+                        listener.was_hovered = hovered;
+                        if let Some(hover_state) = &listener.hover_state {
+                            let mut hover_state = hover_state.borrow_mut();
+                            if listener.group {
+                                hover_state.group = hovered;
+                            } else {
+                                hover_state.element = hovered;
+                            }
+                        }
+                        cx.notify(listener.view);
+                    }
+                }
+            }
+            MouseListener::Active(listener) => {
+                if event.is::<MouseUpEvent>() {
+                    let clicked_state = &listener.clicked_state;
+                    if phase == DispatchPhase::Capture && clicked_state.borrow().is_clicked() {
+                        *clicked_state.borrow_mut() = crate::ElementClickedState::default();
+                        window.refresh();
+                    }
+                } else if event.is::<crate::MouseDownEvent>()
+                    && phase == DispatchPhase::Bubble
+                    && !window.default_prevented()
+                {
+                    let group_hovered = listener
+                        .group_hitbox
+                        .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
+                    let element_hovered = listener.hitbox.is_hovered(window);
+                    if group_hovered || element_hovered {
+                        *listener.clicked_state.borrow_mut() = crate::ElementClickedState {
+                            group: group_hovered,
+                            element: element_hovered,
+                        };
+                        window.refresh();
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
@@ -1044,7 +1135,7 @@ pub(crate) struct Frame {
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
-    pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) mouse_listeners: Vec<Option<MouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     /// First paint operation that belongs on the GPUI overlay surface.
@@ -6411,13 +6502,33 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.mouse_listeners.push(Some(Box::new(
-            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    listener(event, phase, window, cx)
-                }
-            },
-        )));
+        self.next_frame
+            .mouse_listeners
+            .push(Some(MouseListener::Any(Box::new(
+                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    if let Some(event) = event.downcast_ref() {
+                        listener(event, phase, window, cx)
+                    }
+                },
+            ))));
+    }
+
+    /// Register a [`HoverListener`] for the next frame, which dispatches in
+    /// order with the listeners [`Self::on_mouse_event`] registers.
+    pub(crate) fn on_hover_transition(&mut self, listener: HoverListener) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .mouse_listeners
+            .push(Some(MouseListener::Hover(listener)));
+    }
+
+    /// Register an [`ActiveListener`] for the next frame, which dispatches in
+    /// order with the listeners [`Self::on_mouse_event`] registers.
+    pub(crate) fn on_press_transition(&mut self, listener: ActiveListener) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .mouse_listeners
+            .push(Some(MouseListener::Active(listener)));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -6935,7 +7046,7 @@ impl Window {
         // special purposes, such as detecting events outside of a given Bounds.
         for listener in &mut mouse_listeners {
             let listener = listener.as_mut().unwrap();
-            listener(event, DispatchPhase::Capture, self, cx);
+            listener.dispatch(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
                 break;
             }
@@ -6945,7 +7056,7 @@ impl Window {
         if cx.propagate_event {
             for listener in mouse_listeners.iter_mut().rev() {
                 let listener = listener.as_mut().unwrap();
-                listener(event, DispatchPhase::Bubble, self, cx);
+                listener.dispatch(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
                     break;
                 }
