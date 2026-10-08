@@ -865,21 +865,25 @@ impl App {
         now: Instant,
         except: &StateVersion,
     ) -> Option<DependencyChange> {
-        if dependencies
-            .states
-            .iter()
-            .any(|(version, _)| version.same_state(except))
-        {
-            let mut without = dependencies.clone();
-            without.states = without
-                .states
-                .iter()
-                .filter(|(version, _)| !version.same_state(except))
-                .cloned()
-                .collect();
-            return self.dependencies_changed(&without, inside_notified, now);
+        match self.dependencies_changed(dependencies, inside_notified, now) {
+            Some(DependencyChange::State) => {
+                // Only a state result can be hidden by the exception. Keep
+                // entity/global checks and their culprit reporting unchanged.
+                if dependencies.states.iter().any(|(version, read_at)| {
+                    !version.same_state(except) && version.get() != *read_at
+                }) {
+                    Some(DependencyChange::State)
+                } else if dependencies
+                    .rebuild_at
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    Some(DependencyChange::Deadline)
+                } else {
+                    None
+                }
+            }
+            change => change,
         }
-        self.dependencies_changed(dependencies, inside_notified, now)
     }
 
     /// Whether anything in `dependencies` may have changed since it was
@@ -994,6 +998,143 @@ mod empty_nested_tests {
             let outer = cx.finish_recording_dependencies(outer);
             assert_eq!(outer.all.rebuild_at, Some(deadline));
             assert_eq!(outer.own.rebuild_at, None);
+        });
+    }
+}
+
+#[cfg(test)]
+mod state_check_tests {
+    use super::*;
+
+    #[test]
+    fn state_reconciliation_matches_filtered_snapshot() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            for count in [0_usize, 1, 8, 64] {
+                for marker_index in [None, Some(0), Some(count / 2), count.checked_sub(1)] {
+                    for changes in 0..32 {
+                        let marker = StateVersion::default();
+                        let states: Vec<_> = (0..count)
+                            .map(|index| {
+                                if Some(index) == marker_index {
+                                    marker.clone()
+                                } else {
+                                    StateVersion::default()
+                                }
+                            })
+                            .collect();
+                        let entity = EntityId::from(1);
+                        let global = TypeId::of::<u32>();
+                        let now = Instant::now();
+                        let recording = cx.begin_recording_dependencies();
+                        note_access(&cx.entities, entity);
+                        note_global_read(cx, global);
+                        for state in &states {
+                            note_state_read(state);
+                        }
+                        note_deadline(if changes & 4 != 0 {
+                            now
+                        } else {
+                            now + std::time::Duration::from_secs(3600)
+                        });
+                        let dependencies = cx.finish_recording_dependencies(recording).all;
+                        if changes & 1 != 0 {
+                            marker.bump();
+                        }
+                        if changes & 2 != 0
+                            && let Some(state) = states.iter().find(|state| !state.same_state(&marker))
+                        {
+                            state.bump();
+                        }
+                        if changes & 8 != 0 {
+                            cx.dependencies.global_changed(global);
+                        }
+                        if changes & 16 != 0 {
+                            cx.entities.access_log.stamp_changed(entity);
+                        }
+                        let mut filtered = dependencies.clone();
+                        filtered.states = filtered
+                            .states
+                            .iter()
+                            .filter(|(version, _)| !version.same_state(&marker))
+                            .cloned()
+                            .collect();
+                        for inside_notified in [false, true] {
+                            assert_eq!(
+                                cx.dependencies_changed_except(
+                                    &dependencies,
+                                    inside_notified,
+                                    now,
+                                    &marker,
+                                ),
+                                cx.dependencies_changed(&filtered, inside_notified, now),
+                                "count={count} marker={marker_index:?} changes={changes}",
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn ignoring_a_frame_marker_still_checks_other_state() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let marker = StateVersion::default();
+            let other = StateVersion::default();
+            let recording = cx.begin_recording_dependencies();
+            note_state_read(&marker);
+            note_state_read(&other);
+            let dependencies = cx.finish_recording_dependencies(recording).all;
+            marker.bump();
+            let now = Instant::now();
+            assert_eq!(cx.dependencies_changed(&dependencies, false, now), Some(DependencyChange::State));
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), None);
+            other.bump();
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::State));
+        });
+    }
+
+    #[test]
+    fn an_absent_exception_does_not_hide_state_changes() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let marker = StateVersion::default();
+            let other = StateVersion::default();
+            let recording = cx.begin_recording_dependencies();
+            note_state_read(&other);
+            let dependencies = cx.finish_recording_dependencies(recording).all;
+            other.bump();
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, Instant::now(), &marker), Some(DependencyChange::State));
+        });
+    }
+
+    #[test]
+    fn ignoring_state_preserves_entity_global_and_deadline_priority() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let marker = StateVersion::default();
+            let now = Instant::now();
+            let entity = EntityId::from(1);
+            let global = TypeId::of::<u32>();
+            let recording = cx.begin_recording_dependencies();
+            note_access(&cx.entities, entity);
+            note_global_read(cx, global);
+            note_state_read(&marker);
+            note_deadline(now);
+            let dependencies = cx.finish_recording_dependencies(recording).all;
+            marker.bump();
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::Deadline));
+            cx.dependencies.global_changed(global);
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::Global));
+            cx.entities.access_log.stamp_changed(entity);
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::Entity));
+            assert_eq!(cx.dependencies_changed(&dependencies, false, now), Some(DependencyChange::Entity));
         });
     }
 }

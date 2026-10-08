@@ -178,3 +178,110 @@ fn profile_dependency_records() {
         black_box(held);
     });
 }
+
+fn change_code(change: Option<DependencyChange>) -> usize {
+    match change {
+        None => 0,
+        Some(DependencyChange::Entity) => 1,
+        Some(DependencyChange::Global) => 2,
+        Some(DependencyChange::State) => 3,
+        Some(DependencyChange::Deadline) => 4,
+    }
+}
+
+#[test]
+#[ignore]
+fn profile_state_checks() {
+    let case = std::env::var("GPUI_STATE_PROFILE_CASE").expect("profile case");
+    let iterations = std::env::var("GPUI_STATE_PROFILE_ITERATIONS")
+        .expect("profile iterations").parse::<usize>().expect("iteration count");
+    let count = match case.as_str() {
+        "normal-empty" | "except-empty" => 0,
+        "except-only" | "normal-1" | "except-deadline" | "except-global" | "except-entity" => 1,
+        "except-first-8" | "except-last-8" | "except-changed-8" | "except-absent-8"
+        | "except-absent-changed-8" | "except-unchanged-8" | "normal-8" => 8,
+        "except-first-64" | "except-last-64" | "except-unchanged-64"
+        | "except-absent-64" | "normal-changed-64" | "normal-64" => 64,
+        _ => panic!("unknown state profile case"),
+    };
+    let expected = match case.as_str() {
+        "except-deadline" => 4,
+        "except-global" => 2,
+        "except-entity" => 1,
+        "except-changed-8" | "except-absent-changed-8" | "normal-changed-64" => 3,
+        _ => 0,
+    };
+    let cx = crate::TestAppContext::single();
+    cx.update(|cx| {
+        cx.set_view_retention(true);
+        let marker = StateVersion::default();
+        let normal = case.starts_with("normal-");
+        let absent = case.starts_with("except-absent-");
+        let states: Vec<_> = (0..count).map(|index| {
+            if !normal && !absent
+                && index == if case.contains("-last-") { count - 1 } else { 0 }
+            {
+                marker.clone()
+            } else {
+                StateVersion::default()
+            }
+        }).collect();
+        let now = Instant::now();
+        let entity = EntityId::from(1);
+        let global = TypeId::of::<u32>();
+        let recording = cx.begin_recording_dependencies();
+        for state in &states {
+            note_state_read(state);
+        }
+        if case == "except-global" {
+            note_global_read(cx, global);
+        }
+        if case == "except-entity" {
+            note_access(&cx.entities, entity);
+        }
+        if case == "except-deadline" {
+            note_deadline(now);
+        }
+        let dependencies = cx.finish_recording_dependencies(recording).all;
+        if !case.starts_with("except-unchanged-") {
+            marker.bump();
+        }
+        if matches!(case.as_str(), "except-changed-8" | "except-absent-changed-8" | "normal-changed-64") {
+            states[count - 1].bump();
+        }
+        if case == "except-global" {
+            cx.dependencies.global_changed(global);
+        }
+        if case == "except-entity" {
+            cx.entities.access_log.stamp_changed(entity);
+        }
+        let check = |cx: &App| {
+            let dependencies = black_box(&dependencies);
+            let cx = black_box(cx);
+            if normal {
+                cx.dependencies_changed(dependencies, false, black_box(now))
+            } else {
+                cx.dependencies_changed_except(dependencies, false, black_box(now), black_box(&marker))
+            }
+        };
+        for _ in 0..32 {
+            assert_eq!(change_code(black_box(check(cx))), expected);
+        }
+        #[cfg(gpui_dependency_census)]
+        census::start();
+        let cpu = thread_cpu_ns();
+        let elapsed = Instant::now();
+        let mut signature = 0;
+        for _ in 0..iterations {
+            signature += change_code(black_box(check(cx)));
+        }
+        let elapsed_ns = elapsed.elapsed().as_nanos();
+        let cpu_ns = thread_cpu_ns() - cpu;
+        #[cfg(gpui_dependency_census)]
+        let memory = census::finish();
+        #[cfg(not(gpui_dependency_census))]
+        let memory = (0, 0, 0, 0);
+        assert_eq!(signature, iterations * expected);
+        println!("STATE_PROFILE {{\"case\":{case:?},\"iterations\":{iterations},\"cpu_ns\":{cpu_ns},\"elapsed_ns\":{elapsed_ns},\"held_bytes\":{},\"peak_bytes\":{},\"requested_bytes\":{},\"allocation_calls\":{},\"signature\":{signature}}}", memory.0, memory.1, memory.2, memory.3);
+    });
+}
