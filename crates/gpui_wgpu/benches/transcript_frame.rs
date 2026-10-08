@@ -6,9 +6,8 @@
 
 use gpui::{
     App, AppContext as _, Context, FontWeight, HighlightStyle, InteractiveElement as _,
-    IntoElement, ListAlignment, ListState, ParentElement as _, Render, SharedString,
-    Styled as _, StyledText, TestAppContext, TestDispatcher,
-    Window, WindowHandle, div, hsla, list, px, size,
+    IntoElement, ListAlignment, ListState, ParentElement as _, Render, SharedString, Styled as _,
+    StyledText, TestAppContext, TestDispatcher, Window, WindowHandle, div, hsla, list, px, size,
 };
 use gpui_wgpu::CosmicTextSystem;
 use std::{
@@ -49,10 +48,38 @@ const IBM_PLEX: &[u8] =
     include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
 
 const WORDS: &[&str] = &[
-    "the", "render", "loop", "keeps", "every", "frame", "under", "budget", "while", "streaming",
-    "tokens", "arrive", "from", "model", "and", "layout", "wraps", "paragraphs", "across",
-    "narrow", "panes", "with", "inline", "code", "spans", "like", "`shape_text`", "or",
-    "`ListState`", "that", "measure", "rows",
+    "the",
+    "render",
+    "loop",
+    "keeps",
+    "every",
+    "frame",
+    "under",
+    "budget",
+    "while",
+    "streaming",
+    "tokens",
+    "arrive",
+    "from",
+    "model",
+    "and",
+    "layout",
+    "wraps",
+    "paragraphs",
+    "across",
+    "narrow",
+    "panes",
+    "with",
+    "inline",
+    "code",
+    "spans",
+    "like",
+    "`shape_text`",
+    "or",
+    "`ListState`",
+    "that",
+    "measure",
+    "rows",
 ];
 
 fn paragraph(seed: usize, words: usize) -> String {
@@ -76,13 +103,25 @@ struct Message {
 fn message(index: usize) -> Message {
     let paragraph_count = 1 + index % 4;
     Message {
-        author: if index % 2 == 0 { "You".into() } else { "Assistant".into() },
+        author: if index.is_multiple_of(2) {
+            "You".into()
+        } else {
+            "Assistant".into()
+        },
         paragraphs: (0..paragraph_count)
-            .map(|paragraph_index| paragraph(index * 5 + paragraph_index, 20 + (index * 3 + paragraph_index * 11) % 40).into())
+            .map(|paragraph_index| {
+                paragraph(
+                    index * 5 + paragraph_index,
+                    20 + (index * 3 + paragraph_index * 11) % 40,
+                )
+                .into()
+            })
             .collect(),
         code: if index % 3 == 1 {
             (0..12)
-                .map(|line| format!("    let value_{line} = compute(input, {line}) + offset;").into())
+                .map(|line| {
+                    format!("    let value_{line} = compute(input, {line}) + offset;").into()
+                })
                 .collect()
         } else {
             Vec::new()
@@ -132,11 +171,15 @@ impl Transcript {
         let mut text = tail.to_string();
         text.push(' ');
         text.push_str(WORDS[step % WORDS.len()]);
-        if step % 24 == 23 {
+        let ends_paragraph = step % 24 == 23;
+        if ends_paragraph {
             text.push('.');
-            self.messages[last].paragraphs.push(paragraph(step, 1).into());
-        } else {
-            *self.messages[last].paragraphs.last_mut().unwrap() = text.into();
+        }
+        *tail = text.into();
+        if ends_paragraph {
+            self.messages[last]
+                .paragraphs
+                .push(paragraph(step, 1).into());
         }
         self.list.remeasure_items(last..last + 1);
         cx.notify();
@@ -173,11 +216,20 @@ impl Transcript {
                     .text_sm()
                     .text_color(hsla(0., 0., 0.4, 1.))
                     .child(message.author.clone())
-                    .child(div().id("copy").px_1().hover(|style| style.bg(hsla(0., 0., 0.5, 0.2))).child("Copy")),
+                    .child(
+                        div()
+                            .id("copy")
+                            .px_1()
+                            .hover(|style| style.bg(hsla(0., 0., 0.5, 0.2)))
+                            .child("Copy"),
+                    ),
             )
-            .children(message.paragraphs.iter().map(|text| {
-                StyledText::new(text.clone()).with_highlights(highlights(text))
-            }))
+            .children(
+                message
+                    .paragraphs
+                    .iter()
+                    .map(|text| StyledText::new(text.clone()).with_highlights(highlights(text))),
+            )
             .when(!message.code.is_empty(), |this| {
                 this.child(
                     div()
@@ -260,8 +312,15 @@ fn measure(
     frames: usize,
     mut change: impl FnMut(&mut TestAppContext, usize),
 ) -> Sample {
-    let mut sample = Sample { times: Vec::new(), allocations: Vec::new(), bytes: Vec::new() };
-    cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false)).ok();
+    let mut sample = Sample {
+        times: Vec::new(),
+        allocations: Vec::new(),
+        bytes: Vec::new(),
+    };
+    cx.update_window(window.into(), |_, window, _| {
+        window.reset_frame_work_stats(false)
+    })
+    .ok();
     for frame in 0..frames {
         change(cx, frame);
         let (time, allocations, bytes) = draw(cx, window);
@@ -270,24 +329,41 @@ fn measure(
         sample.bytes.push(bytes);
     }
     if std::env::var("WORK").is_ok() {
-        let work = cx.update_window(window.into(), |_, window, _| window.frame_work_stats()).unwrap();
+        let work = cx
+            .update_window(window.into(), |_, window, _| window.frame_work_stats())
+            .unwrap();
         println!("{work:?}");
     }
     sample
 }
 
 fn main() {
-    let frames: usize = std::env::var("FRAMES").ok().and_then(|value| value.parse().ok()).unwrap_or(400);
-    let messages: usize = std::env::var("MESSAGES").ok().and_then(|value| value.parse().ok()).unwrap_or(400);
+    let frames: usize = std::env::var("FRAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(400)
+        .max(1);
+    let messages: usize = std::env::var("MESSAGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(400)
+        .max(1);
     let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
-    gpui::PlatformTextSystem::add_fonts(&text_system, vec![Cow::Borrowed(LILEX), Cow::Borrowed(IBM_PLEX)])
-        .expect("fonts load");
-    let mut cx = TestAppContext::build_with_text_system(TestDispatcher::new(0), None, Arc::new(text_system));
+    gpui::PlatformTextSystem::add_fonts(
+        &text_system,
+        vec![Cow::Borrowed(LILEX), Cow::Borrowed(IBM_PLEX)],
+    )
+    .expect("fonts load");
+    let mut cx =
+        TestAppContext::build_with_text_system(TestDispatcher::new(0), None, Arc::new(text_system));
     if std::env::var("GPUI_RETAINED_VIEWS").as_deref() == Ok("1") {
         cx.update(|cx| cx.set_view_retention(true));
     }
     let window = cx.add_window(|_, _| Transcript::new(messages));
-    cx.update_window(window.into(), |_, window, _| window.resize(size(px(800.), px(1000.)))).ok();
+    cx.update_window(window.into(), |_, window, _| {
+        window.resize(size(px(800.), px(1000.)))
+    })
+    .ok();
     for _ in 0..5 {
         draw(&mut cx, window);
     }
@@ -299,12 +375,17 @@ fn main() {
     .report("stream_tail");
 
     measure(&mut cx, window, frames, |cx, _| {
-        cx.update_window(window.into(), |_, window, _| window.refresh()).ok();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .ok();
     })
     .report("redraw_unchanged");
 
     measure(&mut cx, window, frames, |cx, step| {
-        let distance = if (step / 100) % 2 == 0 { px(-37.) } else { px(37.) };
+        let distance = if (step / 100).is_multiple_of(2) {
+            px(-37.)
+        } else {
+            px(37.)
+        };
         transcript.update(cx, |transcript, cx| {
             transcript.list.scroll_by(distance);
             cx.notify();
@@ -320,9 +401,12 @@ fn main() {
     .report("stream_long_paragraph");
 
     let widths = [800., 640., 520., 700.];
-    measure(&mut cx, window, frames / 4, |cx, step| {
+    measure(&mut cx, window, (frames / 4).max(1), |cx, step| {
         let width = widths[step % widths.len()];
-        cx.update_window(window.into(), |_, window, _| window.resize(size(px(width), px(1000.)))).ok();
+        cx.update_window(window.into(), |_, window, _| {
+            window.resize(size(px(width), px(1000.)))
+        })
+        .ok();
     })
     .report("resize");
 }

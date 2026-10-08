@@ -5,7 +5,10 @@ use schemars::{JsonSchema, json_schema};
 
 /// The OpenType features that can be configured for a given font.
 #[derive(Clone, Eq, PartialEq, Hash)]
-pub struct FontFeatures(pub Arc<Vec<(String, u32)>>);
+pub struct FontFeatures(
+    /// Default values share one empty list, so mutate through `Arc::make_mut`.
+    pub Arc<Vec<(String, u32)>>,
+);
 
 impl Default for FontFeatures {
     /// Shares one empty list: `TextStyle::default()` runs for every style

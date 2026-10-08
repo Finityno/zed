@@ -231,7 +231,9 @@ enum FontLookup {
     Found(FontId),
     /// The font failed to load; `fallback` is the font from the fallback
     /// stack it resolves to, once one has been found.
-    Missing { fallback: Option<FontId> },
+    Missing {
+        fallback: Option<FontId>,
+    },
 }
 
 /// The GPUI text rendering sub system.
@@ -361,7 +363,13 @@ impl TextSystem {
                         FontLookup::Missing { fallback: None }
                     }
                 };
-                self.font_ids_by_font.write().insert(font.clone(), lookup);
+                // Another thread may have resolved this font meanwhile; keep
+                // its entry, which may already carry a memoized fallback.
+                let lookup = *self
+                    .font_ids_by_font
+                    .write()
+                    .entry(font.clone())
+                    .or_insert(lookup);
                 match lookup {
                     FontLookup::Found(font_id) => Some(font_id),
                     FontLookup::Missing { .. } => None,
@@ -399,12 +407,11 @@ impl TextSystem {
         }
         for fallback in &self.fallback_font_stack {
             if let Some(font_id) = self.font_id(fallback) {
-                self.font_ids_by_font.write().insert(
-                    font.clone(),
-                    FontLookup::Missing {
-                        fallback: Some(font_id),
-                    },
-                );
+                if let Some(FontLookup::Missing { fallback: memo }) =
+                    self.font_ids_by_font.write().get_mut(font)
+                {
+                    *memo = Some(font_id);
+                }
                 return font_id;
             }
         }
@@ -1832,6 +1839,100 @@ mod raster_bounds_cache_tests {
             platform.calls(),
             1,
             "a glyph with no design ink rasterizes empty legitimately and must stay cached"
+        );
+    }
+}
+
+#[cfg(test)]
+mod font_lookup_tests {
+    use super::{RenderGlyphParams, TextSystem};
+    use crate::{
+        Bounds, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId, LineLayout,
+        NoopTextSystem, Pixels, PlatformTextSystem, Size, TextRenderingMode, font,
+    };
+    use anyhow::Result;
+    use parking_lot::Mutex;
+    use std::{borrow::Cow, sync::Arc};
+
+    /// Fails to load one family and records every family it was asked for.
+    struct OneMissingFamily {
+        inner: NoopTextSystem,
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl PlatformTextSystem for OneMissingFamily {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.inner.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            self.inner.all_font_names()
+        }
+        fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+            self.requests.lock().push(descriptor.family.to_string());
+            if descriptor.family.as_ref() == "Missing" {
+                anyhow::bail!("no such family");
+            }
+            Ok(FontId(7))
+        }
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.inner.font_metrics(font_id)
+        }
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            self.inner.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.inner.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.inner.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            self.inner.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            self.inner.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.inner.layout_line(text, font_size, runs)
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            self.inner.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    #[test]
+    fn a_missing_font_resolves_to_its_memoized_fallback_without_asking_again() {
+        let platform = Arc::new(OneMissingFamily {
+            inner: NoopTextSystem,
+            requests: Mutex::default(),
+        });
+        let text_system = TextSystem::new(platform.clone());
+        let missing = font("Missing");
+
+        assert_eq!(text_system.resolve_font(&missing), FontId(7));
+        let after_first = platform.requests.lock().len();
+        assert_eq!(text_system.resolve_font(&missing), FontId(7));
+        assert_eq!(text_system.resolve_font(&missing), FontId(7));
+        assert_eq!(
+            platform.requests.lock().len(),
+            after_first,
+            "repeat lookups of a missing font must not reach the platform"
+        );
+
+        text_system.add_fonts(Vec::new()).unwrap();
+        assert_eq!(text_system.resolve_font(&missing), FontId(7));
+        assert_eq!(
+            platform.requests.lock()[after_first],
+            "Missing",
+            "adding fonts must forget the failure so the family is looked up again"
         );
     }
 }
