@@ -84,6 +84,34 @@ dependency objects. See `performance-evidence/retained-layout-sets-20261008`.
 Qualify coherent application adoption separately, then continue with the next
 distinct important owner and bounded renderer work.
 
+Fincode adopted layout replay at owned rendering `861e0d8570cb179c1cb357d770cc58530c2dd312`
+and component `7eec25934e487e684a96326e212f690f6a4d4aa8` in
+`6984a63f579c266e6c9188ff38f9eba4d0c26d30`. Separate native retention on/off,
+marquee/census, scoped production compilation, strict UI/component Clippy and
+guards pass. Every original registry record is preserved after lock regeneration;
+merged changed bytes and the combined tree are verified. No app/GPU gain is inferred.
+
+Distinct state-only reconciliation at `a946b415c2f5967d36f4f82b8530833c94dee4af`
+also remains held. Its ordinary checker body is unchanged and both lanes use
+identical native external objects. All 800 children pass correctness, CPU,
+elapsed, whole-child CPU and requested-memory controls, with target checker
+CPU 79.23–91.94% lower and transient allocations eliminated. Five census
+native RSS fields fail their frozen ranges. Preserve its branch and evidence;
+never rerun this design unchanged to seek acceptance.
+
+Zero-read nested-stretch omission at `96daa6ebbe402f5eac4867e2d0c73e06cca20eaf`
+qualifies across 600 native children and fifteen complete recorder workloads.
+Parents with their own dependencies and an empty child share immutable all/own
+snapshots: 50% lower held requested heap, 49.98–50.03% lower peak, 36.36–43.75%
+fewer calls and 47.95–62.32% fewer requested bytes. All frozen CPU, elapsed,
+whole-child CPU, heap and native RSS controls pass. Owner-sharing fails before
+and passes after; recorder/retained/frame/layout contracts, strict owning Clippy
+and benchmark isolation pass. See `performance-evidence/empty-recording-stretches-20261008`.
+Setup, warm-up, App capacity and a preallocated output Vec are excluded from
+requested census; arrays for 1024 retained outputs are included. This is Linux
+recorder evidence, not an app/GPU/native-platform percentage. Qualify coherent
+component/Fincode adoption separately, then continue with the next important owner.
+
 ## Iteration and merge policy
 
 Use a focused branch for each distinct candidate. Start from current main and

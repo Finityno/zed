@@ -1,0 +1,641 @@
+{
+  "qualified": true,
+  "source": "96daa6ebbe402f5eac4867e2d0c73e06cca20eaf",
+  "base": "861e0d8570cb179c1cb357d770cc58530c2dd312",
+  "policy_sha256": "c87e27606bf2abe984be68215b5940df5aebf5297fb0a30534171744bb475854",
+  "children": 600,
+  "cases": 15,
+  "primary": {
+    "nested-empty-own-entity": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 72580026,
+          "candidate_median": 49036249,
+          "baseline_min": 72178908,
+          "baseline_max": 74534061,
+          "candidate_min": 48826256,
+          "candidate_max": 50370159,
+          "change_percent": -32.43836947647277,
+          "baseline_range": 2355153,
+          "candidate_range": 1543903,
+          "allowed_increase": 2355153,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 72584158,
+          "candidate_median": 49035282,
+          "baseline_min": 72178042,
+          "baseline_max": 74532857,
+          "candidate_min": 48825609,
+          "candidate_max": 50369224,
+          "change_percent": -32.44354780556936,
+          "baseline_range": 2354815,
+          "candidate_range": 1543615,
+          "allowed_increase": 2354815,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 75348000,
+          "candidate_median": 51722000,
+          "baseline_min": 74779000,
+          "baseline_max": 77093000,
+          "candidate_min": 51323000,
+          "candidate_max": 52900000,
+          "change_percent": -31.355842225407436,
+          "baseline_range": 2314000,
+          "candidate_range": 1577000,
+          "allowed_increase": 2314000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8904,
+          "candidate_median": 8984,
+          "baseline_min": 8776,
+          "baseline_max": 9096,
+          "candidate_min": 8800,
+          "candidate_max": 9200,
+          "change_percent": 0.8984725965857976,
+          "baseline_range": 320,
+          "candidate_range": 400,
+          "allowed_increase": 320,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 131072,
+          "candidate_median": 65536,
+          "baseline_min": 131072,
+          "baseline_max": 131072,
+          "candidate_min": 65536,
+          "candidate_max": 65536,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 131104,
+          "candidate_median": 65536,
+          "baseline_min": 131104,
+          "baseline_max": 131104,
+          "candidate_min": 65536,
+          "candidate_max": 65536,
+          "change_percent": -50.01220405174518,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 524288,
+          "candidate_median": 262144,
+          "baseline_min": 524288,
+          "baseline_max": 524288,
+          "candidate_min": 262144,
+          "candidate_max": 262144,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 22528,
+          "candidate_median": 14336,
+          "baseline_min": 22528,
+          "baseline_max": 22528,
+          "candidate_min": 14336,
+          "candidate_max": 14336,
+          "change_percent": -36.36363636363637,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 9044,
+          "candidate_median": 8868,
+          "baseline_min": 8744,
+          "baseline_max": 9212,
+          "candidate_min": 8708,
+          "candidate_max": 9044,
+          "change_percent": -1.9460415745245485,
+          "baseline_range": 468,
+          "candidate_range": 336,
+          "allowed_increase": 468,
+          "pass": true
+        }
+      }
+    },
+    "nested-empty-own-entities-16": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 97448428,
+          "candidate_median": 65727415,
+          "baseline_min": 96636207,
+          "baseline_max": 105608419,
+          "candidate_min": 65225356,
+          "candidate_max": 82111051,
+          "change_percent": -32.551590262697715,
+          "baseline_range": 8972212,
+          "candidate_range": 16885695,
+          "allowed_increase": 8972212,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 97447016,
+          "candidate_median": 65725882,
+          "baseline_min": 96635302,
+          "baseline_max": 105605179,
+          "candidate_min": 65224623,
+          "candidate_max": 82122430,
+          "change_percent": -32.55218610285614,
+          "baseline_range": 8969877,
+          "candidate_range": 16897807,
+          "allowed_increase": 8969877,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 100191000,
+          "candidate_median": 68419000,
+          "baseline_min": 99231000,
+          "baseline_max": 108796000,
+          "candidate_min": 67891000,
+          "candidate_max": 85050000,
+          "change_percent": -31.71143116647204,
+          "baseline_range": 9565000,
+          "candidate_range": 17159000,
+          "allowed_increase": 9565000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 9412,
+          "candidate_median": 9200,
+          "baseline_min": 9280,
+          "baseline_max": 9540,
+          "candidate_min": 9032,
+          "candidate_max": 9448,
+          "change_percent": -2.2524436889077792,
+          "baseline_range": 260,
+          "candidate_range": 416,
+          "allowed_increase": 260,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 622592,
+          "candidate_median": 311296,
+          "baseline_min": 622592,
+          "baseline_max": 622592,
+          "candidate_min": 311296,
+          "candidate_max": 311296,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 622816,
+          "candidate_median": 311520,
+          "baseline_min": 622816,
+          "baseline_max": 622816,
+          "candidate_min": 311520,
+          "candidate_max": 311520,
+          "change_percent": -49.98201716076658,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 2392064,
+          "candidate_median": 1245184,
+          "baseline_min": 2392064,
+          "baseline_max": 2392064,
+          "candidate_min": 1245184,
+          "candidate_max": 1245184,
+          "change_percent": -47.945205479452056,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 22528,
+          "candidate_median": 14336,
+          "baseline_min": 22528,
+          "baseline_max": 22528,
+          "candidate_min": 14336,
+          "candidate_max": 14336,
+          "change_percent": -36.36363636363637,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 9460,
+          "candidate_median": 9300,
+          "baseline_min": 9280,
+          "baseline_max": 9464,
+          "candidate_min": 9124,
+          "candidate_max": 9316,
+          "change_percent": -1.6913319238900604,
+          "baseline_range": 184,
+          "candidate_range": 192,
+          "allowed_increase": 184,
+          "pass": true
+        }
+      }
+    },
+    "nested-empty-own-state": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 75671967,
+          "candidate_median": 50182389,
+          "baseline_min": 74941324,
+          "baseline_max": 79856209,
+          "candidate_min": 49483712,
+          "candidate_max": 55059323,
+          "change_percent": -33.68430742655335,
+          "baseline_range": 4914885,
+          "candidate_range": 5575611,
+          "allowed_increase": 4914885,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 75670553,
+          "candidate_median": 50187357,
+          "baseline_min": 75013042,
+          "baseline_max": 79853704,
+          "candidate_min": 49556446,
+          "candidate_max": 55056713,
+          "change_percent": -33.67650293238904,
+          "baseline_range": 4840662,
+          "candidate_range": 5500267,
+          "allowed_increase": 4840662,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 78242000,
+          "candidate_median": 52704000,
+          "baseline_min": 77559000,
+          "baseline_max": 82909000,
+          "candidate_min": 52068000,
+          "candidate_max": 58443000,
+          "change_percent": -32.63975869737481,
+          "baseline_range": 5350000,
+          "candidate_range": 6375000,
+          "allowed_increase": 5350000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8904,
+          "candidate_median": 8936,
+          "baseline_min": 8840,
+          "baseline_max": 9048,
+          "candidate_min": 8776,
+          "candidate_max": 9204,
+          "change_percent": 0.3593890386343279,
+          "baseline_range": 208,
+          "candidate_range": 428,
+          "allowed_increase": 208,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 131072,
+          "candidate_median": 65536,
+          "baseline_min": 131072,
+          "baseline_max": 131072,
+          "candidate_min": 65536,
+          "candidate_max": 65536,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 131152,
+          "candidate_median": 65552,
+          "baseline_min": 131152,
+          "baseline_max": 131152,
+          "candidate_min": 65552,
+          "candidate_max": 65552,
+          "change_percent": -50.01829937782115,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 557056,
+          "candidate_median": 262144,
+          "baseline_min": 557056,
+          "baseline_max": 557056,
+          "candidate_min": 262144,
+          "candidate_max": 262144,
+          "change_percent": -52.94117647058824,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 24576,
+          "candidate_median": 14336,
+          "baseline_min": 24576,
+          "baseline_max": 24576,
+          "candidate_min": 14336,
+          "candidate_max": 14336,
+          "change_percent": -41.666666666666664,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8860,
+          "candidate_median": 8784,
+          "baseline_min": 8724,
+          "baseline_max": 9028,
+          "candidate_min": 8532,
+          "candidate_max": 9052,
+          "change_percent": -0.8577878103837477,
+          "baseline_range": 304,
+          "candidate_range": 520,
+          "allowed_increase": 304,
+          "pass": true
+        }
+      }
+    },
+    "nested-empty-own-all": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 85553988,
+          "candidate_median": 52332936,
+          "baseline_min": 82883313,
+          "baseline_max": 96183123,
+          "candidate_min": 51551121,
+          "candidate_max": 55446860,
+          "change_percent": -38.830512494636714,
+          "baseline_range": 13299810,
+          "candidate_range": 3895739,
+          "allowed_increase": 13299810,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 85563164,
+          "candidate_median": 52332108,
+          "baseline_min": 82882003,
+          "baseline_max": 96187061,
+          "candidate_min": 51549641,
+          "candidate_max": 55445543,
+          "change_percent": -38.83804016410613,
+          "baseline_range": 13305058,
+          "candidate_range": 3895902,
+          "allowed_increase": 13305058,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 88106000,
+          "candidate_median": 54917000,
+          "baseline_min": 85867000,
+          "baseline_max": 99249000,
+          "candidate_min": 54264000,
+          "candidate_max": 58403000,
+          "change_percent": -37.6693982248655,
+          "baseline_range": 13382000,
+          "candidate_range": 4139000,
+          "allowed_increase": 13382000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8868,
+          "candidate_median": 8904,
+          "baseline_min": 8800,
+          "baseline_max": 9120,
+          "candidate_min": 8724,
+          "candidate_max": 9016,
+          "change_percent": 0.4059539918809252,
+          "baseline_range": 320,
+          "candidate_range": 292,
+          "allowed_increase": 320,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 212992,
+          "candidate_median": 106496,
+          "baseline_min": 212992,
+          "baseline_max": 212992,
+          "candidate_min": 106496,
+          "candidate_max": 106496,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 213144,
+          "candidate_median": 106512,
+          "baseline_min": 213144,
+          "baseline_max": 213144,
+          "candidate_min": 106512,
+          "candidate_max": 106512,
+          "change_percent": -50.028149983110005,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 1130496,
+          "candidate_median": 425984,
+          "baseline_min": 1130496,
+          "baseline_max": 1130496,
+          "candidate_min": 425984,
+          "candidate_max": 425984,
+          "change_percent": -62.31884057971014,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 32768,
+          "candidate_median": 18432,
+          "baseline_min": 32768,
+          "baseline_max": 32768,
+          "candidate_min": 18432,
+          "candidate_max": 18432,
+          "change_percent": -43.75,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8888,
+          "candidate_median": 8848,
+          "baseline_min": 8768,
+          "baseline_max": 9148,
+          "candidate_min": 8544,
+          "candidate_max": 9028,
+          "change_percent": -0.4500450045004545,
+          "baseline_range": 380,
+          "candidate_range": 484,
+          "allowed_increase": 380,
+          "pass": true
+        }
+      }
+    },
+    "nested-empty-own-deadline": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 79120190,
+          "candidate_median": 48605346,
+          "baseline_min": 78220349,
+          "baseline_max": 91934764,
+          "candidate_min": 48094391,
+          "candidate_max": 79423779,
+          "change_percent": -38.56770819180287,
+          "baseline_range": 13714415,
+          "candidate_range": 31329388,
+          "allowed_increase": 13714415,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 79121871,
+          "candidate_median": 48604524,
+          "baseline_min": 78218943,
+          "baseline_max": 91932977,
+          "candidate_min": 48270416,
+          "candidate_max": 79418750,
+          "change_percent": -38.57005226784892,
+          "baseline_range": 13714034,
+          "candidate_range": 31148334,
+          "allowed_increase": 13714034,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 81951000,
+          "candidate_median": 51293000,
+          "baseline_min": 80957000,
+          "baseline_max": 94927000,
+          "candidate_min": 50980000,
+          "candidate_max": 84231000,
+          "change_percent": -37.41015972959452,
+          "baseline_range": 13970000,
+          "candidate_range": 33251000,
+          "allowed_increase": 13970000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8768,
+          "candidate_median": 8952,
+          "baseline_min": 8704,
+          "baseline_max": 8912,
+          "candidate_min": 8776,
+          "candidate_max": 9204,
+          "change_percent": 2.098540145985406,
+          "baseline_range": 208,
+          "candidate_range": 428,
+          "allowed_increase": 208,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 98304,
+          "candidate_median": 49152,
+          "baseline_min": 98304,
+          "baseline_max": 98304,
+          "candidate_min": 49152,
+          "candidate_max": 49152,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 98368,
+          "candidate_median": 49152,
+          "baseline_min": 98368,
+          "baseline_max": 98368,
+          "candidate_min": 49152,
+          "candidate_max": 49152,
+          "change_percent": -50.03253090435914,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 425984,
+          "candidate_median": 196608,
+          "baseline_min": 425984,
+          "baseline_max": 425984,
+          "candidate_min": 196608,
+          "candidate_max": 196608,
+          "change_percent": -53.84615384615385,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 20480,
+          "candidate_median": 12288,
+          "baseline_min": 20480,
+          "baseline_max": 20480,
+          "candidate_min": 12288,
+          "candidate_max": 12288,
+          "change_percent": -40.0,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8756,
+          "candidate_median": 8880,
+          "baseline_min": 8676,
+          "baseline_max": 9072,
+          "candidate_min": 8532,
+          "candidate_max": 8944,
+          "change_percent": 1.416171767930563,
+          "baseline_range": 396,
+          "candidate_range": 412,
+          "allowed_increase": 396,
+          "pass": true
+        }
+      }
+    }
+  },
+  "all_controls_pass": true,
+  "correctness": "Owner-sharing regression fails before/passes after. Four nested recorder contracts and six native retained/frame/layout regressions pass, including default16-seed oracle. Strict owning Clippy and benchmark isolation pass.",
+  "scope": "Complete Linux App recorder; setup/warmup/App capacity and preallocated result Vec outside requested-heap epoch. Held arrays belong to1024 retained output records. Bare System timing separate from forwarding System counting census. Native whole-child RSS/CPU included.",
+  "identities": "Same added fixtures/full current owning24 crate sources except seven-line production guard;59 identical immutable native externs, exact compiler/runtime/allocator/binary/source hashes preserved.",
+  "fixed_overhead": "No field/cache/pool. Remove zero-read nested Stretch so existing all.clone branch shares immutable all/own arrays.",
+  "adverse": "Expected old-owner regression exits101. No failed performance cohort or discarded measurements in this distinct iteration. Inactive metadata compressed with roundtrip hashes to conserve disk. A post-measurement ldd check omitted desktop activation and resolved system paths; rejected before archive generation, then verified in actual unchanged measurement environment. Prior failed pool/state/gap designs remain independently held.",
+  "limits": [
+    "Not a whole-frame/Fincode application/GPU/shipped allocator/macOS/Windows percentage.",
+    "Empty replay_dependencies stretch handling unchanged.",
+    "No native GPU hardware or installed application exercised."
+  ],
+  "archive": {
+    "sha256": "4c877dde886ba35d8b29f7a3ed857f590c3af04682224f3cd9caea59ffd7ea41",
+    "members": 656,
+    "bytes": 262821
+  }
+}
