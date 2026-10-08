@@ -4,7 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios, quad_depth,
+    RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    quad_depth,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -402,6 +403,7 @@ struct WgpuResources {
     path_tile_texture: Option<wgpu::Texture>,
     path_tile_view: Option<wgpu::TextureView>,
     path_free_frames: u32,
+    render_memory: RenderMemoryLedger,
 }
 
 struct CachedTextureBindGroup {
@@ -416,6 +418,24 @@ impl WgpuResources {
         self.release_path_targets();
     }
 
+    /// Reported wherever the targets change, not only per frame, so a release
+    /// that happens without a draw (resize, hidden window) is seen at once.
+    fn publish_target_memory(&mut self) {
+        let depth = texture_bytes(self.depth_texture.as_ref());
+        let paths = [
+            &self.path_intermediate_texture,
+            &self.path_msaa_texture,
+            &self.path_tile_texture,
+        ]
+        .into_iter()
+        .map(|texture| texture_bytes(texture.as_ref()))
+        .sum();
+        self.render_memory
+            .publish(RenderMemoryGauge::DepthTextures, depth);
+        self.render_memory
+            .publish(RenderMemoryGauge::PathTextures, paths);
+    }
+
     /// Dropping is enough: wgpu keeps a texture alive until the submitted work
     /// that references it has finished.
     fn release_path_targets(&mut self) {
@@ -425,7 +445,18 @@ impl WgpuResources {
         self.path_msaa_view = None;
         self.path_tile_texture = None;
         self.path_tile_view = None;
+        self.publish_target_memory();
     }
+}
+
+fn texture_bytes(texture: Option<&wgpu::Texture>) -> u64 {
+    texture.map_or(0, |texture| {
+        let bytes_per_texel = texture.format().block_copy_size(None).unwrap_or(4);
+        u64::from(texture.width())
+            * u64::from(texture.height())
+            * u64::from(bytes_per_texel)
+            * u64::from(texture.sample_count())
+    })
 }
 
 /// Paths with different draw orders are composited through one rect spanning
@@ -1570,6 +1601,8 @@ impl WgpuRendererCore {
             ],
         });
         let max_texture_size = device.limits().max_texture_dimension_2d;
+        let mut render_memory = RenderMemoryLedger::default();
+        render_memory.publish(RenderMemoryGauge::InstanceBuffers, instance_data_capacity);
 
         Self {
             resources: WgpuResources {
@@ -1592,6 +1625,7 @@ impl WgpuRendererCore {
                 path_tile_texture: None,
                 path_tile_view: None,
                 path_free_frames: 0,
+                render_memory,
             },
             atlas,
             path_globals_offset,
@@ -1705,6 +1739,7 @@ impl WgpuRendererCore {
 
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size, !scene.paths.is_empty());
+        self.resources.publish_target_memory();
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -2563,6 +2598,10 @@ impl WgpuRendererCore {
                 }));
             self.instance_data_capacity = capacity;
         }
+        self.resources.render_memory.publish(
+            RenderMemoryGauge::InstanceBuffers,
+            self.instance_data_capacity,
+        );
         Ok(())
     }
 }
@@ -3262,8 +3301,23 @@ mod tests {
                 resources.path_tile_texture.is_some(),
                 resources.path_intermediate_texture.is_some()
             );
+            let published = resources
+                .render_memory
+                .published(RenderMemoryGauge::PathTextures);
+            assert_eq!(
+                published > 0,
+                resources.path_intermediate_texture.is_some(),
+                "path texture gauge reads {published} bytes"
+            );
             resources.path_intermediate_texture.is_some()
         };
+        let published = |renderer: &WgpuHeadlessRenderer, gauge| {
+            renderer.core.resources.render_memory.published(gauge)
+        };
+        assert_eq!(
+            published(&renderer, RenderMemoryGauge::InstanceBuffers),
+            renderer.core.instance_data_capacity
+        );
         let mut path_scene = Scene::default();
         path_scene.insert_primitive(red_square_path(16.0));
         path_scene.finish();
@@ -3272,9 +3326,14 @@ mod tests {
         renderer.render_scene(&empty_scene, device_size(32, 32))?;
         assert!(!path_targets_resident(&renderer));
         assert!(renderer.core.resources.depth_texture.is_some());
+        assert!(published(&renderer, RenderMemoryGauge::DepthTextures) >= 32 * 32 * 2);
 
         let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
         assert!(path_targets_resident(&renderer));
+        // The intermediate alone is 32x32 at four bytes per texel.
+        let path_bytes = published(&renderer, RenderMemoryGauge::PathTextures);
+        assert!(path_bytes >= 32 * 32 * 4);
+        assert!(gpui::render_memory_gauges().path_texture_bytes >= path_bytes);
         assert_pixel(&image, 12, 4, RED);
         assert_pixel(&image, 4, 12, RED);
         assert_pixel(&image, 24, 24, BLACK);
@@ -3292,6 +3351,13 @@ mod tests {
 
         renderer.render_scene(&empty_scene, device_size(32, 33))?;
         assert!(!path_targets_resident(&renderer));
+
+        // A release without a draw is seen at once.
+        renderer.render_scene(&path_scene, device_size(32, 33))?;
+        assert!(path_targets_resident(&renderer));
+        renderer.core.resources.invalidate_intermediate_textures();
+        assert!(!path_targets_resident(&renderer));
+        assert_eq!(published(&renderer, RenderMemoryGauge::DepthTextures), 0);
         Ok(())
     }
 
