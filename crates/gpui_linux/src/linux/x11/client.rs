@@ -12,7 +12,7 @@ use http_client::Url;
 use log::Level;
 use smallvec::SmallVec;
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     collections::{BTreeMap, HashSet},
     ops::Deref,
     path::PathBuf,
@@ -82,6 +82,7 @@ const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
     refresh_state: Option<RefreshState>,
+    frame_demand: Rc<X11FrameDemand>,
     last_visibility: Visibility,
     is_mapped: bool,
 }
@@ -117,8 +118,58 @@ enum RefreshState {
     },
     PeriodicRefresh {
         refresh_rate: Duration,
-        event_loop_token: RegistrationToken,
+        /// `None` while the window is visible but idle: the refresh timer
+        /// dropped itself because nothing asked for a frame, and
+        /// [`X11FrameDemand::request`] restarts it.
+        event_loop_token: Option<RegistrationToken>,
     },
+}
+
+/// Whether a window wants frames, shared between the client's refresh timer
+/// and the window's GPUI frame waker. The timer only refreshes a window
+/// that asked for a frame, and stops ticking once one goes idle, so an idle
+/// window costs no wakeups at the display's refresh rate.
+pub(crate) struct X11FrameDemand {
+    x_window: xproto::Window,
+    loop_handle: LoopHandle<'static, X11Client>,
+    /// Set when a frame is wanted, consumed by the refresh tick that
+    /// delivers it. Starts set so the first frame draws.
+    requested: Cell<bool>,
+    /// Set while the refresh timer is stopped for idleness, so the next
+    /// request has to restart it.
+    paused: Cell<bool>,
+    /// The timer only stops once GPUI holds a waker that can restart it;
+    /// without one, it keeps refreshing every tick as it always did.
+    waker_installed: Cell<bool>,
+}
+
+impl X11FrameDemand {
+    fn new(x_window: xproto::Window, loop_handle: LoopHandle<'static, X11Client>) -> Self {
+        Self {
+            x_window,
+            loop_handle,
+            requested: Cell::new(true),
+            paused: Cell::new(false),
+            waker_installed: Cell::new(false),
+        }
+    }
+
+    /// Asks for a frame on the next refresh tick, restarting the refresh
+    /// timer if it stopped for idleness. Safe to call while the client or the
+    /// window is borrowed: the restart is deferred to an idle callback.
+    pub(crate) fn request(&self) {
+        self.requested.set(true);
+        if self.paused.replace(false) {
+            let x_window = self.x_window;
+            self.loop_handle.insert_idle(move |client| {
+                client.0.borrow_mut().resume_refresh_loop(x_window);
+            });
+        }
+    }
+
+    pub(crate) fn mark_waker_installed(&self) {
+        self.waker_installed.set(true);
+    }
 }
 
 #[derive(Debug)]
@@ -251,7 +302,8 @@ impl X11ClientStatePtr {
 
         if let Some(window_ref) = state.windows.remove(&x_window)
             && let Some(RefreshState::PeriodicRefresh {
-                event_loop_token, ..
+                event_loop_token: Some(event_loop_token),
+                ..
             }) = window_ref.refresh_state
         {
             state.loop_handle.remove(event_loop_token);
@@ -1675,9 +1727,12 @@ impl LinuxClient for X11Client {
         .log_err();
         xcb_flush(&state.xcb_connection);
 
+        let frame_demand = Rc::new(X11FrameDemand::new(x_window, state.loop_handle.clone()));
+        window.0.state.borrow_mut().frame_demand = Some(frame_demand.clone());
         let window_ref = WindowRef {
             window: window.0.clone(),
             refresh_state: None,
+            frame_demand,
             last_visibility: Visibility::UNOBSCURED,
             is_mapped: false,
         };
@@ -1939,7 +1994,12 @@ impl X11ClientState {
                     event_loop_token,
                 }),
             ) => {
-                self.loop_handle.remove(event_loop_token);
+                if let Some(event_loop_token) = event_loop_token {
+                    self.loop_handle.remove(event_loop_token);
+                }
+                // A hidden window's requests wait for it to become visible,
+                // which restarts the timer itself.
+                window_ref.frame_demand.paused.set(false);
                 window_ref.refresh_state = Some(RefreshState::Hidden { refresh_rate });
             }
             (true, Some(RefreshState::Hidden { refresh_rate })) => {
@@ -1949,7 +2009,7 @@ impl X11ClientState {
                 };
                 window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
                     refresh_rate,
-                    event_loop_token,
+                    event_loop_token: Some(event_loop_token),
                 });
             }
             (true, None) => {
@@ -1995,9 +2055,31 @@ impl X11ClientState {
                 };
                 window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
                     refresh_rate,
-                    event_loop_token,
+                    event_loop_token: Some(event_loop_token),
                 });
             }
+        }
+    }
+
+    /// Restarts a visible window's refresh timer after it stopped for
+    /// idleness. A no-op if the window is gone, hidden, or already ticking.
+    fn resume_refresh_loop(&mut self, x_window: xproto::Window) {
+        let Some(window_ref) = self.windows.get(&x_window) else {
+            return;
+        };
+        let Some(RefreshState::PeriodicRefresh {
+            refresh_rate,
+            event_loop_token: None,
+        }) = window_ref.refresh_state
+        else {
+            return;
+        };
+        let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
+        if let Some(window_ref) = self.windows.get_mut(&x_window) {
+            window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
+                refresh_rate,
+                event_loop_token: Some(event_loop_token),
+            });
         }
     }
 
@@ -2007,23 +2089,57 @@ impl X11ClientState {
         x_window: xproto::Window,
         refresh_rate: Duration,
     ) -> RegistrationToken {
+        // A (re)started loop follows the window becoming visible or a frame
+        // request; deliver a frame on the first tick so it catches up.
+        if let Some(window_ref) = self.windows.get(&x_window) {
+            window_ref.frame_demand.requested.set(true);
+            window_ref.frame_demand.paused.set(false);
+        }
         self.loop_handle
             .insert_source(calloop::timer::Timer::immediate(), {
                 move |mut instant, (), client| {
-                    let xcb_connection = {
-                        let mut state = client.0.borrow_mut();
+                    let (xcb_connection, frame_demand) = {
+                        let state = client.0.borrow();
                         let xcb_connection = state.xcb_connection.clone();
-                        if let Some(window) = state.windows.get_mut(&x_window) {
-                            let window = window.window.clone();
-                            drop(state);
-                            window.refresh(RequestFrameOptions {
-                                require_presentation: false,
-                                force_render: false,
-                            });
-                        }
-                        xcb_connection
+                        let window = state.windows.get(&x_window).map(|window_ref| {
+                            (window_ref.window.clone(), window_ref.frame_demand.clone())
+                        });
+                        drop(state);
+                        let frame_demand = window.map(|(window, frame_demand)| {
+                            if frame_demand.requested.replace(false) {
+                                window.refresh(RequestFrameOptions {
+                                    require_presentation: false,
+                                    force_render: false,
+                                });
+                            }
+                            frame_demand
+                        });
+                        (xcb_connection, frame_demand)
                     };
                     client.process_x11_events(&xcb_connection).log_err();
+
+                    // Stop ticking once nothing (the frame above, or the
+                    // events just processed) asked for another frame; the
+                    // window's frame waker restarts the timer on demand.
+                    if let Some(frame_demand) = frame_demand
+                        && frame_demand.waker_installed.get()
+                        && !frame_demand.requested.get()
+                    {
+                        let mut state = client.0.borrow_mut();
+                        if let Some(RefreshState::PeriodicRefresh {
+                            event_loop_token, ..
+                        }) = state
+                            .windows
+                            .get_mut(&x_window)
+                            .and_then(|window_ref| window_ref.refresh_state.as_mut())
+                        {
+                            // Returning `Drop` removes this source, so its
+                            // token must not be removed again later.
+                            *event_loop_token = None;
+                            frame_demand.paused.set(true);
+                            return calloop::timer::TimeoutAction::Drop;
+                        }
+                    }
 
                     // Take into account that some frames have been skipped
                     let now = Instant::now();

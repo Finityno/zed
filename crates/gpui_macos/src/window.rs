@@ -824,6 +824,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// Whether GPUI wants a frame request on the next display refresh. The
+    /// display link only wakes this window while it is set, so an idle
+    /// window costs nothing per vsync. Starts set so the first frame draws.
+    frame_demand: Arc<AtomicBool>,
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
     /// The layered present's two halves; see `draw_layered`.
@@ -1114,8 +1118,9 @@ impl MacWindowState {
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
+        let frame_demand = &self.frame_demand;
         self.frame_source
-            .get_or_insert_with(|| WindowFrameSource::new(data, step))
+            .get_or_insert_with(|| WindowFrameSource::new(data, step, frame_demand.clone()))
             .start(display_id)
             .log_err();
     }
@@ -1369,6 +1374,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                frame_demand: Arc::new(AtomicBool::new(true)),
                 renderer: renderer::new_renderer(
                     renderer_context.clone(),
                     native_window as *mut _,
@@ -2540,6 +2546,14 @@ impl PlatformWindow for MacWindow {
                 .styleMask()
                 .contains(NSWindowStyleMask::NSFullScreenWindowMask)
         }
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Only the shared flag is captured, never the window state, so the
+        // waker (stored in GPUI's invalidator, which the request-frame
+        // callback owns) cannot keep the window alive.
+        let frame_demand = self.0.lock().frame_demand.clone();
+        Some(Rc::new(move || frame_demand.store(true, Ordering::Release)))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
