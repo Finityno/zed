@@ -819,6 +819,7 @@ impl App {
             self.entities.access_log.enabled = enabled;
             if !enabled {
                 self.entities.access_log.forget_all();
+                self.dependencies.release_empty_lists();
             }
             self.refresh_windows();
         }

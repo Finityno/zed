@@ -38,6 +38,11 @@ pub(crate) struct AppDependencies {
     /// replayed inside them, put their reads in the logs, in order: what a
     /// view read itself leaves them out.
     nested: Vec<Stretch>,
+    // Even an empty Rc slice allocates a header. Rebuilt views share these
+    // lazily, without retaining any entity, global or versioned state.
+    empty_entities: Option<Rc<[(EntityId, u64)]>>,
+    empty_globals: Option<Rc<[(TypeId, u64)]>>,
+    empty_states: Option<Rc<[(StateVersion, u64)]>>,
 }
 
 /// Where a recording, or a replay, put its reads in the logs.
@@ -73,6 +78,12 @@ fn outside<T: Clone>(
 }
 
 impl AppDependencies {
+    pub(crate) fn release_empty_lists(&mut self) {
+        self.empty_entities = None;
+        self.empty_globals = None;
+        self.empty_states = None;
+    }
+
     pub(crate) fn global_changed(&mut self, global_type: TypeId) {
         // Stamped on every change, not only the first one an effect is queued
         // for: a view drawn in between has seen only the first.
@@ -731,7 +742,10 @@ impl App {
             deadlines: recording.deadlines..DEADLINES.with_borrow(Vec::len),
         };
         let nested = &self.dependencies.nested[recording.nested.min(self.dependencies.nested.len())..];
-        let reads = |entities: Vec<(EntityId, u64)>,
+        let empty_entities = &mut self.dependencies.empty_entities;
+        let empty_globals = &mut self.dependencies.empty_globals;
+        let empty_states = &mut self.dependencies.empty_states;
+        let mut reads = |entities: Vec<(EntityId, u64)>,
                      globals: Vec<(TypeId, u64)>,
                      states: &[(StateVersion, u64)],
                      deadlines: &[Instant]| {
@@ -740,9 +754,21 @@ impl App {
             let mut globals = globals;
             earliest_reads(&mut globals);
             RenderDependencies {
-                entities: entities.into(),
-                globals: globals.into(),
-                states: unique_states(states),
+                entities: if entities.is_empty() {
+                    empty_entities.get_or_insert_with(|| Rc::from([])).clone()
+                } else {
+                    entities.into()
+                },
+                globals: if globals.is_empty() {
+                    empty_globals.get_or_insert_with(|| Rc::from([])).clone()
+                } else {
+                    globals.into()
+                },
+                states: if states.is_empty() {
+                    empty_states.get_or_insert_with(|| Rc::from([])).clone()
+                } else {
+                    unique_states(states)
+                },
                 rebuild_at: deadlines.iter().copied().min(),
                 // As of when the recording began, so that a global written
                 // while it was open, after being read, counts as changed.
@@ -951,3 +977,70 @@ pub(crate) enum DependencyChange {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "dependency_profile.rs"]
 mod dependency_profile;
+
+#[cfg(test)]
+mod empty_list_tests {
+    use super::*;
+
+    #[test]
+    fn empty_dependency_lists_are_shared_and_released() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let recording = cx.begin_recording_dependencies();
+            let first = cx.finish_recording_dependencies(recording);
+            let recording = cx.begin_recording_dependencies();
+            let second = cx.finish_recording_dependencies(recording);
+            assert!(Rc::ptr_eq(&first.all.entities, &second.all.entities));
+            assert!(Rc::ptr_eq(&first.all.globals, &second.all.globals));
+            assert!(Rc::ptr_eq(&first.all.states, &second.all.states));
+            assert_eq!(Rc::strong_count(&first.all.entities), 5);
+            cx.set_view_retention(false);
+            assert!(cx.dependencies.empty_entities.is_none());
+            assert!(cx.dependencies.empty_globals.is_none());
+            assert!(cx.dependencies.empty_states.is_none());
+            assert_eq!(Rc::strong_count(&first.all.entities), 4);
+            cx.set_view_retention(true);
+            let recording = cx.begin_recording_dependencies();
+            let third = cx.finish_recording_dependencies(recording);
+            assert!(!Rc::ptr_eq(&first.all.entities, &third.all.entities));
+        });
+    }
+
+    #[test]
+    fn nested_recording_preserves_earliest_reads_and_own_dependencies() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let state = StateVersion::default();
+            let deadline = Instant::now();
+            let outer = cx.begin_recording_dependencies();
+            note_access(&cx.entities, EntityId::from(1));
+            note_global_read(cx, TypeId::of::<u32>());
+            note_state_read(&state);
+            note_deadline(deadline);
+            let inner = cx.begin_recording_dependencies();
+            cx.entities.access_log.write_generation += 1;
+            note_access(&cx.entities, EntityId::from(1));
+            note_access(&cx.entities, EntityId::from(2));
+            note_global_read(cx, TypeId::of::<u64>());
+            state.bump();
+            note_state_read(&state);
+            note_deadline(deadline + std::time::Duration::from_secs(1));
+            let inner = cx.finish_recording_dependencies(inner);
+            assert_eq!(inner.all.entities.len(), 2);
+            let outer = cx.finish_recording_dependencies(outer);
+            assert_eq!(&*outer.all.entities, &[(EntityId::from(1), 0), (EntityId::from(2), 1)]);
+            assert_eq!(&*outer.own.entities, &[(EntityId::from(1), 0)]);
+            assert_eq!(&*outer.own.globals, &[(TypeId::of::<u32>(), 0)]);
+            assert_eq!(outer.all.states.len(), 1);
+            assert_eq!(outer.all.states[0].1, 0);
+            assert_eq!(outer.own.states[0].1, 0);
+            assert_eq!(outer.all.rebuild_at, Some(deadline));
+            assert_eq!(outer.own.rebuild_at, Some(deadline));
+            assert!(cx.entities.access_log.access_log.borrow().is_empty());
+            assert!(cx.dependencies.global_read_log.borrow().is_empty());
+            assert!(STATE_READS.with_borrow(Vec::is_empty));
+        });
+    }
+}
