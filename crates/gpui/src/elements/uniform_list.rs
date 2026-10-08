@@ -72,6 +72,10 @@ pub struct UniformList {
 pub struct UniformListFrameState {
     items: SmallVec<[AnyElement; 32]>,
     decorations: SmallVec<[AnyElement; 2]>,
+    /// The measured item size from `request_layout`. Prepaint reuses it rather
+    /// than rendering and laying out the measured item a second time with the
+    /// same inputs.
+    item_size: Size<Pixels>,
 }
 
 /// A handle for controlling the scroll position of a uniform list.
@@ -336,6 +340,7 @@ impl Element for UniformList {
             UniformListFrameState {
                 items: SmallVec::new(),
                 decorations: SmallVec::new(),
+                item_size,
             },
         )
     }
@@ -373,7 +378,7 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = self.measure_item(None, window, cx);
+        let longest_item_size = frame_state.item_size;
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {
@@ -917,5 +922,60 @@ mod test {
                 assert_eq!(view.visible_range, ix..ix + 10);
             })
         }
+    }
+
+    #[gpui::test]
+    fn test_measures_item_once_per_frame(cx: &mut TestAppContext) {
+        use crate::{Context, Window, div, prelude::*, px, uniform_list};
+        use std::ops::Range;
+
+        struct TestView {
+            measure_renders: usize,
+            visible_renders: usize,
+            visible_range: Range<usize>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    uniform_list(
+                        "entries",
+                        47,
+                        cx.processor(|this, range: Range<usize>, _window, _cx| {
+                            if range == (0..1) {
+                                this.measure_renders += 1;
+                            } else {
+                                this.visible_renders += 1;
+                                this.visible_range = range.clone();
+                            }
+                            range
+                                .map(|ix| div().id(ix).h(px(20.0)).child(format!("Item {ix}")))
+                                .collect()
+                        }),
+                    )
+                    .h(px(200.0)),
+                )
+            }
+        }
+
+        let (view, cx) = cx.add_window_view(|_, _| TestView {
+            measure_renders: 0,
+            visible_renders: 0,
+            visible_range: 0..0,
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.visible_renders > 0);
+            assert_eq!(view.measure_renders, view.visible_renders);
+            assert_eq!(view.visible_range, 0..10);
+        });
+
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.visible_renders > 1);
+            assert_eq!(view.measure_renders, view.visible_renders);
+            assert_eq!(view.visible_range, 0..10);
+        });
     }
 }
