@@ -142,6 +142,19 @@ impl Transcript {
         cx.notify();
     }
 
+    fn stream_long(&mut self, step: usize, cx: &mut Context<Self>) {
+        let last = self.messages.len() - 1;
+        let Some(tail) = self.messages[last].paragraphs.last_mut() else {
+            return;
+        };
+        let mut text = tail.to_string();
+        text.push(' ');
+        text.push_str(WORDS[step % WORDS.len()]);
+        *tail = text.into();
+        self.list.remeasure_items(last..last + 1);
+        cx.notify();
+    }
+
     fn render_message(&self, index: usize) -> gpui::AnyElement {
         let message = &self.messages[index];
         div()
@@ -298,6 +311,13 @@ fn main() {
         });
     })
     .report("scroll");
+
+    // One paragraph growing past several thousand characters, the case a
+    // long unbroken answer hits.
+    measure(&mut cx, window, frames, |cx, step| {
+        transcript.update(cx, |transcript, cx| transcript.stream_long(step, cx));
+    })
+    .report("stream_long_paragraph");
 
     let widths = [800., 640., 520., 700.];
     measure(&mut cx, window, frames / 4, |cx, step| {
