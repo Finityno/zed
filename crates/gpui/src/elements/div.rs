@@ -5786,6 +5786,112 @@ mod tests {
         .unwrap();
     }
 
+    struct PressStateTestView;
+
+    impl Render for PressStateTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("press-target")
+                    .size(px(20.))
+                    .bg(crate::black())
+                    .hover(|style| style.bg(crate::green()))
+                    .active(|style| style.bg(crate::yellow())),
+            )
+        }
+    }
+
+    /// Draws the window and returns the background the press target was painted with.
+    fn press_target_background(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+    ) -> crate::Background {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let scene = &window.rendered_frame.scene;
+            let mut painted = crate::Scene::default();
+            painted.replay(0..scene.len(), scene);
+            painted.finish();
+            let width = crate::ScaledPixels::from(20. * window.scale_factor());
+            let targets = painted
+                .quads
+                .iter()
+                .filter(|quad| quad.bounds.size.width == width)
+                .map(|quad| quad.background)
+                .collect::<Vec<_>>();
+            assert_eq!(targets.len(), 1, "one quad paints the press target");
+            targets[0]
+        })
+        .unwrap()
+    }
+
+    /// Entering an element with hover styling notifies its view, a press on it
+    /// marks it active, and a mouse up clears that, through the listeners such
+    /// elements register every frame.
+    #[gpui::test]
+    fn hover_and_press_listeners_drive_hover_and_active_styles(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| PressStateTestView);
+        let window = AnyWindowHandle::from(window);
+        let inside = point(px(10.), px(10.));
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(point(px(100.), px(100.)), cx);
+        })
+        .unwrap();
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::black())
+        );
+
+        let notified = cx
+            .update_window(window, |_, window, cx| {
+                window.simulate_mouse_move(inside, cx);
+                window.invalidator.is_dirty()
+            })
+            .unwrap();
+        assert!(notified, "entering the element notifies its view");
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::green())
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: inside,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::yellow())
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: inside,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            press_target_background(cx, window),
+            crate::Background::from(crate::green())
+        );
+    }
+
     fn key_down(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
         let keystroke = Keystroke::parse(key).unwrap();
         cx.update_window(window, |_, window, cx| {
