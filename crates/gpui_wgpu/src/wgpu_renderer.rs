@@ -252,8 +252,9 @@ impl WgpuResources {
     }
 }
 
-/// The sprites a path batch is composited with: one per path when the batch
-/// shares a draw order, otherwise a single rect spanning all of them.
+/// Paths with different draw orders are composited through one rect spanning
+/// all of them, so every tile under it is cleared and redrawn in this batch and
+/// no tile content from an earlier batch can show through.
 fn path_sprites(paths: &[Path<ScaledPixels>]) -> Vec<PathSprite> {
     let Some(first_path) = paths.first() else {
         return Vec::new();
@@ -3314,12 +3315,14 @@ mod tests {
     /// to a 1100x700 window: three columns and two rows of path tiles.
     #[cfg(target_os = "linux")]
     fn lens_path(x: f32, y: f32, color: Background) -> gpui::Path<ScaledPixels> {
-        let at = |dx: f32, dy: f32| gpui::point(gpui::px(x + dx), gpui::px(y + dy));
-        let mut path = gpui::Path::new(at(0., 20.));
-        path.line_to(at(20., 0.));
-        path.curve_to(at(40., 20.), at(40., 0.));
-        path.line_to(at(20., 40.));
-        path.curve_to(at(0., 20.), at(0., 40.));
+        let point_at = |offset_x: f32, offset_y: f32| {
+            gpui::point(gpui::px(x + offset_x), gpui::px(y + offset_y))
+        };
+        let mut path = gpui::Path::new(point_at(0., 20.));
+        path.line_to(point_at(20., 0.));
+        path.curve_to(point_at(40., 20.), point_at(40., 0.));
+        path.line_to(point_at(20., 40.));
+        path.curve_to(point_at(0., 20.), point_at(0., 40.));
         path.content_mask = ContentMask {
             bounds: Bounds {
                 origin: gpui::point(gpui::px(0.), gpui::px(0.)),
@@ -3385,16 +3388,16 @@ mod tests {
         let mut max_difference = 0;
         for (left, top) in placements {
             let image = render_lenses(&mut renderer, &[(left as f32 + 0.3, top as f32 + 0.6)])?;
-            for dy in -2..43 {
-                for dx in -2..43 {
-                    let (x, y) = (left + dx, top + dy);
+            for offset_y in -2..43 {
+                for offset_x in -2..43 {
+                    let (x, y) = (left + offset_x, top + offset_y);
                     if !(0..TILED_WIDTH as i64).contains(&x) || !(0..TILED_HEIGHT as i64).contains(&y)
                     {
                         continue;
                     }
                     let actual = image.get_pixel(x as u32, y as u32).0;
                     let expected = reference
-                        .get_pixel((reference_x + dx) as u32, (reference_y + dy) as u32)
+                        .get_pixel((reference_x + offset_x) as u32, (reference_y + offset_y) as u32)
                         .0;
                     for (actual, expected) in actual.iter().zip(expected) {
                         max_difference = max_difference.max(actual.abs_diff(expected));
