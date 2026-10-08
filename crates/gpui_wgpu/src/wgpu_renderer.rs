@@ -158,8 +158,6 @@ struct WgpuPipelines {
     factory: PipelineFactory,
 }
 
-/// What `create_pipelines` compiled the eager pipelines with, kept for the
-/// ones compiled on first use.
 struct PipelineFactory {
     device: wgpu::Device,
     layouts: WgpuBindGroupLayouts,
