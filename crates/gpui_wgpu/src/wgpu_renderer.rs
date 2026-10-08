@@ -20,6 +20,14 @@ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
+/// Consecutive path-free frames after which the window-sized path targets are
+/// released, the Metal renderer's count (DirectX uses 300). Frames, not time:
+/// GPUI only draws on activity and the renderer has no clock, so a window that
+/// goes idle keeps its targets for the very next redraw, while two seconds of
+/// sustained 60 Hz drawing with no path means they are not wanted. A path that
+/// comes back costs one allocation, the same as a resize step.
+const PATH_TARGET_IDLE_FRAMES: u32 = 120;
+
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
 const STORAGE_BUFFER_SHADERS: &str = concat!(
@@ -206,6 +214,7 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    path_free_frames: u32,
 }
 
 struct CachedTextureBindGroup {
@@ -217,6 +226,12 @@ impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
         self.depth_texture = None;
         self.depth_view = None;
+        self.release_path_targets();
+    }
+
+    /// Dropping is enough: wgpu keeps a texture alive until the submitted work
+    /// that references it has finished.
+    fn release_path_targets(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
@@ -1471,6 +1486,7 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                path_free_frames: 0,
             },
             atlas,
             path_globals_offset,
@@ -1496,33 +1512,49 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// Path rendering goes through an intermediate texture that must match the frame
-    /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+    /// The depth buffer and the path targets must match the frame target's
+    /// dimensions, so they are keyed by size and rebuilt on mismatch. The path
+    /// intermediate and its MSAA companion are only read by path batches, which
+    /// come from `scene.paths`, so they are created only for a frame that has
+    /// paths (before recording, so a path batch always finds them) and released
+    /// after `PATH_TARGET_IDLE_FRAMES` path-free frames or a path-free resize.
+    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>, scene_has_paths: bool) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
         let matches_size =
             |texture: &wgpu::Texture| texture.width() == width && texture.height() == height;
-        if self
-            .resources
-            .path_intermediate_texture
-            .as_ref()
-            .is_some_and(matches_size)
-            && self.resources.depth_texture.as_ref().is_some_and(matches_size)
-        {
-            return;
-        }
-
         let format = self.target_format;
         let path_sample_count = self.rendering_params.path_sample_count;
         let depth_format = self.rendering_params.depth_format;
         let resources = &mut self.resources;
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&resources.device, depth_format, width, height);
-        resources.depth_texture = Some(depth_texture);
-        resources.depth_view = Some(depth_view);
+        if !resources.depth_texture.as_ref().is_some_and(matches_size) {
+            let (depth_texture, depth_view) =
+                Self::create_depth_texture(&resources.device, depth_format, width, height);
+            resources.depth_texture = Some(depth_texture);
+            resources.depth_view = Some(depth_view);
+        }
 
+        let path_targets_match = resources
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(matches_size);
+        if !scene_has_paths {
+            resources.path_free_frames = resources.path_free_frames.saturating_add(1);
+            if !path_targets_match || resources.path_free_frames >= PATH_TARGET_IDLE_FRAMES {
+                resources.release_path_targets();
+            }
+            return;
+        }
+
+        resources.path_free_frames = 0;
+        if path_targets_match {
+            return;
+        }
+
+        // Release the stale pair first so the old and new targets are never
+        // resident together.
+        resources.release_path_targets();
         let (texture, view) =
             Self::create_path_intermediate(&resources.device, format, width, height);
         resources.path_intermediate_texture = Some(texture);
@@ -1561,7 +1593,7 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
+        self.ensure_intermediate_textures(size, !scene.paths.is_empty());
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -3041,6 +3073,73 @@ mod tests {
 
         renderer.render_scene(&Scene::default(), device_size(16, 17))?;
         assert_ne!(target_texture(&renderer), first);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn red_square_path(size: f32) -> gpui::Path<ScaledPixels> {
+        let mut path = gpui::Path::new(gpui::point(gpui::px(0.), gpui::px(0.)));
+        path.line_to(gpui::point(gpui::px(size), gpui::px(0.)));
+        path.line_to(gpui::point(gpui::px(size), gpui::px(size)));
+        path.line_to(gpui::point(gpui::px(0.), gpui::px(size)));
+        path.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: gpui::point(gpui::px(0.), gpui::px(0.)),
+                size: Size {
+                    width: gpui::px(size),
+                    height: gpui::px(size),
+                },
+            },
+        };
+        path.color = gpui::red().into();
+        path.scale(1.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_targets_exist_only_around_frames_with_paths() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let path_targets_resident = |renderer: &WgpuHeadlessRenderer| {
+            let resources = &renderer.core.resources;
+            let has_msaa = renderer.core.rendering_params.path_sample_count > 1;
+            assert_eq!(
+                resources.path_intermediate_view.is_some(),
+                resources.path_intermediate_texture.is_some()
+            );
+            assert_eq!(
+                resources.path_msaa_texture.is_some(),
+                has_msaa && resources.path_intermediate_texture.is_some()
+            );
+            resources.path_intermediate_texture.is_some()
+        };
+        let mut path_scene = Scene::default();
+        path_scene.insert_primitive(red_square_path(16.0));
+        path_scene.finish();
+        let empty_scene = Scene::default();
+
+        renderer.render_scene(&empty_scene, device_size(32, 32))?;
+        assert!(!path_targets_resident(&renderer));
+        assert!(renderer.core.resources.depth_texture.is_some());
+
+        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
+        assert!(path_targets_resident(&renderer));
+        assert_pixel(&image, 12, 4, RED);
+        assert_pixel(&image, 4, 12, RED);
+        assert_pixel(&image, 24, 24, BLACK);
+
+        for _ in 1..PATH_TARGET_IDLE_FRAMES {
+            renderer.render_scene(&empty_scene, device_size(32, 32))?;
+        }
+        assert!(path_targets_resident(&renderer));
+        renderer.render_scene(&empty_scene, device_size(32, 32))?;
+        assert!(!path_targets_resident(&renderer));
+
+        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
+        assert!(path_targets_resident(&renderer));
+        assert_pixel(&image, 12, 4, RED);
+
+        renderer.render_scene(&empty_scene, device_size(32, 33))?;
+        assert!(!path_targets_resident(&renderer));
         Ok(())
     }
 
