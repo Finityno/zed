@@ -26,7 +26,7 @@ use crate::{
     ScrollAxisLock, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
     TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
-use crate::window::HoverListener;
+use crate::window::{ActiveListener, HoverListener};
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
@@ -3463,37 +3463,15 @@ impl Interactivity {
                 .get_or_insert_with(Default::default)
                 .clone();
 
-            {
-                let active_state = active_state.clone();
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
-                        *active_state.borrow_mut() = ElementClickedState::default();
-                        window.refresh();
-                    }
-                });
-            }
-
-            {
-                let active_group_hitbox = self
-                    .group_active_style
-                    .as_ref()
-                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, window));
-                let hitbox = hitbox.clone();
-                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Bubble && !window.default_prevented() {
-                        let group_hovered = active_group_hitbox
-                            .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
-                        let element_hovered = hitbox.is_hovered(window);
-                        if group_hovered || element_hovered {
-                            *active_state.borrow_mut() = ElementClickedState {
-                                group: group_hovered,
-                                element: element_hovered,
-                            };
-                            window.refresh();
-                        }
-                    }
-                });
-            }
+            let active_group_hitbox = self
+                .group_active_style
+                .as_ref()
+                .and_then(|group_active| GroupHitboxes::get(&group_active.group, window));
+            window.on_press_transition(ActiveListener {
+                clicked_state: active_state,
+                hitbox: hitbox.id,
+                group_hitbox: active_group_hitbox,
+            });
         }
     }
 
@@ -3917,7 +3895,7 @@ pub struct ElementClickedState {
 }
 
 impl ElementClickedState {
-    fn is_clicked(&self) -> bool {
+    pub(crate) fn is_clicked(&self) -> bool {
         self.group || self.element
     }
 }

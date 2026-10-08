@@ -753,6 +753,7 @@ pub(crate) type AnyMouseListener =
 pub(crate) enum MouseListener {
     Any(AnyMouseListener),
     Hover(HoverListener),
+    Active(ActiveListener),
 }
 
 /// Notifies `view` when a mouse move changes whether `hitbox` is hovered.
@@ -769,6 +770,19 @@ pub(crate) struct HoverListener {
     /// Whether this tracks the element's group, rather than the element.
     pub(crate) group: bool,
     pub(crate) view: EntityId,
+}
+
+/// Tracks whether an element is pressed: a mouse down on its hitbox (or its
+/// active group's) marks it clicked, and any mouse up clears that.
+///
+/// Every element with an id registers this each frame, so like
+/// [`HoverListener`] it is plain data. It stands in for two adjacent closures,
+/// one for each event type, so every event still meets it at the same place
+/// among the other listeners.
+pub(crate) struct ActiveListener {
+    pub(crate) clicked_state: Rc<RefCell<crate::ElementClickedState>>,
+    pub(crate) hitbox: HitboxId,
+    pub(crate) group_hitbox: Option<HitboxId>,
 }
 
 impl MouseListener {
@@ -795,6 +809,30 @@ impl MouseListener {
                             }
                         }
                         cx.notify(listener.view);
+                    }
+                }
+            }
+            MouseListener::Active(listener) => {
+                if event.is::<MouseUpEvent>() {
+                    let clicked_state = &listener.clicked_state;
+                    if phase == DispatchPhase::Capture && clicked_state.borrow().is_clicked() {
+                        *clicked_state.borrow_mut() = crate::ElementClickedState::default();
+                        window.refresh();
+                    }
+                } else if event.is::<crate::MouseDownEvent>()
+                    && phase == DispatchPhase::Bubble
+                    && !window.default_prevented()
+                {
+                    let group_hovered = listener
+                        .group_hitbox
+                        .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
+                    let element_hovered = listener.hitbox.is_hovered(window);
+                    if group_hovered || element_hovered {
+                        *listener.clicked_state.borrow_mut() = crate::ElementClickedState {
+                            group: group_hovered,
+                            element: element_hovered,
+                        };
+                        window.refresh();
                     }
                 }
             }
@@ -6482,6 +6520,15 @@ impl Window {
         self.next_frame
             .mouse_listeners
             .push(Some(MouseListener::Hover(listener)));
+    }
+
+    /// Register an [`ActiveListener`] for the next frame, which dispatches in
+    /// order with the listeners [`Self::on_mouse_event`] registers.
+    pub(crate) fn on_press_transition(&mut self, listener: ActiveListener) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .mouse_listeners
+            .push(Some(MouseListener::Active(listener)));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
