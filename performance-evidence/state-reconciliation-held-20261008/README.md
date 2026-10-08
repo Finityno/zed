@@ -6,7 +6,7 @@ preserving entity/global diagnostics and deadline priority. It does not use the
 previous held shared-Option helper.
 
 All 800 native children across twenty workloads complete successfully. Primary
-complete checker thread CPU is 79.23–89.95% lower, and transient requested
+complete checker thread CPU is 79.23–91.94% lower, and transient requested
 bytes/allocation calls/peak are eliminated. Every CPU, elapsed and whole-child
 CPU control passes. Five separate counting-census native RSS controls exceed
 the frozen full baseline ranges. The candidate is held and must not be merged
