@@ -2685,6 +2685,37 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    /// Whether [`unconfigure_surface`](Self::unconfigure_surface) left the
+    /// renderer waiting for a surface. Draws are no-ops until one is restored.
+    pub fn is_unconfigured(&self) -> bool {
+        matches!(self.state, RendererState::Unconfigured { .. })
+    }
+
+    /// Creates and configures a surface for `window` again after
+    /// [`unconfigure_surface`](Self::unconfigure_surface), at the last
+    /// recorded drawable size, transparency and present mode. Used to give a
+    /// hidden window's swapchain and size-dependent targets back while it is
+    /// not shown; the targets are rebuilt by the next draw.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn restore_surface<W: HasWindowHandle>(&mut self, window: &W) -> anyhow::Result<()> {
+        let instance = self
+            .context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .borrow()
+                    .as_ref()
+                    .map(|context| context.instance.clone())
+            })
+            .context("Cannot restore the surface: no GPU context")?;
+        let config = WgpuSurfaceConfig {
+            size: self.viewport_size(),
+            transparent: self.surface_config.alpha_mode != self.opaque_alpha_mode,
+            preferred_present_mode: Some(self.surface_config.present_mode),
+        };
+        self.replace_surface(window, config, &instance)
+    }
+
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
@@ -3358,6 +3389,93 @@ mod tests {
         renderer.core.resources.invalidate_intermediate_textures();
         assert!(!path_targets_resident(&renderer));
         assert_eq!(published(&renderer, RenderMemoryGauge::DepthTextures), 0);
+        Ok(())
+    }
+
+    /// A hidden window's renderer: no surface, the core of `headless` moved in
+    /// and a fresh one left behind. There is no window to create a real
+    /// surface for, so the core is handed back to draw the re-shown frame.
+    #[cfg(target_os = "linux")]
+    fn unconfigured_renderer(headless: &mut WgpuHeadlessRenderer) -> WgpuRenderer {
+        let atlas = headless.core.atlas.clone();
+        let format = headless.core.target_format;
+        let spare = WgpuRendererCore::new(
+            &headless.context,
+            atlas.clone(),
+            format,
+            wgpu::CompositeAlphaMode::Opaque,
+        );
+        let core = std::mem::replace(&mut headless.core, spare);
+        WgpuRenderer {
+            context: None,
+            compositor_gpu: None,
+            max_texture_size: core.max_texture_size,
+            state: RendererState::Unconfigured { core },
+            surface_config: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: 32,
+                height: 32,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                view_formats: vec![],
+            },
+            atlas,
+            transparent_alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            opaque_alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            is_bgr: false,
+            failed_frame_count: 0,
+            device_errors: Arc::clone(headless.context.errors()),
+            observed_error_generation: 0,
+            last_surface_error: None,
+            needs_redraw: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_window_releases_targets_and_draws_again_when_shown() -> anyhow::Result<()> {
+        let mut headless = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(16.0, 0.0, 16.0, 32.0, gpui::blue()));
+        scene.insert_primitive(red_square_path(16.0));
+        scene.finish();
+        headless.render_scene(&scene, device_size(32, 32))?;
+
+        let mut hidden = unconfigured_renderer(&mut headless);
+        hidden.unconfigure_surface();
+        assert!(hidden.is_unconfigured());
+        let resident_bytes = |renderer: &WgpuRenderer| {
+            let ledger = &renderer
+                .core()
+                .expect("core is kept")
+                .resources
+                .render_memory;
+            ledger.published(RenderMemoryGauge::DepthTextures)
+                + ledger.published(RenderMemoryGauge::PathTextures)
+        };
+        assert_eq!(resident_bytes(&hidden), 0);
+
+        // A frame requested while hidden draws nothing and allocates nothing.
+        assert!(!hidden.draw(&scene));
+        assert_eq!(resident_bytes(&hidden), 0);
+        let resources = &hidden.core().expect("core is kept").resources;
+        assert!(resources.depth_texture.is_none());
+        assert!(resources.path_intermediate_texture.is_none());
+
+        let RendererState::Unconfigured { core } =
+            std::mem::replace(&mut hidden.state, RendererState::Released)
+        else {
+            anyhow::bail!("the hidden renderer lost its core");
+        };
+        headless.core = core;
+        let image = headless.render_scene_to_image(&scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, RED);
+        assert_pixel(&image, 24, 8, BLUE);
+        assert_pixel(&image, 8, 24, BLACK);
+        assert!(headless.core.resources.depth_texture.is_some());
+        assert!(headless.core.resources.path_intermediate_texture.is_some());
         Ok(())
     }
 

@@ -675,6 +675,28 @@ impl WaylandWindowState {
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
     }
+
+    fn restore_surface(&mut self) {
+        if !self.renderer.is_unconfigured() {
+            return;
+        }
+        let Some(backend) = self.surface.backend().upgrade() else {
+            log::warn!("Failed to restore the window surface: the Wayland connection is gone");
+            return;
+        };
+        let raw_window = RawWindow {
+            window: self.surface.id().as_ptr().cast::<c_void>(),
+            display: backend.display_ptr().cast::<c_void>(),
+        };
+        match self.renderer.restore_surface(&raw_window) {
+            Ok(()) => self.redraw_requested = true,
+            Err(error) => {
+                log::warn!(
+                    "Failed to restore the window surface, will retry on next frame: {error:#}"
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1109,6 +1131,7 @@ impl WaylandWindowStatePtr {
                     }
                     drop(state);
                     if visibility_changed {
+                        self.update_surface_residency(configure.visibility);
                         self.report_visibility(configure.visibility);
                     }
                     if throttled {
@@ -1576,6 +1599,20 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    /// A suspended toplevel holds no swapchain or window-sized targets: the
+    /// compositor stops frame callbacks, so no frame would release them.
+    /// `suspended` is the conservative signal, set only while the surface is
+    /// not visible at all (minimized, on another workspace, fully covered or
+    /// the output off), never for a window that is merely unfocused.
+    fn update_surface_residency(&self, visibility: WindowVisibility) {
+        let mut state = self.state.borrow_mut();
+        if visibility.is_visible() {
+            state.restore_surface();
+        } else {
+            state.renderer.unconfigure_surface();
+        }
+    }
+
     fn report_visibility(&self, visibility: WindowVisibility) {
         let callback = self.callbacks.borrow_mut().visibility_change.take();
         if let Some(mut callback) = callback {
@@ -1957,6 +1994,12 @@ impl PlatformWindow for WaylandWindow {
 
             state.redraw_requested = true;
             return;
+        }
+
+        // A restore that failed when the window was shown is retried here, so
+        // the first frame of a shown window reconfigures before drawing.
+        if state.visibility.is_visible() {
+            state.restore_surface();
         }
 
         // Surface state changed during this GPUI tick is included in this presentation.

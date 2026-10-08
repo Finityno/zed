@@ -817,8 +817,16 @@ impl X11Client {
                     window_ref.is_mapped = false;
                 }
                 handle_visibility_changed(state, event.window);
+                if let Some(window) = self.get_window(event.window) {
+                    window.set_mapped(false);
+                }
             }
             Event::MapNotify(event) => {
+                // The surface is back before anything learns the window is
+                // visible and asks for a frame.
+                if let Some(window) = self.get_window(event.window) {
+                    window.set_mapped(true);
+                }
                 let mut state = self.0.borrow_mut();
                 if let Some(window_ref) = state.windows.get_mut(&event.window) {
                     window_ref.is_mapped = true;
