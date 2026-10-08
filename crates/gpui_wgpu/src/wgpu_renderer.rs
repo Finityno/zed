@@ -1893,7 +1893,7 @@ impl WgpuRendererCore {
 
             self.draw_instances(
                 &instance_bindings.quads,
-                &self.resources().pipelines.opaque_quads,
+                |pipelines| &pipelines.opaque_quads,
                 scene.blended_quad_indices.len() as u32
                     ..(scene.blended_quad_indices.len() + scene.opaque_quad_indices.len()) as u32,
                 &mut pass,
@@ -1919,14 +1919,14 @@ impl WgpuRendererCore {
                         quad_cursor += range.len() as u32;
                         self.draw_instances(
                             &instance_bindings.quads,
-                            &self.resources().pipelines.quads,
+                            |pipelines| &pipelines.quads,
                             instance_range(blended_range),
                             &mut pass,
                         );
                     }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
-                        self.resources().pipelines.shadows(),
+                        WgpuPipelines::shadows,
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1981,7 +1981,7 @@ impl WgpuRendererCore {
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
                         &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
+                        |pipelines| &pipelines.underlines,
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1989,21 +1989,21 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.monochrome_sprites,
                             texture_id,
-                            &self.resources().pipelines.mono_sprites,
+                            |pipelines| &pipelines.mono_sprites,
                             instance_range(range),
                             &mut pass,
                         )?;
                     }
                     PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let resources = self.resources();
                         self.draw_sprites(
                             &instance_bindings.subpixel_sprites,
                             texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
+                            |pipelines| {
+                                pipelines
+                                    .subpixel_sprites
+                                    .as_ref()
+                                    .unwrap_or(&pipelines.mono_sprites)
+                            },
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -2012,7 +2012,7 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.polychrome_sprites,
                             texture_id,
-                            self.resources().pipelines.poly_sprites(),
+                            WgpuPipelines::poly_sprites,
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -2258,17 +2258,19 @@ impl WgpuRendererCore {
         );
     }
 
+    /// The pipeline is requested only once the draw is known to happen, so a
+    /// lazily compiled pipeline is not built for a batch that draws nothing.
     fn draw_instances(
         &self,
         instances: &InstanceBinding,
-        pipeline: &wgpu::RenderPipeline,
+        pipeline: impl FnOnce(&WgpuPipelines) -> &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
         if range.is_empty() {
             return;
         }
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(pipeline(&self.resources().pipelines));
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.draw(
@@ -2277,11 +2279,13 @@ impl WgpuRendererCore {
         );
     }
 
+    /// Like [`Self::draw_instances`], the pipeline is requested after the
+    /// early returns.
     fn draw_sprites(
         &self,
         sprite_instances: &InstanceBinding,
         texture_id: AtlasTextureId,
-        pipeline: &wgpu::RenderPipeline,
+        pipeline: impl FnOnce(&WgpuPipelines) -> &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
@@ -2294,7 +2298,7 @@ impl WgpuRendererCore {
         let Some(texture) = resources.atlas_texture_bind_groups.get(&texture_id) else {
             return Ok(());
         };
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(pipeline(&resources.pipelines));
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
@@ -3238,7 +3242,7 @@ mod tests {
         linear_gradient,
     };
     #[cfg(target_os = "linux")]
-    use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+    use gpui::{DevicePixels, PlatformAtlas, PlatformHeadlessRenderer, Scene};
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -3614,6 +3618,93 @@ mod tests {
         assert_pixel(&image, 8, 8, RED);
         assert_pixel(&image, 24, 24, BLACK);
         assert_eq!(compiled(&renderer), [false, true, true, false]);
+
+        let sprite = |tile: gpui::AtlasTile| {
+            let bounds = Bounds {
+                origin: gpui::point(gpui::px(16.), gpui::px(16.)),
+                size: Size {
+                    width: gpui::px(16.),
+                    height: gpui::px(16.),
+                },
+            }
+            .scale(1.0);
+            PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                corner_radii: Corners::default(),
+                tile,
+            }
+        };
+
+        // A batch from a stale paint whose texture the atlas has released
+        // draws nothing, so it must not build the pipeline either.
+        let mut stale_scene = Scene::default();
+        stale_scene.insert_primitive(sprite(gpui::AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 99,
+                kind: gpui::AtlasTextureKind::Polychrome,
+            },
+            tile_id: gpui::TileId(0),
+            padding: 0,
+            bounds: Bounds::default(),
+        }));
+        stale_scene.finish();
+        let image = renderer.render_scene_to_image(&stale_scene, device_size(32, 32))?;
+        assert_pixel(&image, 24, 24, BLACK);
+        assert_eq!(compiled(&renderer), [false, true, true, false]);
+
+        // Polychrome uploads are BGRA; green reads the same either way.
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        let tile_size = Size {
+            width: DevicePixels(4),
+            height: DevicePixels(4),
+        };
+        let tile = renderer
+            .core
+            .atlas
+            .get_or_insert_with(
+                gpui::AtlasKey::Image(gpui::RenderImageParams {
+                    image_id: gpui::ImageId(1),
+                    frame_index: 0,
+                }),
+                &mut || Ok(Some((tile_size, std::borrow::Cow::Owned(GREEN.repeat(16))))),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("polychrome tile was not allocated"))?;
+        let mut shadow_and_sprite_scene = Scene::default();
+        let shadow_bounds = Bounds {
+            origin: gpui::point(gpui::px(0.), gpui::px(16.)),
+            size: Size {
+                width: gpui::px(16.),
+                height: gpui::px(16.),
+            },
+        }
+        .scale(1.0);
+        shadow_and_sprite_scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: shadow_bounds,
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: shadow_bounds,
+            },
+            color: gpui::red(),
+            element_bounds: shadow_bounds,
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+        });
+        shadow_and_sprite_scene.insert_primitive(sprite(tile));
+        shadow_and_sprite_scene.finish();
+        let image =
+            renderer.render_scene_to_image(&shadow_and_sprite_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 24, RED);
+        assert_pixel(&image, 24, 24, GREEN);
+        assert_pixel(&image, 24, 8, BLACK);
+        assert_eq!(compiled(&renderer), [true; 4]);
         Ok(())
     }
 
