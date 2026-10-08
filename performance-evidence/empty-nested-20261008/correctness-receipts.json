@@ -1,0 +1,22 @@
+{
+  "test-frames_drawing_views_again_match_frames_drawn_from_scratch.log": {
+    "sha256": "05b1b1bcf7f40a214217ed31becb573bf2b99199ce2cf09a82439b9c8f38317b",
+    "passed_batches": 1,
+    "source": "16295846a6b12ef6066aa4bff6c1f145c648cd29"
+  },
+  "test-changed_models_and_globals_build_the_views_that_read_them.log": {
+    "sha256": "977b00162d728930fc65b3e6d74a49c7d0aa5fb76a458879f34b67a1f51f9f8a",
+    "passed_batches": 1,
+    "source": "16295846a6b12ef6066aa4bff6c1f145c648cd29"
+  },
+  "test-a_global_read_through_an_update_is_a_dependency.log": {
+    "sha256": "4047b7c0e36dc8605d16240d3deb1d4eb0630b8905f7817990497b8d81510a60",
+    "passed_batches": 1,
+    "source": "16295846a6b12ef6066aa4bff6c1f145c648cd29"
+  },
+  "test-empty_nested_tests.log": {
+    "sha256": "728f117efc5929e5f337b2402a6307ff5c7f75bf2870751056b1b0f856813932",
+    "passed_batches": 1,
+    "source": "16295846a6b12ef6066aa4bff6c1f145c648cd29"
+  }
+}
