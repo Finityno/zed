@@ -219,7 +219,9 @@ impl Window {
             return None;
         }
         let splice = self.splice_gaps(previous, cx)?;
-        let layout_id = self.reuse_view_layout(previous)?;
+        // A rebuilt gap records its current states; replaying its old states
+        // would keep removed elements alive even when the splice is abandoned.
+        let layout_id = self.reuse_view_layout(previous, &splice.gaps)?;
         Some((layout_id, splice))
     }
 

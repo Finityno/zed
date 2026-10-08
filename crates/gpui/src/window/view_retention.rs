@@ -1118,7 +1118,7 @@ impl Window {
 
     /// Lays out the view last frame's record `previous` stands for as it was
     /// laid out then, without building it, if its nodes are all still there.
-    fn reuse_view_layout(&mut self, previous: usize) -> Option<LayoutId> {
+    fn reuse_view_layout(&mut self, previous: usize, gaps: &[usize]) -> Option<LayoutId> {
         let records = &self.rendered_frame.retained_views.records;
         let record = &records[previous];
         let layout = record.layout.as_ref()?;
@@ -1148,8 +1148,18 @@ impl Window {
         let keys_after = engine.claimed_keys_len();
         let states = &mut self.next_frame.accessed_element_states;
         let states_before = states.len();
-        for layout in subtree.iter().filter_map(|record| record.layout.as_deref()) {
-            states.extend(layout.element_states.iter().cloned());
+        let mut gap = gaps.iter().copied().peekable();
+        let mut index = previous;
+        while index <= previous + record.nested {
+            if gap.peek() == Some(&index) {
+                gap.next();
+                index += records[index].nested + 1;
+                continue;
+            }
+            if let Some(layout) = records[index].layout.as_deref() {
+                states.extend(layout.element_states.iter().cloned());
+            }
+            index += 1;
         }
         let states_after = states.len();
         self.note_nested(keys_before..keys_after, states_before..states_after);
@@ -2131,7 +2141,7 @@ impl Window {
             }
             match window.reusable_view(global_id, entity, cx) {
                 Ok(previous) => {
-                    if let Some(layout_id) = window.reuse_view_layout(previous) {
+                    if let Some(layout_id) = window.reuse_view_layout(previous, &[]) {
                         return (layout_id, ViewLayout::Retained { previous });
                     }
                     window.note_rebuild(entity, ViewRebuildReason::ContextChanged);

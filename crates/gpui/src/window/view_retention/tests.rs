@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+#[path = "splice_profile.rs"]
+mod splice_profile;
+
 const WORDS: [&str; 8] = [
     "a",
     "card",
@@ -5259,6 +5263,7 @@ impl Render for RemovedStateLeaf {
 #[test]
 fn a_splice_releases_element_state_removed_by_a_rebuilt_gap() {
     let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
     let window = cx.add_window(|_, cx| {
         let leaf = cx.new(|_| RemovedStateLeaf { present: true });
         let nest = cx.new(|_| RemovedStateNest { leaf });
@@ -5293,4 +5298,132 @@ fn a_splice_releases_element_state_removed_by_a_rebuilt_gap() {
     });
     assert_eq!(leaf_states(&mut cx), 0);
     assert_eq!(leaf_states(&mut cx), 0);
+}
+
+struct IndependentRoot(AnyElement);
+
+impl IntoElement for IndependentRoot {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl crate::Element for IndependentRoot {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<crate::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&crate::GlobalElementId>,
+        _: Option<&crate::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (crate::LayoutId, ()) {
+        let mut style = crate::Style::default();
+        style.size.width = crate::relative(1.).into();
+        style.size.height = crate::relative(1.).into();
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&crate::GlobalElementId>,
+        _: Option<&crate::InspectorElementId>,
+        bounds: crate::Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&crate::GlobalElementId>,
+        _: Option<&crate::InspectorElementId>,
+        _: crate::Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.paint(window, cx);
+    }
+}
+
+struct RootStatus(SharedString);
+
+impl Render for RootStatus {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().flex().items_center().child(self.0.clone())
+    }
+}
+
+struct RootStatusHost {
+    status: Entity<RootStatus>,
+}
+
+impl Render for RootStatusHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child("header")
+            .child(div().flex_1().child(IndependentRoot(
+                div().size_full().child(self.status.clone()).into_any_element(),
+            )))
+    }
+}
+
+struct RootStatusShell(Entity<RootStatusHost>);
+
+impl Render for RootStatusShell {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.0.clone())
+    }
+}
+
+#[test]
+fn a_changed_view_under_an_independent_root_matches_a_full_frame() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    let status = cx.new(|_| RootStatus("Starting".into()));
+    let windows = [(); 2].map(|_| {
+        cx.add_window(|_, cx| {
+            RootStatusShell(cx.new(|_| RootStatusHost { status: status.clone() }))
+        })
+    });
+    let frames = |cx: &mut TestAppContext| {
+        windows.map(|window| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                describe_frame(window)
+            })
+            .unwrap()
+        })
+    };
+    cx.update_window(windows[1].into(), |_, window, _| window.set_view_retention(false))
+        .unwrap();
+    let before = frames(&mut cx);
+    assert_eq!(first_difference(&before[0], &before[1]), None);
+    for text in ["Session unavailable: a longer status", "Ready", "Another longer status"] {
+        status.update(&mut cx, |status, cx| {
+            status.0 = text.into();
+            cx.notify();
+        });
+        let changed = frames(&mut cx);
+        assert_ne!(before[0], changed[0]);
+        assert_eq!(first_difference(&changed[0], &changed[1]), None);
+    }
 }
