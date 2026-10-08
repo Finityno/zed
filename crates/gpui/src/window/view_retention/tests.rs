@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+#[path = "splice_profile.rs"]
+mod splice_profile;
+
 const WORDS: [&str; 8] = [
     "a",
     "card",
