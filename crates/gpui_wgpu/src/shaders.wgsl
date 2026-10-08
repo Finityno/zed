@@ -1166,6 +1166,10 @@ struct PathRasterizationVarying {
     @location(1) @interpolate(flat) vertex_id: u32,
     //TODO: use `clip_distance` once Naga supports it
     @location(3) clip_distances: vec4<f32>,
+    // Paths rasterize into a tile whose viewport sits at minus the tile's
+    // origin, so the framebuffer position is tile-relative; this recovers
+    // the whole-pixel origin to put it back in window space.
+    @location(4) window_position: vec2<f32>,
 }
 
 @vertex
@@ -1177,6 +1181,7 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     out.st_position = v.st_position;
     out.vertex_id = vertex_id;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
+    out.window_position = v.xy_position;
     return out;
 }
 
@@ -1208,7 +1213,10 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    // Interpolation error is far below half a pixel, so rounding yields the
+    // tile origin exactly and the gradient sees the full-window position.
+    let tile_origin = round(input.window_position - input.position.xy);
+    let color = gradient_color(background, input.position.xy + tile_origin, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }

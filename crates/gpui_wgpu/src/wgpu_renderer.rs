@@ -1733,13 +1733,9 @@ impl WgpuRendererCore {
             premultiplied_alpha: premultiplied_alpha as u32,
             pad: 0,
         };
-        // Path triangles are rasterized one tile at a time, with vertices
-        // shifted into the tile, so their clip space spans a tile.
-        let tile_size = path_tile_size(size);
         let path_globals = GlobalParams {
-            viewport_size: [tile_size.width as f32, tile_size.height as f32],
             premultiplied_alpha: 0,
-            pad: 0,
+            ..globals
         };
         self.resources.queue.write_buffer(
             &self.resources.globals_buffer,
@@ -2284,53 +2280,26 @@ impl WgpuRendererCore {
             return Ok(false);
         }
 
-        let tile_size = path_tile_size(size);
         let mut vertices = Vec::new();
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            vertices.extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
+                xy_position: vertex.xy_position,
+                st_position: vertex.st_position,
+                color: path.color,
+                bounds,
+            }));
+        }
+        // Uploaded once per batch: every tile draws the same window-space
+        // vertices and only moves its viewport.
+        let vertex_binding = self.write_instance_binding(
+            "path_rasterization_bind_group",
+            instance_offset,
+            &vertices,
+        )?;
+
+        let tile_size = path_tile_size(size);
         for tile in path_tiles(sprites, size, tile_size) {
-            let tile_bounds = Bounds {
-                origin: Point {
-                    x: ScaledPixels(tile.origin.x as f32),
-                    y: ScaledPixels(tile.origin.y as f32),
-                },
-                size: Size {
-                    width: ScaledPixels(tile.size.width as f32),
-                    height: ScaledPixels(tile.size.height as f32),
-                },
-            };
-            // Tile origins are whole pixels, so the shift is exact and the
-            // fragment shader's position-relative maths sees the same values.
-            let shift = |point: Point<ScaledPixels>| Point {
-                x: point.x - tile_bounds.origin.x,
-                y: point.y - tile_bounds.origin.y,
-            };
-            vertices.clear();
-            for path in paths {
-                let bounds = path.clipped_bounds();
-                if !bounds.dilate(ScaledPixels(1.)).intersects(&tile_bounds) {
-                    continue;
-                }
-                let bounds = Bounds {
-                    origin: shift(bounds.origin),
-                    size: bounds.size,
-                };
-                vertices.extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
-                    xy_position: shift(vertex.xy_position),
-                    st_position: vertex.st_position,
-                    color: path.color,
-                    bounds,
-                }));
-            }
-
-            let vertex_binding = if vertices.is_empty() {
-                None
-            } else {
-                Some(self.write_instance_binding(
-                    "path_rasterization_bind_group",
-                    instance_offset,
-                    &vertices,
-                )?)
-            };
-
             let resources = self.resources();
             let (Some(intermediate), Some(tile_texture), Some(tile_view)) = (
                 resources.path_intermediate_texture.as_ref(),
@@ -2359,19 +2328,30 @@ impl WgpuRendererCore {
                     ..Default::default()
                 });
 
-                if let Some(vertex_binding) = &vertex_binding {
-                    pass.set_pipeline(&resources.pipelines.path_rasterization);
-                    pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
-                    pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
-                    // The path rasterization shader loads records by vertex
-                    // index rather than instance index, so the allocation's
-                    // base shifts the vertex range here.
-                    pass.draw(
-                        vertex_binding.first_instance
-                            ..vertex_binding.first_instance + vertices.len() as u32,
-                        0..1,
-                    );
-                }
+                // A window-sized viewport placed at minus the tile's origin
+                // maps window clip space onto this tile, the same transform
+                // the full-window target used shifted by whole pixels. wgpu
+                // accepts viewport origins down to -2 * max_texture_dimension_2d,
+                // which covers any tile of a window within that dimension.
+                pass.set_viewport(
+                    -(tile.origin.x as f32),
+                    -(tile.origin.y as f32),
+                    size.width.0 as f32,
+                    size.height.0 as f32,
+                    0.,
+                    1.,
+                );
+                pass.set_pipeline(&resources.pipelines.path_rasterization);
+                pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
+                pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
+                // The path rasterization shader loads records by vertex
+                // index rather than instance index, so the allocation's
+                // base shifts the vertex range here.
+                pass.draw(
+                    vertex_binding.first_instance
+                        ..vertex_binding.first_instance + vertices.len() as u32,
+                    0..1,
+                );
             }
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -3423,9 +3403,9 @@ mod tests {
             }
             assert_black_outside(&image, &[(left, top)]);
         }
-        // Clip space spans a tile, so a vertex's clip coordinates round
-        // differently per placement; one level of slack absorbs a driver whose
-        // rasterizer snaps such a difference onto the other side of a sample.
+        // Each placement maps through a differently offset viewport; one level
+        // of slack absorbs a driver whose rasterizer rounds that offset onto
+        // the other side of a sample.
         assert!(
             max_difference <= 1,
             "lens pixels differ by {max_difference} between placements"
