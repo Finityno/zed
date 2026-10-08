@@ -351,15 +351,19 @@ impl TaffyLayoutEngine {
     /// one of that set's nodes still, as it is unless its key was released
     /// and made again since (the tree was rebuilt while the window was idle,
     /// or a rolled-back transaction made it and handed it back).
-    pub(crate) fn try_keep_retained_sets(&mut self, key_sets: &[&[u64]], root: LayoutId) -> bool {
+    pub(crate) fn try_keep_retained_sets<'a>(
+        &mut self,
+        key_sets: impl Iterator<Item = &'a [u64]> + Clone,
+        root: LayoutId,
+    ) -> bool {
         let retention = &self.retention;
         let frame = retention.frame;
-        let root_kept = key_sets.first().is_some_and(|keys| {
+        let root_kept = key_sets.clone().next().is_some_and(|keys| {
             keys.iter()
                 .any(|key| retention.retained.get(key).is_some_and(|node| node.id == root))
         });
         let all_kept = root_kept
-            && key_sets.iter().all(|keys| {
+            && key_sets.clone().all(|keys| {
                 keys.iter().all(|key| {
                     retention
                         .retained
@@ -1247,6 +1251,28 @@ mod tests {
         style.size.width = px(width).into();
         style.size.height = px(10.).into();
         style
+    }
+
+    #[test]
+    fn retained_sets_validate_every_set_before_claiming_any_node() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = engine.request_keyed_layout(Some(2), &sized(10.), px(16.), 1., &[]);
+        let root = engine.request_keyed_layout(Some(1), &sized(20.), px(16.), 1., &[child]);
+        engine.clear();
+        let valid: [&[u64]; 2] = [&[1], &[2]];
+        let missing: [&[u64]; 2] = [&[1], &[99]];
+
+        assert!(!engine.try_keep_retained_sets(missing.into_iter(), root));
+        assert_eq!(engine.retention.claimed_this_frame, 0);
+        assert!(!engine.try_keep_retained_sets(valid.into_iter(), child));
+        assert_eq!(engine.retention.claimed_this_frame, 0);
+        assert!(!engine.try_keep_retained_sets(std::iter::empty(), root));
+        assert_eq!(engine.retention.claimed_this_frame, 0);
+
+        assert!(engine.try_keep_retained_sets(valid.into_iter(), root));
+        assert_eq!(engine.retention.claimed_this_frame, 2);
+        assert!(!engine.try_keep_retained_sets(valid.into_iter(), root));
+        assert_eq!(engine.retention.claimed_this_frame, 2);
     }
 
     /// A retained node hidden with `display: none` and shown again is laid

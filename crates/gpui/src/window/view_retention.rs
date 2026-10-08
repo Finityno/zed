@@ -1135,14 +1135,13 @@ impl Window {
         // The view's own nodes and those of the views nested in it, each of
         // which recorded its own.
         let subtree = &records[previous..=previous + record.nested];
-        let key_sets: Vec<&[u64]> = subtree
+        let key_sets = subtree
             .iter()
             .filter_map(|record| record.layout.as_deref())
-            .map(|layout| layout.keys.as_slice())
-            .collect();
+            .map(|layout| layout.keys.as_slice());
         let engine = self.layout_engine.as_mut()?;
         let keys_before = engine.claimed_keys_len();
-        if !engine.try_keep_retained_sets(&key_sets, root) {
+        if !engine.try_keep_retained_sets(key_sets, root) {
             return None;
         }
         let keys_after = engine.claimed_keys_len();
