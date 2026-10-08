@@ -6124,6 +6124,7 @@ impl Window {
                     _ => crate::taffy::Adopted::No,
                 }
             },
+            |_| {},
             |measurement, known, available, window, cx| {
                 (measurement.measure)(known, available, window, cx)
             },
@@ -6137,14 +6138,16 @@ impl Window {
     ///
     /// `adopt` is given `state` and what that element left, and takes its
     /// measurement over when it still stands; the node then stays clean, and
-    /// Taffy keeps what it cached for it and the nodes above it. Otherwise
-    /// `measure` may run here, under the constraints Taffy measured the node
+    /// Taffy keeps what it cached for it and the nodes above it. When the node
+    /// is given `state` along with the measurement, `bind` is given it as the
+    /// node will share it. Otherwise `measure` may run here, under the constraints Taffy measured the node
     /// under, to tell whether it still measures the same.
     pub(crate) fn request_carried_measured_layout<S: 'static>(
         &mut self,
         style: Option<&Style>,
         state: S,
-        adopt: impl FnOnce(&Rc<S>, &Rc<dyn std::any::Any>) -> crate::taffy::Adopted,
+        adopt: impl FnOnce(&S, &Rc<dyn std::any::Any>) -> crate::taffy::Adopted,
+        bind: impl FnOnce(&Rc<S>),
         measure: impl Fn(&Rc<S>, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
         + 'static,
         cx: &mut App,
@@ -6162,6 +6165,7 @@ impl Window {
             scale_factor,
             state,
             adopt,
+            bind,
             measure,
             self,
             cx,
