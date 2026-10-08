@@ -865,21 +865,7 @@ impl App {
         now: Instant,
         except: &StateVersion,
     ) -> Option<DependencyChange> {
-        if dependencies
-            .states
-            .iter()
-            .any(|(version, _)| version.same_state(except))
-        {
-            let mut without = dependencies.clone();
-            without.states = without
-                .states
-                .iter()
-                .filter(|(version, _)| !version.same_state(except))
-                .cloned()
-                .collect();
-            return self.dependencies_changed(&without, inside_notified, now);
-        }
-        self.dependencies_changed(dependencies, inside_notified, now)
+        self.dependencies_changed_inner(dependencies, inside_notified, now, Some(except))
     }
 
     /// Whether anything in `dependencies` may have changed since it was
@@ -896,6 +882,16 @@ impl App {
         dependencies: &RenderDependencies,
         inside_notified: bool,
         now: Instant,
+    ) -> Option<DependencyChange> {
+        self.dependencies_changed_inner(dependencies, inside_notified, now, None)
+    }
+
+    fn dependencies_changed_inner(
+        &self,
+        dependencies: &RenderDependencies,
+        inside_notified: bool,
+        now: Instant,
+        except: Option<&StateVersion>,
     ) -> Option<DependencyChange> {
         let log = &self.entities.access_log;
         if log.changed_since(&dependencies.entities, dependencies.updates, inside_notified)
@@ -932,7 +928,10 @@ impl App {
         if dependencies
             .states
             .iter()
-            .any(|(version, read_at)| version.get() != *read_at)
+            .any(|(version, read_at)| {
+                version.get() != *read_at
+                    && except.is_none_or(|except| !version.same_state(except))
+            })
         {
             return Some(DependencyChange::State);
         }
@@ -994,6 +993,71 @@ mod empty_nested_tests {
             let outer = cx.finish_recording_dependencies(outer);
             assert_eq!(outer.all.rebuild_at, Some(deadline));
             assert_eq!(outer.own.rebuild_at, None);
+        });
+    }
+}
+
+#[cfg(test)]
+mod state_check_tests {
+    use super::*;
+
+    #[test]
+    fn ignoring_a_frame_marker_still_checks_other_state() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let marker = StateVersion::default();
+            let other = StateVersion::default();
+            let recording = cx.begin_recording_dependencies();
+            note_state_read(&marker);
+            note_state_read(&other);
+            let dependencies = cx.finish_recording_dependencies(recording).all;
+            marker.bump();
+            let now = Instant::now();
+            assert_eq!(cx.dependencies_changed(&dependencies, false, now), Some(DependencyChange::State));
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), None);
+            other.bump();
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::State));
+        });
+    }
+
+    #[test]
+    fn an_absent_exception_does_not_hide_state_changes() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let marker = StateVersion::default();
+            let other = StateVersion::default();
+            let recording = cx.begin_recording_dependencies();
+            note_state_read(&other);
+            let dependencies = cx.finish_recording_dependencies(recording).all;
+            other.bump();
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, Instant::now(), &marker), Some(DependencyChange::State));
+        });
+    }
+
+    #[test]
+    fn ignoring_state_preserves_entity_global_and_deadline_priority() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let marker = StateVersion::default();
+            let now = Instant::now();
+            let entity = EntityId::from(1);
+            let global = TypeId::of::<u32>();
+            let recording = cx.begin_recording_dependencies();
+            note_access(&cx.entities, entity);
+            note_global_read(cx, global);
+            note_state_read(&marker);
+            note_deadline(now);
+            let dependencies = cx.finish_recording_dependencies(recording).all;
+            marker.bump();
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::Deadline));
+            cx.dependencies.global_changed(global);
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::Global));
+            cx.entities.access_log.stamp_changed(entity);
+            assert_eq!(cx.dependencies_changed_except(&dependencies, false, now, &marker), Some(DependencyChange::Entity));
+            assert_eq!(cx.dependencies_changed(&dependencies, false, now), Some(DependencyChange::Entity));
         });
     }
 }
