@@ -26,6 +26,7 @@ use crate::{
     ScrollAxisLock, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
     TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
+use crate::window::HoverListener;
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
@@ -3069,7 +3070,6 @@ impl Interactivity {
             || self.base_style.mouse_cursor.is_some()
             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
         {
-            let hitbox = hitbox.clone();
             let hover_state = self.hover_style.as_ref().and_then(|_| {
                 element_state
                     .as_ref()
@@ -3086,19 +3086,14 @@ impl Interactivity {
             // dispatch against the same frame, so update the snapshot after
             // each transition rather than comparing every event against the
             // state at paint time.
-            let mut was_hovered = hitbox.is_hovered(window);
+            let was_hovered = hitbox.is_hovered(window);
 
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    let hovered = hitbox.is_hovered(window);
-                    if hovered != was_hovered {
-                        was_hovered = hovered;
-                        if let Some(hover_state) = &hover_state {
-                            hover_state.borrow_mut().element = hovered;
-                        }
-                        cx.notify(current_view);
-                    }
-                }
+            window.on_hover_transition(HoverListener {
+                hitbox: hitbox.id,
+                was_hovered,
+                hover_state,
+                group: false,
+                view: current_view,
             });
         }
 
@@ -3111,19 +3106,14 @@ impl Interactivity {
                 let current_view = window.current_view();
                 // Paint-time snapshot, updated per observed transition; see
                 // the element-hover listener above.
-                let mut was_group_hovered = group_hitbox_id.is_hovered(window);
+                let was_group_hovered = group_hitbox_id.is_hovered(window);
 
-                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture {
-                        let group_hovered = group_hitbox_id.is_hovered(window);
-                        if group_hovered != was_group_hovered {
-                            was_group_hovered = group_hovered;
-                            if let Some(hover_state) = &hover_state {
-                                hover_state.borrow_mut().group = group_hovered;
-                            }
-                            cx.notify(current_view);
-                        }
-                    }
+                window.on_hover_transition(HoverListener {
+                    hitbox: group_hitbox_id,
+                    was_hovered: was_group_hovered,
+                    hover_state,
+                    group: true,
+                    view: current_view,
                 });
             }
         }
