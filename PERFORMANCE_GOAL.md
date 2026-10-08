@@ -63,6 +63,14 @@ regressions before introducing scroll layers. Account for the independent
 atlas retirement already present in main and preserve active idle-window,
 focus and text-ownership work.
 
+The removed-gap state release at `c3e601eed133e68f2950b53062cb6d4aaa19aeb7`
+is also held. Its native regression fails before and passes after, and 280
+complete-frame comparisons release all obsolete owners with 10/80 KiB less
+held requested heap. Eleven frozen CPU, allocation-churn and RSS controls
+fail. Preserve `performance-evidence/retained-splice-state-held-20261008`;
+do not resample this design unchanged. Continue with transient layout-key
+gathering, measured as a distinct candidate from current owned main.
+
 ## Iteration and merge policy
 
 Use a focused branch for each distinct candidate. Start from current main and
