@@ -1,7 +1,7 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
-use crate::linux::X11ClientStatePtr;
+use crate::linux::{X11ClientStatePtr, X11FrameDemand};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -284,6 +284,8 @@ pub struct X11WindowState {
     visibility: WindowVisibility,
     hovered: bool,
     force_render_after_recovery: bool,
+    /// Set by the client once the window is registered with it.
+    pub(crate) frame_demand: Option<Rc<X11FrameDemand>>,
     fullscreen: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
@@ -836,6 +838,7 @@ impl X11WindowState {
                 visibility: WindowVisibility::Hidden,
                 hovered: false,
                 force_render_after_recovery: false,
+                frame_demand: None,
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
@@ -1697,6 +1700,15 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().fullscreen
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // The demand holds no reference to the window (only its id and the
+        // event loop handle), so the waker, stored in GPUI's invalidator,
+        // cannot keep the window alive.
+        let frame_demand = self.0.state.borrow().frame_demand.clone()?;
+        frame_demand.mark_waker_installed();
+        Some(Rc::new(move || frame_demand.request()))
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1764,6 +1776,11 @@ impl PlatformWindow for X11Window {
             }
 
             inner.force_render_after_recovery = true;
+            // The forced render runs on the next frame request; make sure
+            // one comes even if nothing else is pending.
+            if let Some(frame_demand) = inner.frame_demand.as_ref() {
+                frame_demand.request();
+            }
             return;
         }
 
@@ -1771,6 +1788,9 @@ impl PlatformWindow for X11Window {
 
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
+            if let Some(frame_demand) = inner.frame_demand.as_ref() {
+                frame_demand.request();
+            }
         }
     }
 
