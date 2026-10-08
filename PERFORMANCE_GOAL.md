@@ -103,7 +103,9 @@ Zero-read nested-stretch omission at `96daa6ebbe402f5eac4867e2d0c73e06cca20eaf`
 qualifies across 600 native children and fifteen complete recorder workloads.
 Parents with their own dependencies and an empty child share immutable all/own
 snapshots: 50% lower held requested heap, 49.98–50.03% lower peak, 36.36–43.75%
-fewer calls and 47.95–62.32% fewer requested bytes. All frozen CPU, elapsed,
+fewer calls and 47.95–62.32% fewer requested bytes. Four entity/state/mixed
+workloads also use32.44–38.83% less CPU/elapsed above both full lane ranges;
+the deadline-only CPU difference is below variation. All frozen CPU, elapsed,
 whole-child CPU, heap and native RSS controls pass. Owner-sharing fails before
 and passes after; recorder/retained/frame/layout contracts, strict owning Clippy
 and benchmark isolation pass. See `performance-evidence/empty-recording-stretches-20261008`.

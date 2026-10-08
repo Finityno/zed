@@ -637,5 +637,12 @@
     "sha256": "4c877dde886ba35d8b29f7a3ed857f590c3af04682224f3cd9caea59ffd7ea41",
     "members": 656,
     "bytes": 262821
-  }
+  },
+  "established_component_cpu_cases": [
+    "nested-empty-own-entity",
+    "nested-empty-own-entities-16",
+    "nested-empty-own-state",
+    "nested-empty-own-all"
+  ],
+  "cpu_limit": "Deadline-only CPU difference is below full observed range; no CPU percentage established for it. No whole-frame or app CPU percentage."
 }

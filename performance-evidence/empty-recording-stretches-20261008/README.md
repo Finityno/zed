@@ -11,6 +11,9 @@ requested snapshot heap, 49.98–50.03% less peak requested heap, 36.36–43.75%
 fewer allocation calls and 47.95–62.32% fewer requested bytes. The gains exceed
 both full lane ranges and the declared40% heap/20% churn targets. Every
 CPU, elapsed, whole-child CPU, heap and native RSS control passes.
+Four parent entity/state/mixed workloads also use32.44–38.83% less thread CPU
+and elapsed, beyond both full lane ranges. The deadline-only CPU difference
+does not exceed observed variation and is not an established gain.
 
 The owner-sharing regression fails before and passes after. Four recorder
 contracts and six retained/frame/layout contracts, strict owning Clippy and
