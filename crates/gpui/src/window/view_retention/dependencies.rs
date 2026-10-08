@@ -947,3 +947,7 @@ pub(crate) enum DependencyChange {
     State,
     Deadline,
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "dependency_profile.rs"]
+mod dependency_profile;
