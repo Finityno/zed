@@ -8,7 +8,7 @@ text measurement, hitbox, overlay and notification contract.
 
 ## Baseline and source comparison
 
-On 8 October 2026, Fincode and this fork's main both use
+At the initial 8 October 2026 audit, Fincode and this fork's main both used
 `ef46053b5794ccb57cda5dc658581ca2a399a4e2`. The application pins `gpui`,
 `gpui_platform` and `sum_tree` together. Its fast-layout import is
 `e89b7276d028fb7f9db3da5d290c0f56afb0de6b`, followed by retained replay changes
@@ -23,7 +23,7 @@ for that source. Revision dates alone do not establish feature equivalence.
 | --- | --- | --- |
 | Carried text measurement ownership | Moves uniquely held layouts; copies shared layouts | Preserve the shared-owner tests |
 | Leaf measurements at final width | Text prepaint already calls `fit_to_width` | Compare probe-width and independent-root regressions |
-| Dependency-list allocation | Empty lists allocate for each recording | Measure the complete recorder and retained outputs |
+| Dependency-list allocation | Empty nested snapshots share storage after a qualified owned merge | Preserve recorder and retained-output regressions |
 | GPU scroll layers | Not present in the inspected fork | Prototype CPU/frame gains, GPU cache bounds and hitbox/overlay correctness |
 | Transcript scroll-layer stability | Requires the layer architecture first | Test per-row updates, at-end reads, parent notifications and overscan |
 | Retained splice safety | Different implementation | Reproduce independent-root, deferred overlay and layout-claim regressions |
@@ -33,6 +33,56 @@ Cached scrolling is the largest architectural opportunity. Published numbers
 from another consumer are motivation for a prototype, not Fincode evidence.
 New GPU caches must be bounded, reclaimed appropriately and measured together
 with CPU and latency; lower CPU alone is insufficient.
+
+## Completed and held iterations
+
+Revision `33439ed70c2a38e7371fac721c26582de3f784f2` shares empty nested
+dependency snapshots. Its complete recorder comparison qualified across 400
+native children: 36.23% lower thread CPU, 50% lower held/peak requested heap
+and 33.33% fewer requested bytes and allocation calls. Controls fit the frozen
+baseline ranges. See `performance-evidence/empty-nested-20261008`.
+
+Fincode adopted all three rendering dependencies at that revision in
+`89d8d92ed576f1a87761c7a56cf4e078e7b66e33`, with the matching owned component
+revision `0905a743b7f7b4f895f3ee7041bddbb23926aa20`. Separate scoped production
+compile, native UI retention contracts, strict Clippy and source guards pass.
+The component revision also restores caret blinking after a canceled pause
+and window reactivation; its native regression fails before and passes after.
+Merged source bytes were verified. No app-wide or GPU percentage is established.
+
+Two allocation designs remain held. The broader empty-list pool failed RSS;
+its original failed cohort is preserved. The in-place retained-state checker
+at `caf83a60de3dc429263c81ea70be47f4838c3658` removes measured transient
+allocation and lowers target checker CPU by 79–93%, but eight frozen ordinary
+CPU/elapsed and RSS controls fail. Its 600-child evidence is preserved on its
+owned candidate branch. Neither design may be repeated unchanged to seek a
+passing cohort.
+
+Continue with equivalent retained-splice ownership and independent-root
+regressions before introducing scroll layers. Account for the independent
+atlas retirement already present in main and preserve active idle-window,
+focus and text-ownership work.
+
+The removed-gap state release at `c3e601eed133e68f2950b53062cb6d4aaa19aeb7`
+is also held. Its native regression fails before and passes after, and 280
+complete-frame comparisons release all obsolete owners with 10/80 KiB less
+held requested heap. Eleven frozen CPU, allocation-churn and RSS controls
+fail. Its evidence is retained on branch `perf/retained-splice-state-20261008`
+under `performance-evidence/retained-splice-state-held-20261008`; do not
+resample this design unchanged.
+
+Distinct layout-key gathering at `26c8b7fa65224be324f8eaa5a4a47840e3041431`
+qualified across 336 native children and twelve complete-frame workloads.
+Panel updates with 32/256 unchanged rows use 7.54/8.57% fewer allocation calls
+and 1.60/4.05% fewer requested bytes. The gain exceeds deterministic variation
+and the frozen 5% target; all CPU, requested heap and native RSS controls pass.
+Held/peak heap is unchanged in the primary cases. CPU differences are below
+observed variation, so no CPU percentage is established. Scene/hitbox hashes,
+state-owner counts, atomic-claim and retained-frame regressions, strict owning
+Clippy and benchmark isolation pass. Both lanes link identical immutable
+dependency objects. See `performance-evidence/retained-layout-sets-20261008`.
+Qualify coherent application adoption separately, then continue with the next
+distinct important owner and bounded renderer work.
 
 ## Iteration and merge policy
 
