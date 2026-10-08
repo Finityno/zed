@@ -5406,15 +5406,17 @@ fn a_changed_view_under_an_independent_root_matches_a_full_frame() {
     });
     let frames = |cx: &mut TestAppContext| {
         windows.map(|window| {
+            let from_scratch = window == windows[1];
             cx.update_window(window.into(), |_, window, cx| {
+                if from_scratch {
+                    window.refresh();
+                }
                 window.draw(cx).clear(cx);
                 describe_frame(window)
             })
             .unwrap()
         })
     };
-    cx.update_window(windows[1].into(), |_, window, _| window.set_view_retention(false))
-        .unwrap();
     let before = frames(&mut cx);
     assert_eq!(first_difference(&before[0], &before[1]), None);
     for text in ["Session unavailable: a longer status", "Ready", "Another longer status"] {
