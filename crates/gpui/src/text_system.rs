@@ -16,7 +16,7 @@ use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
     StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
 };
-use anyhow::{Context as _, anyhow};
+use anyhow::Context as _;
 use collections::{FxHashMap, FxHashSet};
 use core::fmt;
 use derive_more::{Add, Deref, FromStr, Sub};
@@ -226,10 +226,18 @@ impl Drop for MissingGlyphReceiver {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FontLookup {
+    Found(FontId),
+    /// The font failed to load; `fallback` is the font from the fallback
+    /// stack it resolves to, once one has been found.
+    Missing { fallback: Option<FontId> },
+}
+
 /// The GPUI text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
-    font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
+    font_ids_by_font: RwLock<FxHashMap<Font, FontLookup>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
@@ -335,27 +343,30 @@ impl TextSystem {
     }
 
     /// Get the FontId for the configure font family and style.
-    fn font_id(&self, font: &Font) -> Result<FontId> {
-        fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
-            match font_id {
-                Ok(font_id) => Ok(*font_id),
-                Err(err) => Err(anyhow!("{err}")),
+    ///
+    /// A font that failed to load is remembered as missing, so asking again
+    /// is one hash lookup rather than another platform lookup or an error
+    /// built (and with `RUST_BACKTRACE` set, a backtrace captured) per text
+    /// run per frame.
+    fn font_id(&self, font: &Font) -> Option<FontId> {
+        let lookup = self.font_ids_by_font.read().get(font).copied();
+        match lookup {
+            Some(FontLookup::Found(font_id)) => Some(font_id),
+            Some(FontLookup::Missing { .. }) => None,
+            None => {
+                let lookup = match self.platform_text_system.font_id(font) {
+                    Ok(font_id) => FontLookup::Found(font_id),
+                    Err(error) => {
+                        log::debug!("failed to load font '{}': {error:#}", font.family);
+                        FontLookup::Missing { fallback: None }
+                    }
+                };
+                self.font_ids_by_font.write().insert(font.clone(), lookup);
+                match lookup {
+                    FontLookup::Found(font_id) => Some(font_id),
+                    FontLookup::Missing { .. } => None,
+                }
             }
-        }
-
-        let font_id = self
-            .font_ids_by_font
-            .read()
-            .get(font)
-            .map(clone_font_id_result);
-        if let Some(font_id) = font_id {
-            font_id
-        } else {
-            let font_id = self.platform_text_system.font_id(font);
-            self.font_ids_by_font
-                .write()
-                .insert(font.clone(), clone_font_id_result(&font_id));
-            font_id
         }
     }
 
@@ -363,8 +374,8 @@ impl TextSystem {
     pub fn get_font_for_id(&self, id: FontId) -> Option<Font> {
         let lock = self.font_ids_by_font.read();
         lock.iter()
-            .filter_map(|(font, result)| match result {
-                Ok(font_id) if *font_id == id => Some(font.clone()),
+            .filter_map(|(font, lookup)| match lookup {
+                FontLookup::Found(font_id) if *font_id == id => Some(font.clone()),
                 _ => None,
             })
             .next()
@@ -377,11 +388,23 @@ impl TextSystem {
     ///
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
-        if let Ok(font_id) = self.font_id(font) {
+        if let Some(font_id) = self.font_id(font) {
             return font_id;
         }
+        if let Some(FontLookup::Missing {
+            fallback: Some(font_id),
+        }) = self.font_ids_by_font.read().get(font)
+        {
+            return *font_id;
+        }
         for fallback in &self.fallback_font_stack {
-            if let Ok(font_id) = self.font_id(fallback) {
+            if let Some(font_id) = self.font_id(fallback) {
+                self.font_ids_by_font.write().insert(
+                    font.clone(),
+                    FontLookup::Missing {
+                        fallback: Some(font_id),
+                    },
+                );
                 return font_id;
             }
         }
