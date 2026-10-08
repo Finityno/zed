@@ -622,16 +622,21 @@ impl RenderDependencies {
     /// Both sets at once, as of the earlier generation, each read as of the
     /// earlier of the two.
     pub(crate) fn union(&self, other: &Self) -> Self {
-        let mut states = self.states.to_vec();
-        for state in other.states.iter() {
-            if !states.iter().any(|(version, _)| version.same_state(&state.0)) {
-                states.push(state.clone());
+        let states = if other.states.is_empty() {
+            self.states.clone()
+        } else {
+            let mut states = self.states.to_vec();
+            for state in other.states.iter() {
+                if !states.iter().any(|(version, _)| version.same_state(&state.0)) {
+                    states.push(state.clone());
+                }
             }
-        }
+            states.into()
+        };
         Self {
             entities: merge_reads(&self.entities, self.floor, &other.entities, other.floor),
             globals: merge_reads(&self.globals, self.floor, &other.globals, other.floor),
-            states: states.into(),
+            states,
             rebuild_at: match (self.rebuild_at, other.rebuild_at) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -968,6 +973,60 @@ mod dependency_profile;
 #[cfg(test)]
 mod empty_nested_tests {
     use super::*;
+
+    #[test]
+    fn empty_right_union_shares_existing_state_snapshot() {
+        let state = StateVersion::default();
+        for reads in [vec![], vec![(state.clone(), 3)], vec![(state.clone(), 3), (state.clone(), 5)]] {
+            let deadline = Instant::now();
+            let left = RenderDependencies {
+                states: reads.into(),
+                entities: vec![(EntityId::from(1), 2)].into(),
+                generation: 7,
+                updates: 9,
+                floor: 4,
+                rebuild_at: Some(deadline + std::time::Duration::from_secs(1)),
+                ..RenderDependencies::default()
+            };
+            let right = RenderDependencies {
+                globals: vec![(TypeId::of::<u32>(), 1)].into(),
+                generation: 6,
+                updates: 8,
+                floor: 3,
+                rebuild_at: Some(deadline),
+                ..RenderDependencies::default()
+            };
+            let owners = Rc::strong_count(&state.0);
+            let merged = left.union(&right);
+            assert!(Rc::ptr_eq(&merged.states, &left.states));
+            assert_eq!(Rc::strong_count(&state.0), owners);
+            assert_eq!(merged.states.len(), left.states.len());
+            assert_eq!(merged.entities.as_ref(), &[(EntityId::from(1), 4)]);
+            assert_eq!(merged.globals.as_ref(), &[(TypeId::of::<u32>(), 3)]);
+            assert_eq!((merged.generation, merged.updates, merged.floor), (6, 8, 0));
+            assert_eq!(merged.rebuild_at, Some(deadline));
+        }
+    }
+
+    #[test]
+    fn nonempty_right_union_preserves_state_membership_and_read_versions() {
+        let first = StateVersion::default();
+        let second = StateVersion::default();
+        for left in [vec![], vec![(first.clone(), 2)]] {
+            let right = RenderDependencies {
+                states: vec![(first.clone(), 3), (first.clone(), 4), (second.clone(), 7)].into(),
+                ..RenderDependencies::default()
+            };
+            let first_read = left.first().map_or(3, |(_, read)| *read);
+            let left = RenderDependencies { states: left.into(), ..RenderDependencies::default() };
+            let merged = left.union(&right);
+            assert_eq!(merged.states.len(), 2);
+            assert!(merged.states[0].0.same_state(&first));
+            assert_eq!(merged.states[0].1, first_read);
+            assert!(merged.states[1].0.same_state(&second));
+            assert_eq!(merged.states[1].1, 7);
+        }
+    }
 
     #[test]
     fn empty_child_shares_nonempty_parent_snapshots() {

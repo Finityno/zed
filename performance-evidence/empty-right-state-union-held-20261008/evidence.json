@@ -1,0 +1,58 @@
+{
+  "qualified": false,
+  "status": "Held/unmerged; never resample this design unchanged or weaken frozen gates.",
+  "source": "b5bd9e8fae0809bf9af4da0b96798b78e316ae40",
+  "base": "eb24f988a4e24c9567d21274c2f87313377c3c86",
+  "policy_sha256": "7ee08b98815cae75c593627f98a6385bfcf1f8edf451b30f8bb0d2df053265db",
+  "children": 560,
+  "cases": 20,
+  "primary_allocation_calls_reduction_percent": [
+    7.016213141177586,
+    9.054338602721646
+  ],
+  "primary_requested_bytes_reduction_percent": [
+    0.3711855899734773,
+    1.0187359414688846
+  ],
+  "failures": [
+    [
+      "bare",
+      "state-remove-256",
+      "peak_rss_kib",
+      "control",
+      188,
+      136
+    ],
+    [
+      "census",
+      "state-panel-keep-256",
+      "peak_rss_kib",
+      "control",
+      92,
+      88
+    ],
+    [
+      "census",
+      "state-remove-32",
+      "peak_rss_kib",
+      "control",
+      384,
+      328
+    ]
+  ],
+  "controls": "All frozen CPU/elapsed/whole-child CPU and requested heap gates pass. Three native RSS fields fail. No established CPU/app/GPU percentage.",
+  "correctness": "Owner-sharing regression fails before/passes after; nonempty union membership/read versions/metadata, six nested/union contracts and six retained/frame/layout contracts pass. Actual owning Clippy1.98/bench isolation pass.",
+  "identities": "Full current24 owning crates/root/font/lock hashes, same extra fixtures and59 immutable externs, Rust1.99 native, bare System separate from counting System. Four distinct output dirs. Exact CPU/nativeRSS/raw samples retained.",
+  "adverse": "Missing font fixture assets reject initial native build before profiling, then exact current assets/licenses are copied. Scoped Clippy preparation rejects omitted scratch patch before compilation, then exact current patch/ licenses are copied. First failures preserved. Inactive2638 cache files roundtrip-verified gzip preservation frees1.755GB; native executables/shared libraries/common59externs and original user target untouched.",
+  "limits": [
+    "Linux complete App/Window fake platform, no app/physicalGPU/macOS/Windows/shipped allocator gain.",
+    "Census includes App setup/four warmups/live App/Window; timing excludes setup and final owner/hash audits.",
+    "Historical live app heap evidence ranks GPUI containers/queues/observers; this specific union ownership comes from complete-component attribution.",
+    "Existing removed-gap state retention bug remains; its failed fix is held separately."
+  ],
+  "archive": {
+    "sha256": "816f1b55988a8ebc558d5737743e023744d82a482db89a5ebb62b0dac398b5f6",
+    "members": 656,
+    "bytes": 898083
+  }
+}
