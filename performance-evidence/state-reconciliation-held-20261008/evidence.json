@@ -1,0 +1,70 @@
+{
+  "status": "HELD, unmerged. Never resample this exact design unchanged or weaken gates.",
+  "source": "a946b415c2f5967d36f4f82b8530833c94dee4af",
+  "base": "861e0d8570cb179c1cb357d770cc58530c2dd312",
+  "policy_sha256": "a3e22a2a19ba934ba2e7d53a0a7c7d6e44368c17c76986f78636f1663339d6b0",
+  "children": 800,
+  "cases": 20,
+  "complete_checker_cpu_primary_reduction_percent": [
+    79.23277456711422,
+    91.93596263929578,
+    89.53965998780913,
+    89.9513100007766,
+    83.102576721265
+  ],
+  "primary_transient_allocations_eliminated": true,
+  "all_cpu_controls_pass": true,
+  "failed_controls": [
+    [
+      "census",
+      "normal-8",
+      "peak_rss_kib",
+      "control",
+      308,
+      256
+    ],
+    [
+      "census",
+      "except-last-64",
+      "peak_rss_kib",
+      "control",
+      232,
+      192
+    ],
+    [
+      "census",
+      "except-absent-changed-8",
+      "peak_rss_kib",
+      "control",
+      208,
+      192
+    ],
+    [
+      "census",
+      "except-empty",
+      "peak_rss_kib",
+      "control",
+      524,
+      384
+    ],
+    [
+      "census",
+      "normal-changed-64",
+      "peak_rss_kib",
+      "control",
+      212,
+      112
+    ]
+  ],
+  "correctness": "Four state tests, including filtered-snapshot oracle1024 comparisons; six native retained/frame/layout contracts; strict owning Clippy and benchmark isolation pass.",
+  "identities": "Ordinary checker source body unchanged. Identical added fixtures and59 immutable direct native extern objects in both lanes; compiler/runtime hashes and command/environment/source manifests preserved. System bare timing separated from forwarding System counting census.",
+  "archive_sha256": "1a416b11a6df43df10f89848aa47c1ddb02aea35c528b72902ea6cdca9b53d9d",
+  "archive_bytes": 461779,
+  "archive_members": 856,
+  "limits": [
+    "Linux complete dependency-check component; no complete-frame/application/GPU/shipped allocator/macOS/Windows gain established.",
+    "Census RSS median increases212\u2013524 KiB in several controls exceed full baseline ranges; no physical cause established. One failure has232 KiB increase vs192 KiB range, another308 vs256.",
+    "A rejected supervisor argument invocation failed before Cargo started; corrected invocation and rejected receipt preserved.",
+    "Inactive compilation metadata was gzip-compressed with exact roundtrip hashes; libraries/binaries/sources/samples untouched."
+  ]
+}
