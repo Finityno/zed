@@ -578,7 +578,10 @@ impl StyledText {
         default_style: &TextStyle,
         highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
     ) -> Vec<TextRun> {
-        let mut runs = Vec::new();
+        let highlights = highlights.into_iter();
+        // Each highlight yields at most itself and the gap before it, plus one
+        // trailing run; sizing for that up front spares the regrowth copies.
+        let mut runs = Vec::with_capacity(highlights.size_hint().0 * 2 + 1);
         let mut ix = 0;
         for (range, highlight) in highlights {
             if ix < range.start {
