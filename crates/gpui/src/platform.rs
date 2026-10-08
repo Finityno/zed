@@ -62,7 +62,7 @@ use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
@@ -1718,13 +1718,37 @@ pub trait AtlasBackend {
 #[doc(hidden)]
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    /// Every live tile, grouped by the page it sits on, with the frame it was
+    /// last drawn. Ordered so `retire_unused` can walk the pages round-robin.
+    pages: BTreeMap<AtlasPageKey, FxHashMap<TileId, AtlasTileRecord>>,
+    /// Frames seen through `note_frame_drawn`. Never reset, not even by
+    /// `clear`: `Window` compares it against the frame it last presented at to
+    /// decide whether its retained scene may name retired tiles.
+    frame: u64,
+    /// The page the previous `retire_unused` call examined.
+    retire_cursor: Option<AtlasPageKey>,
     pub backend: Backend,
+}
+
+/// Orders pages by kind, then by index within the kind.
+type AtlasPageKey = (u32, u32);
+
+fn atlas_page_key(id: AtlasTextureId) -> AtlasPageKey {
+    (id.kind as u32, id.index)
+}
+
+struct AtlasTileRecord {
+    key: AtlasKey,
+    last_used_frame: u64,
 }
 
 impl<Backend> AtlasState<Backend> {
     pub fn new(backend: Backend) -> Self {
         Self {
             tiles_by_key: FxHashMap::default(),
+            pages: BTreeMap::new(),
+            frame: 0,
+            retire_cursor: None,
             backend,
         }
     }
@@ -1735,7 +1759,100 @@ impl<Backend> AtlasState<Backend> {
 
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
         self.tiles_by_key.clear();
+        self.pages.clear();
+        self.retire_cursor = None;
         reset_backend(&mut self.backend);
+    }
+
+    /// See [`PlatformAtlas::frame_index`].
+    pub fn frame_index(&self) -> u64 {
+        self.frame
+    }
+
+    /// The number of tiles the atlas holds.
+    pub fn tile_count(&self) -> usize {
+        self.tiles_by_key.len()
+    }
+
+    /// See [`PlatformAtlas::note_frame_drawn`].
+    pub fn note_frame_drawn(&mut self, scene: &Scene) {
+        self.frame += 1;
+        self.mark_scene_tiles(scene);
+    }
+
+    /// Records every tile `scene` references as used in the current frame,
+    /// without advancing it.
+    pub fn mark_scene_tiles(&mut self, scene: &Scene) {
+        let frame = self.frame;
+        // `Scene::finish` sorts each sprite list by texture and then tile id
+        // within a draw order, so a glyph repeated across a line of text
+        // collapses to one lookup, and a run of sprites on one page to one
+        // page lookup.
+        let mut previous: Option<(AtlasTextureId, TileId)> = None;
+        let mut page: Option<(
+            AtlasTextureId,
+            Option<&mut FxHashMap<TileId, AtlasTileRecord>>,
+        )> = None;
+        let tiles = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| sprite.tile)
+            .chain(scene.subpixel_sprites.iter().map(|sprite| sprite.tile))
+            .chain(scene.polychrome_sprites.iter().map(|sprite| sprite.tile));
+        for tile in tiles {
+            let identity = (tile.texture_id, tile.tile_id);
+            if previous == Some(identity) {
+                continue;
+            }
+            previous = Some(identity);
+            if page.as_ref().is_none_or(|(id, _)| *id != tile.texture_id) {
+                page = Some((
+                    tile.texture_id,
+                    self.pages.get_mut(&atlas_page_key(tile.texture_id)),
+                ));
+            }
+            // A scene can name a tile this atlas no longer holds (a retained
+            // scene outliving the idle window before `Window` catches it);
+            // there is nothing to mark then.
+            if let Some((_, Some(records))) = page.as_mut()
+                && let Some(record) = records.get_mut(&tile.tile_id)
+            {
+                record.last_used_frame = frame;
+            }
+        }
+    }
+
+    fn touch(&mut self, tile: AtlasTile) {
+        if let Some(record) = self
+            .pages
+            .get_mut(&atlas_page_key(tile.texture_id))
+            .and_then(|records| records.get_mut(&tile.tile_id))
+        {
+            record.last_used_frame = self.frame;
+        }
+    }
+
+    fn record(&mut self, tile: AtlasTile, key: AtlasKey) {
+        self.pages
+            .entry(atlas_page_key(tile.texture_id))
+            .or_default()
+            .insert(
+                tile.tile_id,
+                AtlasTileRecord {
+                    key,
+                    last_used_frame: self.frame,
+                },
+            );
+    }
+
+    fn forget(&mut self, tile: AtlasTile) {
+        let page_key = atlas_page_key(tile.texture_id);
+        if let Some(records) = self.pages.get_mut(&page_key) {
+            records.remove(&tile.tile_id);
+            if records.is_empty() {
+                self.pages.remove(&page_key);
+            }
+        }
     }
 }
 
@@ -1751,26 +1868,67 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        match self.tiles_by_key.entry(key) {
-            Entry::Occupied(entry) => Ok(Some(*entry.get())),
-            Entry::Vacant(entry) => {
-                profiling::scope!("new tile");
-                let Some((size, bytes)) = build()? else {
-                    return Ok(None);
-                };
-                let tile = self
-                    .backend
-                    .insert(entry.key().texture_kind(), size, &bytes)?;
-                entry.insert(tile);
-                Ok(Some(tile))
-            }
+        if let Some(tile) = self.tiles_by_key.get(&key).copied() {
+            self.touch(tile);
+            return Ok(Some(tile));
         }
+        profiling::scope!("new tile");
+        let Some((size, bytes)) = build()? else {
+            return Ok(None);
+        };
+        let tile = self.backend.insert(key.texture_kind(), size, &bytes)?;
+        self.record(tile, key.clone());
+        self.tiles_by_key.insert(key, tile);
+        Ok(Some(tile))
     }
 
     pub fn remove(&mut self, key: &AtlasKey) {
         if let Some(tile) = self.tiles_by_key.remove(key) {
+            self.forget(tile);
             self.backend.remove(tile);
         }
+    }
+
+    /// See [`PlatformAtlas::retire_unused`]. Examines the page after the one
+    /// the previous call examined and returns how many tiles it retired; the
+    /// backend frees the page itself once its last tile is removed.
+    pub fn retire_unused(&mut self, max_idle_frames: u64) -> usize {
+        let next = match self.retire_cursor {
+            Some(cursor) => self
+                .pages
+                .range((ops::Bound::Excluded(cursor), ops::Bound::Unbounded))
+                .next()
+                .or_else(|| self.pages.iter().next()),
+            None => self.pages.iter().next(),
+        };
+        let Some((&page_key, records)) = next else {
+            return 0;
+        };
+        self.retire_cursor = Some(page_key);
+        let frame = self.frame;
+        let idle: Vec<AtlasKey> = records
+            .values()
+            .filter(|record| {
+                matches!(record.key, AtlasKey::Glyph(_) | AtlasKey::Svg(_))
+                    && frame.saturating_sub(record.last_used_frame) >= max_idle_frames
+            })
+            .map(|record| record.key.clone())
+            .collect();
+        let retired = idle.len();
+        for key in idle {
+            self.remove(&key);
+        }
+        if retired > 0 {
+            log::debug!(
+                "[atlas] retired {retired} idle tile(s) from page {page_key:?} at frame {frame}{}",
+                if self.pages.contains_key(&page_key) {
+                    ""
+                } else {
+                    "; page emptied"
+                }
+            );
+        }
+        retired
     }
 }
 
@@ -3549,6 +3707,332 @@ mod atlas_tests {
         assert_eq!(reset_calls, 1);
         assert!(!state.contains(&other_key));
         assert_eq!(state.backend.removed_tiles, vec![tile]);
+        Ok(())
+    }
+
+    /// Mirrors the wgpu and DirectX backends' page bookkeeping: 1024² pages
+    /// (larger for an oversized tile) packed with etagere, a page freed once
+    /// its last tile is removed and its index reused through the free list.
+    #[derive(Default)]
+    struct PagedAtlasBackend {
+        pages: [AtlasTextureList<SimulatedPage>; 3],
+    }
+
+    struct SimulatedPage {
+        id: AtlasTextureId,
+        allocator: etagere::BucketedAtlasAllocator,
+        live_tiles: u32,
+        byte_size: u64,
+    }
+
+    impl PagedAtlasBackend {
+        fn page_count(&self) -> usize {
+            self.pages
+                .iter()
+                .map(|list| list.textures.iter().flatten().count())
+                .sum()
+        }
+
+        fn allocated_bytes(&self) -> u64 {
+            self.pages
+                .iter()
+                .flat_map(|list| list.textures.iter().flatten())
+                .map(|page| page.byte_size)
+                .sum()
+        }
+
+        fn page_is_live(&self, id: AtlasTextureId) -> bool {
+            self.pages[id.kind as usize]
+                .textures
+                .get(id.index as usize)
+                .is_some_and(|slot| slot.is_some())
+        }
+    }
+
+    impl SimulatedPage {
+        fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
+            let allocation = self
+                .allocator
+                .allocate(etagere::size2(size.width.0, size.height.0))?;
+            self.live_tiles += 1;
+            Some(AtlasTile {
+                texture_id: self.id,
+                tile_id: allocation.id.into(),
+                padding: 0,
+                bounds: Bounds {
+                    origin: point(
+                        DevicePixels(allocation.rectangle.min.x),
+                        DevicePixels(allocation.rectangle.min.y),
+                    ),
+                    size,
+                },
+            })
+        }
+    }
+
+    impl AtlasBackend for PagedAtlasBackend {
+        fn insert(
+            &mut self,
+            kind: AtlasTextureKind,
+            size: Size<DevicePixels>,
+            _bytes: &[u8],
+        ) -> Result<AtlasTile> {
+            let list = &mut self.pages[kind as usize];
+            if let Some(tile) = list.iter_mut().rev().find_map(|page| page.allocate(size)) {
+                return Ok(tile);
+            }
+            let page_size = size.max(&Size {
+                width: DevicePixels(1024),
+                height: DevicePixels(1024),
+            });
+            let bytes_per_pixel = match kind {
+                AtlasTextureKind::Monochrome => 1,
+                AtlasTextureKind::Polychrome | AtlasTextureKind::Subpixel => 4,
+            };
+            let free_index = list.free_list.pop();
+            let index = free_index.unwrap_or(list.textures.len());
+            let mut page = SimulatedPage {
+                id: AtlasTextureId {
+                    index: index as u32,
+                    kind,
+                },
+                allocator: etagere::BucketedAtlasAllocator::new(etagere::size2(
+                    page_size.width.0,
+                    page_size.height.0,
+                )),
+                live_tiles: 0,
+                byte_size: page_size.width.0 as u64 * page_size.height.0 as u64 * bytes_per_pixel,
+            };
+            let tile = page.allocate(size).context("tile larger than a page")?;
+            if free_index.is_some() {
+                list.textures[index] = Some(page);
+            } else {
+                list.textures.push(Some(page));
+            }
+            Ok(tile)
+        }
+
+        fn remove(&mut self, tile: AtlasTile) {
+            let id = tile.texture_id;
+            let list = &mut self.pages[id.kind as usize];
+            let Some(slot) = list.textures.get_mut(id.index as usize) else {
+                return;
+            };
+            if let Some(page) = slot.as_mut() {
+                page.allocator.deallocate(tile.tile_id.into());
+                page.live_tiles -= 1;
+                if page.live_tiles == 0 {
+                    *slot = None;
+                    list.free_list.push(id.index as usize);
+                }
+            }
+        }
+    }
+
+    const IDLE: u64 = ATLAS_TILE_MAX_IDLE_FRAMES;
+
+    fn glyph_key(font_id: usize, glyph_id: u32, font_size: f32) -> AtlasKey {
+        AtlasKey::Glyph(RenderGlyphParams {
+            font_id: FontId(font_id),
+            glyph_id: GlyphId(glyph_id),
+            font_size: px(font_size),
+            subpixel_variant: Point::default(),
+            scale_factor: 1.0,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        })
+    }
+
+    fn insert_sized(
+        state: &mut AtlasState<PagedAtlasBackend>,
+        key: AtlasKey,
+        size: Size<DevicePixels>,
+    ) -> Result<AtlasTile> {
+        state
+            .get_or_insert_with(key, &mut || Ok(Some((size, Cow::Borrowed(&[])))))?
+            .context("builder should produce a tile")
+    }
+
+    fn glyph_size() -> Size<DevicePixels> {
+        size(DevicePixels(16), DevicePixels(20))
+    }
+
+    fn scene_drawing(tiles: &[AtlasTile]) -> Scene {
+        let mut scene = Scene::default();
+        for tile in tiles {
+            scene.monochrome_sprites.push(crate::MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: Default::default(),
+                content_mask: Default::default(),
+                color: crate::transparent_black(),
+                effect: Default::default(),
+                tile: *tile,
+                transformation: crate::TransformationMatrix::unit(),
+            });
+        }
+        scene
+    }
+
+    /// Runs `frames` frames drawing `scene`, retiring after each like the renderers.
+    fn run_frames(state: &mut AtlasState<PagedAtlasBackend>, frames: u64, scene: &Scene) {
+        for _ in 0..frames {
+            state.note_frame_drawn(scene);
+            state.retire_unused(IDLE);
+        }
+    }
+
+    #[test]
+    fn tiles_a_drawn_scene_names_are_never_retired() -> Result<()> {
+        let mut state = AtlasState::new(PagedAtlasBackend::default());
+        let hot_key = glyph_key(0, 1, 14.0);
+        let hot = insert_sized(&mut state, hot_key.clone(), glyph_size())?;
+
+        // Well past the idle window, with no lookups at all: a replayed scene
+        // reaches the renderer without going back to the atlas.
+        run_frames(&mut state, IDLE * 3, &scene_drawing(&[hot]));
+
+        assert!(state.contains(&hot_key));
+        assert!(state.backend.page_is_live(hot.texture_id));
+        assert_eq!(
+            state.get_or_insert_with(hot_key, &mut || {
+                anyhow::bail!("a hot tile must be served from the atlas")
+            })?,
+            Some(hot)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_glyph_tiles_retire_and_free_their_page() -> Result<()> {
+        let mut state = AtlasState::new(PagedAtlasBackend::default());
+        let hot_key = glyph_key(0, 1, 14.0);
+        let cold_key = glyph_key(0, 2, 14.0);
+        let hot = insert_sized(&mut state, hot_key.clone(), glyph_size())?;
+        let cold = insert_sized(&mut state, cold_key.clone(), glyph_size())?;
+        assert_eq!(hot.texture_id, cold.texture_id);
+        let hot_scene = scene_drawing(&[hot]);
+
+        // One frame short of the window: the cold tile survives.
+        run_frames(&mut state, IDLE - 1, &hot_scene);
+        assert!(state.contains(&cold_key));
+
+        // The page holds a live tile, so it stays once `cold` goes.
+        run_frames(&mut state, 2, &hot_scene);
+        assert!(!state.contains(&cold_key));
+        assert!(state.contains(&hot_key));
+        assert!(state.backend.page_is_live(hot.texture_id));
+
+        // Stop drawing the hot tile too: it retires and the page is released.
+        run_frames(&mut state, IDLE + 1, &Scene::default());
+        assert!(!state.contains(&hot_key));
+        assert!(!state.backend.page_is_live(hot.texture_id));
+        assert_eq!(state.backend.page_count(), 0);
+        assert_eq!(state.tile_count(), 0);
+
+        // The next glyph gets a fresh page and a fresh record.
+        let reinserted = insert_sized(&mut state, cold_key.clone(), glyph_size())?;
+        assert!(state.backend.page_is_live(reinserted.texture_id));
+        run_frames(&mut state, IDLE - 1, &Scene::default());
+        assert!(
+            state.contains(&cold_key),
+            "a new tile starts its idle window at insertion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lookups_keep_a_tile_alive_and_images_are_never_retired() -> Result<()> {
+        let mut state = AtlasState::new(PagedAtlasBackend::default());
+        let image = image_key(7);
+        insert_sized(&mut state, image.clone(), glyph_size())?;
+        let looked_up = glyph_key(0, 3, 14.0);
+        insert_sized(&mut state, looked_up.clone(), glyph_size())?;
+        for _ in 0..IDLE * 3 {
+            insert_sized(&mut state, looked_up.clone(), glyph_size())?;
+            state.note_frame_drawn(&Scene::default());
+            state.retire_unused(IDLE);
+        }
+        assert!(state.contains(&image));
+        assert!(state.contains(&looked_up));
+
+        run_frames(&mut state, IDLE * 3, &Scene::default());
+        assert!(state.contains(&image), "only drop_image releases an image");
+        assert!(!state.contains(&looked_up));
+
+        state.remove(&image);
+        assert_eq!(state.backend.page_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_keeps_the_frame_counter() -> Result<()> {
+        let mut state = AtlasState::new(PagedAtlasBackend::default());
+        let tile = insert_sized(&mut state, glyph_key(0, 1, 14.0), glyph_size())?;
+        run_frames(&mut state, 5, &scene_drawing(&[tile]));
+        state.clear(|backend| *backend = PagedAtlasBackend::default());
+        assert_eq!(state.frame_index(), 5);
+        // Nothing left to examine: retirement is a no-op, not a panic.
+        assert_eq!(state.retire_unused(IDLE), 0);
+        run_frames(&mut state, 1, &scene_drawing(&[tile]));
+        assert_eq!(state.frame_index(), 6);
+        Ok(())
+    }
+
+    /// A long chat session: the visible text keeps changing font, size and
+    /// glyphs, so each ten-second phase rasterizes a fresh working set while
+    /// the old one scrolls away for good. Reports what the atlas retains at
+    /// the end with and without retirement; run with `--nocapture` to see it.
+    #[test]
+    fn long_session_retains_only_the_working_set() -> Result<()> {
+        const PHASES: usize = 40;
+        const GLYPHS_PER_PHASE: u32 = 1000;
+        const FRAMES_PER_PHASE: u64 = 900;
+
+        fn simulate(retire: bool) -> Result<(usize, usize, u64, u64)> {
+            let mut state = AtlasState::new(PagedAtlasBackend::default());
+            let mut peak_bytes = 0;
+            for phase in 0..PHASES {
+                let font_size = 10.0 + (phase % 12) as f32;
+                let tiles = (0..GLYPHS_PER_PHASE)
+                    .map(|glyph| {
+                        let key = glyph_key(phase / 12, phase as u32 * 10_000 + glyph, font_size);
+                        insert_sized(&mut state, key, glyph_size())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let scene = scene_drawing(&tiles);
+                for _ in 0..FRAMES_PER_PHASE {
+                    state.note_frame_drawn(&scene);
+                    if retire {
+                        state.retire_unused(IDLE);
+                    }
+                }
+                peak_bytes = peak_bytes.max(state.backend.allocated_bytes());
+            }
+            Ok((
+                state.tile_count(),
+                state.backend.page_count(),
+                state.backend.allocated_bytes(),
+                peak_bytes,
+            ))
+        }
+
+        let (tiles_before, pages_before, bytes_before, peak_before) = simulate(false)?;
+        let (tiles_after, pages_after, bytes_after, peak_after) = simulate(true)?;
+        const MIB: f64 = 1024.0 * 1024.0;
+        println!(
+            "atlas after {PHASES} phases x {GLYPHS_PER_PHASE} glyphs x {FRAMES_PER_PHASE} frames: \
+             without retirement {tiles_before} tiles, {pages_before} pages, {:.1} MiB (peak {:.1} MiB); \
+             with retirement {tiles_after} tiles, {pages_after} pages, {:.1} MiB (peak {:.1} MiB)",
+            bytes_before as f64 / MIB,
+            peak_before as f64 / MIB,
+            bytes_after as f64 / MIB,
+            peak_after as f64 / MIB,
+        );
+        assert_eq!(tiles_before, PHASES * GLYPHS_PER_PHASE as usize);
+        assert!(tiles_after <= 2 * GLYPHS_PER_PHASE as usize);
+        assert!(bytes_after * 4 < bytes_before);
         Ok(())
     }
 }

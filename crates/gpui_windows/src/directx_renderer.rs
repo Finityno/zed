@@ -759,6 +759,7 @@ impl DirectXRenderer {
     fn draw_inner(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
         self.render(scene, clear_color)?;
         self.note_frame_paths(!scene.paths.is_empty());
+        self.atlas.on_frame_drawn(scene);
         self.present()
     }
 
@@ -824,6 +825,9 @@ impl DirectXRenderer {
         self.pre_draw(ScenePlane::Overlay, &[0.0; 4])?;
         self.draw_scene(overlay_scene)?;
         self.note_frame_paths(!scene.paths.is_empty());
+        // Both planes are replays of `scene`, so marking it covers every tile
+        // this present draws, before anything idle is retired.
+        self.atlas.on_frame_drawn(scene);
 
         unsafe {
             self.resources
