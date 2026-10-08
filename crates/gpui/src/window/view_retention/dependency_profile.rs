@@ -90,24 +90,26 @@ fn thread_cpu_ns() -> u64 {
 
 fn record(cx: &mut App, case: &str, state: &StateVersion, deadline: Instant) -> Recorded {
     let outer = cx.begin_recording_dependencies();
-    if matches!(case, "entity" | "all" | "nested") {
+    if matches!(case, "entity" | "all" | "nested" | "nested-empty-own-entity" | "nested-empty-own-all") {
         note_access(&cx.entities, EntityId::from(1));
     }
-    if case == "entities-16" {
+    if matches!(case, "entities-16" | "nested-empty-own-entities-16") {
         for entity in 1..=16 {
             note_access(&cx.entities, EntityId::from(entity));
         }
     }
-    if matches!(case, "global" | "all" | "nested") {
+    if matches!(case, "global" | "all" | "nested" | "nested-empty-own-all") {
         note_global_read(cx, TypeId::of::<u32>());
     }
-    if matches!(case, "state" | "all" | "nested") {
+    if matches!(case, "state" | "all" | "nested" | "nested-empty-own-state" | "nested-empty-own-all") {
         note_state_read(state);
     }
-    if case == "deadline" {
+    if matches!(case, "deadline" | "nested-empty-own-deadline") {
         note_deadline(deadline);
     }
-    if matches!(case, "nested" | "nested-empty" | "nested-deadline") {
+    if matches!(case, "nested" | "nested-empty" | "nested-deadline")
+        || case.starts_with("nested-empty-own-")
+    {
         let inner = cx.begin_recording_dependencies();
         if case == "nested" {
             note_access(&cx.entities, EntityId::from(2));
@@ -127,7 +129,7 @@ fn record(cx: &mut App, case: &str, state: &StateVersion, deadline: Instant) -> 
 #[ignore]
 fn profile_dependency_records() {
     let case = std::env::var("GPUI_DEPENDENCY_PROFILE_CASE").expect("profile case");
-    assert!(["empty", "entity", "entities-16", "global", "state", "all", "nested", "nested-empty", "nested-deadline", "deadline"].contains(&case.as_str()));
+    assert!(["empty", "entity", "entities-16", "global", "state", "all", "nested", "nested-empty", "nested-deadline", "deadline", "nested-empty-own-entity", "nested-empty-own-entities-16", "nested-empty-own-state", "nested-empty-own-all", "nested-empty-own-deadline"].contains(&case.as_str()));
     let iterations = std::env::var("GPUI_DEPENDENCY_PROFILE_ITERATIONS")
         .expect("profile iterations").parse::<usize>().expect("iteration count");
     let cx = crate::TestAppContext::single();
@@ -142,13 +144,13 @@ fn profile_dependency_records() {
         let example = record(cx, &case, &state, deadline);
         let signature = [example.all.entities.len(), example.all.globals.len(), example.all.states.len(), example.own.entities.len(), example.own.globals.len(), example.own.states.len(), usize::from(example.all.rebuild_at.is_some())];
         let expected = match case.as_str() {
-            "entity" => [1, 0, 0, 1, 0, 0, 0],
-            "entities-16" => [16, 0, 0, 16, 0, 0, 0],
+            "entity" | "nested-empty-own-entity" => [1, 0, 0, 1, 0, 0, 0],
+            "entities-16" | "nested-empty-own-entities-16" => [16, 0, 0, 16, 0, 0, 0],
             "global" => [0, 1, 0, 0, 1, 0, 0],
-            "state" => [0, 0, 1, 0, 0, 1, 0],
-            "all" => [1, 1, 1, 1, 1, 1, 0],
+            "state" | "nested-empty-own-state" => [0, 0, 1, 0, 0, 1, 0],
+            "all" | "nested-empty-own-all" => [1, 1, 1, 1, 1, 1, 0],
             "nested" => [2, 2, 1, 1, 1, 1, 0],
-            "deadline" | "nested-deadline" => [0, 0, 0, 0, 0, 0, 1],
+            "deadline" | "nested-deadline" | "nested-empty-own-deadline" => [0, 0, 0, 0, 0, 0, 1],
             _ => [0; 7],
         };
         assert_eq!(signature, expected);

@@ -803,7 +803,13 @@ impl App {
             STATE_READS.with_borrow_mut(Vec::clear);
             DEADLINES.with_borrow_mut(Vec::clear);
             nested.clear();
-        } else {
+        } else if !stretch.entities.is_empty()
+            || !stretch.globals.is_empty()
+            || !stretch.states.is_empty()
+            || !stretch.deadlines.is_empty()
+        {
+            // An empty child excludes no reads from its parent. Leaving it
+            // out also lets identical all/own snapshots share their storage.
             nested.push(stretch);
         }
         self.entities.mark_access_boundary();
@@ -962,6 +968,60 @@ mod dependency_profile;
 #[cfg(test)]
 mod empty_nested_tests {
     use super::*;
+
+    #[test]
+    fn empty_child_shares_nonempty_parent_snapshots() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let state = StateVersion::default();
+            let deadline = Instant::now();
+            let outer = cx.begin_recording_dependencies();
+            note_access(&cx.entities, EntityId::from(1));
+            note_global_read(cx, TypeId::of::<u32>());
+            note_state_read(&state);
+            note_deadline(deadline);
+            let inner = cx.begin_recording_dependencies();
+            drop(cx.finish_recording_dependencies(inner));
+            let outer = cx.finish_recording_dependencies(outer);
+            assert_eq!(outer.all.entities.len(), 1);
+            assert_eq!(outer.own.entities.len(), 1);
+            assert_eq!(outer.all.globals.len(), 1);
+            assert_eq!(outer.own.globals.len(), 1);
+            assert_eq!(outer.all.states.len(), 1);
+            assert_eq!(outer.own.states.len(), 1);
+            assert_eq!(outer.all.rebuild_at, Some(deadline));
+            assert_eq!(outer.own.rebuild_at, Some(deadline));
+            assert!(Rc::ptr_eq(&outer.all.entities, &outer.own.entities));
+            assert!(Rc::ptr_eq(&outer.all.globals, &outer.own.globals));
+            assert!(Rc::ptr_eq(&outer.all.states, &outer.own.states));
+        });
+    }
+
+    #[test]
+    fn empty_child_between_reading_siblings_preserves_own_reads() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let outer = cx.begin_recording_dependencies();
+            note_access(&cx.entities, EntityId::from(1));
+            let first = cx.begin_recording_dependencies();
+            note_access(&cx.entities, EntityId::from(2));
+            drop(cx.finish_recording_dependencies(first));
+            let empty = cx.begin_recording_dependencies();
+            drop(cx.finish_recording_dependencies(empty));
+            let last = cx.begin_recording_dependencies();
+            note_access(&cx.entities, EntityId::from(3));
+            drop(cx.finish_recording_dependencies(last));
+            note_access(&cx.entities, EntityId::from(4));
+            let outer = cx.finish_recording_dependencies(outer);
+            let entities = |reads: &Rc<[(EntityId, u64)]>| {
+                reads.iter().map(|(entity, _)| *entity).collect::<Vec<_>>()
+            };
+            assert_eq!(entities(&outer.all.entities), (1..=4).map(EntityId::from).collect::<Vec<_>>());
+            assert_eq!(entities(&outer.own.entities), vec![EntityId::from(1), EntityId::from(4)]);
+        });
+    }
 
     #[test]
     fn empty_nested_recording_shares_all_and_own_lists() {
