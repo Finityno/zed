@@ -2297,7 +2297,7 @@ pub struct Interactivity {
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
-    pub base_style: Box<StyleRefinement>,
+    pub base_style: StyleRefinement,
     pub(crate) focus_style: Option<Box<StyleRefinement>>,
     pub(crate) in_focus_style: Option<Box<StyleRefinement>>,
     pub(crate) focus_visible_style: Option<Box<StyleRefinement>>,
@@ -2367,10 +2367,10 @@ impl Interactivity {
             cx,
             |inspector_state: &mut Option<DivInspectorState>, _window| {
                 if let Some(inspector_state) = inspector_state {
-                    self.base_style = inspector_state.base_style.clone();
+                    self.base_style = (*inspector_state.base_style).clone();
                 } else {
                     *inspector_state = Some(DivInspectorState {
-                        base_style: self.base_style.clone(),
+                        base_style: Box::new(self.base_style.clone()),
                         bounds: Default::default(),
                         content_size: Default::default(),
                     })
@@ -3128,7 +3128,7 @@ impl Interactivity {
             }
         }
 
-        let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
+        let drag_cursor_style = self.base_style.mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
         let drop_listeners = mem::take(&mut self.drop_listeners);

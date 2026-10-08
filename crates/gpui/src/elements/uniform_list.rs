@@ -45,7 +45,7 @@ where
         decorations: Vec::new(),
         interactivity: Interactivity {
             element_id: Some(id),
-            base_style: Box::new(base_style),
+            base_style,
             ..Interactivity::new()
         },
         scroll_handle: None,
