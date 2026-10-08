@@ -1,7 +1,7 @@
 use super::*;
 use std::{hash::{Hash, Hasher}, hint::black_box};
 
-#[cfg(gpui_splice_census)]
+#[cfg(gpui_layout_sets_census)]
 mod census {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::Relaxed};
@@ -122,14 +122,14 @@ impl Render for RemovalShell {
 
 #[test]
 #[ignore]
-fn profile_gap_state_removal() {
-    let case = std::env::var("SPLICE_PROFILE_CASE").expect("SPLICE_PROFILE_CASE");
-    let iterations: usize = std::env::var("SPLICE_PROFILE_ITERATIONS")
-        .expect("SPLICE_PROFILE_ITERATIONS").parse().expect("iterations");
+fn profile_layout_key_sets() {
+    let case = std::env::var("LAYOUT_SETS_PROFILE_CASE").expect("LAYOUT_SETS_PROFILE_CASE");
+    let iterations: usize = std::env::var("LAYOUT_SETS_PROFILE_ITERATIONS")
+        .expect("LAYOUT_SETS_PROFILE_ITERATIONS").parse().expect("iterations");
     assert!(iterations > 0 && iterations.is_multiple_of(2));
     let rows = if case.ends_with("256") { 256 } else { 32 };
     let retained = !case.starts_with("off-");
-    #[cfg(gpui_splice_census)]
+    #[cfg(gpui_layout_sets_census)]
     census::start();
     let mut cx = TestAppContext::single();
     cx.update(|cx| cx.set_view_retention(retained));
@@ -174,9 +174,9 @@ fn profile_gap_state_removal() {
     }
     let cpu_ns = thread_cpu_ns() - cpu_started;
     let elapsed_ns = started.elapsed().as_nanos();
-    #[cfg(gpui_splice_census)]
+    #[cfg(gpui_layout_sets_census)]
     let (held_bytes, peak_bytes, requested_bytes, allocation_calls) = census::finish();
-    #[cfg(not(gpui_splice_census))]
+    #[cfg(not(gpui_layout_sets_census))]
     let (held_bytes, peak_bytes, requested_bytes, allocation_calls) = (-1, -1, 0, 0);
     let (state_count, state_box_bytes, frame_hash) = cx.update_window(window.into(), |_, window, _| {
         let states = window.rendered_frame.element_states.iter().filter(|((id, _), _)| {
@@ -189,5 +189,5 @@ fn profile_gap_state_removal() {
         describe_frame(window).hash(&mut hasher);
         (count, bytes, hasher.finish())
     }).unwrap();
-    println!("SPLICE_PROFILE {{\"case\":\"{case}\",\"iterations\":{iterations},\"cpu_ns\":{cpu_ns},\"elapsed_ns\":{elapsed_ns},\"signature\":{frame_hash},\"state_count\":{state_count},\"state_box_bytes\":{state_box_bytes},\"held_bytes\":{held_bytes},\"peak_bytes\":{peak_bytes},\"requested_bytes\":{requested_bytes},\"allocation_calls\":{allocation_calls}}}");
+    println!("LAYOUT_SETS_PROFILE {{\"case\":\"{case}\",\"iterations\":{iterations},\"cpu_ns\":{cpu_ns},\"elapsed_ns\":{elapsed_ns},\"signature\":{frame_hash},\"state_count\":{state_count},\"state_box_bytes\":{state_box_bytes},\"held_bytes\":{held_bytes},\"peak_bytes\":{peak_bytes},\"requested_bytes\":{requested_bytes},\"allocation_calls\":{allocation_calls}}}");
 }
