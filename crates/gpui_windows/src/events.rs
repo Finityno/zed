@@ -1450,6 +1450,11 @@ impl WindowsWindowInner {
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
+        // A gesture may be starting; `draw_window` polls Direct Manipulation
+        // and keeps frames coming while it reports one.
+        self.state
+            .frame_demand
+            .store(true, std::sync::atomic::Ordering::Release);
         None
     }
 
@@ -1462,16 +1467,28 @@ impl WindowsWindowInner {
             }
             // Validate the region so a nested message pump doesn't keep
             // re-dispatching WM_PAINT for the still-invalid region in a busy
-            // loop until the in-progress draw unwinds. The vsync thread
-            // re-invalidates every window on each vsync (see
+            // loop until the in-progress draw unwinds. Asking for a frame
+            // makes the vsync thread re-invalidate this window (see
             // `begin_vsync_thread`), so the deferred frame still gets drawn,
             // at most one vsync late.
+            self.state
+                .frame_demand
+                .store(true, std::sync::atomic::Ordering::Release);
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
         self.state.direct_manipulation.update();
+        // Direct Manipulation runs in manual-update mode: a touchpad gesture
+        // (and its inertia) only advances when `update` is called, which
+        // happens here. Keep frames coming while one may be in progress, or
+        // an idle window would freeze the gesture.
+        if self.state.direct_manipulation.needs_updates() {
+            self.state
+                .frame_demand
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
 
         let events = self.state.direct_manipulation.drain_events();
         if !events.is_empty() {

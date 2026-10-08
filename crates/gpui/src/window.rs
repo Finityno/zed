@@ -2041,6 +2041,10 @@ impl Window {
                 if draw_in_progress() {
                     log::debug!("deferring re-entrant window draw request");
                     deferred_force_render |= request_frame_options.force_render;
+                    // Platforms that stop requesting frames for idle windows
+                    // would otherwise never deliver the deferred frame. The
+                    // waker only touches the invalidator, never the App.
+                    invalidator.wake_platform();
                     return;
                 }
                 // Take the deferred flag first: `||` short-circuits, and leaving
@@ -2207,14 +2211,27 @@ impl Window {
 
                 // Platforms that stop requesting frames for idle windows only
                 // deliver another request after a wakeup. If demand remains
-                // after this frame (the window was re-invalidated mid-draw,
-                // animations scheduled next-frame callbacks, the scene
-                // animates on its own, or the present was deferred), re-arm
-                // the frame source explicitly.
+                // after this frame, re-arm the frame source explicitly:
+                // - the window was re-invalidated mid-draw;
+                // - animations scheduled next-frame callbacks;
+                // - the scene animates on its own, or a transition is running
+                //   (both present on later requests without being dirty);
+                // - the present was deferred;
+                // - high-rate input keeps presentation going for a while
+                //   after it stops, so the display does not underclock;
+                // - a forced render is still owed (a throttled frame, or a
+                //   re-entrant request deferred above).
+                // A platform-required presentation is served by this frame
+                // and needs no follow-up unless it was deferred, which
+                // `present_owed` covers. A missed wake leaves the window frozen until unrelated
+                // activity, so this errs toward waking.
                 if invalidator.is_dirty()
                     || !next_frame_callbacks.borrow().is_empty()
                     || scene_animates.get()
+                    || scene_transitioning.get()
                     || present_owed
+                    || deferred_force_render
+                    || input_rate_tracker.borrow().is_high_rate()
                 {
                     invalidator.wake_platform();
                 }
@@ -6964,6 +6981,8 @@ impl Window {
         // focus change the tap just caused.
         if tapped && self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
+            // This draw is presented by the next frame request.
+            self.invalidator.wake_platform();
         }
         if self.touch_gestures.has_momentum() {
             self.schedule_touch_momentum_tick();
@@ -7112,6 +7131,8 @@ impl Window {
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
+            // This draw is presented by the next frame request.
+            self.invalidator.wake_platform();
         }
 
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
@@ -9605,6 +9626,51 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
+        );
+    }
+
+    /// Demand that is not a dirty window must still re-arm the frame source
+    /// after a frame, or platforms that stop requesting frames for idle
+    /// windows (macOS, Windows, X11) stop presenting while GPUI still wants
+    /// presentation: high-rate input sustains presentation for a while after
+    /// it stops.
+    #[gpui::test]
+    fn test_frame_waker_rearms_for_non_dirty_demand(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        // Record a burst of input fast enough to count as high-rate.
+        window
+            .update(cx, |_, window, _| {
+                let mut tracker = window.input_rate_tracker.borrow_mut();
+                for _ in 0..64 {
+                    tracker.record_input();
+                }
+                assert!(tracker.is_high_rate());
+            })
+            .unwrap();
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            test_window.frame_wake_count() > baseline,
+            "sustained presentation after high-rate input must re-arm the frame source"
+        );
+
+        // Once the sustain period ends, a clean frame returns to idle.
+        window
+            .update(cx, |_, window, _| {
+                window.input_rate_tracker.borrow_mut().sustain_until = std::time::Instant::now();
+            })
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            test_window.frame_wake_count(),
+            baseline,
+            "a clean frame after high-rate input ends must return to idle"
         );
     }
 

@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui::*;
@@ -26,7 +27,15 @@ pub(crate) struct DirectManipulationHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    /// Until when updates continue after a touchpad contact was handed to
+    /// Direct Manipulation, covering the gap before its viewport reports
+    /// the gesture as running.
+    contact_grace_until: Cell<Option<Instant>>,
 }
+
+/// How long after a touchpad contact `needs_updates` reports true even
+/// though the viewport has not (yet) reported a running gesture.
+const CONTACT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 impl DirectManipulationHandler {
     pub fn new(window: HWND, scale_factor: f32) -> Result<Self> {
@@ -86,6 +95,7 @@ impl DirectManipulationHandler {
                 window,
                 scale_factor,
                 pending_events,
+                contact_grace_until: Cell::new(None),
             })
         }
     }
@@ -101,6 +111,8 @@ impl DirectManipulationHandler {
             if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
             {
                 self.viewport.SetContact(pointer_id).log_err();
+                self.contact_grace_until
+                    .set(Some(Instant::now() + CONTACT_GRACE_PERIOD));
             }
         }
     }
@@ -108,6 +120,24 @@ impl DirectManipulationHandler {
     pub fn update(&self) {
         unsafe {
             self.update_manager.Update(None).log_err();
+        }
+    }
+
+    /// Whether a gesture may be in progress, so `update` must keep being
+    /// called each frame for it (and its inertia) to advance.
+    pub fn needs_updates(&self) -> bool {
+        if let Some(grace_until) = self.contact_grace_until.get() {
+            if Instant::now() < grace_until {
+                return true;
+            }
+            self.contact_grace_until.set(None);
+        }
+        // Err toward polling: an unknown status keeps updates coming.
+        match unsafe { self.viewport.GetStatus() } {
+            Ok(status) => {
+                status == DIRECTMANIPULATION_RUNNING || status == DIRECTMANIPULATION_INERTIA
+            }
+            Err(_) => true,
         }
     }
 
