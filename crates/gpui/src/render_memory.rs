@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct RenderMemoryGauges {
     /// Atlas pages holding glyphs and SVGs, one byte per pixel.
     pub atlas_monochrome_bytes: u64,
-    /// Atlas pages holding images and emoji, four bytes per pixel.
+    /// Atlas pages holding images, emoji and subpixel glyphs, four bytes per
+    /// pixel.
     pub atlas_polychrome_bytes: u64,
     /// Instance buffers waiting in the renderers' shared pool. Buffers in
     /// flight for a frame being drawn return to the pool when the frame

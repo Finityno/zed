@@ -1601,11 +1601,20 @@ impl WgpuRendererCore {
             .clone()
             .context("depth buffer missing after ensuring intermediate textures")?;
 
-        self.record_frame(scene, target_view, &depth_view, size, clear_color)
+        let submission = self
+            .record_frame(scene, target_view, &depth_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
-            })
+            })?;
+        // Only a frame that was actually submitted counts its sprite tiles as
+        // used and ages the atlas: `Window` reads the atlas frame to tell a
+        // present that drew from one that bailed. Retiring after the submit is
+        // safe for the GPU: wgpu keeps a dropped page alive until the work
+        // that samples it has finished, and a re-used tile's upload is queued
+        // ahead of the next submit, after this one.
+        self.atlas.on_frame_drawn(scene);
+        Ok(submission)
     }
 
     fn record_frame(

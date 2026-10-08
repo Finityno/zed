@@ -9,8 +9,9 @@ use windows::Win32::Graphics::{
 };
 
 use gpui::{
-    AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    ATLAS_TILE_MAX_IDLE_FRAMES, AtlasBackend, AtlasKey, AtlasState, AtlasTextureId,
+    AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point,
+    RenderMemoryGauge, RenderMemoryLedger, Scene, Size,
 };
 
 pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
@@ -21,11 +22,16 @@ struct DirectXAtlasTextures {
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
+    /// What this atlas has reported into the process-wide render memory
+    /// gauges; refreshed whenever a page is created or freed.
+    render_memory: RenderMemoryLedger,
 }
 
 struct DirectXAtlasTexture {
     id: AtlasTextureId,
     bytes_per_pixel: u32,
+    /// Device bytes the texture holds.
+    byte_size: u64,
     allocator: BucketedAtlasAllocator,
     texture: ID3D11Texture2D,
     view: [Option<ID3D11ShaderResourceView>; 1],
@@ -40,7 +46,18 @@ impl DirectXAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
+            render_memory: RenderMemoryLedger::default(),
         })))
+    }
+
+    /// The renderer's once-per-frame hook, called once a frame's draws have
+    /// been issued: marks every tile `scene` draws as used this frame, then
+    /// lets one page's idle glyph and SVG tiles go. Marking comes first so a
+    /// tile drawn this very frame can never be the one retired.
+    pub(crate) fn on_frame_drawn(&self, scene: &Scene) {
+        let mut lock = self.0.lock();
+        lock.note_frame_drawn(scene);
+        lock.retire_unused(ATLAS_TILE_MAX_IDLE_FRAMES);
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -68,6 +85,7 @@ impl DirectXAtlas {
             textures.monochrome_textures = AtlasTextureList::default();
             textures.polychrome_textures = AtlasTextureList::default();
             textures.subpixel_textures = AtlasTextureList::default();
+            textures.publish_memory();
         });
     }
 }
@@ -85,6 +103,18 @@ impl PlatformAtlas for DirectXAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn note_frame_drawn(&self, scene: &Scene) {
+        self.0.lock().note_frame_drawn(scene);
+    }
+
+    fn retire_unused(&self, max_idle_frames: u64) {
+        self.0.lock().retire_unused(max_idle_frames);
+    }
+
+    fn frame_index(&self) -> u64 {
+        self.0.lock().frame_index()
     }
 }
 
@@ -143,6 +173,8 @@ impl AtlasBackend for DirectXAtlasTextures {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
                 textures.free_list.push(texture.id.index as usize);
+                drop(texture);
+                self.publish_memory();
             } else {
                 *texture_slot = Some(texture);
             }
@@ -151,6 +183,29 @@ impl AtlasBackend for DirectXAtlasTextures {
 }
 
 impl DirectXAtlasTextures {
+    /// Device bytes the pages hold, as (monochrome, polychrome and subpixel).
+    fn allocated_bytes(&self) -> (u64, u64) {
+        fn total(list: &AtlasTextureList<DirectXAtlasTexture>) -> u64 {
+            list.textures
+                .iter()
+                .flatten()
+                .map(|texture| texture.byte_size)
+                .sum()
+        }
+        (
+            total(&self.monochrome_textures),
+            total(&self.polychrome_textures) + total(&self.subpixel_textures),
+        )
+    }
+
+    fn publish_memory(&mut self) {
+        let (monochrome, polychrome) = self.allocated_bytes();
+        self.render_memory
+            .publish(RenderMemoryGauge::AtlasMonochrome, monochrome);
+        self.render_memory
+            .publish(RenderMemoryGauge::AtlasPolychrome, polychrome);
+    }
+
     /// See `DirectXRenderer::device_is_lost`: a runtime-level query that is
     /// safe on a removed device, unlike the texture calls below it.
     fn device_is_lost(&self) -> bool {
@@ -262,18 +317,29 @@ impl DirectXAtlasTextures {
                 kind,
             },
             bytes_per_pixel,
+            byte_size: size.width.0 as u64 * size.height.0 as u64 * u64::from(bytes_per_pixel),
             allocator: etagere::BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             texture,
             view,
             live_atlas_keys: 0,
         };
-        if let Some(ix) = index {
-            texture_list.textures[ix] = Some(atlas_texture);
-            texture_list.textures.get_mut(ix).unwrap().as_mut()
-        } else {
-            texture_list.textures.push(Some(atlas_texture));
-            texture_list.textures.last_mut().unwrap().as_mut()
-        }
+        let ix = match index {
+            Some(ix) => {
+                texture_list.textures[ix] = Some(atlas_texture);
+                ix
+            }
+            None => {
+                texture_list.textures.push(Some(atlas_texture));
+                texture_list.textures.len() - 1
+            }
+        };
+        self.publish_memory();
+        let texture_list = match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
+        };
+        texture_list.textures.get_mut(ix)?.as_mut()
     }
 
     fn texture(&self, id: AtlasTextureId) -> Option<&DirectXAtlasTexture> {

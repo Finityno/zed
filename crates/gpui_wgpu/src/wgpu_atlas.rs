@@ -1,8 +1,9 @@
 use anyhow::{Context as _, Result};
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
-    AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    ATLAS_TILE_MAX_IDLE_FRAMES, AtlasBackend, AtlasKey, AtlasState, AtlasTextureId,
+    AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point,
+    RenderMemoryGauge, RenderMemoryLedger, Scene, Size,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -36,6 +37,9 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    /// What this atlas has reported into the process-wide render memory
+    /// gauges; refreshed whenever a page is created or freed.
+    render_memory: RenderMemoryLedger,
 }
 
 pub struct WgpuTextureInfo {
@@ -59,6 +63,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            render_memory: RenderMemoryLedger::default(),
         })))
     }
 
@@ -73,6 +78,22 @@ impl WgpuAtlas {
     pub fn before_frame(&self) {
         let mut lock = self.0.lock();
         lock.backend.flush_uploads();
+    }
+
+    /// The renderer's once-per-frame hook, called once a frame has been
+    /// submitted: marks every tile `scene` draws as used this frame, then lets
+    /// one page's idle glyph and SVG tiles go. Marking comes first so a tile
+    /// drawn this very frame can never be the one retired.
+    pub fn on_frame_drawn(&self, scene: &Scene) {
+        let mut lock = self.0.lock();
+        lock.note_frame_drawn(scene);
+        lock.retire_unused(ATLAS_TILE_MAX_IDLE_FRAMES);
+    }
+
+    /// Device bytes the atlas's pages hold, as (monochrome, polychrome and
+    /// subpixel).
+    pub fn allocated_bytes(&self) -> (u64, u64) {
+        self.0.lock().backend.storage.allocated_bytes()
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -94,6 +115,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.publish_memory();
         });
     }
 
@@ -106,6 +128,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.publish_memory();
         });
     }
 }
@@ -121,6 +144,18 @@ impl PlatformAtlas for WgpuAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn note_frame_drawn(&self, scene: &Scene) {
+        self.0.lock().note_frame_drawn(scene);
+    }
+
+    fn retire_unused(&self, max_idle_frames: u64) {
+        self.0.lock().retire_unused(max_idle_frames);
+    }
+
+    fn frame_index(&self) -> u64 {
+        self.0.lock().frame_index()
     }
 }
 
@@ -151,6 +186,8 @@ impl AtlasBackend for WgpuAtlasTextures {
                 self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
+                drop(texture);
+                self.publish_memory();
             } else {
                 *texture_slot = Some(texture);
             }
@@ -159,6 +196,14 @@ impl AtlasBackend for WgpuAtlasTextures {
 }
 
 impl WgpuAtlasTextures {
+    fn publish_memory(&mut self) {
+        let (monochrome, polychrome) = self.storage.allocated_bytes();
+        self.render_memory
+            .publish(RenderMemoryGauge::AtlasMonochrome, monochrome);
+        self.render_memory
+            .publish(RenderMemoryGauge::AtlasPolychrome, polychrome);
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -229,6 +274,9 @@ impl WgpuAtlasTextures {
                 kind,
             },
             generation,
+            byte_size: size.width.0 as u64
+                * size.height.0 as u64
+                * u64::from(format.block_copy_size(None).unwrap_or(4)),
             allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             format,
             texture,
@@ -236,21 +284,22 @@ impl WgpuAtlasTextures {
             live_atlas_keys: 0,
         };
 
-        if let Some(ix) = index {
-            texture_list.textures[ix] = Some(atlas_texture);
-            texture_list
-                .textures
-                .get_mut(ix)
-                .and_then(|t| t.as_mut())
-                .expect("texture must exist")
-        } else {
-            texture_list.textures.push(Some(atlas_texture));
-            texture_list
-                .textures
-                .last_mut()
-                .and_then(|t| t.as_mut())
-                .expect("texture must exist")
-        }
+        let ix = match index {
+            Some(ix) => {
+                texture_list.textures[ix] = Some(atlas_texture);
+                ix
+            }
+            None => {
+                texture_list.textures.push(Some(atlas_texture));
+                texture_list.textures.len() - 1
+            }
+        };
+        self.publish_memory();
+        self.storage[kind]
+            .textures
+            .get_mut(ix)
+            .and_then(|t| t.as_mut())
+            .expect("texture must exist")
     }
 
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
@@ -327,6 +376,21 @@ impl ops::IndexMut<AtlasTextureKind> for WgpuAtlasStorage {
 }
 
 impl WgpuAtlasStorage {
+    /// Device bytes the pages hold, as (monochrome, polychrome and subpixel).
+    fn allocated_bytes(&self) -> (u64, u64) {
+        fn total(list: &AtlasTextureList<WgpuAtlasTexture>) -> u64 {
+            list.textures
+                .iter()
+                .flatten()
+                .map(|texture| texture.byte_size)
+                .sum()
+        }
+        (
+            total(&self.monochrome_textures),
+            total(&self.polychrome_textures) + total(&self.subpixel_textures),
+        )
+    }
+
     fn get(&self, id: AtlasTextureId) -> Option<&WgpuAtlasTexture> {
         self[id.kind]
             .textures
@@ -338,6 +402,8 @@ impl WgpuAtlasStorage {
 struct WgpuAtlasTexture {
     id: AtlasTextureId,
     generation: u64,
+    /// Device bytes the texture holds.
+    byte_size: u64,
     allocator: BucketedAtlasAllocator,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -543,6 +609,44 @@ mod tests {
 
         assert_eq!(second_tile.texture_id, first_tile.texture_id);
         assert_ne!(second_generation, first_generation);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_glyph_page_is_released_and_unreported() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = AtlasKey::Glyph(gpui::RenderGlyphParams {
+            font_id: gpui::FontId(0),
+            glyph_id: gpui::GlyphId(1),
+            font_size: gpui::px(14.0),
+            subpixel_variant: Default::default(),
+            scale_factor: 1.0,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        });
+        let size = Size {
+            width: DevicePixels(8),
+            height: DevicePixels(8),
+        };
+        let tile = atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((size, Cow::Owned(vec![0; 64]))))
+            })?
+            .context("tile should be created")?;
+        assert_eq!(atlas.allocated_bytes(), (1024 * 1024, 0));
+
+        let empty = Scene::default();
+        for _ in 1..ATLAS_TILE_MAX_IDLE_FRAMES {
+            atlas.on_frame_drawn(&empty);
+        }
+        assert!(atlas.get_texture_info(tile.texture_id).is_some());
+        atlas.on_frame_drawn(&empty);
+        assert_eq!(atlas.frame_index(), ATLAS_TILE_MAX_IDLE_FRAMES);
+        assert!(atlas.get_texture_info(tile.texture_id).is_none());
+        assert_eq!(atlas.allocated_bytes(), (0, 0));
+        atlas.before_frame();
         Ok(())
     }
 
