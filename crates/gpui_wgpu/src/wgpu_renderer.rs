@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -98,13 +98,6 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SurfaceParams {
-    bounds: PodBounds,
-    content_mask: PodBounds,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -151,15 +144,198 @@ const FALLBACK_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32F
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     opaque_quads: wgpu::RenderPipeline,
-    shadows: wgpu::RenderPipeline,
-    path_rasterization: wgpu::RenderPipeline,
-    paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
-    poly_sprites: wgpu::RenderPipeline,
-    #[allow(dead_code)]
-    surfaces: wgpu::RenderPipeline,
+    // Compiling a pipeline is most of renderer creation, and a text-only
+    // first frame draws none of these, so each is compiled the first time a
+    // frame draws it. Replacing `WgpuPipelines` (transparency change, device
+    // recovery) starts them over.
+    shadows: OnceLock<wgpu::RenderPipeline>,
+    path_rasterization: OnceLock<wgpu::RenderPipeline>,
+    paths: OnceLock<wgpu::RenderPipeline>,
+    poly_sprites: OnceLock<wgpu::RenderPipeline>,
+    factory: PipelineFactory,
+}
+
+struct PipelineFactory {
+    device: wgpu::Device,
+    layouts: WgpuBindGroupLayouts,
+    shader_module: wgpu::ShaderModule,
+    color_target: wgpu::ColorTargetState,
+    surface_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+    path_sample_count: u32,
+}
+
+impl PipelineFactory {
+    fn depth_stencil(&self, depth_write_enabled: bool) -> Option<wgpu::DepthStencilState> {
+        Some(wgpu::DepthStencilState {
+            format: self.depth_format,
+            depth_write_enabled: Some(depth_write_enabled),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        })
+    }
+
+    fn create_pipeline(
+        &self,
+        name: &str,
+        vs_entry: &str,
+        fs_entry: &str,
+        globals_layout: &wgpu::BindGroupLayout,
+        data_layout: &wgpu::BindGroupLayout,
+        texture_layout: Option<&wgpu::BindGroupLayout>,
+        topology: wgpu::PrimitiveTopology,
+        color_targets: &[Option<wgpu::ColorTargetState>],
+        depth_stencil: Option<wgpu::DepthStencilState>,
+        sample_count: u32,
+        module: &wgpu::ShaderModule,
+    ) -> wgpu::RenderPipeline {
+        let mut group_layouts = vec![Some(globals_layout), Some(data_layout)];
+        group_layouts.extend(texture_layout.map(Some));
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{name}_layout")),
+                bind_group_layouts: &group_layouts,
+                immediate_size: 0,
+            });
+
+        self.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs_entry),
+                    targets: color_targets,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil,
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+    }
+}
+
+impl WgpuPipelines {
+    fn shadows(&self) -> &wgpu::RenderPipeline {
+        self.shadows.get_or_init(|| {
+            let factory = &self.factory;
+            factory.create_pipeline(
+                "shadows",
+                "vs_shadow",
+                "fs_shadow",
+                &factory.layouts.globals,
+                &factory.layouts.instances,
+                None,
+                wgpu::PrimitiveTopology::TriangleStrip,
+                &[Some(factory.color_target.clone())],
+                factory.depth_stencil(false),
+                1,
+                &factory.shader_module,
+            )
+        })
+    }
+
+    fn path_rasterization(&self) -> &wgpu::RenderPipeline {
+        self.path_rasterization.get_or_init(|| {
+            let factory = &self.factory;
+            factory.create_pipeline(
+                "path_rasterization",
+                "vs_path_rasterization",
+                "fs_path_rasterization",
+                &factory.layouts.globals,
+                &factory.layouts.instances,
+                None,
+                wgpu::PrimitiveTopology::TriangleList,
+                &[Some(wgpu::ColorTargetState {
+                    format: factory.surface_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                None,
+                factory.path_sample_count,
+                &factory.shader_module,
+            )
+        })
+    }
+
+    fn paths(&self) -> &wgpu::RenderPipeline {
+        self.paths.get_or_init(|| {
+            let factory = &self.factory;
+            let paths_blend = wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            };
+            factory.create_pipeline(
+                "paths",
+                "vs_path",
+                "fs_path",
+                &factory.layouts.globals,
+                &factory.layouts.instances,
+                Some(&factory.layouts.texture),
+                wgpu::PrimitiveTopology::TriangleStrip,
+                &[Some(wgpu::ColorTargetState {
+                    format: factory.surface_format,
+                    blend: Some(paths_blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                factory.depth_stencil(false),
+                1,
+                &factory.shader_module,
+            )
+        })
+    }
+
+    fn poly_sprites(&self) -> &wgpu::RenderPipeline {
+        self.poly_sprites.get_or_init(|| {
+            let factory = &self.factory;
+            factory.create_pipeline(
+                "poly_sprites",
+                "vs_poly_sprite",
+                "fs_poly_sprite",
+                &factory.layouts.globals,
+                &factory.layouts.instances,
+                Some(&factory.layouts.texture),
+                wgpu::PrimitiveTopology::TriangleStrip,
+                &[Some(factory.color_target.clone())],
+                factory.depth_stencil(false),
+                1,
+                &factory.shader_module,
+            )
+        })
+    }
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -182,12 +358,12 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
 }
 
+#[derive(Clone)]
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     quads: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
-    surfaces: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -709,56 +885,11 @@ impl WgpuRendererCore {
             ],
         });
 
-        let surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("surfaces_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<SurfaceParams>() as u64
-                        ),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
         WgpuBindGroupLayouts {
             globals,
             instances,
             quads,
             texture,
-            surfaces,
         }
     }
 
@@ -859,77 +990,21 @@ impl WgpuRendererCore {
             _ => wgpu::BlendState::ALPHA_BLENDING,
         };
 
-        let color_target = wgpu::ColorTargetState {
-            format: surface_format,
-            blend: Some(blend_mode),
-            write_mask: wgpu::ColorWrites::ALL,
+        let factory = PipelineFactory {
+            device: device.clone(),
+            layouts: layouts.clone(),
+            shader_module,
+            color_target: wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(blend_mode),
+                write_mask: wgpu::ColorWrites::ALL,
+            },
+            surface_format,
+            depth_format,
+            path_sample_count,
         };
 
-        let depth_stencil = |depth_write_enabled: bool| {
-            Some(wgpu::DepthStencilState {
-                format: depth_format,
-                depth_write_enabled: Some(depth_write_enabled),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            })
-        };
-
-        let create_pipeline = |name: &str,
-                               vs_entry: &str,
-                               fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
-                               texture_layout: Option<&wgpu::BindGroupLayout>,
-                               topology: wgpu::PrimitiveTopology,
-                               color_targets: &[Option<wgpu::ColorTargetState>],
-                               depth_stencil: Option<wgpu::DepthStencilState>,
-                               sample_count: u32,
-                               module: &wgpu::ShaderModule| {
-            let mut group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            group_layouts.extend(texture_layout.map(Some));
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &group_layouts,
-                immediate_size: 0,
-            });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let quads = create_pipeline(
+        let quads = factory.create_pipeline(
             "quads",
             "vs_quad",
             "fs_quad",
@@ -937,13 +1012,13 @@ impl WgpuRendererCore {
             &layouts.quads,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            depth_stencil(false),
+            &[Some(factory.color_target.clone())],
+            factory.depth_stencil(false),
             1,
-            &shader_module,
+            &factory.shader_module,
         );
 
-        let opaque_quads = create_pipeline(
+        let opaque_quads = factory.create_pipeline(
             "opaque_quads",
             "vs_opaque_quad",
             "fs_opaque_quad",
@@ -956,75 +1031,12 @@ impl WgpuRendererCore {
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
-            depth_stencil(true),
+            factory.depth_stencil(true),
             1,
-            &shader_module,
+            &factory.shader_module,
         );
 
-        let shadows = create_pipeline(
-            "shadows",
-            "vs_shadow",
-            "fs_shadow",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            depth_stencil(false),
-            1,
-            &shader_module,
-        );
-
-        let path_rasterization = create_pipeline(
-            "path_rasterization",
-            "vs_path_rasterization",
-            "fs_path_rasterization",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleList,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            None,
-            path_sample_count,
-            &shader_module,
-        );
-
-        let paths_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-
-        let paths = create_pipeline(
-            "paths",
-            "vs_path",
-            "fs_path",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(paths_blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            depth_stencil(false),
-            1,
-            &shader_module,
-        );
-
-        let underlines = create_pipeline(
+        let underlines = factory.create_pipeline(
             "underlines",
             "vs_underline",
             "fs_underline",
@@ -1032,13 +1044,13 @@ impl WgpuRendererCore {
             &layouts.instances,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            depth_stencil(false),
+            &[Some(factory.color_target.clone())],
+            factory.depth_stencil(false),
             1,
-            &shader_module,
+            &factory.shader_module,
         );
 
-        let mono_sprites = create_pipeline(
+        let mono_sprites = factory.create_pipeline(
             "mono_sprites",
             "vs_mono_sprite",
             "fs_mono_sprite",
@@ -1046,10 +1058,10 @@ impl WgpuRendererCore {
             &layouts.instances,
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            depth_stencil(false),
+            &[Some(factory.color_target.clone())],
+            factory.depth_stencil(false),
             1,
-            &shader_module,
+            &factory.shader_module,
         );
 
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
@@ -1066,7 +1078,7 @@ impl WgpuRendererCore {
                 },
             };
 
-            Some(create_pipeline(
+            Some(factory.create_pipeline(
                 "subpixel_sprites",
                 "vs_subpixel_sprite",
                 "fs_subpixel_sprite",
@@ -1079,7 +1091,7 @@ impl WgpuRendererCore {
                     blend: Some(subpixel_blend),
                     write_mask: wgpu::ColorWrites::COLOR,
                 })],
-                depth_stencil(false),
+                factory.depth_stencil(false),
                 1,
                 subpixel_module,
             ))
@@ -1087,45 +1099,17 @@ impl WgpuRendererCore {
             None
         };
 
-        let poly_sprites = create_pipeline(
-            "poly_sprites",
-            "vs_poly_sprite",
-            "fs_poly_sprite",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            depth_stencil(false),
-            1,
-            &shader_module,
-        );
-
-        let surfaces = create_pipeline(
-            "surfaces",
-            "vs_surface",
-            "fs_surface",
-            &layouts.globals,
-            &layouts.surfaces,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
-            depth_stencil(false),
-            1,
-            &shader_module,
-        );
-
         WgpuPipelines {
             quads,
             opaque_quads,
-            shadows,
-            path_rasterization,
-            paths,
             underlines,
             mono_sprites,
             subpixel_sprites,
-            poly_sprites,
-            surfaces,
+            shadows: OnceLock::new(),
+            path_rasterization: OnceLock::new(),
+            paths: OnceLock::new(),
+            poly_sprites: OnceLock::new(),
+            factory,
         }
     }
 
@@ -1866,7 +1850,7 @@ impl WgpuRendererCore {
                     }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
+                        self.resources().pipelines.shadows(),
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1952,7 +1936,7 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.polychrome_sprites,
                             texture_id,
-                            &self.resources().pipelines.poly_sprites,
+                            self.resources().pipelines.poly_sprites(),
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -2250,7 +2234,7 @@ impl WgpuRendererCore {
             &path_intermediate_view,
         );
         let resources = self.resources();
-        pass.set_pipeline(&resources.pipelines.paths);
+        pass.set_pipeline(resources.pipelines.paths());
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
@@ -2342,7 +2326,7 @@ impl WgpuRendererCore {
                     0.,
                     1.,
                 );
-                pass.set_pipeline(&resources.pipelines.path_rasterization);
+                pass.set_pipeline(resources.pipelines.path_rasterization());
                 pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
                 pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
                 // The path rasterization shader loads records by vertex
@@ -3308,6 +3292,38 @@ mod tests {
 
         renderer.render_scene(&empty_scene, device_size(32, 33))?;
         assert!(!path_targets_resident(&renderer));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rare_pipelines_are_compiled_on_first_draw() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let compiled = |renderer: &WgpuHeadlessRenderer| {
+            let pipelines = &renderer.core.resources.pipelines;
+            [
+                pipelines.shadows.get().is_some(),
+                pipelines.path_rasterization.get().is_some(),
+                pipelines.paths.get().is_some(),
+                pipelines.poly_sprites.get().is_some(),
+            ]
+        };
+        assert_eq!(compiled(&renderer), [false; 4]);
+
+        let mut quad_scene = Scene::default();
+        quad_scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::blue()));
+        quad_scene.finish();
+        let image = renderer.render_scene_to_image(&quad_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, BLUE);
+        assert_eq!(compiled(&renderer), [false; 4]);
+
+        let mut path_scene = Scene::default();
+        path_scene.insert_primitive(red_square_path(16.0));
+        path_scene.finish();
+        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, RED);
+        assert_pixel(&image, 24, 24, BLACK);
+        assert_eq!(compiled(&renderer), [false, true, true, false]);
         Ok(())
     }
 
