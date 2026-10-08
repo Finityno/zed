@@ -364,7 +364,7 @@ impl Window {
         };
         let color = run.sprite_color;
         if subpixel_rendering {
-            self.next_frame.scene.insert_primitive(SubpixelSprite {
+            self.next_frame.scene.insert_subpixel_sprite(SubpixelSprite {
                 order: 0,
                 pad: 0,
                 bounds,
@@ -375,7 +375,7 @@ impl Window {
                 transformation: TransformationMatrix::unit(),
             });
         } else {
-            self.next_frame.scene.insert_primitive(MonochromeSprite {
+            self.next_frame.scene.insert_monochrome_sprite(MonochromeSprite {
                 order: 0,
                 pad: 0,
                 bounds,

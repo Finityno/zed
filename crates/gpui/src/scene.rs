@@ -47,6 +47,27 @@ fn glyph_drop_reporting() -> GlyphDropReporting {
 /// been scrolled away and very likely to have been rounded away.
 const GLYPH_NEAR_MISS_PIXELS: f32 = 2.0;
 
+/// Logs a glyph sprite culled by its content mask, when reporting is on.
+fn report_dropped_glyph(bounds: &Bounds<ScaledPixels>, mask: &Bounds<ScaledPixels>) {
+    let mode = glyph_drop_reporting();
+    if mode != GlyphDropReporting::Off {
+        let (horizontal, vertical) = mask_miss_distances(bounds, mask);
+        // A horizontal miss means a clip edge cut into a line of text, which is
+        // the suspicious case at any distance under a pixel. A purely vertical
+        // miss is the line above a scroll viewport and is expected.
+        let suspicious =
+            horizontal > 0.0 && horizontal < GLYPH_NEAR_MISS_PIXELS && vertical == 0.0;
+        if mode == GlyphDropReporting::All || suspicious {
+            let axis = if suspicious { "HORIZONTAL" } else { "vertical" };
+            log::warn!(
+                "dropped a glyph sprite ({axis}) {horizontal:.3}px x / \
+                 {vertical:.3}px y outside its content mask: \
+                 bounds {bounds:?} vs mask {mask:?}",
+            );
+        }
+    }
+}
+
 /// Scaled pixels by which `bounds` misses `mask` on each axis; zero where they touch or
 /// overlap.
 ///
@@ -294,6 +315,60 @@ impl Scene {
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    /// [`Self::insert_primitive`] for a glyph sprite, without first moving the
+    /// sprite into a [`Primitive`]: text paints one of these per visible glyph,
+    /// and the detour through the enum costs an extra copy of every sprite.
+    pub(crate) fn insert_monochrome_sprite(&mut self, mut sprite: MonochromeSprite) {
+        let Some(order) =
+            self.glyph_sprite_order(&sprite.bounds, &sprite.content_mask.bounds, &mut sprite.pad)
+        else {
+            return;
+        };
+        sprite.order = order;
+        let index = self.painted_monochrome_sprites.len() as u32;
+        self.painted_monochrome_sprites.push(sprite);
+        self.paint_operations
+            .push(PaintOperation::MonochromeSprite(index));
+    }
+
+    /// See [`Self::insert_monochrome_sprite`].
+    pub(crate) fn insert_subpixel_sprite(&mut self, mut sprite: SubpixelSprite) {
+        let Some(order) =
+            self.glyph_sprite_order(&sprite.bounds, &sprite.content_mask.bounds, &mut sprite.pad)
+        else {
+            return;
+        };
+        sprite.order = order;
+        let index = self.painted_subpixel_sprites.len() as u32;
+        self.painted_subpixel_sprites.push(sprite);
+        self.paint_operations
+            .push(PaintOperation::SubpixelSprite(index));
+    }
+
+    /// The cull, transition and draw order steps of [`Self::insert_primitive`]
+    /// for a glyph sprite; `None` when the sprite is culled.
+    fn glyph_sprite_order(
+        &mut self,
+        bounds: &Bounds<ScaledPixels>,
+        mask: &Bounds<ScaledPixels>,
+        pad: &mut u32,
+    ) -> Option<DrawOrder> {
+        let clipped_bounds = bounds.intersect(mask);
+        if clipped_bounds.is_empty() {
+            report_dropped_glyph(bounds, mask);
+            return None;
+        }
+        if self.current_transition != 0 && *pad == 0 {
+            *pad = self.current_transition;
+        }
+        Some(
+            self.layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds)),
+        )
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
@@ -313,25 +388,7 @@ impl Scene {
                 primitive,
                 Primitive::MonochromeSprite(_) | Primitive::SubpixelSprite(_)
             ) {
-                let mode = glyph_drop_reporting();
-                if mode != GlyphDropReporting::Off {
-                    let bounds = primitive.bounds();
-                    let mask = &primitive.content_mask().bounds;
-                    let (horizontal, vertical) = mask_miss_distances(bounds, mask);
-                    // A horizontal miss means a clip edge cut into a line of text, which is
-                    // the suspicious case at any distance under a pixel. A purely vertical
-                    // miss is the line above a scroll viewport and is expected.
-                    let suspicious =
-                        horizontal > 0.0 && horizontal < GLYPH_NEAR_MISS_PIXELS && vertical == 0.0;
-                    if mode == GlyphDropReporting::All || suspicious {
-                        let axis = if suspicious { "HORIZONTAL" } else { "vertical" };
-                        log::warn!(
-                            "dropped a glyph sprite ({axis}) {horizontal:.3}px x / \
-                             {vertical:.3}px y outside its content mask: \
-                             bounds {bounds:?} vs mask {mask:?}",
-                        );
-                    }
-                }
+                report_dropped_glyph(primitive.bounds(), &primitive.content_mask().bounds);
             }
             return;
         }
@@ -1760,6 +1817,90 @@ mod tests {
         let background = scene.quads[0].background;
         assert_eq!(background.time_animation(), animation);
         assert!((background.solid.a - quad.background.solid.a * 0.5).abs() < 1e-6);
+    }
+
+    /// The glyph sprite inserts build the same scene `insert_primitive` builds
+    /// from the same sprites: culling, draw order, transition tagging and paint
+    /// operations alike.
+    #[test]
+    fn glyph_sprite_inserts_match_insert_primitive() {
+        fn subpixel(sprite: MonochromeSprite) -> SubpixelSprite {
+            SubpixelSprite {
+                order: sprite.order,
+                pad: sprite.pad,
+                bounds: sprite.bounds,
+                content_mask: sprite.content_mask,
+                color: sprite.color,
+                effect: sprite.effect,
+                tile: sprite.tile,
+                transformation: sprite.transformation,
+            }
+        }
+        let started_at = std::time::Instant::now();
+        let offscreen = MonochromeSprite {
+            bounds: Bounds {
+                origin: point(ScaledPixels::from(50.), ScaledPixels::from(0.)),
+                ..unit_bounds()
+            },
+            ..shimmering_glyph(0)
+        };
+        let shifted = MonochromeSprite {
+            bounds: Bounds {
+                origin: point(ScaledPixels::from(4.), ScaledPixels::from(2.)),
+                ..unit_bounds()
+            },
+            ..shimmering_glyph(0)
+        };
+        let build = |fast: bool| {
+            let mut scene = Scene::default();
+            let mut insert = |scene: &mut Scene, sprite: MonochromeSprite| {
+                if fast {
+                    scene.insert_monochrome_sprite(sprite);
+                    scene.insert_subpixel_sprite(subpixel(sprite));
+                } else {
+                    scene.insert_primitive(sprite);
+                    scene.insert_primitive(subpixel(sprite));
+                }
+            };
+            insert(&mut scene, shimmering_glyph(0));
+            insert(&mut scene, offscreen);
+            scene.insert_primitive(opaque_quad());
+            let Some(transition) = scene.push_transition(rolling_in(started_at)) else {
+                panic!("a first transition always fits");
+            };
+            scene.set_current_transition(transition);
+            insert(&mut scene, shifted);
+            scene.set_current_transition(0);
+            scene.push_layer(unit_bounds());
+            insert(&mut scene, shifted);
+            scene.pop_layer();
+            scene.finish();
+            scene
+        };
+        let primitive = build(false);
+        let fast = build(true);
+        assert_eq!(fast.paint_operations.len(), primitive.paint_operations.len());
+        assert_eq!(fast.monochrome_sprites.len(), 3);
+        assert_eq!(fast.subpixel_sprites.len(), 3);
+        let key = |order: DrawOrder, pad: u32, bounds: Bounds<ScaledPixels>| (order, pad, bounds);
+        let monochrome = |scene: &Scene| {
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| key(sprite.order, sprite.pad, sprite.bounds))
+                .collect::<Vec<_>>()
+        };
+        let subpixel_keys = |scene: &Scene| {
+            scene
+                .subpixel_sprites
+                .iter()
+                .map(|sprite| key(sprite.order, sprite.pad, sprite.bounds))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(monochrome(&fast), monochrome(&primitive));
+        assert_eq!(subpixel_keys(&fast), subpixel_keys(&primitive));
+        assert_eq!(fast.quads[0].order, primitive.quads[0].order);
+        assert_eq!(fast.transitioned.len(), primitive.transitioned.len());
     }
 }
 
