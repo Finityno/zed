@@ -107,11 +107,14 @@ fn record(cx: &mut App, case: &str, state: &StateVersion, deadline: Instant) -> 
     if case == "deadline" {
         note_deadline(deadline);
     }
-    if matches!(case, "nested" | "nested-empty") {
+    if matches!(case, "nested" | "nested-empty" | "nested-deadline") {
         let inner = cx.begin_recording_dependencies();
         if case == "nested" {
             note_access(&cx.entities, EntityId::from(2));
             note_global_read(cx, TypeId::of::<u64>());
+        }
+        if case == "nested-deadline" {
+            note_deadline(deadline);
         }
         black_box(cx.finish_recording_dependencies(inner));
     }
@@ -124,7 +127,7 @@ fn record(cx: &mut App, case: &str, state: &StateVersion, deadline: Instant) -> 
 #[ignore]
 fn profile_dependency_records() {
     let case = std::env::var("GPUI_DEPENDENCY_PROFILE_CASE").expect("profile case");
-    assert!(["empty", "entity", "entities-16", "global", "state", "all", "nested", "nested-empty", "deadline"].contains(&case.as_str()));
+    assert!(["empty", "entity", "entities-16", "global", "state", "all", "nested", "nested-empty", "nested-deadline", "deadline"].contains(&case.as_str()));
     let iterations = std::env::var("GPUI_DEPENDENCY_PROFILE_ITERATIONS")
         .expect("profile iterations").parse::<usize>().expect("iteration count");
     let cx = crate::TestAppContext::single();
@@ -145,7 +148,7 @@ fn profile_dependency_records() {
             "state" => [0, 0, 1, 0, 0, 1, 0],
             "all" => [1, 1, 1, 1, 1, 1, 0],
             "nested" => [2, 2, 1, 1, 1, 1, 0],
-            "deadline" => [0, 0, 0, 0, 0, 0, 1],
+            "deadline" | "nested-deadline" => [0, 0, 0, 0, 0, 0, 1],
             _ => [0; 7],
         };
         assert_eq!(signature, expected);

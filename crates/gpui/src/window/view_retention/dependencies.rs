@@ -761,7 +761,14 @@ impl App {
                 )
             })
         });
-        let own = if nested.is_empty() {
+        // Nested recordings that read nothing leave the enclosing recording's
+        // all and own dependencies identical, including its deadline.
+        let own = if nested.is_empty()
+            || (stretch.entities.is_empty()
+                && stretch.globals.is_empty()
+                && stretch.states.is_empty()
+                && stretch.deadlines.is_empty())
+        {
             all.clone()
         } else {
             STATE_READS.with_borrow(|states| {
@@ -951,3 +958,42 @@ pub(crate) enum DependencyChange {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "dependency_profile.rs"]
 mod dependency_profile;
+
+#[cfg(test)]
+mod empty_nested_tests {
+    use super::*;
+
+    #[test]
+    fn empty_nested_recording_shares_all_and_own_lists() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let outer = cx.begin_recording_dependencies();
+            let inner = cx.begin_recording_dependencies();
+            drop(cx.finish_recording_dependencies(inner));
+            let outer = cx.finish_recording_dependencies(outer);
+            assert!(outer.all.entities.is_empty());
+            assert!(outer.all.globals.is_empty());
+            assert!(outer.all.states.is_empty());
+            assert!(Rc::ptr_eq(&outer.all.entities, &outer.own.entities));
+            assert!(Rc::ptr_eq(&outer.all.globals, &outer.own.globals));
+            assert!(Rc::ptr_eq(&outer.all.states, &outer.own.states));
+        });
+    }
+
+    #[test]
+    fn nested_deadline_stays_out_of_own_dependencies() {
+        let cx = crate::TestAppContext::single();
+        cx.update(|cx| {
+            cx.set_view_retention(true);
+            let outer = cx.begin_recording_dependencies();
+            let inner = cx.begin_recording_dependencies();
+            let deadline = Instant::now();
+            note_deadline(deadline);
+            drop(cx.finish_recording_dependencies(inner));
+            let outer = cx.finish_recording_dependencies(outer);
+            assert_eq!(outer.all.rebuild_at, Some(deadline));
+            assert_eq!(outer.own.rebuild_at, None);
+        });
+    }
+}
