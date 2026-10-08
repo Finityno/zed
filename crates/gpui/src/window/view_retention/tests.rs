@@ -5213,3 +5213,84 @@ fn frame_work_transcript() {
         }
     }
 }
+
+struct RemovedStateHost {
+    middle: Entity<RemovedStateMiddle>,
+}
+
+impl Render for RemovedStateHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.middle.clone())
+    }
+}
+
+struct RemovedStateMiddle {
+    nest: Entity<RemovedStateNest>,
+}
+
+impl Render for RemovedStateMiddle {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.nest.clone())
+    }
+}
+
+struct RemovedStateNest {
+    leaf: Entity<RemovedStateLeaf>,
+}
+
+impl Render for RemovedStateNest {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().child(self.leaf.clone())
+    }
+}
+
+struct RemovedStateLeaf {
+    present: bool,
+}
+
+impl Render for RemovedStateLeaf {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().when(self.present, |this| {
+            this.child(div().id("removed-splice-leaf").size(px(10.)))
+        })
+    }
+}
+
+#[test]
+fn a_splice_releases_element_state_removed_by_a_rebuilt_gap() {
+    let mut cx = TestAppContext::single();
+    let window = cx.add_window(|_, cx| {
+        let leaf = cx.new(|_| RemovedStateLeaf { present: true });
+        let nest = cx.new(|_| RemovedStateNest { leaf });
+        RemovedStateHost {
+            middle: cx.new(|_| RemovedStateMiddle { nest }),
+        }
+    });
+    let leaf = window
+        .update(&mut cx, |host, _, cx| {
+            let nest = host.middle.read(cx).nest.clone();
+            nest.read(cx).leaf.clone()
+        })
+        .unwrap();
+    let leaf_states = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window
+                .rendered_frame
+                .element_states
+                .keys()
+                .filter(|(id, _)| {
+                    id.0.last() == Some(&crate::ElementId::from("removed-splice-leaf"))
+                })
+                .count()
+        })
+        .unwrap()
+    };
+    assert_ne!(leaf_states(&mut cx), 0);
+    leaf.update(&mut cx, |leaf, cx| {
+        leaf.present = false;
+        cx.notify();
+    });
+    assert_eq!(leaf_states(&mut cx), 0);
+    assert_eq!(leaf_states(&mut cx), 0);
+}
