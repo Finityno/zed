@@ -126,7 +126,7 @@ fn profile_gap_state_removal() {
     let case = std::env::var("SPLICE_PROFILE_CASE").expect("SPLICE_PROFILE_CASE");
     let iterations: usize = std::env::var("SPLICE_PROFILE_ITERATIONS")
         .expect("SPLICE_PROFILE_ITERATIONS").parse().expect("iterations");
-    assert!(iterations > 0 && iterations % 2 == 0);
+    assert!(iterations > 0 && iterations.is_multiple_of(2));
     let rows = if case.ends_with("256") { 256 } else { 32 };
     let retained = !case.starts_with("off-");
     #[cfg(gpui_splice_census)]
