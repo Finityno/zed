@@ -246,11 +246,7 @@ enum Claim {
     Unkeyed,
 }
 
-fn boxed_measure(
-    measure: impl FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
-    + 'static,
-) -> super::NodeMeasureFn {
-    let measure = Box::new(measure) as Box<MeasureFn>;
+fn node_measure(measure: Box<MeasureFn>) -> super::NodeMeasureFn {
     #[cfg(feature = "stacker")]
     let measure = super::StackSafe::new(measure);
     measure
@@ -754,7 +750,8 @@ impl TaffyLayoutEngine {
     /// element, in which case the node stays clean and keeps what Taffy
     /// cached for it and the nodes above it. [`Adopted::Node`] leaves the
     /// node's closure and state as they are, and this element's `state` is
-    /// dropped; [`Adopted::Measurement`] gives the node this element's.
+    /// dropped; [`Adopted::Measurement`] gives the node this element's, and
+    /// `bind` is given it once it is shared.
     ///
     /// When the measurement does not stand, the node is still left clean if
     /// `measure` gives every size Taffy took of the node since it was last
@@ -768,13 +765,13 @@ impl TaffyLayoutEngine {
         rem_size: Pixels,
         scale_factor: f32,
         state: S,
-        adopt: impl FnOnce(&Rc<S>, &Rc<dyn Any>) -> Adopted,
+        adopt: impl FnOnce(&S, &Rc<dyn Any>) -> Adopted,
+        bind: impl FnOnce(&Rc<S>),
         measure: impl Fn(&Rc<S>, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
         + 'static,
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutId {
-        let state = Rc::new(state);
         let fingerprint = self.style_fingerprint(style, rem_size, scale_factor);
         let frame = self.retention.frame;
         let reusable = key
@@ -787,9 +784,25 @@ impl TaffyLayoutEngine {
             })
             .map(|node| (node.measurement.clone(), node.measure_log.clone()));
 
+        // The state is only shared once the node needs it: a node carried
+        // over as it is, the common case, drops it without allocating.
+        let mut carried = None;
         if let Some((previous, log)) = reusable {
             let adopted = previous.map_or(Adopted::No, |previous| adopt(&state, &previous));
-            let kept = if adopted != Adopted::No {
+            if adopted == Adopted::Node {
+                self.retention.counts.measurements_carried += 1;
+                if let Claim::Reused(_, id) = self.claim(key) {
+                    return id;
+                }
+            } else {
+                carried = Some((adopted, log));
+            }
+        }
+
+        let state = Rc::new(state);
+        if let Some((adopted, log)) = carried {
+            let kept = if adopted == Adopted::Measurement {
+                bind(&state);
                 self.retention.counts.measurements_carried += 1;
                 true
             } else if let Some(log) = &log
@@ -808,15 +821,12 @@ impl TaffyLayoutEngine {
                 false
             };
             if kept && let Claim::Reused(key, id) = self.claim(key) {
-                if adopted == Adopted::Node {
-                    return id;
-                }
                 // A measured node always has a context; one without is
                 // measured afresh below rather than left without one.
                 if self.taffy.get_node_context(id.into()).is_some() {
                     let measurement: Rc<dyn Any> = state.clone();
                     let log = log.unwrap_or_default();
-                    let measure = boxed_measure(MeasureLog::logged(
+                    let measure = node_measure(MeasureLog::logged(
                         &log,
                         move |known, available, window, cx| {
                             measure(&state, known, available, window, cx)

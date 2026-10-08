@@ -102,8 +102,15 @@ pub struct Scene {
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
+    /// Filled by `finish`, in draw order, from the painted sprites below.
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
+    /// Glyph sprites in the order they were painted, which paint operations
+    /// name by index rather than keeping a copy of each as well. Unlike the
+    /// draw-order vectors, presenting never changes them, so they are what a
+    /// later frame replays.
+    painted_monochrome_sprites: Vec<MonochromeSprite>,
+    painted_subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub blended_quad_indices: Vec<u32>,
@@ -131,7 +138,7 @@ pub struct Scene {
     /// prepared, reused across presents.
     transition_states: Vec<(Point<ScaledPixels>, f32)>,
     /// One tracker per vector above, in the order `clear` destructures them.
-    shrink: [CapacityShrink; 12],
+    shrink: [CapacityShrink; 14],
     /// Room `finish` sorts in, kept across frames.
     draw_order_scratch: DrawOrderScratch,
 }
@@ -152,6 +159,8 @@ impl Scene {
             surfaces,
             blended_quad_indices,
             opaque_quad_indices,
+            painted_monochrome_sprites,
+            painted_subpixel_sprites,
         ] = &mut self.shrink;
         paint_operations.clear_vec(&mut self.paint_operations);
         self.primitive_bounds.clear();
@@ -166,6 +175,8 @@ impl Scene {
         surfaces.clear_vec(&mut self.surfaces);
         blended_quad_indices.clear_vec(&mut self.blended_quad_indices);
         opaque_quad_indices.clear_vec(&mut self.opaque_quad_indices);
+        painted_monochrome_sprites.clear_vec(&mut self.painted_monochrome_sprites);
+        painted_subpixel_sprites.clear_vec(&mut self.painted_subpixel_sprites);
         self.shimmer_animations.clear();
         self.animated_monochrome_sprites.clear();
         self.animated_subpixel_sprites.clear();
@@ -194,6 +205,8 @@ impl Scene {
             surfaces,
             blended_quad_indices,
             opaque_quad_indices,
+            painted_monochrome_sprites,
+            painted_subpixel_sprites,
         ] = &mut self.shrink;
         paint_operations.shrink_vec_idle(&mut self.paint_operations, rendered.paint_operations.len());
         self.primitive_bounds.shrink_idle(&rendered.primitive_bounds);
@@ -212,6 +225,14 @@ impl Scene {
             .shrink_vec_idle(&mut self.blended_quad_indices, rendered.blended_quad_indices.len());
         opaque_quad_indices
             .shrink_vec_idle(&mut self.opaque_quad_indices, rendered.opaque_quad_indices.len());
+        painted_monochrome_sprites.shrink_vec_idle(
+            &mut self.painted_monochrome_sprites,
+            rendered.painted_monochrome_sprites.len(),
+        );
+        painted_subpixel_sprites.shrink_vec_idle(
+            &mut self.painted_subpixel_sprites,
+            rendered.painted_subpixel_sprites.len(),
+        );
         self.draw_order_scratch.shrink_idle(rendered.largest_primitive_count());
     }
 
@@ -221,8 +242,8 @@ impl Scene {
             .max(self.quads.len())
             .max(self.paths.len())
             .max(self.underlines.len())
-            .max(self.monochrome_sprites.len())
-            .max(self.subpixel_sprites.len())
+            .max(self.painted_monochrome_sprites.len())
+            .max(self.painted_subpixel_sprites.len())
             .max(self.polychrome_sprites.len())
             .max(self.surfaces.len())
     }
@@ -241,8 +262,8 @@ impl Scene {
             && self.quads.is_empty()
             && self.paths.is_empty()
             && self.underlines.is_empty()
-            && self.monochrome_sprites.is_empty()
-            && self.subpixel_sprites.is_empty()
+            && self.painted_monochrome_sprites.is_empty()
+            && self.painted_subpixel_sprites.is_empty()
             && self.polychrome_sprites.is_empty()
             && self.surfaces.is_empty()
     }
@@ -359,11 +380,19 @@ impl Scene {
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
+                let index = self.painted_monochrome_sprites.len() as u32;
+                self.painted_monochrome_sprites.push(*sprite);
+                self.paint_operations
+                    .push(PaintOperation::MonochromeSprite(index));
+                return;
             }
             Primitive::SubpixelSprite(sprite) => {
                 sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
+                let index = self.painted_subpixel_sprites.len() as u32;
+                self.painted_subpixel_sprites.push(*sprite);
+                self.paint_operations
+                    .push(PaintOperation::SubpixelSprite(index));
+                return;
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
@@ -463,12 +492,21 @@ impl Scene {
     /// it reached past; see [`SceneMove`].
     pub(crate) fn clipped_only_inside(&self, range: Range<usize>, outer: [f32; 4]) -> bool {
         use crate::window::view_retention::moving::{clipped_only_inside, scaled_edges};
+        let clipped = |extent: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            clipped_only_inside(scaled_edges(extent), scaled_edges(&mask.bounds), outer)
+        };
         self.paint_operations[range].iter().all(|operation| match operation {
-            PaintOperation::Primitive(primitive) => clipped_only_inside(
-                scaled_edges(&primitive_extent(primitive)),
-                scaled_edges(&primitive.content_mask().bounds),
-                outer,
-            ),
+            PaintOperation::Primitive(primitive) => {
+                clipped(&primitive_extent(primitive), primitive.content_mask())
+            }
+            PaintOperation::MonochromeSprite(index) => {
+                let sprite = &self.painted_monochrome_sprites[*index as usize];
+                clipped(&sprite.bounds, &sprite.content_mask)
+            }
+            PaintOperation::SubpixelSprite(index) => {
+                let sprite = &self.painted_subpixel_sprites[*index as usize];
+                clipped(&sprite.bounds, &sprite.content_mask)
+            }
             // A layer is clipped again where it is drawn moved (see
             // `replay_inside`).
             PaintOperation::StartLayer(_) | PaintOperation::EndLayer => true,
@@ -506,8 +544,19 @@ impl Scene {
         let mut layers_left_out: Vec<bool> = Vec::new();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => {
-                    let mut primitive = primitive.clone();
+                PaintOperation::Primitive(_)
+                | PaintOperation::MonochromeSprite(_)
+                | PaintOperation::SubpixelSprite(_) => {
+                    let mut primitive = match operation {
+                        PaintOperation::MonochromeSprite(index) => Primitive::MonochromeSprite(
+                            prev_scene.painted_monochrome_sprites[*index as usize],
+                        ),
+                        PaintOperation::SubpixelSprite(index) => Primitive::SubpixelSprite(
+                            prev_scene.painted_subpixel_sprites[*index as usize],
+                        ),
+                        PaintOperation::Primitive(primitive) => primitive.clone(),
+                        PaintOperation::StartLayer(_) | PaintOperation::EndLayer => continue,
+                    };
                     if let Some(moved) = moved {
                         moved.move_primitive(&mut primitive);
                     }
@@ -598,12 +647,16 @@ impl Scene {
         // the order they were painted in (a layer, such as a line of text,
         // gives everything in it one order), so grouping by texture does not
         // reorder anything that was in paint order before.
-        scratch.sort_sprites(&mut self.monochrome_sprites, |sprite| {
-            (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
-        });
-        scratch.sort_sprites(&mut self.subpixel_sprites, |sprite| {
-            (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
-        });
+        scratch.sort_sprites_into(
+            &self.painted_monochrome_sprites,
+            &mut self.monochrome_sprites,
+            |sprite| (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0),
+        );
+        scratch.sort_sprites_into(
+            &self.painted_subpixel_sprites,
+            &mut self.subpixel_sprites,
+            |sprite| (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0),
+        );
         scratch.sort_sprites(&mut self.polychrome_sprites, |sprite| {
             (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
         });
@@ -881,6 +934,7 @@ impl Scene {
 struct DrawOrderScratch {
     keys: Vec<u64>,
     sprite_keys: Vec<u128>,
+    radix_scratch: Vec<u64>,
     permutation: Vec<u32>,
 }
 
@@ -909,18 +963,74 @@ impl DrawOrderScratch {
         if items.is_sorted_by_key(&key) {
             return;
         }
-        self.sprite_keys.clear();
-        self.sprite_keys.extend(items.iter().enumerate().map(|(index, item)| {
-            let (order, texture, tile) = key(item);
-            (u128::from(order) << 96)
-                | (u128::from(texture) << 64)
-                | (u128::from(tile) << 32)
-                | index as u128
-        }));
-        self.sprite_keys.sort_unstable();
-        self.permutation.clear();
-        self.permutation.extend(self.sprite_keys.iter().map(|&key| key as u32));
+        self.sort_sprite_indices(items, key);
         permute_in_place(items, &mut self.permutation);
+    }
+
+    /// Replaces `sorted` with `items` sorted as [`Self::sort_sprites`] sorts
+    /// them, copying each sprite once rather than swapping it into place.
+    fn sort_sprites_into<T: Copy>(
+        &mut self,
+        items: &[T],
+        sorted: &mut Vec<T>,
+        key: impl Fn(&T) -> (u32, u32, u32),
+    ) {
+        sorted.clear();
+        if items.is_sorted_by_key(&key) {
+            sorted.extend_from_slice(items);
+            return;
+        }
+        self.sort_sprite_indices(items, key);
+        sorted.extend(self.permutation.iter().map(|&index| items[index as usize]));
+    }
+
+    /// Leaves the indices of `items` in `permutation`, sorted as
+    /// [`Self::sort_sprites`] sorts them.
+    fn sort_sprite_indices<T>(&mut self, items: &[T], key: impl Fn(&T) -> (u32, u32, u32)) {
+        let (mut orders, mut textures, mut tiles) = (0, 0, 0);
+        for item in items {
+            let (order, texture, tile) = key(item);
+            orders |= order;
+            textures |= texture;
+            tiles |= tile;
+        }
+        let width = |bits: u32| u32::BITS - bits.leading_zeros();
+        let tile_shift = usize::BITS - items.len().leading_zeros();
+        let texture_shift = tile_shift + width(tiles);
+        let order_shift = texture_shift + width(textures);
+        let key_width = order_shift + width(orders);
+        self.permutation.clear();
+        // Each part packed only as wide as this frame needs usually fits all
+        // four in 64 bits, which sort in a few linear passes instead of a
+        // comparison sort of 128-bit keys.
+        if key_width < u64::BITS {
+            self.keys.clear();
+            self.keys.extend(items.iter().enumerate().map(|(index, item)| {
+                let (order, texture, tile) = key(item);
+                (u64::from(order) << order_shift)
+                    | (u64::from(texture) << texture_shift)
+                    | (u64::from(tile) << tile_shift)
+                    | index as u64
+            }));
+            // The keys start in index order and the sort is stable, so the
+            // index bits need no pass of their own.
+            radix_sort(&mut self.keys, &mut self.radix_scratch, tile_shift..key_width);
+            let index_mask = (1 << tile_shift) - 1;
+            self.permutation
+                .extend(self.keys.iter().map(|&key| (key & index_mask) as u32));
+        } else {
+            self.sprite_keys.clear();
+            self.sprite_keys.extend(items.iter().enumerate().map(|(index, item)| {
+                let (order, texture, tile) = key(item);
+                (u128::from(order) << 96)
+                    | (u128::from(texture) << 64)
+                    | (u128::from(tile) << 32)
+                    | index as u128
+            }));
+            self.sprite_keys.sort_unstable();
+            self.permutation
+                .extend(self.sprite_keys.iter().map(|&key| key as u32));
+        }
     }
 
     fn shrink_idle(&mut self, largest_primitive_count: usize) {
@@ -929,7 +1039,36 @@ impl DrawOrderScratch {
             .max(crate::util::MIN_RETAINED_CAPACITY);
         self.keys.shrink_to(capacity);
         self.sprite_keys.shrink_to(capacity);
+        self.radix_scratch.shrink_to(capacity);
         self.permutation.shrink_to(capacity);
+    }
+}
+
+/// Sorts `keys` stably by their bits in `bits`, a byte at a time, through
+/// `scratch`.
+fn radix_sort(keys: &mut Vec<u64>, scratch: &mut Vec<u64>, bits: Range<u32>) {
+    scratch.clear();
+    scratch.resize(keys.len(), 0);
+    for shift in bits.step_by(8) {
+        let mut offsets = [0usize; 256];
+        for &key in keys.iter() {
+            offsets[(key >> shift) as u8 as usize] += 1;
+        }
+        // A byte every key shares, such as the texture of a frame drawn from
+        // one atlas page, moves nothing.
+        if offsets.contains(&keys.len()) {
+            continue;
+        }
+        let mut offset = 0;
+        for slot in &mut offsets {
+            offset += std::mem::replace(slot, offset);
+        }
+        for &key in keys.iter() {
+            let slot = &mut offsets[(key >> shift) as u8 as usize];
+            scratch[*slot] = key;
+            *slot += 1;
+        }
+        std::mem::swap(keys, scratch);
     }
 }
 
@@ -1259,6 +1398,37 @@ mod tests {
                     .enumerate()
                     .all(|(index, &source)| source as usize == index)
             );
+        }
+    }
+
+    /// Sprites sort as a stable sort by `(order, texture, tile)` would, both
+    /// when the parts pack into 64 bits and when they are too wide to.
+    #[test]
+    fn sprite_sort_matches_a_stable_sort() {
+        use rand::{Rng, SeedableRng};
+        let mut scratch = DrawOrderScratch::default();
+        for seed in 0..200u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let len = rng.random_range(0..600);
+            let widest = if seed % 4 == 0 { u32::MAX } else { 1 << rng.random_range(0..12) };
+            let items: Vec<(u32, u32, u32, usize)> = (0..len)
+                .map(|index| {
+                    (
+                        rng.random_range(0..=widest),
+                        rng.random_range(0..3),
+                        rng.random_range(0..=widest),
+                        index,
+                    )
+                })
+                .collect();
+            let mut expected = items.clone();
+            expected.sort_by_key(|item| (item.0, item.1, item.2));
+            let mut sorted = items.clone();
+            scratch.sort_sprites(&mut sorted, |item| (item.0, item.1, item.2));
+            assert_eq!(sorted, expected, "seed {seed}");
+            let mut copied = Vec::new();
+            scratch.sort_sprites_into(&items, &mut copied, |item| (item.0, item.1, item.2));
+            assert_eq!(copied, expected, "seed {seed}");
         }
     }
 
@@ -1739,6 +1909,12 @@ pub(crate) struct Layer {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    /// Indices into [`Scene::painted_monochrome_sprites`] and
+    /// [`Scene::painted_subpixel_sprites`]: glyphs are most of a frame, and
+    /// copying each into a paint operation as well cost as much as the rest
+    /// of inserting it.
+    MonochromeSprite(u32),
+    SubpixelSprite(u32),
     StartLayer(Layer),
     EndLayer,
 }

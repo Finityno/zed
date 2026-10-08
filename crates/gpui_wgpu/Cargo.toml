@@ -55,3 +55,8 @@ naga = { version = "29.0.4", features = ["wgsl-in"] }
 [[bench]]
 name = "layout_line"
 harness = false
+
+[[bench]]
+name = "transcript_frame"
+harness = false
+required-features = ["test-support"]

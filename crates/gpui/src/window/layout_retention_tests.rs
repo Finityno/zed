@@ -1574,6 +1574,167 @@ fn a_keyed_measurement_is_taken_again_only_when_its_key_changes() {
     assert!(new_size.measure_calls > 0, "{new_size:?}");
 }
 
+/// A leaf in a box of a given width, whose measurement is carried over as
+/// the view says, logging which element's state each measurement and binding
+/// was given.
+struct CarriedBox {
+    width: Pixels,
+    generation: usize,
+    adopted: crate::taffy::Adopted,
+    log: Rc<CarryLog>,
+}
+
+#[derive(Default)]
+struct CarryLog {
+    bound: RefCell<Vec<usize>>,
+    measured: RefCell<Vec<usize>>,
+}
+
+impl Render for CarriedBox {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().flex().flex_col().w(self.width).child(CarriedLeaf {
+            generation: self.generation,
+            adopted: self.adopted,
+            log: self.log.clone(),
+        })
+    }
+}
+
+struct CarriedLeaf {
+    generation: usize,
+    adopted: crate::taffy::Adopted,
+    log: Rc<CarryLog>,
+}
+
+/// The state a [`CarriedLeaf`] leaves on its node.
+struct CarriedState(usize);
+
+impl IntoElement for CarriedLeaf {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for CarriedLeaf {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let adopted = self.adopted;
+        let (bind_log, measure_log) = (self.log.clone(), self.log.clone());
+        (
+            window.request_carried_measured_layout(
+                None,
+                CarriedState(self.generation),
+                move |_, previous| {
+                    if previous.is::<CarriedState>() {
+                        adopted
+                    } else {
+                        crate::taffy::Adopted::No
+                    }
+                },
+                move |state| bind_log.bound.borrow_mut().push(state.0),
+                move |state, _, available, _, _| {
+                    measure_log.measured.borrow_mut().push(state.0);
+                    let width = match available.width {
+                        AvailableSpace::Definite(width) => width.min(px(60.)),
+                        _ => px(60.),
+                    };
+                    size(width, px(10.))
+                },
+                cx,
+            ),
+            (),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        window.paint_quad(crate::fill(bounds, PALETTE[2]));
+    }
+}
+
+/// Which elements' states measured the leaf, and were bound, on the frame
+/// after the next element adopts the measurement as `adopted` and the box
+/// narrows, so Taffy measures the leaf again.
+fn carried_after_narrowing(adopted: crate::taffy::Adopted) -> (Vec<usize>, Vec<usize>) {
+    let log = Rc::new(CarryLog::default());
+    let work = work_after(
+        {
+            let log = log.clone();
+            move |_| CarriedBox {
+                width: px(100.),
+                generation: 0,
+                adopted,
+                log,
+            }
+        },
+        {
+            let log = log.clone();
+            move |view, _| {
+                log.bound.borrow_mut().clear();
+                log.measured.borrow_mut().clear();
+                view.width = px(40.);
+                view.generation = 1;
+            }
+        },
+    );
+    assert_eq!(work.measurements_carried, 1, "{work:?}");
+    assert_eq!(work.measured_nodes_dirtied, 0, "{work:?}");
+    let measured = log.measured.borrow().clone();
+    assert!(!measured.is_empty(), "the narrower box measures the leaf again");
+    (log.bound.borrow().clone(), measured)
+}
+
+/// A node carried over as it is keeps measuring with last frame's state, and
+/// the element's own is dropped without being bound; one whose measurement is
+/// taken over measures from then on with the state it was bound to.
+#[test]
+fn a_carried_measurement_measures_with_the_state_it_was_bound_to() {
+    let (bound, measured) = carried_after_narrowing(crate::taffy::Adopted::Node);
+    assert_eq!(bound, Vec::<usize>::new());
+    assert!(measured.iter().all(|&generation| generation == 0), "{measured:?}");
+
+    let (bound, measured) = carried_after_narrowing(crate::taffy::Adopted::Measurement);
+    assert_eq!(bound, vec![1]);
+    assert!(measured.iter().all(|&generation| generation == 1), "{measured:?}");
+}
+
 /// Text in a box narrower than the text, which Taffy probes at one width and
 /// lays out at another; kept nodes may answer the layout from a probe's
 /// cached size.

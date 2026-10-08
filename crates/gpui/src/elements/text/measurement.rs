@@ -184,7 +184,14 @@ pub(super) fn layout_text(
     cx: &mut App,
 ) -> LayoutId {
     let inputs = TextMeasureInputs::new(text, runs, layout, window);
-    window.request_carried_measured_layout(None, inputs, adopt_measurement, measure_text, cx)
+    window.request_carried_measured_layout(
+        None,
+        inputs,
+        adopt_measurement,
+        bind_measurement,
+        measure_text,
+        cx,
+    )
 }
 
 /// Takes over the measurement `previous` left, if it stands for `inputs`.
@@ -194,7 +201,9 @@ pub(super) fn layout_text(
 /// when Taffy measures it under other constraints. Otherwise the node keeps
 /// last frame's inputs, which measure it the same way, and only its layout is
 /// pointed at this element's, where the measurement is kept from now on.
-fn adopt_measurement(inputs: &Rc<TextMeasureInputs>, previous: &Rc<dyn Any>) -> Adopted {
+/// A repainted measurement is pointed back at `inputs` by
+/// [`bind_measurement`].
+fn adopt_measurement(inputs: &TextMeasureInputs, previous: &Rc<dyn Any>) -> Adopted {
     let Ok(previous) = previous.clone().downcast::<TextMeasureInputs>() else {
         return Adopted::No;
     };
@@ -211,7 +220,6 @@ fn adopt_measurement(inputs: &Rc<TextMeasureInputs>, previous: &Rc<dyn Any>) -> 
     let layout = inputs.layout.borrow();
     if recolored {
         update_decoration_runs(&mut inner.lines, &inputs.runs());
-        inner.measured_by = Rc::downgrade(inputs);
         *layout.0.borrow_mut() = Some(inner);
         Adopted::Measurement
     } else {
@@ -219,6 +227,14 @@ fn adopt_measurement(inputs: &Rc<TextMeasureInputs>, previous: &Rc<dyn Any>) -> 
         *layout.0.borrow_mut() = Some(inner);
         *previous.layout.borrow_mut() = layout.clone();
         Adopted::Node
+    }
+}
+
+/// Points the measurement [`adopt_measurement`] repainted at the inputs that
+/// now measure it, once they are shared.
+fn bind_measurement(inputs: &Rc<TextMeasureInputs>) {
+    if let Some(inner) = inputs.layout.borrow().0.borrow_mut().as_mut() {
+        inner.measured_by = Rc::downgrade(inputs);
     }
 }
 

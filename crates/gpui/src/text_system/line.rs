@@ -566,6 +566,10 @@ fn paint_line(
             // than outline extents, as the cosmic-text one reports) has left
             // the descent out of it, so take that from the font.
             let descent = font_extents.descent.abs();
+            // Whether the pre-cull box below overlaps the content mask vertically, which is the
+            // same for glyph after glyph of a run on one row: keyed by the bits of the row's y
+            // and the glyph's vertical offset.
+            let mut row_in_mask: Option<((u32, u32), bool)> = None;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -735,27 +739,44 @@ fn paint_line(
                 // included. Union with the line row so the box is never smaller than the row,
                 // and allow a glyph box of horizontal overhang for negative side bearings.
                 let vertical_offset = point(px(0.0), glyph.position.y);
-                let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
-                let ink_top = baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
-                let ink_bottom = (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
-                // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull later
-                // runs against the RASTERIZED quad, which is larger: the rasterizer's alpha
-                // texture bounds include the antialiasing skirt, and some fonts report a box
-                // their own glyphs then exceed. Berkeley Mono Variable -- fincode's code font --
-                // rasterizes its descenders 0.55px below the box it reports, at every weight and
-                // at every leading from 1.0x to 1.6x, so without this pad the cheap box is not a
-                // superset of the exact one and a descender at a clip edge is dropped while
-                // visible. The pre-cull only exists to avoid rasterizing obviously offscreen
-                // glyphs, so erring large costs a few edge rasterizations and nothing else.
-                const RASTER_SKIRT: Pixels = px(2.0);
-                let cull_top = ink_top.min(glyph_origin.y) - RASTER_SKIRT;
-                let cull_bottom = ink_bottom.max(glyph_origin.y + line_height) + RASTER_SKIRT;
-                let max_glyph_bounds = Bounds {
-                    origin: point(glyph_origin.x - max_glyph_size.width, cull_top),
-                    size: size(max_glyph_size.width * 3., cull_bottom - cull_top),
+                let row_key = (glyph_origin.y.0.to_bits(), vertical_offset.y.0.to_bits());
+                let row_visible = match row_in_mask {
+                    Some((key, visible)) if key == row_key => visible,
+                    _ => {
+                        let baseline_y = glyph_origin.y + baseline_offset.y + vertical_offset.y;
+                        let ink_top =
+                            baseline_y - (max_glyph_box.origin.y + max_glyph_box.size.height);
+                        let ink_bottom =
+                            (baseline_y - max_glyph_box.origin.y).max(baseline_y + descent);
+                        // `max_glyph_box` is the font's GEOMETRIC outline box, but the exact cull
+                        // later runs against the RASTERIZED quad, which is larger: the rasterizer's
+                        // alpha texture bounds include the antialiasing skirt, and some fonts
+                        // report a box their own glyphs then exceed. Berkeley Mono Variable --
+                        // fincode's code font -- rasterizes its descenders 0.55px below the box it
+                        // reports, at every weight and at every leading from 1.0x to 1.6x, so
+                        // without this pad the cheap box is not a superset of the exact one and a
+                        // descender at a clip edge is dropped while visible. The pre-cull only
+                        // exists to avoid rasterizing obviously offscreen glyphs, so erring large
+                        // costs a few edge rasterizations and nothing else.
+                        const RASTER_SKIRT: Pixels = px(2.0);
+                        let cull_top = ink_top.min(glyph_origin.y) - RASTER_SKIRT;
+                        let cull_bottom =
+                            ink_bottom.max(glyph_origin.y + line_height) + RASTER_SKIRT;
+                        // The vertical half of `Bounds::intersects` for a box from `cull_top`
+                        // to `cull_bottom`.
+                        let visible = cull_top < content_mask.bounds.bottom()
+                            && cull_top + (cull_bottom - cull_top) > content_mask.bounds.top();
+                        row_in_mask = Some((row_key, visible));
+                        visible
+                    }
                 };
+                // And the horizontal half, for a box `max_glyph_size.width * 3.` wide.
+                let cull_left = glyph_origin.x - max_glyph_size.width;
+                let visible = row_visible
+                    && cull_left < content_mask.bounds.right()
+                    && cull_left + max_glyph_size.width * 3. > content_mask.bounds.left();
 
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                if visible {
                     if glyph.is_emoji {
                         window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,

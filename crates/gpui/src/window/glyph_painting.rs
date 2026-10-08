@@ -32,7 +32,20 @@ pub(crate) struct LineGlyphPainter {
     content_mask: ContentMask<ScaledPixels>,
     effect: SpriteEffect,
     element_opacity: f32,
-    run: Option<(FontId, Pixels, Hsla, GlyphRunRendering)>,
+    run: Option<GlyphRun>,
+}
+
+/// What the glyphs of a run share while its font, size and colour stay the
+/// same.
+#[derive(Clone, Copy)]
+struct GlyphRun {
+    font_id: FontId,
+    font_size: Pixels,
+    color: Hsla,
+    rendering: GlyphRunRendering,
+    slot_seed: u64,
+    /// `color` with the element opacity applied, as its sprites are painted.
+    sprite_color: Hsla,
 }
 
 impl LineGlyphPainter {
@@ -57,19 +70,33 @@ impl LineGlyphPainter {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
-        let rendering = match self.run {
-            Some((run_font_id, run_font_size, run_color, rendering))
-                if run_font_id == font_id && run_font_size == font_size && run_color == color =>
+        let run = match self.run {
+            Some(run)
+                if run.font_id == font_id && run.font_size == font_size && run.color == color =>
             {
-                rendering
+                run
             }
             _ => {
                 let rendering = window.glyph_run_rendering(font_id, font_size, color);
-                self.run = Some((font_id, font_size, color, rendering));
-                rendering
+                let run = GlyphRun {
+                    font_id,
+                    font_size,
+                    color,
+                    rendering,
+                    slot_seed: GlyphRasterCache::slot_seed(
+                        font_id,
+                        font_size,
+                        window.scale_factor(),
+                        false,
+                        rendering,
+                    ),
+                    sprite_color: color.opacity(self.element_opacity),
+                };
+                self.run = Some(run);
+                run
             }
         };
-        window.paint_glyph_in_run(self, rendering, origin, font_id, glyph_id, font_size, color)
+        window.paint_glyph_in_run(self, &run, origin, glyph_id)
     }
 }
 
@@ -117,17 +144,62 @@ struct GlyphSlot {
 }
 
 impl GlyphRasterCache {
-    fn slot(params: &RenderGlyphParams) -> usize {
-        (FxBuildHasher.hash_one(params) >> (u64::BITS - GLYPH_SLOT_BITS)) as usize
+    /// Hashes what a glyph's parameters share with the rest of its run, so
+    /// that finding a glyph's slot only mixes in its id and subpixel variant.
+    fn slot_seed(
+        font_id: FontId,
+        font_size: Pixels,
+        scale_factor: f32,
+        is_emoji: bool,
+        rendering: GlyphRunRendering,
+    ) -> u64 {
+        FxBuildHasher.hash_one((
+            font_id.0,
+            font_size.0.to_bits(),
+            scale_factor.to_bits(),
+            is_emoji,
+            rendering.subpixel_rendering,
+            rendering.dilation,
+        ))
     }
 
-    /// The glyph's raster bounds if kept, with its tile if it was looked up
-    /// in this draw.
+    /// Fibonacci hashing of the glyph's id and variant over its run's seed:
+    /// a multiply and a shift, where hashing every field of the parameters
+    /// cost a round per field, for every glyph painted.
+    fn slot_in_run(seed: u64, glyph_id: GlyphId, subpixel_variant: Point<u8>) -> usize {
+        let glyph = (glyph_id.0 as u64) << 16
+            | (subpixel_variant.x as u64) << 8
+            | subpixel_variant.y as u64;
+        ((seed ^ glyph).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - GLYPH_SLOT_BITS))
+            as usize
+    }
+
+    #[cfg(test)]
+    fn slot(params: &RenderGlyphParams) -> usize {
+        Self::slot_in_run(
+            Self::slot_seed(
+                params.font_id,
+                params.font_size,
+                params.scale_factor,
+                params.is_emoji,
+                GlyphRunRendering {
+                    subpixel_rendering: params.subpixel_rendering,
+                    dilation: params.dilation,
+                },
+            ),
+            params.glyph_id,
+            params.subpixel_variant,
+        )
+    }
+
+    /// The glyph's raster bounds if kept in `slot`, with its tile if it was
+    /// looked up in this draw.
     fn lookup(
         &self,
+        slot: usize,
         params: &RenderGlyphParams,
     ) -> Option<(Bounds<DevicePixels>, Option<AtlasTile>)> {
-        match self.slots.get(Self::slot(params)) {
+        match self.slots.get(slot) {
             Some(Some(slot)) if slot.params == *params => Some((
                 slot.raster_bounds,
                 slot.tile
@@ -137,19 +209,24 @@ impl GlyphRasterCache {
         }
     }
 
-    fn insert(&mut self, params: &RenderGlyphParams, raster_bounds: Bounds<DevicePixels>) {
+    fn insert(
+        &mut self,
+        slot: usize,
+        params: &RenderGlyphParams,
+        raster_bounds: Bounds<DevicePixels>,
+    ) {
         if self.slots.is_empty() {
             self.slots.resize(1 << GLYPH_SLOT_BITS, None);
         }
-        self.slots[Self::slot(params)] = Some(GlyphSlot {
+        self.slots[slot] = Some(GlyphSlot {
             params: params.clone(),
             raster_bounds,
             tile: None,
         });
     }
 
-    fn insert_tile(&mut self, params: &RenderGlyphParams, tile: AtlasTile) {
-        if let Some(Some(slot)) = self.slots.get_mut(Self::slot(params))
+    fn insert_tile(&mut self, slot: usize, params: &RenderGlyphParams, tile: AtlasTile) {
+        if let Some(Some(slot)) = self.slots.get_mut(slot)
             && slot.params == *params
         {
             slot.tile = Some((self.draw, tile));
@@ -225,16 +302,12 @@ impl Window {
         mode == TextRenderingMode::Subpixel
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn paint_glyph_in_run(
         &mut self,
         line: &LineGlyphPainter,
-        rendering: GlyphRunRendering,
+        run: &GlyphRun,
         origin: Point<Pixels>,
-        font_id: FontId,
         glyph_id: GlyphId,
-        font_size: Pixels,
-        color: Hsla,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -244,11 +317,11 @@ impl Window {
         let GlyphRunRendering {
             subpixel_rendering,
             dilation,
-        } = rendering;
+        } = run.rendering;
         let params = RenderGlyphParams {
-            font_id,
+            font_id: run.font_id,
             glyph_id,
-            font_size,
+            font_size: run.font_size,
             subpixel_variant,
             scale_factor,
             is_emoji: false,
@@ -256,13 +329,14 @@ impl Window {
             dilation,
         };
 
-        let (raster_bounds, tile) = match self.glyph_raster_cache.lookup(&params) {
+        let slot = GlyphRasterCache::slot_in_run(run.slot_seed, glyph_id, subpixel_variant);
+        let (raster_bounds, tile) = match self.glyph_raster_cache.lookup(slot, &params) {
             Some(kept) => kept,
             None => {
                 let (raster_bounds, remembered) =
                     self.text_system().remembered_raster_bounds(&params)?;
                 if remembered {
-                    self.glyph_raster_cache.insert(&params, raster_bounds);
+                    self.glyph_raster_cache.insert(slot, &params, raster_bounds);
                 }
                 (raster_bounds, None)
             }
@@ -280,7 +354,7 @@ impl Window {
                         Ok(Some((size, Cow::Owned(bytes))))
                     })?
                     .expect("Callback above only errors or returns Some");
-                self.glyph_raster_cache.insert_tile(&params, tile);
+                self.glyph_raster_cache.insert_tile(slot, &params, tile);
                 tile
             }
         };
@@ -288,7 +362,7 @@ impl Window {
             origin: integer_origin + raster_bounds.origin.map(Into::into),
             size: tile.bounds.size.map(Into::into),
         };
-        let color = color.opacity(line.element_opacity);
+        let color = run.sprite_color;
         if subpixel_rendering {
             self.next_frame.scene.insert_primitive(SubpixelSprite {
                 order: 0,
@@ -363,18 +437,21 @@ mod tests {
     fn raster_bounds_outlive_a_draw_and_tiles_do_not() {
         let mut cache = GlyphRasterCache::default();
         let glyph = params(7);
-        assert!(cache.lookup(&glyph).is_none());
+        let slot = GlyphRasterCache::slot(&glyph);
+        assert!(cache.lookup(slot, &glyph).is_none());
 
-        cache.insert(&glyph, bounds(5));
-        cache.insert_tile(&glyph, tile(3));
-        assert_eq!(cache.lookup(&glyph), Some((bounds(5), Some(tile(3)))));
+        cache.insert(slot, &glyph, bounds(5));
+        cache.insert_tile(slot, &glyph, tile(3));
+        assert_eq!(cache.lookup(slot, &glyph), Some((bounds(5), Some(tile(3)))));
 
         let mut dilated = glyph.clone();
         dilated.dilation = 1;
-        assert!(cache.lookup(&dilated).is_none());
+        assert!(cache.lookup(GlyphRasterCache::slot(&dilated), &dilated).is_none());
+        // Even in the slot the other glyph holds.
+        assert!(cache.lookup(slot, &dilated).is_none());
 
         cache.finish_draw();
-        assert_eq!(cache.lookup(&glyph), Some((bounds(5), None)));
+        assert_eq!(cache.lookup(slot, &glyph), Some((bounds(5), None)));
     }
 
     /// A glyph whose slot another took over is looked up afresh rather than
@@ -389,9 +466,10 @@ mod tests {
         else {
             panic!("some glyph shares a slot among so many");
         };
-        cache.insert(&first, bounds(1));
-        cache.insert(&second, bounds(2));
-        assert!(cache.lookup(&first).is_none());
-        assert_eq!(cache.lookup(&second), Some((bounds(2), None)));
+        let slot = GlyphRasterCache::slot(&first);
+        cache.insert(slot, &first, bounds(1));
+        cache.insert(slot, &second, bounds(2));
+        assert!(cache.lookup(slot, &first).is_none());
+        assert_eq!(cache.lookup(slot, &second), Some((bounds(2), None)));
     }
 }

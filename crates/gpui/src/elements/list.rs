@@ -15,7 +15,7 @@ use crate::{
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{cell::RefCell, mem, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
@@ -122,6 +122,12 @@ struct StateInner {
     /// moves anything, and which would build the view on the frame after
     /// every one it was built in.
     wheel_scrolls: crate::window::view_retention::dependencies::StateVersion,
+    /// The run of items `layout_items` walks, kept across frames so its
+    /// capacity is reused instead of regrown every frame. Empty between calls.
+    measured_items_scratch: VecDeque<ListItem>,
+    /// How many item layouts the previous `layout_items` produced, used to
+    /// size the next frame's buffer up front.
+    last_item_layout_count: usize,
 }
 
 /// What can be read of a list's state, compared before and after a change.
@@ -551,6 +557,8 @@ impl ListState {
             version: Default::default(),
             item_version: Default::default(),
             wheel_scrolls: Default::default(),
+            measured_items_scratch: VecDeque::new(),
+            last_item_layout_count: 0,
         })));
         this.splice(0..0, item_count);
         this
@@ -1600,8 +1608,8 @@ impl StateInner {
         cx: &mut App,
     ) -> LayoutItemsResponse {
         let old_items = self.items.clone();
-        let mut measured_items = VecDeque::new();
-        let mut item_layouts = VecDeque::new();
+        let mut measured_items = mem::take(&mut self.measured_items_scratch);
+        let mut item_layouts = VecDeque::with_capacity(self.last_item_layout_count);
         let mut rendered_height = padding.top;
         let mut max_item_width = px(0.);
         let mut scroll_top = self.logical_scroll_top();
@@ -1795,13 +1803,21 @@ impl StateInner {
             }
         }
 
-        let measured_range = cursor.start().0..(cursor.start().0 + measured_items.len());
-        let mut cursor = old_items.cursor::<Count>(());
-        let mut new_items = cursor.slice(&Count(measured_range.start), Bias::Right);
-        new_items.extend(measured_items, ());
-        cursor.seek(&Count(measured_range.end), Bias::Right);
-        new_items.append(cursor.suffix(), ());
-        self.items = new_items;
+        // When no walked item changed its measured state, every entry in the
+        // run equals the tree's own item, so splicing it back would rebuild
+        // the same tree.
+        if items_changed {
+            let measured_range = cursor.start().0..(cursor.start().0 + measured_items.len());
+            let mut cursor = old_items.cursor::<Count>(());
+            let mut new_items = cursor.slice(&Count(measured_range.start), Bias::Right);
+            new_items.extend(measured_items.drain(..), ());
+            cursor.seek(&Count(measured_range.end), Bias::Right);
+            new_items.append(cursor.suffix(), ());
+            self.items = new_items;
+        } else {
+            measured_items.clear();
+        }
+        self.measured_items_scratch = measured_items;
         self.item_version.bump_if(items_changed);
 
         // If follow_tail mode is on but the user scrolled away
@@ -1845,6 +1861,7 @@ impl StateInner {
             }
         }
 
+        self.last_item_layout_count = item_layouts.len();
         LayoutItemsResponse {
             max_item_width,
             scroll_top,
@@ -3119,6 +3136,82 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 2);
         assert_eq!(offset.offset_in_item, px(20.));
+    }
+
+    #[gpui::test]
+    fn test_unchanged_frame_keeps_item_tree(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let item_height = Rc::new(Cell::new(100usize));
+        let state = ListState::new(10, crate::ListAlignment::Top, px(10.));
+
+        struct TestView {
+            state: ListState,
+            item_height: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let height = self.item_height.get();
+                list(self.state.clone(), move |_, _, _| {
+                    div().h(px(height as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state.clone(),
+                item_height: item_height.clone(),
+            })
+        });
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(40.),
+        });
+
+        let draw = |cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+        let measured_sizes = |state: &ListState| {
+            state
+                .0
+                .borrow()
+                .items
+                .iter()
+                .map(|item| item.size())
+                .collect::<Vec<_>>()
+        };
+
+        draw(cx);
+        let first_sizes = measured_sizes(&state);
+        let first_version = state.0.borrow().item_version.get();
+        assert_eq!(first_sizes[2], Some(size(px(100.), px(100.))));
+
+        // Nothing changed: the measured run matches the tree, so the frame
+        // keeps it and records no item change.
+        draw(cx);
+        assert_eq!(measured_sizes(&state), first_sizes);
+        assert_eq!(state.0.borrow().item_version.get(), first_version);
+        assert!(state.0.borrow().measured_items_scratch.is_empty());
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 2);
+        assert_eq!(offset.offset_in_item, px(40.));
+
+        // Visible items re-render every frame, so a height change is still
+        // recorded without an explicit remeasure.
+        item_height.set(50);
+        draw(cx);
+        let second_sizes = measured_sizes(&state);
+        assert_ne!(state.0.borrow().item_version.get(), first_version);
+        assert_eq!(second_sizes[2], Some(size(px(100.), px(50.))));
+        assert_eq!(second_sizes[3], Some(size(px(100.), px(50.))));
+        assert_eq!(second_sizes[0], first_sizes[0]);
+        assert!(state.0.borrow().measured_items_scratch.is_empty());
     }
 
     #[gpui::test]

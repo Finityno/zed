@@ -6124,6 +6124,7 @@ impl Window {
                     _ => crate::taffy::Adopted::No,
                 }
             },
+            |_| {},
             |measurement, known, available, window, cx| {
                 (measurement.measure)(known, available, window, cx)
             },
@@ -6137,14 +6138,16 @@ impl Window {
     ///
     /// `adopt` is given `state` and what that element left, and takes its
     /// measurement over when it still stands; the node then stays clean, and
-    /// Taffy keeps what it cached for it and the nodes above it. Otherwise
-    /// `measure` may run here, under the constraints Taffy measured the node
+    /// Taffy keeps what it cached for it and the nodes above it. When the node
+    /// is given `state` along with the measurement, `bind` is given it as the
+    /// node will share it. Otherwise `measure` may run here, under the constraints Taffy measured the node
     /// under, to tell whether it still measures the same.
     pub(crate) fn request_carried_measured_layout<S: 'static>(
         &mut self,
         style: Option<&Style>,
         state: S,
-        adopt: impl FnOnce(&Rc<S>, &Rc<dyn std::any::Any>) -> crate::taffy::Adopted,
+        adopt: impl FnOnce(&S, &Rc<dyn std::any::Any>) -> crate::taffy::Adopted,
+        bind: impl FnOnce(&Rc<S>),
         measure: impl Fn(&Rc<S>, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
         + 'static,
         cx: &mut App,
@@ -6162,6 +6165,7 @@ impl Window {
             scale_factor,
             state,
             adopt,
+            bind,
             measure,
             self,
             cx,
@@ -8849,20 +8853,51 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
 /// `trunc` rounds toward zero rather than down. For non-negative coordinates — every ordinary
 /// layout — this is exactly what the straightforward `fract`/`trunc` version computes.
 fn quantize_glyph_origin(glyph_origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, Point<u8>) {
-    let quantized_origin = Point::new(
-        round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-            / SUBPIXEL_VARIANTS_X as f32,
-        round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-            / SUBPIXEL_VARIANTS_Y as f32,
-    );
-    let subpixel_variant = Point::new(
-        ((quantized_origin.x - quantized_origin.x.floor()) * SUBPIXEL_VARIANTS_X as f32) as u8,
-        ((quantized_origin.y - quantized_origin.y.floor()) * SUBPIXEL_VARIANTS_Y as f32) as u8,
-    );
+    let (x, variant_x) = quantize_glyph_coordinate::<SUBPIXEL_VARIANTS_X>(glyph_origin.x.0);
+    let (y, variant_y) = quantize_glyph_coordinate::<SUBPIXEL_VARIANTS_Y>(glyph_origin.y.0);
     (
-        quantized_origin.map(|coordinate| ScaledPixels(coordinate.floor())),
-        subpixel_variant,
+        Point::new(ScaledPixels(x), ScaledPixels(y)),
+        Point::new(variant_x, variant_y),
     )
+}
+
+/// One coordinate of [`quantize_glyph_origin`]: rounded half toward zero to a whole number of
+/// `1 / VARIANTS` steps, then split into the pixel at or below it and the step within it.
+///
+/// Every glyph painted comes through here, and without SSE4.1 (the default x86-64 target)
+/// `f32::ceil` and `f32::floor` are libm calls. While the step count fits an `i32` exactly it
+/// is worked out in integers instead: `magnitude` is at least -0.5, so truncating it is its
+/// ceiling unless it has a positive fraction, and with `VARIANTS` a power of two the float
+/// quotient and floor are exact, so they are the Euclidean quotient and remainder. That gives
+/// the same numbers as the float path, except a zero origin is never `-0.0`, which adding the
+/// glyph's integer raster offset erases anyway. Larger coordinates, infinities and NaN take
+/// the float path.
+#[inline]
+fn quantize_glyph_coordinate<const VARIANTS: u8>(coordinate: f32) -> (f32, u8) {
+    const { assert!(VARIANTS.is_power_of_two()) };
+    const EXACT_LIMIT: f32 = (1u32 << (f32::MANTISSA_DIGITS - 1)) as f32;
+    let scaled = coordinate * VARIANTS as f32;
+    let magnitude = scaled.abs() - 0.5;
+    if magnitude < EXACT_LIMIT {
+        // SAFETY: `magnitude` is finite and within [-0.5, 2^23), which truncates into an
+        // `i32`; the checked `as` cast costs every glyph its saturation and NaN tests.
+        let truncated: i32 = unsafe { magnitude.to_int_unchecked() };
+        let ceiling = truncated + ((truncated as f32) < magnitude) as i32;
+        let steps = if scaled.is_sign_negative() {
+            -ceiling
+        } else {
+            ceiling
+        };
+        // An arithmetic shift is the Euclidean quotient by a power of two, and the low bits
+        // its remainder.
+        return (
+            (steps >> VARIANTS.trailing_zeros()) as f32,
+            (steps & (VARIANTS as i32 - 1)) as u8,
+        );
+    }
+    let quantized = round_half_toward_zero(scaled) / VARIANTS as f32;
+    let floor = quantized.floor();
+    (floor, ((quantized - floor) * VARIANTS as f32) as u8)
 }
 
 #[cfg(test)]
@@ -8921,6 +8956,54 @@ mod glyph_quantization_tests {
             );
             coordinate += 0.05;
         }
+    }
+
+    /// The integer path gives the numbers the float formula does, on both sides of zero, at
+    /// every quarter and the ties between them, and on either side of where it hands over to
+    /// the float path.
+    #[test]
+    fn integer_path_matches_the_float_formula() {
+        fn float_formula(x: f32) -> (f32, u8) {
+            let variants = SUBPIXEL_VARIANTS_X as f32;
+            let quantized = crate::util::round_half_toward_zero(x * variants) / variants;
+            (
+                quantized.floor(),
+                ((quantized - quantized.floor()) * variants) as u8,
+            )
+        }
+
+        let mut coordinates = vec![0.0f32, -0.0, 0.125, -0.125, 0.124, -0.126, f32::MIN_POSITIVE];
+        for whole in -300..300 {
+            for eighth in 0..8 {
+                let coordinate = whole as f32 + eighth as f32 / 8.0;
+                coordinates.extend([
+                    coordinate,
+                    coordinate.next_up(),
+                    coordinate.next_down(),
+                    coordinate * 1.37,
+                ]);
+            }
+        }
+        let limit = (1u32 << (f32::MANTISSA_DIGITS - 1)) as f32 / SUBPIXEL_VARIANTS_X as f32;
+        for edge in [limit, limit * 2.0, 1.0e9, f32::MAX] {
+            for coordinate in [edge, edge.next_up(), edge.next_down()] {
+                coordinates.extend([coordinate, -coordinate]);
+            }
+        }
+
+        for coordinate in coordinates {
+            let (origin, variant) = quantize(coordinate);
+            let (expected_origin, expected_variant) = float_formula(coordinate);
+            assert!(
+                origin == expected_origin && variant == expected_variant,
+                "{coordinate}: got ({origin}, {variant}), float formula gives \
+                 ({expected_origin}, {expected_variant})"
+            );
+        }
+
+        let (origin, variant) = quantize(f32::NAN);
+        assert!(origin.is_nan());
+        assert_eq!(variant, 0);
     }
 }
 
