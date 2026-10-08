@@ -1,0 +1,10 @@
+{
+  "policy.json": "96e2e6ac1b6bf7165174f48ad3675dc8a9fd8bffd059229bf3dcb1a9b0e61039",
+  "measure.py": "0b83b871249ae7e8613f2318920d3a1081323b00108c5b2def467f5193068402",
+  "qualify.py": "b2174b5442319625a2d97a51b11081e139214bf66ae360cf452706dee10739b2",
+  "binary-identities.json": "16e05b403378fec868ff42c857bdf3db85e64229d87a2580792c4d2c90117fc1",
+  "source-inputs.json": "df3000b53c61802352fc596d663dc705ab49d359844c5815e358cdbe6bba7741",
+  "external-dependencies.json": "4cc97a92141a716ce7b1c1ed6bb8b7e0eccc7311f4569df1162d6892d0923016",
+  "native-run": "a5ae0dbf90fcee74702f91cbcedf442085b31b8a24810d63ffd10a2e2c1a44a5",
+  "native_run.c": "5b4aabca1672799624cfd0b2b2d3f3a1fb7e0ea56ec3ff5c366f94c6da75ece4"
+}

@@ -1,0 +1,32 @@
+{
+  "test-frames_drawing_views_again_match_frames_drawn_from_scratch.log": {
+    "path": "/workspace/scratch/gpui-fork-loop/test-frames_drawing_views_again_match_frames_drawn_from_scratch.log",
+    "sha256": "f9dedcdf02c94b4395cd56d4685c001757bdbfa6258c7e6957e6b430b7b3a9fd",
+    "passes": 1,
+    "source": "685a83f822c8f152d3f88250db882c07e820e9f0"
+  },
+  "test-changed_models_and_globals_build_the_views_that_read_them.log": {
+    "path": "/workspace/scratch/gpui-fork-loop/test-changed_models_and_globals_build_the_views_that_read_them.log",
+    "sha256": "977b00162d728930fc65b3e6d74a49c7d0aa5fb76a458879f34b67a1f51f9f8a",
+    "passes": 1,
+    "source": "685a83f822c8f152d3f88250db882c07e820e9f0"
+  },
+  "test-a_global_read_through_an_update_is_a_dependency.log": {
+    "path": "/workspace/scratch/gpui-fork-loop/test-a_global_read_through_an_update_is_a_dependency.log",
+    "sha256": "f964701e451bde96a5a941cf8df40db0eefe3713c770fca10c9b24ca5fec5b1c",
+    "passes": 1,
+    "source": "685a83f822c8f152d3f88250db882c07e820e9f0"
+  },
+  "test-baseline-oracle.log": {
+    "path": "/workspace/scratch/gpui-fork-loop/test-baseline-oracle.log",
+    "sha256": "dd2dec75fc8b83e7ef33b50af9ebf7dc2a47e2d6edfc8d656e22daa20d195a36",
+    "passes": 1,
+    "source": "685a83f822c8f152d3f88250db882c07e820e9f0"
+  },
+  "test-empty_list_tests.log": {
+    "path": "/workspace/scratch/gpui-fork-loop/test-empty_list_tests.log",
+    "sha256": "96f344902a701643ea364ecb06fe7b642f1c5a02c3083048a51209f6309fee23",
+    "passes": 1,
+    "source": "685a83f822c8f152d3f88250db882c07e820e9f0"
+  }
+}

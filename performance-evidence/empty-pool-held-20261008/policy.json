@@ -1,0 +1,41 @@
+{
+  "goal": "Reduce real costs of fast and retained rendering for Fincode while preserving correctness and responsiveness",
+  "baseline": "ef46053b5794ccb57cda5dc658581ca2a399a4e2",
+  "upstream_inspected": "5ea0f5b14f39f85ce3e3b34b3b8d31a9cc8a813f",
+  "iteration": "Empty dependency-list sharing",
+  "primary_target": "At least 25% less requested dependency-record heap for 1024 records with empty entity/global/state dimensions",
+  "controls": [
+    "empty",
+    "entity",
+    "entities-16",
+    "global",
+    "state",
+    "all",
+    "nested",
+    "nested-empty",
+    "deadline"
+  ],
+  "timing_pairs": 15,
+  "memory_pairs": 5,
+  "timing_gate": "Paired median CPU/elapsed increases must fit baseline max-minus-min; primary improvement must be larger than both measured run ranges",
+  "memory_gate": "At least 25% lower held/peak dependency heap in primary cases; nonempty controls allow at most 96 bytes of fixed lazy app-local pool overhead; no unbounded cache or lost dependencies",
+  "rss_gate": "Median native peak RSS increase must fit baseline max-minus-min",
+  "limits": [
+    "Linux System allocator component fixture, not Fincode mimalloc or GPU frame",
+    "No app-wide or macOS/Windows performance claim"
+  ],
+  "status": "declared before native performance measurements",
+  "primary_cases": [
+    "empty",
+    "entity",
+    "global",
+    "state",
+    "nested-empty",
+    "deadline"
+  ],
+  "timing_iterations": 262144,
+  "memory_iterations": 1024,
+  "baseline_harness_source": "16d4fc8df62069576a62422c06fc7e116dabe4cf",
+  "candidate_source": "685a83f822c8f152d3f88250db882c07e820e9f0",
+  "fixed_overhead": "Three Option<Rc<[T]>> handles occupy 48 bytes on 64-bit hosts; up to three empty Rc allocation headers request 48 bytes. App construction is outside the recorder census."
+}

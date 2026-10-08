@@ -1,0 +1,630 @@
+{
+  "qualified": false,
+  "failures": [
+    [
+      "census",
+      "nested",
+      "peak_rss_kib",
+      256,
+      152
+    ]
+  ],
+  "summary": {
+    "bare": {
+      "empty": {
+        "cpu_ns": {
+          "baseline_median": 28096717,
+          "candidate_median": 12962674,
+          "change_percent": -53.86409736055639,
+          "baseline_range": 17569746,
+          "allowed_increase": 17569746,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 28148409,
+          "candidate_median": 12962061,
+          "change_percent": -53.950999504092756,
+          "baseline_range": 17568872,
+          "allowed_increase": 17568872,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8892,
+          "candidate_median": 8660,
+          "change_percent": -2.609086819613138,
+          "baseline_range": 292,
+          "allowed_increase": 292,
+          "pass": true
+        }
+      },
+      "entity": {
+        "cpu_ns": {
+          "baseline_median": 30549717,
+          "candidate_median": 20182142,
+          "change_percent": -33.936730084930076,
+          "baseline_range": 1319367,
+          "allowed_increase": 1319367,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 30570162,
+          "candidate_median": 20258967,
+          "change_percent": -33.729605358322935,
+          "baseline_range": 1397135,
+          "allowed_increase": 1397135,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8892,
+          "candidate_median": 8652,
+          "change_percent": -2.6990553306342813,
+          "baseline_range": 320,
+          "allowed_increase": 320,
+          "pass": true
+        }
+      },
+      "entities-16": {
+        "cpu_ns": {
+          "baseline_median": 46883388,
+          "candidate_median": 42691545,
+          "change_percent": -8.940998461971217,
+          "baseline_range": 5736857,
+          "allowed_increase": 5736857,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 46882581,
+          "candidate_median": 42694702,
+          "change_percent": -8.932697199413997,
+          "baseline_range": 5735267,
+          "allowed_increase": 5735267,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 9188,
+          "candidate_median": 8840,
+          "change_percent": -3.787548976926425,
+          "baseline_range": 396,
+          "allowed_increase": 396,
+          "pass": true
+        }
+      },
+      "global": {
+        "cpu_ns": {
+          "baseline_median": 29589134,
+          "candidate_median": 20001123,
+          "change_percent": -32.403824322807154,
+          "baseline_range": 1932582,
+          "allowed_increase": 1932582,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 29588277,
+          "candidate_median": 20000202,
+          "change_percent": -32.404979174691384,
+          "baseline_range": 1932835,
+          "allowed_increase": 1932835,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8820,
+          "candidate_median": 8648,
+          "change_percent": -1.9501133786848035,
+          "baseline_range": 208,
+          "allowed_increase": 208,
+          "pass": true
+        }
+      },
+      "state": {
+        "cpu_ns": {
+          "baseline_median": 29847459,
+          "candidate_median": 21132159,
+          "change_percent": -29.19947054789488,
+          "baseline_range": 2263146,
+          "allowed_increase": 2263146,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 29846622,
+          "candidate_median": 21131328,
+          "change_percent": -29.20026929680686,
+          "baseline_range": 2261975,
+          "allowed_increase": 2261975,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8896,
+          "candidate_median": 8764,
+          "change_percent": -1.483812949640284,
+          "baseline_range": 268,
+          "allowed_increase": 268,
+          "pass": true
+        }
+      },
+      "all": {
+        "cpu_ns": {
+          "baseline_median": 33744011,
+          "candidate_median": 36219292,
+          "change_percent": 7.335467618238978,
+          "baseline_range": 20038929,
+          "allowed_increase": 20038929,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 33743336,
+          "candidate_median": 36218680,
+          "change_percent": 7.335801060096725,
+          "baseline_range": 20034873,
+          "allowed_increase": 20034873,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8956,
+          "candidate_median": 8852,
+          "change_percent": -1.1612326931665917,
+          "baseline_range": 348,
+          "allowed_increase": 348,
+          "pass": true
+        }
+      },
+      "nested": {
+        "cpu_ns": {
+          "baseline_median": 88343978,
+          "candidate_median": 88474353,
+          "change_percent": 0.1475765558123232,
+          "baseline_range": 32823253,
+          "allowed_increase": 32823253,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 88343041,
+          "candidate_median": 88487567,
+          "change_percent": 0.16359636069127603,
+          "baseline_range": 32822117,
+          "allowed_increase": 32822117,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 9148,
+          "candidate_median": 9148,
+          "change_percent": 0.0,
+          "baseline_range": 268,
+          "allowed_increase": 268,
+          "pass": true
+        }
+      },
+      "nested-empty": {
+        "cpu_ns": {
+          "baseline_median": 73195304,
+          "candidate_median": 27638264,
+          "change_percent": -62.240386350468604,
+          "baseline_range": 8831873,
+          "allowed_increase": 8831873,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 73194529,
+          "candidate_median": 27642233,
+          "change_percent": -62.234564006826254,
+          "baseline_range": 8830896,
+          "allowed_increase": 8830896,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8880,
+          "candidate_median": 8604,
+          "change_percent": -3.1081081081081097,
+          "baseline_range": 276,
+          "allowed_increase": 276,
+          "pass": true
+        }
+      },
+      "deadline": {
+        "cpu_ns": {
+          "baseline_median": 28184609,
+          "candidate_median": 13276032,
+          "change_percent": -52.89616400213322,
+          "baseline_range": 1738063,
+          "allowed_increase": 1738063,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 28183791,
+          "candidate_median": 13274997,
+          "change_percent": -52.89846919458068,
+          "baseline_range": 1737843,
+          "allowed_increase": 1737843,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8828,
+          "candidate_median": 8604,
+          "change_percent": -2.5373810602628,
+          "baseline_range": 392,
+          "allowed_increase": 392,
+          "pass": true
+        }
+      }
+    },
+    "census": {
+      "empty": {
+        "held_bytes": {
+          "baseline_median": 49152,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 49152,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 98304,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 6144,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8736,
+          "candidate_median": 8668,
+          "change_percent": -0.7783882783882756,
+          "baseline_range": 192,
+          "allowed_increase": 192,
+          "pass": true
+        }
+      },
+      "entity": {
+        "held_bytes": {
+          "baseline_median": 65536,
+          "candidate_median": 32768,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 65536,
+          "candidate_median": 32784,
+          "change_percent": -49.9755859375,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 163840,
+          "candidate_median": 98304,
+          "change_percent": -40.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 8192,
+          "candidate_median": 4096,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8796,
+          "candidate_median": 8896,
+          "change_percent": 1.1368804001818944,
+          "baseline_range": 144,
+          "allowed_increase": 144,
+          "pass": true
+        }
+      },
+      "entities-16": {
+        "held_bytes": {
+          "baseline_median": 311296,
+          "candidate_median": 278528,
+          "change_percent": -10.526315789473683,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 311520,
+          "candidate_median": 278784,
+          "change_percent": -10.508474576271187,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 1146880,
+          "candidate_median": 1081344,
+          "change_percent": -5.714285714285716,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 8192,
+          "candidate_median": 4096,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 9136,
+          "candidate_median": 8852,
+          "change_percent": -3.1085814360770625,
+          "baseline_range": 192,
+          "allowed_increase": 192,
+          "pass": true
+        }
+      },
+      "global": {
+        "held_bytes": {
+          "baseline_median": 73728,
+          "candidate_median": 40960,
+          "change_percent": -44.44444444444444,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 73736,
+          "candidate_median": 40984,
+          "change_percent": -44.41792340240859,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 196608,
+          "candidate_median": 131072,
+          "change_percent": -33.333333333333336,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 8192,
+          "candidate_median": 4096,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8748,
+          "candidate_median": 8580,
+          "change_percent": -1.9204389574759895,
+          "baseline_range": 148,
+          "allowed_increase": 148,
+          "pass": true
+        }
+      },
+      "state": {
+        "held_bytes": {
+          "baseline_median": 65536,
+          "candidate_median": 32768,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 65552,
+          "candidate_median": 32784,
+          "change_percent": -49.98779594825482,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 163840,
+          "candidate_median": 98304,
+          "change_percent": -40.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 8192,
+          "candidate_median": 4096,
+          "change_percent": -50.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8744,
+          "candidate_median": 8768,
+          "change_percent": 0.2744739249771255,
+          "baseline_range": 144,
+          "allowed_increase": 144,
+          "pass": true
+        }
+      },
+      "all": {
+        "held_bytes": {
+          "baseline_median": 106496,
+          "candidate_median": 106496,
+          "change_percent": 0.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 106512,
+          "candidate_median": 106512,
+          "change_percent": 0.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 327680,
+          "candidate_median": 327680,
+          "change_percent": 0.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 12288,
+          "candidate_median": 12288,
+          "change_percent": 0.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8816,
+          "candidate_median": 8796,
+          "change_percent": -0.22686025408348298,
+          "baseline_range": 136,
+          "allowed_increase": 136,
+          "pass": true
+        }
+      },
+      "nested": {
+        "held_bytes": {
+          "baseline_median": 253952,
+          "candidate_median": 253952,
+          "change_percent": 0.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 254104,
+          "candidate_median": 254104,
+          "change_percent": 0.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 1458176,
+          "candidate_median": 1425408,
+          "change_percent": -2.2471910112359605,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 36864,
+          "candidate_median": 34816,
+          "change_percent": -5.555555555555558,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8924,
+          "candidate_median": 9180,
+          "change_percent": 2.8686687584043025,
+          "baseline_range": 152,
+          "allowed_increase": 152,
+          "pass": false
+        }
+      },
+      "nested-empty": {
+        "held_bytes": {
+          "baseline_median": 98304,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 98304,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 294912,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 18432,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8720,
+          "candidate_median": 8796,
+          "change_percent": 0.8715596330275188,
+          "baseline_range": 132,
+          "allowed_increase": 132,
+          "pass": true
+        }
+      },
+      "deadline": {
+        "held_bytes": {
+          "baseline_median": 49152,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 49152,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 96,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 98304,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 6144,
+          "candidate_median": 0,
+          "change_percent": -100.0,
+          "baseline_range": 0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 8748,
+          "candidate_median": 8668,
+          "change_percent": -0.9144947416552363,
+          "baseline_range": 128,
+          "allowed_increase": 128,
+          "pass": true
+        }
+      }
+    }
+  }
+}
