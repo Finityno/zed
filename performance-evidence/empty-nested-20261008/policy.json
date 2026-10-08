@@ -1,0 +1,37 @@
+{
+  "goal": "Reduce real costs of fast and retained rendering for Fincode while preserving correctness and responsiveness",
+  "baseline": "ef46053b5794ccb57cda5dc658581ca2a399a4e2",
+  "upstream_inspected": "5ea0f5b14f39f85ce3e3b34b3b8d31a9cc8a813f",
+  "iteration": "Reuse all/own dependency snapshot for a nested recording with no reads",
+  "primary_target": "At least 40% less held and peak dependency heap for 1024 empty nested records; no app cache or new app fields",
+  "controls": [
+    "empty",
+    "entity",
+    "entities-16",
+    "global",
+    "state",
+    "all",
+    "nested",
+    "nested-empty",
+    "deadline",
+    "nested-deadline"
+  ],
+  "timing_pairs": 15,
+  "memory_pairs": 5,
+  "timing_gate": "Paired median CPU/elapsed increases must fit baseline max-minus-min; primary improvement must be larger than both measured run ranges",
+  "memory_gate": "Primary held/peak heap at least40% lower; all other requested held/peak/bytes/calls must not increase",
+  "rss_gate": "Median native peak RSS increase must fit baseline max-minus-min",
+  "limits": [
+    "Linux System allocator component fixture, not Fincode mimalloc or GPU frame",
+    "No app-wide or macOS/Windows performance claim"
+  ],
+  "status": "declared before native performance measurements",
+  "primary_cases": [
+    "nested-empty"
+  ],
+  "timing_iterations": 262144,
+  "memory_iterations": 1024,
+  "baseline_harness_source": "16d4fc8df62069576a62422c06fc7e116dabe4cf",
+  "candidate_source": "16295846a6b12ef6066aa4bff6c1f145c648cd29",
+  "fixed_overhead": "None. AppDependencies fields and nonempty recording allocation sites stay unchanged. App construction is outside the recorder census."
+}
