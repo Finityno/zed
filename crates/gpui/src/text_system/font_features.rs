@@ -1,11 +1,21 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use schemars::{JsonSchema, json_schema};
 
 /// The OpenType features that can be configured for a given font.
-#[derive(Default, Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct FontFeatures(pub Arc<Vec<(String, u32)>>);
+
+impl Default for FontFeatures {
+    /// Shares one empty list: `TextStyle::default()` runs for every style
+    /// computed each frame, and a fresh `Arc` there was most of a frame's
+    /// heap allocations.
+    fn default() -> Self {
+        static EMPTY: LazyLock<FontFeatures> = LazyLock::new(|| FontFeatures(Arc::default()));
+        EMPTY.clone()
+    }
+}
 
 impl FontFeatures {
     /// Disables `calt`.
