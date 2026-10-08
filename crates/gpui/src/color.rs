@@ -372,12 +372,15 @@ mod property {
 }
 
 impl PartialEq for Hsla {
+    /// The equality of [`Ord`]: `total_cmp` orders by a bijection of the
+    /// bits, so it finds two floats equal exactly when their bits are, and
+    /// comparing the bits skips mapping all eight of them first. Painting
+    /// text compares every glyph's colour with its run's.
     fn eq(&self, other: &Self) -> bool {
-        self.h
-            .total_cmp(&other.h)
-            .then(self.s.total_cmp(&other.s))
-            .then(self.l.total_cmp(&other.l).then(self.a.total_cmp(&other.a)))
-            .is_eq()
+        self.h.to_bits() == other.h.to_bits()
+            && self.s.to_bits() == other.s.to_bits()
+            && self.l.to_bits() == other.l.to_bits()
+            && self.a.to_bits() == other.a.to_bits()
     }
 }
 
@@ -1152,6 +1155,27 @@ mod tests {
         assert_eq!(background.opacity(0.5).solid, color.opacity(0.5));
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn test_hsla_eq_agrees_with_cmp() {
+        let values = [0.0, -0.0, 0.5, 1.0, f32::NAN, -f32::NAN, f32::INFINITY];
+        for &h in &values {
+            for &a in &values {
+                let left = Hsla { h, s: 0.5, l: 0.5, a };
+                for &other_h in &values {
+                    for &other_a in &values {
+                        let right = Hsla {
+                            h: other_h,
+                            s: 0.5,
+                            l: 0.5,
+                            a: other_a,
+                        };
+                        assert_eq!(left == right, left.cmp(&right).is_eq());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
