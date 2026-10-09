@@ -1,0 +1,69 @@
+{
+  "kind": "New current-owned complete-component attribution, not optimization qualification",
+  "source": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "workspace": "/workspace/zed-renderer-cache-qualification",
+  "fincode_source": "3d7e2953ff58befa0859c8a2e67f0a84682735f2",
+  "gpui_pins": [
+    "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+    "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+    "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65"
+  ],
+  "component_pin": "ab07cd7695af1dfd9f1c6ad06a77660d288e568d",
+  "cases": [
+    "stream",
+    "scroll",
+    "redraw",
+    "resize",
+    "multi",
+    "background"
+  ],
+  "retained": [
+    false,
+    true
+  ],
+  "subpixel": [
+    false,
+    true
+  ],
+  "phases": {
+    "bare": {
+      "repetitions": 3,
+      "frames": 48,
+      "children": 144
+    },
+    "census": {
+      "repetitions": 2,
+      "frames": 32,
+      "children": 96
+    }
+  },
+  "runtime_environment": {
+    "VK_DRIVER_FILES": "/workspace/.fincode-tools/native/usr/share/vulkan/icd.d/lvp_icd.json",
+    "XDG_RUNTIME_DIR": "/workspace/scratch/gpui-renderer-cache-loop/runtime",
+    "MESA_SHADER_CACHE_DISABLE": "true",
+    "LP_NUM_THREADS": "2"
+  },
+  "declared_contracts": [
+    "54 existing native WGPU correctness checks pass",
+    "Actual software CPU adapter, Vulkan backend and dual-source blending verified",
+    "Complete native draw+queue completion and whole-process/foreground CPU recorded; readback checksums outside timed frames",
+    "Grayscale/subpixel actual glyphs nonzero and each active frame submitted, inactive sibling submits none",
+    "Initial/final pixel hashes match retained on/off and repetitions within glyph mode; resize final readback intentionally omitted",
+    "All logical renderer gauges return to original after App/renderer drop",
+    "CPU statistics only from bare lanes; census CPU diagnostic only; no per-child hashing or compression",
+    "All first diagnostic samples retained, no optimization gain claimed; acceptance gates for future candidate must be frozen separately"
+  ],
+  "requested_heap_scope": "Process-global counting System, all Rust threads, startup/warmup included in absolute live/peak. Measured delta includes a pre-sized 16-byte-per-frame diagnostic sample Vec allocated after warmed snapshot. Native Mesa C requests excluded; process RSS retained. No malloc_trim.",
+  "limits": [
+    "Current-source GPUI production library rebuilt without dev-dependency gpui_platform; current WGPU tests link only this new GPUI",
+    "Exact current GPUI test-support, leak-detection, backtrace and proptest features enable headless interfaces. Native external objects retain original unified test-support features. No installed app or physical GPU.",
+    "Original immutable native dependency objects retained and read only; renderer tests add original image/naga objects; no new registry resolution",
+    "Private diagnostic observer is insertion only. Original production renderer bytes and current GPUI library remain unchanged. It measures actual queue completion, not submit-only wall time; foreground and whole-process CPU both retained. Census includes all Rust threads/setup, excludes Mesa native C allocations covered by RSS.",
+    "GPUI non-shipping owned_renderer_fixture observer mirrors original guarded presentation helper. Production GPUI bytes preserved; only appended private-cfg helper. Library is built again coherently for this fixture.",
+    "LLVMPipe software Vulkan Mesa25.0.7 LLVM19.1.7 fixed two driver workers, default test display scale2 at800x1000 logical /1600x2000 device",
+    "Matched renderer-free control is not identical atlas/raster allocation behavior and is not a whole-app baseline; wrapped rendering/submit and wait attributed separately",
+    "No physical GPU/presentation, actual shipped app, macOS/Windows or shipped allocator claim",
+    "No frozen improvement target here: diagnostic foundation and owner attribution only; do not merge an optimization using it alone"
+  ],
+  "frozen_unix": 1791581155.8110604
+}

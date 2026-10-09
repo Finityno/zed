@@ -1,0 +1,338 @@
+{
+  "bare:stream:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:stream:subpixel0:final_pixels": {
+    "hashes": [
+      6464825641541121219
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:stream:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:stream:subpixel1:final_pixels": {
+    "hashes": [
+      14055053844921490228
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:scroll:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:scroll:subpixel0:final_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:scroll:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:scroll:subpixel1:final_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:redraw:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:redraw:subpixel0:final_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:redraw:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:redraw:subpixel1:final_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:resize:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:resize:subpixel0:final_pixels": {
+    "hashes": [
+      null
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:resize:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:resize:subpixel1:final_pixels": {
+    "hashes": [
+      null
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:multi:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:multi:subpixel0:final_pixels": {
+    "hashes": [
+      6464825641541121219
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:multi:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:multi:subpixel1:final_pixels": {
+    "hashes": [
+      14055053844921490228
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:background:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:background:subpixel0:final_pixels": {
+    "hashes": [
+      6464825641541121219
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:background:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "bare:background:subpixel1:final_pixels": {
+    "hashes": [
+      14055053844921490228
+    ],
+    "children": 6,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:stream:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:stream:subpixel0:final_pixels": {
+    "hashes": [
+      11234421663092538495
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:stream:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:stream:subpixel1:final_pixels": {
+    "hashes": [
+      12713028211905088316
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:scroll:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:scroll:subpixel0:final_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:scroll:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:scroll:subpixel1:final_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:redraw:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:redraw:subpixel0:final_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:redraw:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:redraw:subpixel1:final_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:resize:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:resize:subpixel0:final_pixels": {
+    "hashes": [
+      null
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:resize:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:resize:subpixel1:final_pixels": {
+    "hashes": [
+      null
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:multi:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:multi:subpixel0:final_pixels": {
+    "hashes": [
+      11234421663092538495
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:multi:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:multi:subpixel1:final_pixels": {
+    "hashes": [
+      12713028211905088316
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:background:subpixel0:initial_pixels": {
+    "hashes": [
+      14755878034596492605
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:background:subpixel0:final_pixels": {
+    "hashes": [
+      11234421663092538495
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:background:subpixel1:initial_pixels": {
+    "hashes": [
+      14432900318917569376
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  },
+  "census:background:subpixel1:final_pixels": {
+    "hashes": [
+      12713028211905088316
+    ],
+    "children": 4,
+    "retention_on_off_and_repetitions_match": true
+  }
+}
