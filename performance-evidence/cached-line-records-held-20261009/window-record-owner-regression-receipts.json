@@ -1,0 +1,26 @@
+[
+  {
+    "lane": "baseline",
+    "command": [
+      "/workspace/scratch/gpui-cached-line-records-loop/comparison/baseline-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "a_cached_long_line_does_not_keep_one_wide_record_per_glyph",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 101,
+    "log": "/workspace/scratch/gpui-cached-line-records-loop/comparison/window-record-owner-regression/baseline.log",
+    "log_sha256": "b6476af44993ec203e879f8e76f9b6443c632d05135bf911cd5c7b58681048cd"
+  },
+  {
+    "lane": "candidate",
+    "command": [
+      "/workspace/scratch/gpui-cached-line-records-loop/comparison/candidate-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "a_cached_long_line_does_not_keep_one_wide_record_per_glyph",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/workspace/scratch/gpui-cached-line-records-loop/comparison/window-record-owner-regression/candidate.log",
+    "log_sha256": "c6edea3127433614659ef94017273d5218be2d5a40e505666265a1e03a9f94aa"
+  }
+]

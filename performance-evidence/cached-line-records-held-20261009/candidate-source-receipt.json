@@ -1,0 +1,10 @@
+{
+  "source": "e18d38f62a106a8ad0bae9cd849cc50a02b78413",
+  "tree": "da8d38219f60bc38b978eef96e8580b1e7b8154f",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "a6401d2e9c987652a50eb6e596158ff6a7ce9d54b0f43d13227c676beb7a5c99",
+    "crates/gpui/src/window/view_retention/tests.rs": "5d0910da079a1d33c700f1e248b5701fbe1aade48dc981eb7954f0d4341d169b"
+  },
+  "scope": "Cached replay range only; original cold insertion, text_system/line, window/glyph_painting, publication and Scene/Window header unchanged. Shared normalized overlay/helper instrumentation frozen before pairs."
+}

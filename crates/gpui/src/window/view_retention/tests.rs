@@ -5217,3 +5217,26 @@ fn frame_work_transcript() {
         }
     }
 }
+
+#[test]
+fn a_cached_long_line_does_not_keep_one_wide_record_per_glyph() {
+    struct LongLine;
+    impl Render for LongLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(1600.)).h(px(40.)).child("A".repeat(128))
+        }
+    }
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(false));
+    let window = cx.add_window(|_, _| LongLine);
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx)).expect("warm");
+    window.update(&mut cx, |_, _, cx| cx.notify()).expect("notify");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(window.line_glyph_cache.replayed_lines > 0);
+        let scene = &window.rendered_frame.scene;
+        let glyphs = scene.monochrome_sprites.len() + scene.subpixel_sprites.len();
+        assert!(glyphs >= 32);
+        assert!(scene.len() * 2 < glyphs, "a cached line keeps one record for a glyph run");
+    }).expect("window");
+}

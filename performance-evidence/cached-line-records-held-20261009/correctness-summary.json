@@ -1,0 +1,22 @@
+{
+  "common_native_passes": 624,
+  "common_children": 278,
+  "matched_frame_audit_cases": 121,
+  "empty_release_children": 6,
+  "cached_owner_expected_red_green_children": 2,
+  "zero_filters_explicit": [
+    {
+      "lane": "baseline",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    }
+  ],
+  "earlier_correctness_diagnostic_only_preserved_separately": true
+}

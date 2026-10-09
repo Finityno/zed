@@ -197,3 +197,14 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Cached-line-only glyph ranges at `e18d38f62a106a8ad0bae9cd849cc50a02b78413`
+remain held. All 3,418 native children and complete correctness are preserved;
+110 frozen fields fail. All 18 primary live/record-capacity owners are unchanged
+despite fewer logical records, because fresh-paint capacity survives 120 low-use
+clears. Ordinary CPU and recolor byte/allocation/RSS controls also fail. Do not
+lengthen histories, weaken gates or resample this source unchanged. See
+`performance-evidence/cached-line-records-held-20261009`. Continue with distinct
+direct glyph-record emission that avoids the initial allocation and preserves
+scalar replay. No consumer adoption or app/GPU/platform gain is claimed.
