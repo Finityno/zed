@@ -292,38 +292,45 @@ impl TaffyLayoutEngine {
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
-                    let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
-                    };
+                |inputs, _id, node_context, style| {
+                    taffy::compute_leaf_layout(
+                        inputs,
+                        style,
+                        |_, _| 0.,
+                        |known_dimensions, available_space| {
+                            let Some(node_context) = node_context else {
+                                return taffy::geometry::Size::default();
+                            };
 
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
+                            let known_dimensions = Size {
+                                width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
+                                height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+                            };
 
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
-                        }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
+                            let available_space: Size<AvailableSpace> = available_space.into();
+                            let untransform = |ev: AvailableSpace| match ev {
+                                AvailableSpace::Definite(pixels) => {
+                                    AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
+                                }
+                                AvailableSpace::MinContent => AvailableSpace::MinContent,
+                                AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+                            };
+                            let available_space = size(
+                                untransform(available_space.width),
+                                untransform(available_space.height),
+                            );
 
-                    let started_at = window.frame_work.clock();
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    window.frame_work.stats.measure_calls += 1;
-                    crate::window::add_elapsed(
-                        &mut window.frame_work.stats.measure_time,
-                        started_at,
-                    );
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                            let started_at = window.frame_work.clock();
+                            let measured_size: Size<Pixels> =
+                                (node_context.measure)(known_dimensions, available_space, window, cx);
+                            window.frame_work.stats.measure_calls += 1;
+                            crate::window::add_elapsed(
+                                &mut window.frame_work.stats.measure_time,
+                                started_at,
+                            );
+                            snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                        },
+                    )
                 },
             )
             .expect(EXPECT_MESSAGE);

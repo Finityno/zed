@@ -958,8 +958,11 @@ impl TaffyLayoutEngine {
         let height =
             taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
         fixed.size = taffy::geometry::Size { width, height };
-        fixed.min_size = fixed.size;
-        fixed.max_size = fixed.size;
+        fixed.min_size = taffy::geometry::Size {
+            width: taffy::style::LengthPercentageAuto::length(round_to_device_pixel(size.width.0, scale_factor)),
+            height: taffy::style::LengthPercentageAuto::length(round_to_device_pixel(size.height.0, scale_factor)),
+        };
+        fixed.max_size = fixed.min_size;
         self.taffy
             .set_style(id.into(), fixed)
             .expect(EXPECT_MESSAGE);

@@ -197,3 +197,16 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Taffy constraint-cache upgrade at `93ae3a430c6cc7388e54706b05f9e630fcb03214`
+remains held. Its 2352 native children across 84 workloads lower four nested
+panel CPU/elapsed targets by 34.83–37.54%, above the frozen 15% goal and both
+lane ranges, but 55 frozen CPU, peak-heap and native RSS fields fail. The
+predeclared fixed cache/style/layout overhead does not cover the measured
+component RSS/resize peaks. All final native functional scenes and owner
+contracts pass. No merge or Fincode adoption occurs; never repeat unchanged
+or weaken gates. Source and raw evidence remain on
+`perf/layout-constraint-cache-20261009` under
+`performance-evidence/layout-constraint-cache-held-20261009`. Continue with
+a distinct layout-owner design while preserving the current dependency and
+independent arena/frame-demand/atlas/text work.
