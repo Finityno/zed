@@ -13,6 +13,7 @@
 //! `malloc_trim`, the atlas pages' bytes and how many glyphs' raster bounds
 //! the text system remembers, every `REPORT_EVERY` (default 600) frames.
 
+use anyhow::Context as _;
 use gpui::{
     AppContext as _, Context, HeadlessAppContext, IntoElement, ListAlignment, ListState,
     ParentElement as _, Render, RenderImage, SharedString, Styled as _, Window, WindowHandle, div,
@@ -125,13 +126,14 @@ impl Render for Stream {
     }
 }
 
-fn rss_kib() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+fn rss_kib() -> anyhow::Result<u64> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .context("RSS is read from /proc/self/status, which this platform lacks")?;
     status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))
         .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
-        .unwrap_or(0)
+        .context("no VmRSS line in /proc/self/status")
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -154,25 +156,25 @@ fn env_or(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn draw(cx: &mut HeadlessAppContext, window: WindowHandle<Stream>) {
+fn draw(cx: &mut HeadlessAppContext, window: WindowHandle<Stream>) -> anyhow::Result<()> {
     cx.update_window(window.into(), |_, window, cx| {
         window.draw(cx).clear(cx);
         window.present_if_needed();
     })
-    .expect("window draws");
 }
 
-fn report(cx: &mut HeadlessAppContext, frame: usize) {
+fn report(cx: &mut HeadlessAppContext, frame: usize) -> anyhow::Result<()> {
     let raster_bounds = cx.update(|cx| cx.text_system().remembered_raster_bounds_count());
     let gauges = gpui::render_memory_gauges();
     let atlas_kib = (gauges.atlas_monochrome_bytes + gauges.atlas_polychrome_bytes) / 1024;
-    let rss = rss_kib();
+    let rss = rss_kib()?;
     trim_heap();
+    let rss_trimmed = rss_kib()?;
     println!(
-        "frame={frame} rss_kib={rss} rss_trimmed_kib={} atlas_kib={atlas_kib} \
-         raster_bounds={raster_bounds}",
-        rss_kib()
+        "frame={frame} rss_kib={rss} rss_trimmed_kib={rss_trimmed} atlas_kib={atlas_kib} \
+         raster_bounds={raster_bounds}"
     );
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -196,8 +198,8 @@ fn main() -> anyhow::Result<()> {
             image_every,
         })
     })?;
-    draw(&mut cx, window);
-    report(&mut cx, 0);
+    draw(&mut cx, window)?;
+    report(&mut cx, 0)?;
 
     let stream = window.root(&mut cx)?;
     for step in 1..=frames {
@@ -210,9 +212,9 @@ fn main() -> anyhow::Result<()> {
                 stream.step(step, cx);
             })
         });
-        draw(&mut cx, window);
+        draw(&mut cx, window)?;
         if step.is_multiple_of(report_every) {
-            report(&mut cx, step);
+            report(&mut cx, step)?;
         }
     }
     Ok(())

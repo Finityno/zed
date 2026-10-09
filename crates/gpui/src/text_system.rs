@@ -238,9 +238,10 @@ enum FontLookup {
 
 /// Glyph raster bounds the platform has computed, kept in two generations so
 /// that a long session (zoom steps, many scripts, several displays) cannot
-/// grow it without bound: once `recent` holds [`Self::GENERATION`] entries it
-/// becomes `older` and the previous `older` is dropped. A glyph found in
-/// `older` moves back to `recent`, so whatever is still being drawn survives.
+/// grow it without bound: once `recent` holds [`Self::GENERATION`] entries, or
+/// both together hold two generations, the next new glyph turns `recent` into
+/// `older` and the previous `older` is dropped. A glyph found in `older` moves
+/// back to `recent`, so whatever is still being drawn survives.
 #[derive(Default)]
 struct RasterBoundsCache {
     recent: FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>,
@@ -258,14 +259,19 @@ impl RasterBoundsCache {
         self.recent.get(params).copied()
     }
 
+    /// Never rotates: rotating here would drop the rest of `older` while a
+    /// working set spanning both generations is part way through being
+    /// revisited, and moving an entry leaves the total unchanged anyway.
     fn take_older(&mut self, params: &RenderGlyphParams) -> Option<Bounds<DevicePixels>> {
-        let bounds = self.older.remove(params)?;
-        self.insert(params.clone(), bounds);
+        let (params, bounds) = self.older.remove_entry(params)?;
+        self.recent.insert(params, bounds);
         Some(bounds)
     }
 
     fn insert(&mut self, params: RenderGlyphParams, bounds: Bounds<DevicePixels>) {
-        if self.recent.len() >= Self::GENERATION {
+        if self.recent.len() >= Self::GENERATION
+            || self.recent.len() + self.older.len() >= 2 * Self::GENERATION
+        {
             self.older = std::mem::take(&mut self.recent);
         }
         self.recent.insert(params, bounds);
@@ -1916,6 +1922,26 @@ mod raster_bounds_cache_tests {
         assert_eq!(platform.calls(), calls, "a glyph still drawn is not asked again");
         text_system.raster_bounds(&params(GlyphId(100))).unwrap();
         assert_eq!(platform.calls(), calls + 1, "a glyph long out of use was let go");
+    }
+
+    /// Revisiting a working set that fills both generations, in the order it
+    /// was first drawn, must not rotate away the half still waiting in `older`.
+    #[test]
+    fn a_working_set_spanning_both_generations_is_kept() {
+        let platform = Arc::new(AlwaysEmptyRasterizer::new());
+        let text_system = TextSystem::new(platform.clone());
+        let working_set = 2 * super::RasterBoundsCache::GENERATION as u32;
+        for glyph in 0..working_set {
+            text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+        }
+        let calls = platform.calls();
+        for _ in 0..3 {
+            for glyph in 0..working_set {
+                text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+            }
+        }
+        assert_eq!(platform.calls(), calls, "every glyph in the working set stays");
+        assert!(text_system.raster_bounds.read().len() <= working_set as usize);
     }
 }
 
