@@ -456,13 +456,7 @@ impl TestAppContext {
 
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_window_resize(&self, window_handle: AnyWindowHandle, size: Size<Pixels>) {
-        let position = self.update(|cx| {
-            cx.update_window(window_handle, |_, window, _| window.mouse_position())
-        }).expect("resized test window must exist");
-        let mut window = self.test_window(window_handle);
-        // Bounds callbacks read the platform cursor and can redraw before returning.
-        window.set_mouse_position(position);
-        window.simulate_resize(size);
+        self.test_window(window_handle).simulate_resize(size);
     }
 
     /// Simulates a change in whether the platform is presenting the window.

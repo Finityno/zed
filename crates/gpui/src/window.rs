@@ -3220,6 +3220,11 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
+        // Test input updates Window directly; every bounds callback must preserve that cursor.
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(window) = self.platform_window.as_test() {
+            window.set_mouse_position(self.mouse_position);
+        }
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());

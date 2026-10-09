@@ -5081,6 +5081,19 @@ mod tests {
         assert_eq!(*hover_transitions.borrow(), [true]);
         assert_eq!(mouse_moves.get(), initial_mouse_moves);
 
+        let pointer = point(px(15.), px(10.));
+        cx.update_window(any_window, |_, window, cx| window.simulate_mouse_move(pointer, cx))
+            .unwrap();
+        let initial_mouse_moves = mouse_moves.get();
+        cx.simulate_window_scale_factor_change(any_window, 1.5);
+        cx.update_window(any_window, |_, window, cx| {
+            assert_eq!(window.mouse_position(), pointer);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+        assert_eq!(mouse_moves.get(), initial_mouse_moves);
+
         window
             .update(cx, |view, _, cx| {
                 view.target_left = px(40.);
