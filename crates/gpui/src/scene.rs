@@ -601,6 +601,40 @@ impl Scene {
         let mut layers_left_out: Vec<bool> = Vec::new();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
+                // Ordinary glyphs need no id remapping. Keeping them typed avoids
+                // copying each through Primitive before its insertion.
+                PaintOperation::MonochromeSprite(index)
+                    if rebase.is_none()
+                        && prev_scene.painted_monochrome_sprites[*index as usize].pad == 0
+                        && prev_scene.painted_monochrome_sprites[*index as usize].effect.animation == 0 =>
+                {
+                    let mut sprite = prev_scene.painted_monochrome_sprites[*index as usize];
+                    if let Some(moved) = moved {
+                        moved.move_glyph(
+                            &mut sprite.bounds,
+                            &mut sprite.content_mask,
+                            &mut sprite.effect,
+                            &mut sprite.transformation,
+                        );
+                    }
+                    self.insert_monochrome_sprite(sprite);
+                }
+                PaintOperation::SubpixelSprite(index)
+                    if rebase.is_none()
+                        && prev_scene.painted_subpixel_sprites[*index as usize].pad == 0
+                        && prev_scene.painted_subpixel_sprites[*index as usize].effect.animation == 0 =>
+                {
+                    let mut sprite = prev_scene.painted_subpixel_sprites[*index as usize];
+                    if let Some(moved) = moved {
+                        moved.move_glyph(
+                            &mut sprite.bounds,
+                            &mut sprite.content_mask,
+                            &mut sprite.effect,
+                            &mut sprite.transformation,
+                        );
+                    }
+                    self.insert_subpixel_sprite(sprite);
+                }
                 PaintOperation::Primitive(_)
                 | PaintOperation::MonochromeSprite(_)
                 | PaintOperation::SubpixelSprite(_) => {
@@ -1902,6 +1936,146 @@ mod tests {
         assert_eq!(fast.quads[0].order, primitive.quads[0].order);
         assert_eq!(fast.transitioned.len(), primitive.transitioned.len());
     }
+    #[test]
+    fn packed_glyph_replay_matches_generic_operations() {
+        let started_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let moves = [
+            None,
+            Some(SceneMove {
+                delta: point(ScaledPixels(3.), ScaledPixels(2.)),
+                old_outer: [0., 0., 10., 10.],
+                new_outer: [3., 2., 13., 12.],
+            }),
+            Some(SceneMove {
+                delta: point(ScaledPixels(3.), ScaledPixels(2.)),
+                old_outer: [0., 0., 10., 10.],
+                new_outer: [3., 2., 8., 12.],
+            }),
+            Some(SceneMove {
+                delta: point(ScaledPixels(20.), ScaledPixels(0.)),
+                old_outer: [0., 0., 10., 10.],
+                new_outer: [0., 0., 10., 10.],
+            }),
+        ];
+        for animated in [false, true] {
+            for transitioned in [false, true] {
+                for transformed in [false, true] {
+                    for landed in [false, true] {
+                        let transition_start = if landed {
+                            started_at - std::time::Duration::from_secs(2)
+                        } else {
+                            started_at
+                        };
+                        let build_source = |generic: bool| {
+                            let mut scene = Scene::default();
+                            let Some(transition) = scene.push_transition(rolling_in(transition_start)) else {
+                                panic!("a first transition always fits");
+                            };
+                            let animation = scene.push_shimmer_animation(ShimmerAnimation {
+                                band_start: -40.,
+                                travel: 1000.,
+                                period: std::time::Duration::from_secs(1),
+                                hold: 0.2,
+                            });
+                            scene.insert_primitive(opaque_quad());
+                            scene.push_layer(unit_bounds());
+                            scene.push_layer(unit_bounds());
+                            for position in [0., 4.] {
+                                let mut glyph = shimmering_glyph(if animated { animation } else { 0 });
+                                glyph.bounds.origin.x = ScaledPixels(position);
+                                glyph.pad = if transitioned { transition } else { 0 };
+                                if transformed {
+                                    glyph.transformation = TransformationMatrix {
+                                        rotation_scale: [[2., 0.25], [0.5, 1.]],
+                                        translation: [2., -3.],
+                                    };
+                                }
+                                scene.insert_monochrome_sprite(glyph);
+                                scene.insert_subpixel_sprite(SubpixelSprite {
+                                    order: glyph.order,
+                                    pad: glyph.pad,
+                                    bounds: glyph.bounds,
+                                    content_mask: glyph.content_mask,
+                                    color: glyph.color,
+                                    effect: glyph.effect,
+                                    tile: glyph.tile,
+                                    transformation: glyph.transformation,
+                                });
+                            }
+                            scene.pop_layer();
+                            scene.pop_layer();
+                            scene.insert_monochrome_sprite(shimmering_glyph(0));
+                            if generic {
+                                for operation in &mut scene.paint_operations {
+                                    match operation {
+                                        PaintOperation::MonochromeSprite(index) => {
+                                            *operation = PaintOperation::Primitive(Primitive::MonochromeSprite(
+                                                scene.painted_monochrome_sprites[*index as usize],
+                                            ));
+                                        }
+                                        PaintOperation::SubpixelSprite(index) => {
+                                            *operation = PaintOperation::Primitive(Primitive::SubpixelSprite(
+                                                scene.painted_subpixel_sprites[*index as usize],
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            scene.finish();
+                            scene
+                        };
+                        let packed_source = build_source(false);
+                        let generic_source = build_source(true);
+                        for moved in &moves {
+                            for rebase in [None, Some((0, 0)), Some((0, 1)), Some((1, 2))] {
+                                let replay = |source: &Scene| {
+                                    let mut scene = Scene::default();
+                                    scene.push_transition(rolling_in(started_at));
+                                    scene.push_transition(rolling_in(started_at));
+                                    scene.push_shimmer_animation(ShimmerAnimation {
+                                        band_start: 0.,
+                                        travel: 10.,
+                                        period: std::time::Duration::from_secs(1),
+                                        hold: 0.,
+                                    });
+                                    scene.set_current_transition(if rebase.is_some() { 1 } else { 0 });
+                                    scene.replay_inside(0..source.len(), source, rebase, moved.as_ref());
+                                    scene.finish();
+                                    scene
+                                };
+                                let packed = replay(&packed_source);
+                                let generic = replay(&generic_source);
+                                assert_eq!(format!("{:?}", packed.monochrome_sprites), format!("{:?}", generic.monochrome_sprites));
+                                assert_eq!(format!("{:?}", packed.subpixel_sprites), format!("{:?}", generic.subpixel_sprites));
+                                assert_eq!(format!("{:?}", packed.painted_monochrome_sprites), format!("{:?}", generic.painted_monochrome_sprites));
+                                assert_eq!(format!("{:?}", packed.painted_subpixel_sprites), format!("{:?}", generic.painted_subpixel_sprites));
+                                assert_eq!(format!("{:?}", packed.quads), format!("{:?}", generic.quads));
+                                assert_eq!(format!("{:?}", packed.transitions), format!("{:?}", generic.transitions));
+                                assert_eq!(packed.shimmer_animations, generic.shimmer_animations);
+                                assert_eq!(format!("{:?}", packed.transitioned), format!("{:?}", generic.transitioned));
+                                let operations = |scene: &Scene| {
+                                    scene.paint_operations.iter().map(|operation| match operation {
+                                        PaintOperation::MonochromeSprite(index) => format!("monochrome {index}"),
+                                        PaintOperation::SubpixelSprite(index) => format!("subpixel {index}"),
+                                        PaintOperation::Primitive(primitive) => format!("primitive {:?} {:?}", primitive.bounds(), primitive.content_mask()),
+                                        PaintOperation::StartLayer(layer) => format!("start {layer:?}"),
+                                        PaintOperation::EndLayer => "end".to_owned(),
+                                    }).collect::<Vec<_>>()
+                                };
+                                assert_eq!(operations(&packed), operations(&generic));
+                                assert_eq!(packed.blended_quad_indices, generic.blended_quad_indices);
+                                assert_eq!(packed.opaque_quad_indices, generic.opaque_quad_indices);
+                                assert_eq!(packed.animated_monochrome_sprites, generic.animated_monochrome_sprites);
+                                assert_eq!(packed.animated_subpixel_sprites, generic.animated_subpixel_sprites);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
@@ -1984,22 +2158,18 @@ impl SceneMove {
                 underline.bounds = self.bounds(underline.bounds);
                 underline.content_mask = self.mask(&underline.content_mask);
             }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.bounds = self.bounds(sprite.bounds);
-                sprite.content_mask = self.mask(&sprite.content_mask);
-                if sprite.effect.kind != 0 {
-                    sprite.effect.origin = sprite.effect.origin + self.delta;
-                }
-                sprite.transformation = self.transformation(sprite.transformation);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.bounds = self.bounds(sprite.bounds);
-                sprite.content_mask = self.mask(&sprite.content_mask);
-                if sprite.effect.kind != 0 {
-                    sprite.effect.origin = sprite.effect.origin + self.delta;
-                }
-                sprite.transformation = self.transformation(sprite.transformation);
-            }
+            Primitive::MonochromeSprite(sprite) => self.move_glyph(
+                &mut sprite.bounds,
+                &mut sprite.content_mask,
+                &mut sprite.effect,
+                &mut sprite.transformation,
+            ),
+            Primitive::SubpixelSprite(sprite) => self.move_glyph(
+                &mut sprite.bounds,
+                &mut sprite.content_mask,
+                &mut sprite.effect,
+                &mut sprite.transformation,
+            ),
             Primitive::PolychromeSprite(sprite) => {
                 sprite.bounds = self.bounds(sprite.bounds);
                 sprite.content_mask = self.mask(&sprite.content_mask);
@@ -2009,6 +2179,21 @@ impl SceneMove {
                 surface.content_mask = self.mask(&surface.content_mask);
             }
         }
+    }
+
+    fn move_glyph(
+        &self,
+        bounds: &mut Bounds<ScaledPixels>,
+        content_mask: &mut ContentMask<ScaledPixels>,
+        effect: &mut SpriteEffect,
+        transformation: &mut TransformationMatrix,
+    ) {
+        *bounds = self.bounds(*bounds);
+        *content_mask = self.mask(content_mask);
+        if effect.kind != 0 {
+            effect.origin = effect.origin + self.delta;
+        }
+        *transformation = self.transformation(*transformation);
     }
 
     /// A sprite's transformation, which maps scene positions, moved: it is

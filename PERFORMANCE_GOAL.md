@@ -197,3 +197,12 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Ordinary typed glyph replay at `9f2e5c64ad4d619eb614d98b9d245d84992e9610`
+remains held. Its 1624-child, 58-workload comparison passes the native scene,
+256-case packed/generic representation oracle and retained-rendering contracts,
+but four target gain fields, six normal CPU fields and five census RSS fields
+fail. Requested held/peak/churn medians are unchanged. The scrolling/redraw
+differences do not qualify the complete design. Preserve all raw evidence under
+`performance-evidence/ordinary-glyph-replay-held-20261009`; never repeat this
+design unchanged or weaken its gates. Continue with an attributed memory owner.

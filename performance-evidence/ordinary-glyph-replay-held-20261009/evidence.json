@@ -1,0 +1,162 @@
+{
+  "status": "HELD/unmerged; no unchanged rerun or weaker gates",
+  "baseline": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "source": "9f2e5c64ad4d619eb614d98b9d245d84992e9610",
+  "initial_fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "initial_component": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "current_fincode_main": "cbcfba7301739d768def4ef1ed9b647f5cf8b69c",
+  "current_fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "current_component": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "valid_children": 1624,
+  "workloads": 58,
+  "qualified": false,
+  "failures": [
+    [
+      "bare",
+      "stream-on-200",
+      "cpu_ns",
+      "primary gain",
+      -1671564,
+      30439522,
+      25090583
+    ],
+    [
+      "bare",
+      "stream-on-200",
+      "elapsed_ns",
+      "primary gain",
+      -1671413,
+      30439332,
+      25102029
+    ],
+    [
+      "bare",
+      "tick-on-32",
+      "cpu_ns",
+      "control",
+      3102528,
+      1003708
+    ],
+    [
+      "bare",
+      "tick-on-32",
+      "elapsed_ns",
+      "control",
+      3102391,
+      1009497
+    ],
+    [
+      "bare",
+      "tick-on-32",
+      "child_cpu_ns",
+      "control",
+      3324000,
+      1327000
+    ],
+    [
+      "bare",
+      "tick-on-200",
+      "cpu_ns",
+      "primary gain",
+      -2696532,
+      2905423,
+      2437526
+    ],
+    [
+      "bare",
+      "tick-on-200",
+      "elapsed_ns",
+      "primary gain",
+      -2695326,
+      2905776,
+      2437808
+    ],
+    [
+      "bare",
+      "tick-on-512",
+      "cpu_ns",
+      "control",
+      3085091,
+      2702100
+    ],
+    [
+      "bare",
+      "tick-on-512",
+      "elapsed_ns",
+      "control",
+      3084673,
+      2702282
+    ],
+    [
+      "bare",
+      "tick-on-512",
+      "child_cpu_ns",
+      "control",
+      2927000,
+      2806000
+    ],
+    [
+      "census",
+      "replace-32",
+      "peak_rss_kib",
+      "control",
+      180,
+      64
+    ],
+    [
+      "census",
+      "state-panel-keep-256",
+      "peak_rss_kib",
+      "control",
+      60,
+      4
+    ],
+    [
+      "census",
+      "state-grow-256",
+      "peak_rss_kib",
+      "control",
+      120,
+      64
+    ],
+    [
+      "census",
+      "stream-on-32",
+      "peak_rss_kib",
+      "control",
+      132,
+      68
+    ],
+    [
+      "census",
+      "rebuild-on-200",
+      "peak_rss_kib",
+      "control",
+      96,
+      68
+    ]
+  ],
+  "observed_primary_cpu_difference_percent": {
+    "scroll-on-200": 10.252856695030077,
+    "stream-on-200": -2.3373464237619768,
+    "tick-on-200": -5.11508278027295,
+    "redraw-on-200": 10.195018767858299
+  },
+  "important_gain_not_qualified": "Streaming and ticking primary CPU/elapsed regress2.34/5.11%; four gain fields fail. Six normalCPU/elapsed/whole-child controls and five censusRSSfields fail;15failed fields total.",
+  "heap_and_controls": "All58requested held/peak/bytes/calls medians exactly identical. Scrolling/redraw CPU differences10.25/10.19% do not qualify the complete design. CPU/elapsed/whole-child/RSS control failures are retained exactly.",
+  "mechanism": "Ordinary packedglyphs pad0/animation0/rebaseNone bypass genericPrimitive construction. Movement logic extracted exactly from original mono/subpixel branches. Animated/rebased and allother primitives retain original genericreplay. No newfields/cache/allocator orrenderer resources.",
+  "correctness": "Full native Scene tests and new256packed/generic representation oracle in both lanes, exhaustive typed/generic glyph equivalence, retained-frame oracle16seeds50steps, wheel/dependency/panel/layout/atomic-claim/read/nested contracts and all1624 paired scene/hitbox/owner signatures pass.",
+  "not_run": "Strict owningClippy, PR creation, merge and application adoption not run because performance gates fail.",
+  "protocol": "Four sequential builds before1044alternating bare children, followed by580alternating separate counting children. Exact59externs/Rust1.99/System/runtime/source/binary identities preserved. Attribution clocks disabled in bare samples. No failed cohort repeated.",
+  "attribution": "30prior current-main complete200row transcript children identify retained paint53.27-72.71microseconds/draw. First inline-output parser failure retained/reparsed without rerunning its successful native child; resume setup failure before any child retained. Diagnostic counters/fakeplatform are not gain evidence.",
+  "coverage_limits": [
+    "Linux fake-platform complete App/Window, not app/physicalGPU/macOS/Windows/shippedallocator gains.",
+    "Frame timing excludes setup/4warmups and final audits. Counting census includes setup/warmups/finalheldowners.",
+    "Private consumer build-cache preservation affects workspace capacity only and is not application memory evidence. Exact22091file restoration metadata remains durable outside this performance archive.",
+    "Independent owned hidden-window GPU, component and coherentFincode adoption changes are preserved."
+  ],
+  "policy_sha256": "8b9e64f51a4fc5ea9bcb3bd101b9e2f2111a3a78366f040f3c598c46f505e3f0",
+  "archive_sha256": "76cb4a5461dc2f1b3608361a328f9a6f3b213487d0c38653b39df2862f1b68bc",
+  "archive_bytes": 670301,
+  "members": 1759
+}
