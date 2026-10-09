@@ -135,8 +135,17 @@ fn rss_kib() -> u64 {
     pages * 4
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 unsafe extern "C" {
     fn malloc_trim(pad: usize) -> i32;
+}
+
+fn trim_heap() {
+    // SAFETY: glibc's malloc_trim only returns free heap pages to the system.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        malloc_trim(0)
+    };
 }
 
 fn env_or(name: &str, default: usize) -> usize {
@@ -159,8 +168,7 @@ fn report(cx: &mut HeadlessAppContext, frame: usize) {
     let gauges = gpui::render_memory_gauges();
     let atlas_kib = (gauges.atlas_monochrome_bytes + gauges.atlas_polychrome_bytes) / 1024;
     let rss = rss_kib();
-    // SAFETY: glibc's malloc_trim only returns free heap pages to the system.
-    unsafe { malloc_trim(0) };
+    trim_heap();
     println!(
         "frame={frame} rss_kib={rss} rss_trimmed_kib={} atlas_kib={atlas_kib} \
          raster_bounds={raster_bounds}",
