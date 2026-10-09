@@ -197,3 +197,13 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Direct replay glyph insertion at `97bfcabe8c1e681ed5ee2c7a83e0be5d4381730d`
+remains held. One 1624-child comparison across 58 workloads passes native
+correctness and all requested heap/churn controls, but streaming misses the
+frozen 5% CPU/elapsed and full-variation gates and one census RSS control fails.
+Other target CPU differences of 7.72–9.18% do not qualify the complete design.
+All raw samples and adverse diagnostic outputs are preserved under
+`performance-evidence/direct-glyph-replay-held-20261009` on its branch.
+Do not repeat this design unchanged or weaken its acceptance gates. Continue
+with a distinct measured replay design and preserve current independent work.

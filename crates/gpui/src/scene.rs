@@ -652,7 +652,11 @@ impl Scene {
                         }
                         effect.animation = remapped_animation.1;
                     }
-                    self.insert_primitive(primitive)
+                    match primitive {
+                        Primitive::MonochromeSprite(sprite) => self.insert_monochrome_sprite(sprite),
+                        Primitive::SubpixelSprite(sprite) => self.insert_subpixel_sprite(sprite),
+                        primitive => self.insert_primitive(primitive),
+                    }
                 }
                 PaintOperation::StartLayer(layer) => match moved {
                     Some(moved) => {

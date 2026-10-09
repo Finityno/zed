@@ -1,0 +1,64 @@
+{
+  "status": "HELD/unmerged; no unchanged rerun or weaker gates",
+  "baseline": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "source": "97bfcabe8c1e681ed5ee2c7a83e0be5d4381730d",
+  "initial_fincode_gpui": "4661be26e8da24bda712cd9096bf9fabfe351d5b",
+  "initial_component": "de14de8f92c6ade7ca616cd1861135f04185d170",
+  "current_fincode_main": "cbcfba7301739d768def4ef1ed9b647f5cf8b69c",
+  "current_fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "current_component": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "valid_children": 1624,
+  "workloads": 58,
+  "qualified": false,
+  "failures": [
+    [
+      "bare",
+      "stream-on-200",
+      "cpu_ns",
+      "primary gain",
+      3496044,
+      10565149,
+      1255593
+    ],
+    [
+      "bare",
+      "stream-on-200",
+      "elapsed_ns",
+      "primary gain",
+      3488828,
+      10641198,
+      1852979
+    ],
+    [
+      "census",
+      "rebuild-off-512",
+      "peak_rss_kib",
+      "control",
+      404,
+      144
+    ]
+  ],
+  "observed_primary_cpu_difference_percent": {
+    "scroll-on-200": 7.717581815707597,
+    "stream-on-200": 4.9244384295183075,
+    "tick-on-200": 9.182678459292259,
+    "redraw-on-200": 8.172303432541728
+  },
+  "important_gain_not_qualified": "Streaming CPU/elapsed differences 4.92/4.91% miss both 5% target and full baseline variation. One census rebuild-off-512 native RSS control fails (404KiB increase, 144KiB baseline range).",
+  "heap_and_controls": "All58 requested held/peak/bytes/calls medians exactly identical. All bare CPU/elapsed/whole-child/RSS controls pass; one census RSS field fails. Three other primary CPU/elapsed differences 7.72/9.18/8.17% exceed target and both ranges but do not qualify the complete design.",
+  "mechanism": "Only final replay insertion dispatch changes. Replayed monochrome/subpixel glyphs use existing typed methods after original movement/clipping/transition/shimmer remapping. Other primitives retain original generic insertion.",
+  "correctness": "Full native Scene tests in both lanes, exhaustive typed/generic glyph equivalence, retained-frame oracle16seeds50steps, wheel/dependency/panel/layout/atomic-claim/read/nested contracts and all1624 paired scene/hitbox/owner signatures pass.",
+  "not_run": "Strict owningClippy, PR creation, merge and application adoption not run because performance gates fail.",
+  "protocol": "Four sequential builds before1044alternating bare children, followed by580alternating separate counting children. Exact59externs/Rust1.99/System/runtime/source/binary identities preserved. Attribution clocks disabled in bare samples. No failed cohort repeated.",
+  "attribution": "30prior current-main complete200row transcript children identify retained paint53.27-72.71microseconds/draw. First inline-output parser failure retained/reparsed without rerunning its successful native child; resume setup failure before any child retained. Diagnostic counters/fakeplatform are not gain evidence.",
+  "coverage_limits": [
+    "Linux fake-platform complete App/Window, not app/physicalGPU/macOS/Windows/shippedallocator gains.",
+    "Frame timing excludes setup/4warmups and final audits. Counting census includes setup/warmups/finalheldowners.",
+    "Private consumer build-cache preservation affects workspace capacity only and is not application memory evidence. Exact22091file restoration metadata remains durable outside this performance archive.",
+    "Independent owned hidden-window GPU, component and coherentFincode adoption changes are preserved."
+  ],
+  "policy_sha256": "27fe7928aab38b8a22e84bfb0f1faa61ec1d9640693235684e20d6a9f2b83faf",
+  "archive_sha256": "7dae5de78e6a9a35c7139b794472316df430a1269d03a4dc8c9e579dd5efe675",
+  "archive_bytes": 678210,
+  "members": 1765
+}
