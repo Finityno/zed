@@ -4124,6 +4124,10 @@ impl Window {
         }));
     }
 
+    pub(crate) fn idle_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_draw_at)
+    }
+
     /// Frees the per-frame capacity a window that has stopped drawing no
     /// longer uses.
     ///
@@ -4163,6 +4167,11 @@ impl Window {
             self.rendered_frame.retained_views.forget_layouts();
         }
         cx.element_arena.borrow_mut().release_idle_chunks(now);
+        if let Some(delay) =
+            cx.reclaim_idle_effect_capacity(self.handle.window_id(), now, quiet_for)
+        {
+            self.schedule_idle_capacity_reclaim(delay, cx);
+        }
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {

@@ -197,3 +197,15 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Window-owned effects reclamation at
+`c7cbdd4e365c121e476d04db576dee6eeb304c57` remains held. Across 2,296 children
+and 82 complete App/Window workloads, all eight memory targets pass: held heap
+falls 58.74–75.66%, queue ownership falls 87.5–93.75%, and native current RSS
+falls 21.39–33.41%. Eighteen CPU/churn/RSS controls fail. Rearming costs nineteen
+extra calls per window including a resize, above the frozen eight-call budget;
+active background refills also exceed their requested-byte budget. All lifecycle,
+callback/owner, scene and retained-output contracts pass; App/Window sizes match.
+Preserve `performance-evidence/window-idle-effects-held-20261009` on its branch
+and never resample this design unchanged or weaken its gates. Investigate the
+measured existing window-task rearm overhead as a distinct component first.

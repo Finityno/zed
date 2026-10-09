@@ -2034,6 +2034,41 @@ impl App {
         }
     }
 
+    /// Reuses a window's idle callback to retire a large, drained effects queue.
+    /// The reserve keeps ordinary bursts from immediately growing it again.
+    pub(crate) fn reclaim_idle_effect_capacity(
+        &mut self,
+        current_window: WindowId,
+        now: Instant,
+        current_quiet_for: Duration,
+    ) -> Option<Duration> {
+        const QUIET_PERIOD: Duration = Duration::from_secs(30);
+        const LARGE_QUEUE: usize = 32_768;
+        const RESERVE: usize = 8_192;
+
+        if !self.pending_effects.is_empty() || self.pending_effects.capacity() <= LARGE_QUEUE {
+            return None;
+        }
+
+        let mut remaining = QUIET_PERIOD.saturating_sub(current_quiet_for);
+        for (id, window) in &self.windows {
+            if id == current_window {
+                continue;
+            }
+            // A different window borrowed by an update cannot be inspected.
+            let Some(window) = window else {
+                return Some(QUIET_PERIOD);
+            };
+            remaining = remaining.max(QUIET_PERIOD.saturating_sub(window.idle_for(now)));
+        }
+        if !remaining.is_zero() {
+            return Some(remaining);
+        }
+
+        self.pending_effects.shrink_to(RESERVE);
+        None
+    }
+
     /// Obtains a reference to the executor, which can be used to spawn futures.
     pub fn background_executor(&self) -> &BackgroundExecutor {
         &self.background_executor
@@ -3530,5 +3565,158 @@ mod test {
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
         MissingGlyph::new(grapheme.into(), FallbackFontClass::Proportional)
+    }
+}
+
+#[cfg(test)]
+mod window_effect_idle_tests {
+    use super::*;
+
+    struct CountedView(Rc<Cell<usize>>);
+
+    impl Render for CountedView {
+        fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl crate::IntoElement {
+            self.0.set(self.0.get() + 1);
+            crate::Empty
+        }
+    }
+
+    fn window(cx: &mut TestAppContext) -> (WindowHandle<CountedView>, Rc<Cell<usize>>) {
+        let draws = Rc::new(Cell::new(0));
+        let handle = cx.add_window({
+            let draws = draws.clone();
+            move |_, _| CountedView(draws)
+        });
+        draw(cx, handle);
+        (handle, draws)
+    }
+
+    fn draw(cx: &mut TestAppContext, handle: WindowHandle<CountedView>) {
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    }
+
+    fn burst(cx: &mut TestAppContext, count: usize) {
+        let completed = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            for index in 0..count {
+                let completed = completed.clone();
+                cx.defer(move |_| {
+                    assert_eq!(completed.get(), index);
+                    completed.set(index + 1);
+                });
+            }
+        });
+        assert_eq!(completed.get(), count);
+        assert_eq!(Rc::strong_count(&completed), 1);
+    }
+
+    fn capacity(cx: &mut TestAppContext) -> usize {
+        cx.update(|cx| {
+            assert!(cx.pending_effects.is_empty());
+            cx.pending_effects.capacity()
+        })
+    }
+
+    fn quiet(cx: &mut TestAppContext, seconds: u64) {
+        cx.executor().advance_clock(Duration::from_secs(seconds));
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn one_window_waits_a_full_quiet_period_then_reclaims() {
+        let mut cx = TestAppContext::single();
+        let _window = window(&mut cx);
+        burst(&mut cx, 65536);
+        quiet(&mut cx, 29);
+        assert_eq!(capacity(&mut cx), 65536);
+        quiet(&mut cx, 2);
+        assert_eq!(capacity(&mut cx), 8192);
+    }
+
+    #[test]
+    fn ordinary_queue_reserve_is_preserved() {
+        let mut cx = TestAppContext::single();
+        let _window = window(&mut cx);
+        burst(&mut cx, 32768);
+        let before = capacity(&mut cx);
+        quiet(&mut cx, 31);
+        assert_eq!(capacity(&mut cx), before);
+    }
+
+    #[test]
+    fn every_window_must_be_quiet_before_global_queue_reclaims() {
+        let mut cx = TestAppContext::single();
+        let _first = window(&mut cx);
+        let (second, _) = window(&mut cx);
+        burst(&mut cx, 65536);
+        quiet(&mut cx, 25);
+        draw(&mut cx, second);
+        quiet(&mut cx, 6);
+        assert_eq!(capacity(&mut cx), 65536);
+        quiet(&mut cx, 23);
+        assert_eq!(capacity(&mut cx), 65536);
+        quiet(&mut cx, 2);
+        assert_eq!(capacity(&mut cx), 8192);
+    }
+
+    #[test]
+    fn queue_reclaim_does_not_draw() {
+        let mut cx = TestAppContext::single();
+        let (_, draws) = window(&mut cx);
+        burst(&mut cx, 65536);
+        let before = draws.get();
+        quiet(&mut cx, 31);
+        assert_eq!(draws.get(), before);
+    }
+
+    #[test]
+    fn closing_the_window_cancels_its_followup() {
+        let mut cx = TestAppContext::single();
+        let (handle, _) = window(&mut cx);
+        burst(&mut cx, 65536);
+        quiet(&mut cx, 3);
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).unwrap();
+        quiet(&mut cx, 31);
+        assert_eq!(capacity(&mut cx), 65536);
+        assert_eq!(cx.update(|cx| cx.windows.len()), 0);
+    }
+
+    #[test]
+    fn a_burst_after_the_window_callback_ended_has_no_new_timer() {
+        let mut cx = TestAppContext::single();
+        let _window = window(&mut cx);
+        quiet(&mut cx, 31);
+        burst(&mut cx, 65536);
+        quiet(&mut cx, 31);
+        assert_eq!(capacity(&mut cx), 65536);
+    }
+
+    #[test]
+    fn drawing_keeps_large_queue_capacity_until_the_window_is_quiet() {
+        let mut cx = TestAppContext::single();
+        let (handle, _) = window(&mut cx);
+        burst(&mut cx, 65536);
+        for _ in 0..5 {
+            quiet(&mut cx, 10);
+            draw(&mut cx, handle);
+            assert_eq!(capacity(&mut cx), 65536);
+        }
+        quiet(&mut cx, 29);
+        assert_eq!(capacity(&mut cx), 65536);
+        quiet(&mut cx, 2);
+        assert_eq!(capacity(&mut cx), 8192);
+    }
+
+    #[test]
+    fn callbacks_and_owners_survive_reclaim_and_regrowth() {
+        let mut cx = TestAppContext::single();
+        let (handle, _) = window(&mut cx);
+        burst(&mut cx, 65536);
+        quiet(&mut cx, 31);
+        assert_eq!(capacity(&mut cx), 8192);
+        burst(&mut cx, 65536);
+        draw(&mut cx, handle);
+        quiet(&mut cx, 31);
+        assert_eq!(capacity(&mut cx), 8192);
     }
 }

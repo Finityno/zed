@@ -1,0 +1,510 @@
+{
+  "status": "HELD/unmerged; never unchanged rerun or weaker gates",
+  "qualified": false,
+  "baseline": "df6e7d05b529313ad142f397a4e4ea428c2c01ae",
+  "source": "c7cbdd4e365c121e476d04db576dee6eeb304c57",
+  "fincode_main_at_freeze": "37ec31483e85fea4c366317dec717897abd5e282",
+  "fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "component_pin": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "valid_children": 2296,
+  "workloads": 82,
+  "failures": [
+    [
+      "bare",
+      "effect-long_refault-on-131072",
+      "cpu_ns",
+      "control",
+      1273830,
+      735307
+    ],
+    [
+      "bare",
+      "effect-long_refault-on-131072",
+      "elapsed_ns",
+      "control",
+      1273791,
+      735327
+    ],
+    [
+      "bare",
+      "effect-long_refault-on-131072",
+      "child_cpu_ns",
+      "control",
+      1340000,
+      1052000
+    ],
+    [
+      "bare",
+      "effect-two_quiet-off-131072",
+      "cpu_ns",
+      "control",
+      260359,
+      224385
+    ],
+    [
+      "bare",
+      "effect-two_quiet-off-131072",
+      "elapsed_ns",
+      "control",
+      260169,
+      225036
+    ],
+    [
+      "census",
+      "scroll-off-200",
+      "peak_rss_kib",
+      "control",
+      128,
+      92
+    ],
+    [
+      "census",
+      "stream-off-200",
+      "peak_rss_kib",
+      "control",
+      228,
+      148
+    ],
+    [
+      "census",
+      "rebuild-off-200",
+      "peak_rss_kib",
+      "control",
+      244,
+      144
+    ],
+    [
+      "census",
+      "effect-idle-off-65536",
+      "allocation_calls",
+      "control",
+      19,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-off-131072",
+      "allocation_calls",
+      "control",
+      19,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-on-65536",
+      "allocation_calls",
+      "control",
+      19,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-on-131072",
+      "allocation_calls",
+      "control",
+      19,
+      8
+    ],
+    [
+      "census",
+      "effect-boundary-on-8193",
+      "peak_rss_kib",
+      "control",
+      128,
+      120
+    ],
+    [
+      "census",
+      "effect-active-on-131072",
+      "requested_bytes",
+      "control",
+      18285552,
+      3276800
+    ],
+    [
+      "census",
+      "effect-two_quiet-off-65536",
+      "allocation_calls",
+      "control",
+      38,
+      16
+    ],
+    [
+      "census",
+      "effect-two_quiet-off-131072",
+      "allocation_calls",
+      "control",
+      38,
+      16
+    ],
+    [
+      "census",
+      "effect-two_quiet-on-65536",
+      "allocation_calls",
+      "control",
+      38,
+      16
+    ],
+    [
+      "census",
+      "effect-two_quiet-on-131072",
+      "allocation_calls",
+      "control",
+      38,
+      16
+    ]
+  ],
+  "all_eight_primary_memory_targets_pass": true,
+  "observed_primary_changes": {
+    "effect-idle-off-65536": {
+      "held_bytes": {
+        "baseline_median": 6975186,
+        "candidate_median": 2846418,
+        "baseline_min": 6975186,
+        "baseline_max": 6975186,
+        "candidate_min": 2846418,
+        "candidate_max": 2846418,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -59.192227992199776,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 4718592,
+        "candidate_median": 589824,
+        "baseline_min": 4718592,
+        "baseline_max": 4718592,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -87.5,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 18208,
+        "candidate_median": 14164,
+        "baseline_min": 18076,
+        "baseline_max": 18592,
+        "candidate_min": 14040,
+        "candidate_max": 14424,
+        "baseline_range": 516,
+        "candidate_range": 384,
+        "change_percent": -22.210017574692444,
+        "allowed_increase": 516,
+        "pass": true
+      }
+    },
+    "effect-idle-off-131072": {
+      "held_bytes": {
+        "baseline_median": 11693778,
+        "candidate_median": 2846418,
+        "baseline_min": 11693778,
+        "baseline_max": 11693778,
+        "candidate_min": 2846418,
+        "candidate_max": 2846418,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -75.6586964452378,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 9437184,
+        "candidate_median": 589824,
+        "baseline_min": 9437184,
+        "baseline_max": 9437184,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -93.75,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 25888,
+        "candidate_median": 17240,
+        "baseline_min": 25692,
+        "baseline_max": 26272,
+        "candidate_min": 17108,
+        "candidate_max": 17496,
+        "baseline_range": 580,
+        "candidate_range": 388,
+        "change_percent": -33.40543881334982,
+        "allowed_increase": 580,
+        "pass": true
+      }
+    },
+    "effect-idle-on-65536": {
+      "held_bytes": {
+        "baseline_median": 6978866,
+        "candidate_median": 2850098,
+        "baseline_min": 6978866,
+        "baseline_max": 6978866,
+        "candidate_min": 2850098,
+        "candidate_max": 2850098,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -59.16101555754187,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 4718592,
+        "candidate_median": 589824,
+        "baseline_min": 4718592,
+        "baseline_max": 4718592,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -87.5,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 18592,
+        "candidate_median": 14488,
+        "baseline_min": 18276,
+        "baseline_max": 18724,
+        "candidate_min": 14424,
+        "candidate_max": 14680,
+        "baseline_range": 448,
+        "candidate_range": 256,
+        "change_percent": -22.074010327022375,
+        "allowed_increase": 448,
+        "pass": true
+      }
+    },
+    "effect-idle-on-131072": {
+      "held_bytes": {
+        "baseline_median": 11697458,
+        "candidate_median": 2850098,
+        "baseline_min": 11697458,
+        "baseline_max": 11697458,
+        "candidate_min": 2850098,
+        "candidate_max": 2850098,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -75.63489435055035,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 9437184,
+        "candidate_median": 589824,
+        "baseline_min": 9437184,
+        "baseline_max": 9437184,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -93.75,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 26212,
+        "candidate_median": 17624,
+        "baseline_min": 25952,
+        "baseline_max": 26596,
+        "candidate_min": 17500,
+        "candidate_max": 17752,
+        "baseline_range": 644,
+        "candidate_range": 252,
+        "change_percent": -32.76361971616054,
+        "allowed_increase": 644,
+        "pass": true
+      }
+    },
+    "effect-two_quiet-off-65536": {
+      "held_bytes": {
+        "baseline_median": 7022090,
+        "candidate_median": 2893322,
+        "baseline_min": 7022090,
+        "baseline_max": 7022090,
+        "candidate_min": 2893322,
+        "candidate_max": 2893322,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -58.79685392810403,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 4718592,
+        "candidate_median": 589824,
+        "baseline_min": 4718592,
+        "baseline_max": 4718592,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -87.5,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 18248,
+        "candidate_median": 14212,
+        "baseline_min": 18116,
+        "baseline_max": 18632,
+        "candidate_min": 14016,
+        "candidate_max": 14464,
+        "baseline_range": 516,
+        "candidate_range": 448,
+        "change_percent": -22.117492327926346,
+        "allowed_increase": 516,
+        "pass": true
+      }
+    },
+    "effect-two_quiet-off-131072": {
+      "held_bytes": {
+        "baseline_median": 11740682,
+        "candidate_median": 2893322,
+        "baseline_min": 11740682,
+        "baseline_max": 11740682,
+        "candidate_min": 2893322,
+        "candidate_max": 2893322,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -75.35644011140067,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 9437184,
+        "candidate_median": 589824,
+        "baseline_min": 9437184,
+        "baseline_max": 9437184,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -93.75,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 25924,
+        "candidate_median": 17280,
+        "baseline_min": 25732,
+        "baseline_max": 26120,
+        "candidate_min": 17152,
+        "candidate_max": 17536,
+        "baseline_range": 388,
+        "candidate_range": 384,
+        "change_percent": -33.34361981175744,
+        "allowed_increase": 388,
+        "pass": true
+      }
+    },
+    "effect-two_quiet-on-65536": {
+      "held_bytes": {
+        "baseline_median": 7029270,
+        "candidate_median": 2900502,
+        "baseline_min": 7029270,
+        "baseline_max": 7029270,
+        "candidate_min": 2900502,
+        "candidate_max": 2900502,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -58.73679628183297,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 4718592,
+        "candidate_median": 589824,
+        "baseline_min": 4718592,
+        "baseline_max": 4718592,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -87.5,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 18572,
+        "candidate_median": 14600,
+        "baseline_min": 18316,
+        "baseline_max": 18764,
+        "candidate_min": 14408,
+        "candidate_max": 14772,
+        "baseline_range": 448,
+        "candidate_range": 364,
+        "change_percent": -21.387034245100157,
+        "allowed_increase": 448,
+        "pass": true
+      }
+    },
+    "effect-two_quiet-on-131072": {
+      "held_bytes": {
+        "baseline_median": 11747862,
+        "candidate_median": 2900502,
+        "baseline_min": 11747862,
+        "baseline_max": 11747862,
+        "candidate_min": 2900502,
+        "candidate_max": 2900502,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -75.31038413627944,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "owner_bytes": {
+        "baseline_median": 9437184,
+        "candidate_median": 589824,
+        "baseline_min": 9437184,
+        "baseline_max": 9437184,
+        "candidate_min": 589824,
+        "candidate_max": 589824,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -93.75,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "current_rss_kib": {
+        "baseline_median": 26380,
+        "candidate_median": 17608,
+        "baseline_min": 26064,
+        "baseline_max": 26512,
+        "candidate_min": 17544,
+        "candidate_max": 17672,
+        "baseline_range": 448,
+        "candidate_range": 128,
+        "change_percent": -33.2524639878696,
+        "allowed_increase": 448,
+        "pass": true
+      }
+    }
+  },
+  "important_gain_not_qualified": "58.74\u201375.66% lesscompleteApp heldheap,87.5\u201393.75% lessqueueowner,21.39\u201333.41%lowernativecurrentRSS.18failedcontrols:5CPU/elapsed/wholechildfields,4censusRSS,8primaryallocation-callfields,1activebackgroundrequestedbytes. Allgainsthreshold/exceedbothranges; controlsdisqualify.",
+  "mechanism": "ExistingWindowidlecallback checksalleveryWindowquiet30s andlargeemptyAppqueue>32768; reserve8192Effects. NoApp/Windowfields/queue-enqueuehooks/independentAppTask. At2s usesexistingcallbackrearm towaitremaining30s, costing19extraalloccalls perWindow inclresize against8budget. Backgroundlargebursts withoutdraw canrefaultafterreclaim:active requested+18.29MB exceeds3.28MB frozenbudget.",
+  "correctness": "36nativecontract invocations pass expectedbaseline4red/4pass andcandidate8pass inbothbare/census. NativeallWindowquiet/earlyactivity/no-redraw/ordinaryreserve/cancel-on-close/alreadyquiet/refill/callbackownership pass; existingScene/App/Subscriber/cursor/read/nested/idle/retainedoracle16seeds50steps/wheel/dependency/panel/layout/atomic preserved.96fourlanefunctionalchecks andall2296pairedoutputs/state/owner match; App/Windowsizeof unchanged.",
+  "protocol": "Foursequentialbuilds51.05/47.22/47.82/50.86s;1476alternatingbarechildren252.02s,then820countingchildren42.77s. Same59immutableexterns/compiler/System/source/runtime/binary/frozen19methodinputs reverified. Effectquiet periods pollat3s thenthe remainder so2s callback/rearm costsincluded, frozenbeforecandidate. No cohortrepeat.",
+  "attribution": "Ten currentnativecompleteApp/Window deferred-order ownerchildren retain9437184queuebytes after3s withallclosures released, bothretentionmodes. Existingownedlargeclosedheapranks8.4MBsampledestimate; notRSS.",
+  "adverse_setup": "Originalbaselineownerbuild duplicatecountingallocator error preserved; existingtest-only splicefixture changedtocorrectcommoncounter. Prematureattribution afterfailedbuild ranzerochildren andfailedmissingbinary, fullypreserved. Correctedownerbuild/10childrenpass beforecandidate. Beforefreeze preparationscriptfixture-only-copy assertion preserved whereavailable; no candidate/performance samples atthatpoint.",
+  "not_run": "OwningstrictClippy/guards/PR/merge/consumeradoption withheld onfailedperformancegates.",
+  "limits": [
+    "Linux fake-platform completeApp/Window/queuecomponent withSystem; notFincode wholeapp/macOS/Windows/shippedallocator/GPU percentage.",
+    "NativecurrentRSS fromprocstatm afterloop/censusfinish; peakRSS/wholechildCPU fromnativewait4. Virtualscheduler advances testquiet time; timing measures actualCPU work, not a real30s idle appCPU recording.",
+    "Timers exclude App/window/4warmups/finalaudits; census includes completeowner setup/finalheldmemory. Extra cold-refill allocationchurn is explicitlybudgeted, never claimedreduced.",
+    "No oldfailed candidate resampling, no formatting, noinstalledapp orActions. Source current-main independentGPU/style/atlas andownedapp changes preserved.",
+    "Window-scoped idle reuse: noWindow/already-quiet-beforeburst/lastWindowclose andlargeburstwithoutsubsequentdraw canretainoldqueue; no claimofunconditionalApp idlecleanup.",
+    "A largequeue reclaim requires one coldresize of8192*72bytes and may require bounded refill growth after30s. Allcosts included and predeclared; no ordinaryCPU/RSS exemption.",
+    "Prior35-control failedApptimer design unchanged/unmerged; this source changes Windowidle ownership, reserve and callback architecture, not codeplacement tofitnoise.",
+    "Allnew effect quiet periods longerthan3s poll at3s andtheremainder soexisting2s callback/rearm work is measured, notskipped byonevirtualclockjump. This stronger lifecycle fixture frozenbeforecandidate; oldfailedcohortunchanged."
+  ],
+  "policy_sha256": "1ed9ed912a4cb464c6e81dfa41914d9f5928e63580f973740ac77442656aeec0",
+  "archive_sha256": "88920dbfc1f815c650b91646efc8e0776278190fc50d7c680276e803a4e853fb",
+  "archive_bytes": 1312893,
+  "members": 2599,
+  "archive_extension": "Originalfd7b17archivepreservedexact; append2adversepreparation/archival receipts, everyoriginalmemberbyteunchangedandallnewmanifesthashesverified. No performance/gate changes."
+}
