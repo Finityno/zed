@@ -345,6 +345,72 @@ impl Scene {
             .push(PaintOperation::SubpixelSprite(index));
     }
 
+    /// The number of paint operations and of painted glyph sprites so far,
+    /// which tell what a line painted when taken before and after it.
+    pub(crate) fn glyph_watermark(&self) -> GlyphWatermark {
+        GlyphWatermark {
+            operations: self.paint_operations.len(),
+            sprites: self.painted_monochrome_sprites.len() + self.painted_subpixel_sprites.len(),
+        }
+    }
+
+    /// The paint operations since `start`, if every one of them is a glyph
+    /// sprite.
+    pub(crate) fn glyph_sprites_since(&self, start: GlyphWatermark) -> Option<Range<usize>> {
+        let end = self.glyph_watermark();
+        (end.operations - start.operations == end.sprites - start.sprites)
+            .then_some(start.operations..end.operations)
+    }
+
+    /// Paints again the glyph sprites `operations` names in `prev_scene`, all
+    /// of which [`Self::glyph_sprites_since`] found to be glyph sprites, into
+    /// the layer being painted, as painting the same glyphs at the same place
+    /// would: each takes the layer's draw order and the current transition.
+    /// Returns false, having painted nothing, outside a layer, where each
+    /// sprite would take a draw order of its own.
+    pub(crate) fn replay_glyph_sprites(
+        &mut self,
+        prev_scene: &Scene,
+        operations: Range<usize>,
+    ) -> bool {
+        let Some(&order) = self.layer_stack.last() else {
+            return false;
+        };
+        let Some(prev_operations) = prev_scene.paint_operations.get(operations) else {
+            return false;
+        };
+        let pad = self.current_transition;
+        self.paint_operations.reserve(prev_operations.len());
+        for operation in prev_operations {
+            match *operation {
+                PaintOperation::MonochromeSprite(index) => {
+                    let mut sprite = prev_scene.painted_monochrome_sprites[index as usize];
+                    sprite.order = order;
+                    sprite.pad = pad;
+                    let index = self.painted_monochrome_sprites.len() as u32;
+                    self.painted_monochrome_sprites.push(sprite);
+                    self.paint_operations
+                        .push(PaintOperation::MonochromeSprite(index));
+                }
+                PaintOperation::SubpixelSprite(index) => {
+                    let mut sprite = prev_scene.painted_subpixel_sprites[index as usize];
+                    sprite.order = order;
+                    sprite.pad = pad;
+                    let index = self.painted_subpixel_sprites.len() as u32;
+                    self.painted_subpixel_sprites.push(sprite);
+                    self.paint_operations
+                        .push(PaintOperation::SubpixelSprite(index));
+                }
+                PaintOperation::Primitive(_)
+                | PaintOperation::StartLayer(_)
+                | PaintOperation::EndLayer => {
+                    debug_assert!(false, "only glyph sprites are replayed");
+                }
+            }
+        }
+        true
+    }
+
     /// The cull, transition and draw order steps of [`Self::insert_primitive`]
     /// for a glyph sprite; `None` when the sprite is culled.
     fn glyph_sprite_order(
@@ -2037,6 +2103,13 @@ pub(crate) fn primitive_extent(primitive: &Primitive) -> Bounds<ScaledPixels> {
         }
         primitive => *primitive.bounds(),
     }
+}
+
+/// See [`Scene::glyph_watermark`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GlyphWatermark {
+    operations: usize,
+    sprites: usize,
 }
 
 /// A layer a paint operation starts: the bounds it orders what is in it by,

@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, Half, Hsla, LineGlyphPainter, LineLayout, Pixels, Point, Result, SharedString,
-    StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black,
-    fill, point, px, size, underline_y_offset,
+    App, Bounds, Half, Hsla, LineGlyphPainter, LineGlyphsLayout, LineLayout, Pixels, Point, Result,
+    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
+    WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -140,6 +140,7 @@ impl ShapedLine {
             &[],
             window,
             &mut paint_underline,
+            Some(LineGlyphsLayout::Shaped(self.layout.clone())),
         )
     }
 
@@ -391,6 +392,7 @@ impl LineLayout {
             &[],
             window,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
+            None,
         )
     }
 
@@ -470,6 +472,7 @@ impl WrappedLine {
             &self.wrap_boundaries,
             window,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
+            Some(LineGlyphsLayout::Wrapped(self.layout.clone())),
         )?;
 
         Ok(())
@@ -521,6 +524,7 @@ fn paint_line(
         &UnderlineStyle,
         &mut Window,
     ),
+    glyphs_layout: Option<LineGlyphsLayout>,
 ) -> Result<()> {
     let line_bounds = Bounds::new(
         origin,
@@ -530,6 +534,25 @@ fn paint_line(
         ),
     );
     window.paint_layer(line_bounds, |window| {
+        let glyphs_key = glyphs_layout.and_then(|layout| {
+            window.line_glyphs_key(
+                layout,
+                origin,
+                line_height,
+                align,
+                align_width,
+                decoration_runs,
+            )
+        });
+        let recording = match glyphs_key {
+            Some(key) => {
+                if window.replay_line_glyphs(&key) {
+                    return Ok(());
+                }
+                Some(window.record_line_glyphs(key))
+            }
+            None => None,
+        };
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
@@ -831,6 +854,9 @@ fn paint_line(
             );
         }
 
+        if let Some(recording) = recording {
+            window.finish_line_glyphs(recording);
+        }
         Ok(())
     })
 }
@@ -1350,6 +1376,7 @@ mod tests {
                         strokes.push((range, origin, width, *style));
                         window.paint_underline(origin, width, style);
                     },
+                    None,
                 )
                 .unwrap();
                 let (start, width) = if zero_advance {
@@ -1941,13 +1968,14 @@ mod tests {
 #[cfg(test)]
 mod pre_cull_regression_tests {
     use crate::{
-        AppContext as _, Bounds, ContentMask, Context, DevicePixels, Font, FontId,
-        FontMetrics, FontRun,
+        AppContext as _, AtlasTile, Bounds, ContentMask, Context, DevicePixels, DrawOrder, Font,
+        FontId, FontMetrics, FontRun,
         GlyphId, Hsla, IntoElement, LineLayout, NoopTextSystem, Pixels, PlatformTextSystem, Point,
-        ParentElement as _, Render, RenderGlyphParams, Size, Styled as _, TestAppContext,
+        ParentElement as _, Render, RenderGlyphParams, ScaledPixels, Size, Styled as _,
+        TestAppContext,
         TestDispatcher,
         TextAlign,
-        TextRenderingMode, TextRun, Window, black, canvas, div, font, point, px, size,
+        TextRenderingMode, TextRun, Window, black, canvas, div, font, hsla, point, px, size,
     };
     use anyhow::Result;
     use std::{borrow::Cow, cell::Cell, cell::RefCell, rc::Rc, sync::Arc};
@@ -2058,6 +2086,118 @@ mod pre_cull_regression_tests {
                 },
             ))
         }
+    }
+
+    struct ReplayedLine {
+        origin: Rc<Cell<Point<Pixels>>>,
+        color: Rc<Cell<Hsla>>,
+        line: Rc<RefCell<Option<crate::ShapedLine>>>,
+    }
+
+    impl Render for ReplayedLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let origin = self.origin.get();
+            let color = self.color.get();
+            let line = self.line.clone();
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, cx| {
+                        let mut line = line.borrow_mut();
+                        if line
+                            .as_ref()
+                            .is_none_or(|line| line.decoration_runs[0].color != color)
+                        {
+                            let runs = [TextRun {
+                                len: TEXT.len(),
+                                font: font("test"),
+                                color,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }];
+                            *line = Some(window.text_system().shape_line(
+                                TEXT.into(),
+                                FONT_SIZE,
+                                &runs,
+                                None,
+                            ));
+                        }
+                        if let Some(line) = line.as_ref() {
+                            line.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
+                                .unwrap();
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// A line painted again unchanged copies its glyph sprites from the frame
+    /// before, and one moved or recoloured paints them afresh; either way the
+    /// frame holds the sprites drawing it from scratch would.
+    #[test]
+    fn a_line_painted_again_unchanged_replays_the_sprites_it_painted() {
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(InkedTextSystem(NoopTextSystem)),
+        );
+        let origin = Rc::new(Cell::new(point(px(10.), px(20.))));
+        let color = Rc::new(Cell::new(black()));
+        let window = cx.add_window({
+            let origin = origin.clone();
+            let color = color.clone();
+            move |_, _| ReplayedLine {
+                origin,
+                color,
+                line: Rc::default(),
+            }
+        });
+        type Painted = Vec<(Bounds<ScaledPixels>, Hsla, AtlasTile, DrawOrder)>;
+        let mut draw = |from_scratch: bool| -> (Painted, usize) {
+            cx.update_window(window.into(), |_, window, cx| {
+                if from_scratch {
+                    window.line_glyph_cache.forget_previous();
+                }
+                let replayed = window.line_glyph_cache.replayed_lines;
+                window.refresh();
+                window.draw(cx).clear(cx);
+                let painted = window
+                    .rendered_frame
+                    .scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| (sprite.bounds, sprite.color, sprite.tile, sprite.order))
+                    .collect();
+                (painted, window.line_glyph_cache.replayed_lines - replayed)
+            })
+            .unwrap()
+        };
+
+        // Adding the window drew it once already.
+        let (first, replayed) = draw(true);
+        assert_eq!(replayed, 0);
+        assert!(!first.is_empty());
+        let (again, replayed) = draw(false);
+        assert_eq!(replayed, 1);
+        assert_eq!(again, first);
+
+        origin.set(point(px(10.3), px(20.)));
+        let (moved, replayed) = draw(false);
+        assert_eq!(replayed, 0);
+        assert_ne!(moved, first);
+        assert_eq!(moved, draw(true).0);
+
+        color.set(hsla(0.6, 0.5, 0.5, 1.));
+        let (recoloured, replayed) = draw(false);
+        assert_eq!(replayed, 0);
+        assert!(recoloured.iter().all(|(_, color, _, _)| color.h == 0.6));
+        assert_eq!(recoloured, draw(true).0);
+        let (again, replayed) = draw(false);
+        assert_eq!(replayed, 1);
+        assert_eq!(again, recoloured);
     }
 
     /// Every glyph whose ink lands inside the content mask has to reach the scene. The mask here

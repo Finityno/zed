@@ -116,6 +116,10 @@ impl PlatformAtlas for DirectXAtlas {
     fn frame_index(&self) -> u64 {
         self.0.lock().frame_index()
     }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().generation()
+    }
 }
 
 impl AtlasBackend for DirectXAtlasTextures {
