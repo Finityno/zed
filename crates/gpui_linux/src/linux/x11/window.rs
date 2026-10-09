@@ -1,7 +1,7 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
-use crate::linux::X11ClientStatePtr;
+use crate::linux::{X11ClientStatePtr, X11FrameDemand};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -286,6 +286,8 @@ pub struct X11WindowState {
     mapped: bool,
     hovered: bool,
     force_render_after_recovery: bool,
+    /// Set by the client once the window is registered with it.
+    pub(crate) frame_demand: Option<Rc<X11FrameDemand>>,
     fullscreen: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
@@ -296,6 +298,16 @@ pub struct X11WindowState {
 }
 
 impl X11WindowState {
+    /// Renders the next frame even if nothing in the window is dirty, and
+    /// makes sure that frame is requested: an idle window's refresh timer is
+    /// stopped, and a latched forced render alone would never restart it.
+    fn force_render_next_frame(&mut self) {
+        self.force_render_after_recovery = true;
+        if let Some(frame_demand) = self.frame_demand.as_ref() {
+            frame_demand.request();
+        }
+    }
+
     fn is_transparent(&self) -> bool {
         self.background_appearance != WindowBackgroundAppearance::Opaque
     }
@@ -839,6 +851,7 @@ impl X11WindowState {
                 mapped: false,
                 hovered: false,
                 force_render_after_recovery: false,
+                frame_demand: None,
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
@@ -1078,7 +1091,7 @@ impl X11WindowStatePtr {
             // restore needs that frame too: its draw retries the restore.
             if state.renderer.is_unconfigured() {
                 self.restore_surface(&mut state);
-                state.force_render_after_recovery = true;
+                state.force_render_next_frame();
             }
         } else {
             state.renderer.unconfigure_surface();
@@ -1245,6 +1258,12 @@ impl X11WindowStatePtr {
             if state.renderer.recovery_delay().is_none() {
                 request_frame_options.force_render |=
                     std::mem::take(&mut state.force_render_after_recovery);
+            } else if state.force_render_after_recovery
+                && let Some(frame_demand) = state.frame_demand.as_ref()
+            {
+                // Keep the refresh timer ticking through the backoff so the
+                // latched render is delivered once the attempt is due.
+                frame_demand.request();
             }
             drop(state);
             fun(request_frame_options);
@@ -1756,6 +1775,15 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().fullscreen
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // The demand holds no reference to the window (only its id and the
+        // event loop handle), so the waker, stored in GPUI's invalidator,
+        // cannot keep the window alive.
+        let frame_demand = self.0.state.borrow().frame_demand.clone()?;
+        frame_demand.mark_waker_installed();
+        Some(Rc::new(move || frame_demand.request()))
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1818,7 +1846,7 @@ impl PlatformWindow for X11Window {
                 }
             }
 
-            inner.force_render_after_recovery = true;
+            inner.force_render_next_frame();
             return;
         }
 
@@ -1831,14 +1859,14 @@ impl PlatformWindow for X11Window {
             if inner.renderer.is_unconfigured() {
                 // Still released: force the next frame so it retries, since an
                 // idle window would otherwise never draw again.
-                inner.force_render_after_recovery = true;
+                inner.force_render_next_frame();
                 return;
             }
         }
         inner.renderer.draw(scene);
 
         if inner.renderer.needs_redraw() {
-            inner.force_render_after_recovery = true;
+            inner.force_render_next_frame();
         }
     }
 

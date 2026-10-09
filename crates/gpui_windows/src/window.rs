@@ -98,6 +98,11 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    /// Whether GPUI wants a frame. The platform's vsync thread only
+    /// invalidates windows whose flag is set (consuming it), so an idle
+    /// window is not painted on every vsync. Starts set so the first frame
+    /// draws; shared with the platform's window registry.
+    pub(crate) frame_demand: Arc<AtomicBool>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -180,8 +185,10 @@ impl WindowsWindowState {
         let fullscreen = None;
         let initial_placement = None;
 
-        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
-            .context("initializing Direct Manipulation")?;
+        let frame_demand = Arc::new(AtomicBool::new(true));
+        let direct_manipulation =
+            DirectManipulationHandler::new(hwnd, scale_factor, Arc::clone(&frame_demand))
+                .context("initializing Direct Manipulation")?;
 
         Ok(Self {
             origin: Cell::new(origin),
@@ -207,6 +214,7 @@ impl WindowsWindowState {
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            frame_demand,
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -1104,6 +1112,16 @@ impl PlatformWindow for WindowsWindow {
 
     fn is_fullscreen(&self) -> bool {
         self.state.is_fullscreen()
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Only the shared flag is captured, never the window state, so the
+        // waker (stored in GPUI's invalidator, which the request-frame
+        // callback owns) cannot keep the window alive.
+        let frame_demand = self.state.frame_demand.clone();
+        Some(Rc::new(move || {
+            frame_demand.store(true, std::sync::atomic::Ordering::Release)
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

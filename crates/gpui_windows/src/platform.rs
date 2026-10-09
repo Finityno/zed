@@ -39,9 +39,21 @@ use windows::{
 use crate::*;
 use gpui::*;
 
+pub(crate) struct RegisteredWindow {
+    hwnd: SafeHwnd,
+    /// The window's [`WindowsWindowState::frame_demand`].
+    frame_demand: Arc<AtomicBool>,
+}
+
+impl RegisteredWindow {
+    pub(crate) fn as_raw(&self) -> HWND {
+        self.hwnd.as_raw()
+    }
+}
+
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
-    raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    raw_window_handles: Arc<RwLock<SmallVec<[RegisteredWindow; 4]>>>,
     // The below members will never change throughout the entire lifecycle of the app.
     headless: bool,
     icon: HICON,
@@ -63,7 +75,7 @@ pub struct WindowsPlatform {
 
 struct WindowsPlatformInner {
     state: WindowsPlatformState,
-    raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    raw_window_handles: std::sync::Weak<RwLock<SmallVec<[RegisteredWindow; 4]>>>,
     // The below members will never change throughout the entire lifecycle of the app.
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
@@ -403,9 +415,17 @@ impl WindowsPlatform {
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
-                    for hwnd in all_windows.read().iter() {
+                    for window in all_windows.read().iter() {
+                        // Only windows that asked for a frame are painted, so
+                        // an idle window costs no main-thread wakeup per
+                        // vsync. Swapping consumes the demand: GPUI re-arms
+                        // it after each frame for as long as it still needs
+                        // frames.
+                        if !window.frame_demand.swap(false, Ordering::AcqRel) {
+                            continue;
+                        }
                         unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            let _ = RedrawWindow(Some(window.as_raw()), None, None, RDW_INVALIDATE);
                         }
                     }
                 }
@@ -676,7 +696,10 @@ impl Platform for WindowsPlatform {
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
         let handle = window.get_raw_handle();
         window.state.registered_with_platform.set(true);
-        self.raw_window_handles.write().push(handle.into());
+        self.raw_window_handles.write().push(RegisteredWindow {
+            hwnd: handle.into(),
+            frame_demand: window.state.frame_demand.clone(),
+        });
 
         Ok(Box::new(window))
     }
@@ -1324,7 +1347,7 @@ pub(crate) struct WindowCreationInfo {
 
 struct PlatformWindowCreateContext {
     inner: Option<Result<Rc<WindowsPlatformInner>>>,
-    raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    raw_window_handles: std::sync::Weak<RwLock<SmallVec<[RegisteredWindow; 4]>>>,
     validation_number: usize,
     main_sender: Option<PriorityQueueSender<RunnableVariant>>,
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
@@ -1552,7 +1575,7 @@ fn handle_gpu_device_lost(
     directx_devices: &mut DirectXDevices,
     platform_window: HWND,
     validation_number: usize,
-    all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    all_windows: &std::sync::Weak<RwLock<SmallVec<[RegisteredWindow; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
     // Here we wait a bit to ensure the system has time to recover from the device lost state.

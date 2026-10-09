@@ -59,7 +59,10 @@ use gpui_util::ResultExt;
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
@@ -81,7 +84,16 @@ impl Registry {
 struct DisplayEntry {
     link: sys::DisplayLink,
     running: bool,
-    subscribers: Vec<(SubscriberId, DispatchRetained<DispatchSource>)>,
+    subscribers: Vec<Subscriber>,
+}
+
+struct Subscriber {
+    id: SubscriberId,
+    frame_requests: DispatchRetained<DispatchSource>,
+    /// Set by the window when it wants a frame; the output callback only
+    /// delivers a request to subscribers that asked for one, so an idle
+    /// window is not woken on every refresh.
+    frame_demand: Arc<AtomicBool>,
 }
 
 // SAFETY: Both fields wrapping raw pointers are refcounted handles to
@@ -127,8 +139,13 @@ unsafe extern "C" fn display_link_output_callback(
     let display_id = display_id as usize as CGDirectDisplayID;
     let registry = lock_registry();
     if let Some(entry) = registry.displays.get(&display_id) {
-        for (_, frame_requests) in &entry.subscribers {
-            frame_requests.merge_data(1);
+        for subscriber in &entry.subscribers {
+            // Swap rather than load: each demand produces at least one
+            // request, and the window re-arms the flag after that frame if
+            // it still wants frames.
+            if subscriber.frame_demand.swap(false, Ordering::AcqRel) {
+                subscriber.frame_requests.merge_data(1);
+            }
         }
     }
     0
@@ -137,6 +154,7 @@ unsafe extern "C" fn display_link_output_callback(
 fn subscribe(
     display_id: CGDirectDisplayID,
     frame_requests: DispatchRetained<DispatchSource>,
+    frame_demand: Arc<AtomicBool>,
 ) -> Result<SubscriberId> {
     debug_assert_main_thread();
 
@@ -175,7 +193,11 @@ fn subscribe(
                 anyhow::bail!("display link registry entry vanished for display {display_id}");
             }
         };
-        entry.subscribers.push((subscriber_id, frame_requests));
+        entry.subscribers.push(Subscriber {
+            id: subscriber_id,
+            frame_requests,
+            frame_demand,
+        });
         let link_to_start = if entry.running {
             None
         } else {
@@ -192,7 +214,9 @@ fn subscribe(
             let mut registry = lock_registry();
             if let Some(entry) = registry.displays.get_mut(&display_id) {
                 entry.running = false;
-                entry.subscribers.retain(|(id, _)| *id != subscriber_id);
+                entry
+                    .subscribers
+                    .retain(|subscriber| subscriber.id != subscriber_id);
             }
             return Err(error);
         }
@@ -209,7 +233,9 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
         let Some(entry) = registry.displays.get_mut(&display_id) else {
             return;
         };
-        entry.subscribers.retain(|(id, _)| *id != subscriber_id);
+        entry
+            .subscribers
+            .retain(|subscriber| subscriber.id != subscriber_id);
         if entry.subscribers.is_empty() && entry.running {
             entry.running = false;
             Some(entry.link.clone())
@@ -228,13 +254,25 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 /// A per-window source of frame requests, paced by the display the window is
 /// on. The wrapped dispatch source coalesces vsync ticks from the display's
 /// io thread and invokes `callback(data)` on the main queue.
+///
+/// Requests are demand-driven: a refresh only reaches the window when its
+/// `frame_demand` flag was set since the last delivered request. The link itself keeps running
+/// while the window is subscribed; starting and stopping it per idle period
+/// would reintroduce the teardown races described above.
 pub struct WindowFrameSource {
     frame_requests: DispatchRetained<DispatchSource>,
+    frame_demand: Arc<AtomicBool>,
     registration: Option<(CGDirectDisplayID, SubscriberId)>,
 }
 
 impl WindowFrameSource {
-    pub fn new(data: *mut c_void, callback: extern "C" fn(*mut c_void)) -> Self {
+    /// `frame_demand` is shared with whoever asks for frames; setting it
+    /// (from any thread) asks for a request on the display's next refresh.
+    pub fn new(
+        data: *mut c_void,
+        callback: extern "C" fn(*mut c_void),
+        frame_demand: Arc<AtomicBool>,
+    ) -> Self {
         let frame_requests = unsafe {
             let frame_requests = DispatchSource::new(
                 &raw const _dispatch_source_type_data_add as *mut _,
@@ -251,13 +289,22 @@ impl WindowFrameSource {
         };
         Self {
             frame_requests,
+            frame_demand,
             registration: None,
         }
     }
 
     pub fn start(&mut self, display_id: CGDirectDisplayID) -> Result<()> {
         self.stop();
-        let subscriber_id = subscribe(display_id, self.frame_requests.clone())?;
+        // A (re)subscription follows an occlusion, screen, resize or
+        // activation change; deliver a frame on the first refresh so the
+        // window catches up even if nothing was pending.
+        self.frame_demand.store(true, Ordering::Release);
+        let subscriber_id = subscribe(
+            display_id,
+            self.frame_requests.clone(),
+            self.frame_demand.clone(),
+        )?;
         self.registration = Some((display_id, subscriber_id));
         Ok(())
     }
