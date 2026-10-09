@@ -1531,7 +1531,7 @@ pub struct Window {
     /// that reclaims per-frame capacity once that is `SHRINK_AFTER_DURATION`
     /// ago; see [`Self::reclaim_idle_capacity`].
     last_draw_at: Instant,
-    idle_capacity_reclaim: Option<Task<()>>,
+    pub(crate) idle_capacity_reclaim: Option<Task<()>>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -9549,20 +9549,43 @@ mod tests {
             })
         };
         let (heavy_chunks, heavy_elements) = arena_retained(cx);
+        assert!(heavy_elements > 0);
         assert!(heavy_chunks > 1024 * 1024);
 
         cx.executor().advance_clock(Duration::from_secs(3));
         cx.run_until_parked();
         let (idle_chunks, idle_elements) = arena_retained(cx);
-        eprintln!(
-            "element arena after a heavy draw: chunks {heavy_chunks} B, element list {heavy_elements} B; \
-             after idle: chunks {idle_chunks} B, element list {idle_elements} B"
-        );
         assert_eq!(idle_chunks, 1024 * 1024);
         assert_eq!(idle_elements, 0);
 
         draw_window(cx, window.into());
         assert_eq!(arena_retained(cx).0, heavy_chunks);
+    }
+
+    #[gpui::test]
+    fn test_closing_a_window_before_its_reclaim_still_frees_its_arena(cx: &mut TestAppContext) {
+        let idle_window = cx.add_window(|_, _| QuadGrid {
+            quads: Rc::new(Cell::new(1)),
+        });
+        draw_window(cx, idle_window.into());
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+
+        let heavy_window = cx.add_window(|_, _| QuadGrid {
+            quads: Rc::new(Cell::new(20_000)),
+        });
+        draw_window(cx, heavy_window.into());
+        assert!(cx.update(|cx| cx.element_arena.borrow().capacity()) > 1024 * 1024);
+        heavy_window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| cx.element_arena.borrow().capacity()),
+            1024 * 1024
+        );
     }
 
     /// Prints how long the first heavy draw after an idle reclaim takes next

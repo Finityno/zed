@@ -266,7 +266,8 @@ impl Arena {
     /// arena for as long as the app sits idle. The busy-draw guard is the per-clear policy's: a
     /// draw that needed every chunk within `SHRINK_AFTER_DURATION` keeps them,
     /// since the arena is shared by every window and another one may be the
-    /// heavy drawer. Returns whether any chunk was freed.
+    /// heavy drawer. Returns whether any chunk or element-list capacity was
+    /// freed.
     pub(crate) fn release_idle_chunks(&mut self, now: Instant) -> bool {
         if now.saturating_duration_since(self.last_high_use) < SHRINK_AFTER_DURATION {
             return false;

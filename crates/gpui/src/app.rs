@@ -39,6 +39,7 @@ pub use visual_test_context::*;
 
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
+use crate::arena::SHRINK_AFTER_DURATION;
 use crate::asset_cache::CachedLoad;
 use crate::{
     Action, ActionBuildError, ActionRegistry, ActivityGuard, Any, AnyView, AnyWindowHandle,
@@ -2981,6 +2982,19 @@ impl App {
                 cx.window_update_stack.pop();
 
                 if window.removed {
+                    // The window's own idle reclaim is dropped with it, so a
+                    // heavy last frame would keep its arena chunks until some
+                    // other window happened to draw.
+                    if window.idle_capacity_reclaim.is_some() {
+                        cx.spawn(async move |cx| {
+                            cx.background_executor().timer(SHRINK_AFTER_DURATION).await;
+                            cx.update(|cx| {
+                                let now = cx.background_executor().now();
+                                cx.element_arena.borrow_mut().release_idle_chunks(now);
+                            });
+                        })
+                        .detach();
+                    }
                     cx.end_platform_drag(window_id);
                     cx.window_handles.remove(&window_id);
                     cx.windows.remove(window_id);
