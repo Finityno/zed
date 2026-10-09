@@ -3,6 +3,7 @@ use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle, RegistrationToken,
     generic::{FdWrapper, Generic},
+    ping::Ping,
 };
 use collections::HashMap;
 use core::str;
@@ -130,8 +131,12 @@ enum RefreshState {
 /// that asked for a frame, and stops ticking once one goes idle, so an idle
 /// window costs no wakeups at the display's refresh rate.
 pub(crate) struct X11FrameDemand {
-    x_window: xproto::Window,
-    loop_handle: LoopHandle<'static, X11Client>,
+    /// Wakes the client's resume source, which restarts the refresh timers of
+    /// windows whose demand came back. The waker runs inside foreground tasks,
+    /// which X11 dispatches from calloop idle callbacks while calloop holds its
+    /// idle list borrowed, so it must never insert an idle or a source itself;
+    /// a ping only writes to an eventfd.
+    resume_ping: Ping,
     /// Set when a frame is wanted, consumed by the refresh tick that
     /// delivers it. Starts set so the first frame draws.
     requested: Cell<bool>,
@@ -144,10 +149,9 @@ pub(crate) struct X11FrameDemand {
 }
 
 impl X11FrameDemand {
-    fn new(x_window: xproto::Window, loop_handle: LoopHandle<'static, X11Client>) -> Self {
+    fn new(resume_ping: Ping) -> Self {
         Self {
-            x_window,
-            loop_handle,
+            resume_ping,
             requested: Cell::new(true),
             paused: Cell::new(false),
             waker_installed: Cell::new(false),
@@ -155,15 +159,13 @@ impl X11FrameDemand {
     }
 
     /// Asks for a frame on the next refresh tick, restarting the refresh
-    /// timer if it stopped for idleness. Safe to call while the client or the
-    /// window is borrowed: the restart is deferred to an idle callback.
+    /// timer if it stopped for idleness. Safe to call from anywhere, including
+    /// while the client or the window is borrowed and from inside a calloop
+    /// callback: the restart happens when the event loop dispatches the ping.
     pub(crate) fn request(&self) {
         self.requested.set(true);
         if self.paused.replace(false) {
-            let x_window = self.x_window;
-            self.loop_handle.insert_idle(move |client| {
-                client.0.borrow_mut().resume_refresh_loop(x_window);
-            });
+            self.resume_ping.ping();
         }
     }
 
@@ -232,6 +234,9 @@ struct ScrollAxisState {
 
 pub struct X11ClientState {
     pub(crate) loop_handle: LoopHandle<'static, X11Client>,
+    /// Shared by every window's [`X11FrameDemand`]; registered once, so a
+    /// frame request never has to touch calloop's source or idle lists.
+    frame_resume_ping: Ping,
     pub(crate) event_loop: Option<calloop::EventLoop<'static, X11Client>>,
 
     pub(crate) last_click: Instant,
@@ -415,6 +420,14 @@ impl X11Client {
                 anyhow!("Failed to initialize event loop handling of sleep/wake events: {err:?}")
             })?;
 
+        let (frame_resume_ping, frame_resume_ping_source) = calloop::ping::make_ping()
+            .map_err(|err| anyhow!("Failed to create the X11 frame resume ping: {err:?}"))?;
+        handle
+            .insert_source(frame_resume_ping_source, |(), &mut (), client: &mut X11Client| {
+                client.0.borrow_mut().resume_requested_refresh_loops();
+            })
+            .map_err(|err| anyhow!("Failed to initialize X11 frame resume source: {err:?}"))?;
+
         let (xcb_connection, x_root_index) = XCBConnection::connect(None)?;
         xcb_connection.prefetch_extension_information(xkb::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(randr::X11_EXTENSION_NAME)?;
@@ -586,6 +599,7 @@ impl X11Client {
             last_capslock_changed_event: Capslock::default(),
             event_loop: Some(event_loop),
             loop_handle: handle,
+            frame_resume_ping,
             common,
             last_click: Instant::now(),
             last_mouse_button: None,
@@ -1735,7 +1749,7 @@ impl LinuxClient for X11Client {
         .log_err();
         xcb_flush(&state.xcb_connection);
 
-        let frame_demand = Rc::new(X11FrameDemand::new(x_window, state.loop_handle.clone()));
+        let frame_demand = Rc::new(X11FrameDemand::new(state.frame_resume_ping.clone()));
         window.0.state.borrow_mut().frame_demand = Some(frame_demand.clone());
         let window_ref = WindowRef {
             window: window.0.clone(),
@@ -2069,25 +2083,30 @@ impl X11ClientState {
         }
     }
 
-    /// Restarts a visible window's refresh timer after it stopped for
-    /// idleness. A no-op if the window is gone, hidden, or already ticking.
-    fn resume_refresh_loop(&mut self, x_window: xproto::Window) {
-        let Some(window_ref) = self.windows.get(&x_window) else {
-            return;
-        };
-        let Some(RefreshState::PeriodicRefresh {
-            refresh_rate,
-            event_loop_token: None,
-        }) = window_ref.refresh_state
-        else {
-            return;
-        };
-        let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
-        if let Some(window_ref) = self.windows.get_mut(&x_window) {
-            window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
-                refresh_rate,
-                event_loop_token: Some(event_loop_token),
-            });
+    /// Restarts the refresh timers of visible windows that stopped for
+    /// idleness and have since asked for a frame. Windows that are gone,
+    /// hidden, still idle or already ticking are left alone, so a stale or
+    /// coalesced ping is harmless.
+    fn resume_requested_refresh_loops(&mut self) {
+        let windows_to_resume: SmallVec<[(xproto::Window, Duration); 2]> = self
+            .windows
+            .iter()
+            .filter_map(|(x_window, window_ref)| match window_ref.refresh_state {
+                Some(RefreshState::PeriodicRefresh {
+                    refresh_rate,
+                    event_loop_token: None,
+                }) if !window_ref.frame_demand.paused.get() => Some((*x_window, refresh_rate)),
+                _ => None,
+            })
+            .collect();
+        for (x_window, refresh_rate) in windows_to_resume {
+            let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
+            if let Some(window_ref) = self.windows.get_mut(&x_window) {
+                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
+                    refresh_rate,
+                    event_loop_token: Some(event_loop_token),
+                });
+            }
         }
     }
 
@@ -3283,5 +3302,51 @@ mod tests {
 
         // Assert pressing space while on the Czech layout still types a space.
         assert_eq!(key_event_state.key_get_utf8(space), " ");
+    }
+
+    // X11 runs every foreground task inside a calloop idle callback, and calloop
+    // holds its idle list borrowed while dispatching one, so a frame request
+    // made from a task (any `cx.notify()` after the window went idle) must not
+    // touch the event loop's idle or source lists.
+    #[test]
+    fn frame_request_from_an_idle_callback_resumes_through_the_ping() {
+        let mut event_loop = EventLoop::<'static, usize>::try_new().expect("event loop");
+        let handle = event_loop.handle();
+        let (resume_ping, resume_ping_source) =
+            calloop::ping::make_ping().expect("resume ping");
+        handle
+            .insert_source(resume_ping_source, |(), &mut (), resumes: &mut usize| {
+                *resumes += 1;
+            })
+            .expect("resume source");
+
+        let frame_demand = Rc::new(X11FrameDemand::new(resume_ping));
+        frame_demand.requested.set(false);
+        frame_demand.paused.set(true);
+        handle.insert_idle({
+            let frame_demand = frame_demand.clone();
+            move |_| {
+                frame_demand.request();
+                frame_demand.request();
+            }
+        });
+
+        let mut resumes = 0;
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut resumes)
+            .expect("dispatch idle");
+        assert!(frame_demand.requested.get());
+        assert!(!frame_demand.paused.get());
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut resumes)
+            .expect("dispatch ping");
+        assert_eq!(resumes, 1);
+
+        // A request while the timer runs needs no resume.
+        frame_demand.request();
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut resumes)
+            .expect("dispatch without ping");
+        assert_eq!(resumes, 1);
     }
 }

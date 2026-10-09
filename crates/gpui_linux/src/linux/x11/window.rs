@@ -298,6 +298,16 @@ pub struct X11WindowState {
 }
 
 impl X11WindowState {
+    /// Renders the next frame even if nothing in the window is dirty, and
+    /// makes sure that frame is requested: an idle window's refresh timer is
+    /// stopped, and a latched forced render alone would never restart it.
+    fn force_render_next_frame(&mut self) {
+        self.force_render_after_recovery = true;
+        if let Some(frame_demand) = self.frame_demand.as_ref() {
+            frame_demand.request();
+        }
+    }
+
     fn is_transparent(&self) -> bool {
         self.background_appearance != WindowBackgroundAppearance::Opaque
     }
@@ -1081,7 +1091,7 @@ impl X11WindowStatePtr {
             // restore needs that frame too: its draw retries the restore.
             if state.renderer.is_unconfigured() {
                 self.restore_surface(&mut state);
-                state.force_render_after_recovery = true;
+                state.force_render_next_frame();
             }
         } else {
             state.renderer.unconfigure_surface();
@@ -1248,6 +1258,12 @@ impl X11WindowStatePtr {
             if state.renderer.recovery_delay().is_none() {
                 request_frame_options.force_render |=
                     std::mem::take(&mut state.force_render_after_recovery);
+            } else if state.force_render_after_recovery
+                && let Some(frame_demand) = state.frame_demand.as_ref()
+            {
+                // Keep the refresh timer ticking through the backoff so the
+                // latched render is delivered once the attempt is due.
+                frame_demand.request();
             }
             drop(state);
             fun(request_frame_options);
@@ -1830,12 +1846,7 @@ impl PlatformWindow for X11Window {
                 }
             }
 
-            inner.force_render_after_recovery = true;
-            // The forced render runs on the next frame request; make sure
-            // one comes even if nothing else is pending.
-            if let Some(frame_demand) = inner.frame_demand.as_ref() {
-                frame_demand.request();
-            }
+            inner.force_render_next_frame();
             return;
         }
 
@@ -1848,17 +1859,14 @@ impl PlatformWindow for X11Window {
             if inner.renderer.is_unconfigured() {
                 // Still released: force the next frame so it retries, since an
                 // idle window would otherwise never draw again.
-                inner.force_render_after_recovery = true;
+                inner.force_render_next_frame();
                 return;
             }
         }
         inner.renderer.draw(scene);
 
         if inner.renderer.needs_redraw() {
-            inner.force_render_after_recovery = true;
-            if let Some(frame_demand) = inner.frame_demand.as_ref() {
-                frame_demand.request();
-            }
+            inner.force_render_next_frame();
         }
     }
 
