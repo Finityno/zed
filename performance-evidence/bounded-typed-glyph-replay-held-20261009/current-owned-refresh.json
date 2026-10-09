@@ -1,0 +1,11 @@
+{
+  "observed_at": "2026-10-09",
+  "zed_main": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "fincode_main": "555df3dabfc88211ee04681efb167e56dd4a3753",
+  "pins": [
+    "gpui = { git = \"https://github.com/Finityno/zed.git\", rev = \"08d5555709d7afab3936c7afcd9f7f0ff9ecbd65\", features = [",
+    "gpui_platform = { git = \"https://github.com/Finityno/zed.git\", rev = \"08d5555709d7afab3936c7afcd9f7f0ff9ecbd65\", features = [",
+    "sum_tree = { git = \"https://github.com/Finityno/zed.git\", rev = \"08d5555709d7afab3936c7afcd9f7f0ff9ecbd65\" }",
+    "gpui-component = { git = \"https://github.com/Finityno/gpui-component.git\", rev = \"ab07cd7695af1dfd9f1c6ad06a77660d288e568d\" }"
+  ]
+}

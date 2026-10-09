@@ -681,6 +681,9 @@ impl Scene {
         rebase: Option<(u32, u32)>,
         moved: Option<&SceneMove>,
     ) {
+        if range.len() >= 64 {
+            return self.replay_inside_large(range, prev_scene, rebase, moved);
+        }
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
         let mut remapped_animation = (0, 0);
@@ -747,6 +750,122 @@ impl Scene {
                         effect.animation = remapped_animation.1;
                     }
                     self.insert_primitive(primitive)
+                }
+                PaintOperation::StartLayer(layer) => match moved {
+                    Some(moved) => {
+                        // Clipped again by the mask it is in now, as painting
+                        // it there would.
+                        let extent = moved.bounds(layer.extent);
+                        let mask = moved.mask(&ContentMask { bounds: layer.mask }).bounds;
+                        let clipped = extent.intersect(&mask);
+                        let left_out = clipped.is_empty();
+                        if !left_out {
+                            let bounds = Bounds::from_corners(
+                                point(
+                                    ScaledPixels(clipped.origin.x.0.floor()),
+                                    ScaledPixels(clipped.origin.y.0.floor()),
+                                ),
+                                point(
+                                    ScaledPixels(clipped.bottom_right().x.0.ceil()),
+                                    ScaledPixels(clipped.bottom_right().y.0.ceil()),
+                                ),
+                            );
+                            self.push_clipped_layer(bounds, extent, mask);
+                        }
+                        layers_left_out.push(left_out);
+                    }
+                    None => {
+                        self.push_clipped_layer(layer.bounds, layer.extent, layer.mask);
+                        layers_left_out.push(false);
+                    }
+                },
+                PaintOperation::EndLayer => {
+                    if !layers_left_out.pop().unwrap_or(false) {
+                        self.pop_layer();
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn replay_inside_large(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        rebase: Option<(u32, u32)>,
+        moved: Option<&SceneMove>,
+    ) {
+        // Every glyph of one shimmering label names the same sweep, so the
+        // label's glyphs share one remapped entry rather than one each.
+        let mut remapped_animation = (0, 0);
+        let mut remapped_transitions: Vec<(u32, u32)> = Vec::new();
+        // Only content drawn again from a view's record is compacted; a
+        // cached view's replay stays as it was.
+        let landed_before = rebase.map(|_| std::time::Instant::now());
+        let rebase = rebase.filter(|(from, to)| from != to);
+        remapped_transitions.extend(rebase);
+        // Layers moved out from under the mask around them are left out, as
+        // painting them there would have; so is the end of each.
+        let mut layers_left_out: Vec<bool> = Vec::new();
+        for operation in &prev_scene.paint_operations[range] {
+            match operation {
+                PaintOperation::Primitive(_)
+                | PaintOperation::MonochromeSprite(_)
+                | PaintOperation::SubpixelSprite(_) => {
+                    let mut primitive = match operation {
+                        PaintOperation::MonochromeSprite(index) => Primitive::MonochromeSprite(
+                            prev_scene.painted_monochrome_sprites[*index as usize],
+                        ),
+                        PaintOperation::SubpixelSprite(index) => Primitive::SubpixelSprite(
+                            prev_scene.painted_subpixel_sprites[*index as usize],
+                        ),
+                        PaintOperation::Primitive(primitive) => primitive.clone(),
+                        PaintOperation::StartLayer(_) | PaintOperation::EndLayer => continue,
+                    };
+                    if let Some(moved) = moved {
+                        moved.move_primitive(&mut primitive);
+                    }
+                    let transition = primitive_transition(&primitive);
+                    if let Some((from, to)) = rebase
+                        && transition == from
+                    {
+                        set_primitive_transition(&mut primitive, to);
+                    } else if transition != 0 {
+                        let remapped = self.remap_transition(
+                            prev_scene,
+                            transition,
+                            &mut remapped_transitions,
+                            landed_before,
+                        );
+                        set_primitive_transition(&mut primitive, remapped);
+                    }
+                    if let Primitive::Quad(quad) = &mut primitive
+                        && quad.background.time_animation() != 0
+                    {
+                        let animation = self.push_quad_animation(
+                            prev_scene.quad_animations
+                                [quad.background.time_animation() as usize - 1],
+                        );
+                        quad.background = quad.background.with_time_animation(animation);
+                    }
+                    if let Primitive::MonochromeSprite(MonochromeSprite { effect, .. })
+                    | Primitive::SubpixelSprite(SubpixelSprite { effect, .. }) = &mut primitive
+                        && effect.animation != 0
+                    {
+                        if remapped_animation.0 != effect.animation {
+                            let animation =
+                                prev_scene.shimmer_animations[effect.animation as usize - 1];
+                            remapped_animation =
+                                (effect.animation, self.push_shimmer_animation(animation));
+                        }
+                        effect.animation = remapped_animation.1;
+                    }
+                    match primitive {
+                        Primitive::MonochromeSprite(sprite) => self.insert_monochrome_sprite(sprite),
+                        Primitive::SubpixelSprite(sprite) => self.insert_subpixel_sprite(sprite),
+                        primitive => self.insert_primitive(primitive),
+                    }
                 }
                 PaintOperation::StartLayer(layer) => match moved {
                     Some(moved) => {
@@ -3497,5 +3616,44 @@ mod glyph_drop_diagnostic_tests {
         // miss. That is the most suspicious geometry of all and must not read as "far away".
         assert_eq!(mask_miss_distances(&bounds(92., 150., 8., 10.), &mask).0, 0.0);
         assert_eq!(mask_miss_distances(&bounds(150., 150., 8., 10.), &mask), (0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod bounded_typed_replay_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_replay_preserves_payloads_at_dispatch_boundaries() {
+        let bounds = Bounds { origin: Point::default(), size: Size { width: ScaledPixels::from(100.), height: ScaledPixels::from(100.) } };
+        for count in [63, 64, 65, 128, 256] {
+            let mut source = Scene::default();
+            source.push_layer(bounds);
+            for index in 0..count - 2 {
+                let sprite = MonochromeSprite {
+                    bounds, content_mask: ContentMask { bounds }, color: crate::white(),
+                    tile: AtlasTile { texture_id: crate::AtlasTextureId { index: 0, kind: crate::AtlasTextureKind::Monochrome }, tile_id: crate::TileId(index as u32), padding: 0, bounds: Bounds::default() },
+                    transformation: TransformationMatrix::unit(), order: 0, pad: 0, effect: SpriteEffect::default()
+                };
+                match index % 3 {
+                    0 => source.insert_primitive(Quad { bounds, content_mask: ContentMask { bounds }, background: Background::from(Hsla::black()), ..Default::default() }),
+                    1 => source.insert_monochrome_sprite(sprite),
+                    _ => source.insert_subpixel_sprite(SubpixelSprite {
+                        order: sprite.order, pad: sprite.pad, bounds: sprite.bounds, content_mask: sprite.content_mask,
+                        color: sprite.color, effect: sprite.effect, tile: sprite.tile, transformation: sprite.transformation,
+                    }),
+                }
+            }
+            source.pop_layer();
+            assert_eq!(source.len(), count);
+            let mut replayed = Scene::default();
+            replayed.replay_inside(0..source.len(), &source, None, None);
+            assert_eq!(replayed.len(), count);
+            source.finish();
+            replayed.finish();
+            assert_eq!(format!("{:?}", source.quads), format!("{:?}", replayed.quads));
+            assert_eq!(format!("{:?}", source.monochrome_sprites), format!("{:?}", replayed.monochrome_sprites));
+            assert_eq!(format!("{:?}", source.subpixel_sprites), format!("{:?}", replayed.subpixel_sprites));
+        }
     }
 }

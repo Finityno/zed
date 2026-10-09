@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/workspace/scratch/gpui-bounded-glyph-replay-loop/comparison/baseline-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+    "window::view_retention::tests::a_cold_long_line_does_not_keep_one_wide_record_per_glyph",
+    "--exact",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "started_unix": 1791578445.4313807,
+  "finished_unix": 1791578445.4390907,
+  "exit_code": 101,
+  "log": "/workspace/scratch/gpui-bounded-glyph-replay-loop/comparison/inherited-baseline-cold-line-memory-contract.log",
+  "log_sha256": "ad676dd0d022d2fa5b5e092ac5f7c97ae24f498723c22372afc6fc177f66626f",
+  "classification": "Known inherited private compact-record memory contract, excluded from typed scalar dispatch qualification. Both exact baseline and candidate fail; no correctness pass claimed for this contract."
+}

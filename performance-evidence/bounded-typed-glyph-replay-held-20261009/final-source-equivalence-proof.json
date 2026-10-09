@@ -1,0 +1,14 @@
+{
+  "checked_unix": 1791578439.0560179,
+  "all_original_bytes_except_guard_and_large_kernel_unchanged": true,
+  "small_body_byte_exact_after_guard": true,
+  "large_body_byte_exact_except_final_typed_insertion": true,
+  "existing_observer_and_test_changes_insertion_only": true,
+  "compiled_both_lanes_share_exact_observers_and_boundary_test": true,
+  "production_source": "f2b40ab0bb4506b3411d0b3435102103c77a2b70",
+  "policy_sha256": "0a4b9fae3d5411efc087f9c231fc34c6aa25fc58b148a28e6fe897bdd5e7a380",
+  "baseline_private_insertions": [
+    10,
+    117
+  ]
+}

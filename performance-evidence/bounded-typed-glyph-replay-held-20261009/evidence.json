@@ -1,0 +1,30 @@
+{
+  "production_source": "f2b40ab0bb4506b3411d0b3435102103c77a2b70",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "archive_sha256": "aa7e0166d7e6da883f0f30c40024fa9ecdf9a7000724d97ac260c0548cd5bada",
+  "archive_bytes": 8643355,
+  "archive_members": 5555,
+  "identical_member_hardlinks": 905,
+  "all_members_byte_exact_roundtrip": true,
+  "children": 3810,
+  "failed_fields": 27,
+  "all_record_owner_widths_counts_capacities_unchanged": true,
+  "all_primary_gain_gates_pass": false,
+  "all_requested_heap_churn_controls_pass": true,
+  "held": true,
+  "merged": false,
+  "never_resample_unchanged": true,
+  "no_app_GPU_platform_shipped_allocator_gain": true,
+  "parts": [
+    {
+      "path": "performance-evidence/bounded-typed-glyph-replay-held-20261009/receipts.tar.gz.part-000",
+      "bytes": 8388608,
+      "sha256": "ca71cc9921a71e65374c1a4db4acca3203b629dfda5b50a3b63053923d5f45e1"
+    },
+    {
+      "path": "performance-evidence/bounded-typed-glyph-replay-held-20261009/receipts.tar.gz.part-001",
+      "bytes": 254747,
+      "sha256": "b6e4a2ac76471c7d7d8b6fc906e4c5eeb4ebebdd9218b80a49269631453c9067"
+    }
+  ]
+}

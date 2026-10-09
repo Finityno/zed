@@ -1,0 +1,28 @@
+{
+  "frozen_before_first_pair_unix": 1791578398.620871,
+  "one_fresh_cohort_each": true,
+  "bare_children": 2430,
+  "census_children": 1380,
+  "policy_sha256": "0a4b9fae3d5411efc087f9c231fc34c6aa25fc58b148a28e6fe897bdd5e7a380",
+  "measurement_tool_identities": {
+    "measure.py": "4172fd7aa83115e55d2db1ee5dae13b8ecee6813af9c63f0e072f7359e85439f",
+    "decide.py": "c4fb42f2903e4040b4fb4677e80679388a3f7455d512884b8f6dfe87a2168271",
+    "run_metric_phase.py": "d67670092343beb11739bc6e02b2b51413d0695618d8804cbd3aa5cf53682ff2",
+    "verify_inputs.py": "01b5039c0afbb57416b0933c69cf6645fba29dce262fe86ff9591f070b07c864",
+    "collect_identities.py": "9cb2614380137242e179d5ecb0137db32133f9b8d646087bf459b4c06e8e428b",
+    "supervise.py": "bc5933c7a5e3542727fd6c5b84f4aa0362cd112bd38036a1de35320c6f9e9fcd",
+    "native-run": "a5ae0dbf90fcee74702f91cbcedf442085b31b8a24810d63ffd10a2e2c1a44a5",
+    "run_correctness.py": "22cd7e077327c9e1335e07ec9d279cb7c5c3b7406b21eebb7485904f4e162cd1",
+    "check_correctness.py": "fa4a33ab60cfee25d0a784f139da58033fe86cdb2ce752077d709ba49ef842ff",
+    "check_scene_release.py": "1d55e04a64e1d63cc87ce41a23498a043488184162f02ee41cf58124559c059b",
+    "check_inherited_cold_contract.py": "a0f287b511270ceecb8aaa8b4a755fe4a510ee997b1fed4f2aad55e5e24a2e25"
+  },
+  "no_per_child_binary_hashing": true,
+  "binary_source_compiler59_runtime_and_tools_verified_before_and_after_each_phase": true,
+  "host_guards_before_and_after_each_child": true,
+  "raw_child_start_end_and_process_snapshots": true,
+  "bare_vs_process_global_counting_System_separate": true,
+  "inherited_private_cold_line_memory_contract_both_fail_and_excluded_explicitly": true,
+  "exact_gates_unchanged": true,
+  "coverage": "Linux fake-platform/Text/System; no app/physicalGPU/macOS/Windows/shippedallocator gains."
+}

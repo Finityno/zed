@@ -1,0 +1,12 @@
+{
+  "common_correctness_children": 308,
+  "shared_suite_passes": 898,
+  "matched_per_frame_histories": 135,
+  "scene_release_children": 6,
+  "all_standalone_Scene_owners_release": true,
+  "both_boundary_regressions_pass": true,
+  "reused_exact_successful_preflight_receipts": 4,
+  "known_inherited_private_cold_line_memory_contract": "Both baseline and candidate fail; raw adverse results retained; explicitly excluded, not a typed-dispatch regression or memory pass.",
+  "correctness_outer_exit": 0,
+  "no_app_GPU_nativeplatform_gain_claim": true
+}

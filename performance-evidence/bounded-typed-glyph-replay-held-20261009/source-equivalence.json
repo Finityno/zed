@@ -1,0 +1,21 @@
+{
+  "source": "f2b40ab0bb4506b3411d0b3435102103c77a2b70",
+  "tree": "109fd65762e215003ee6d079e81b1936fdfe1308",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "5ac7ec54053ccbed0bab08d075dccc7cc9e769a81a6bcedfaf08b4a5806fec7d"
+  },
+  "small_replay_body_byte_exact_after_guard": true,
+  "large_replay_body_byte_exact_except_final_typed_dispatch": true,
+  "threshold64_inline_never_frozen": true,
+  "no_runtime_span_scanner_or_new_fields": true,
+  "original_replay_sha256": "9181c819a87a10cc80b73eaac440e9a35f06d78f332efe4c254110d7c4f55427",
+  "policy_sha256": "0a4b9fae3d5411efc087f9c231fc34c6aa25fc58b148a28e6fe897bdd5e7a380",
+  "different_compiled_files": [
+    "crates/gpui/src/scene.rs"
+  ],
+  "identical_shared_private_fixtures_and_allocator": true,
+  "initial_algorithm_source": "f1f226d4b7c8e60010c9b7ae1c75c4673077a18a",
+  "candidate_compiled_source_with_only_identical_existing_private_observer_insertions": true,
+  "baseline_original_production_with_only_shared_private_observer_and_test_insertions": true
+}
