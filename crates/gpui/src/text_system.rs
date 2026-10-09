@@ -238,9 +238,9 @@ enum FontLookup {
 
 /// Glyph raster bounds the platform has computed, kept in two generations so
 /// that a long session (zoom steps, many scripts, several displays) cannot
-/// grow it without bound: once `recent` holds [`Self::GENERATION`] entries, or
-/// both together hold two generations, the next new glyph turns `recent` into
-/// `older` and the previous `older` is dropped. A glyph found in `older` moves
+/// grow it past two generations: once `recent` holds [`Self::GENERATION`]
+/// entries, or both together hold two generations, the next new glyph turns
+/// `recent` into `older` and the previous `older` is dropped. A glyph found in `older` moves
 /// back to `recent`, so whatever is still being drawn survives.
 #[derive(Default)]
 struct RasterBoundsCache {
@@ -272,7 +272,16 @@ impl RasterBoundsCache {
         if self.recent.len() >= Self::GENERATION
             || self.recent.len() + self.older.len() >= 2 * Self::GENERATION
         {
-            self.older = std::mem::take(&mut self.recent);
+            let previous = std::mem::take(&mut self.recent);
+            // Promotions can fill `recent` past one generation. Keeping it
+            // whole once it reaches two would let the total creep past the
+            // bound by one entry per rotation; a working set that size no
+            // longer fits anyway.
+            self.older = if previous.len() >= 2 * Self::GENERATION {
+                FxHashMap::default()
+            } else {
+                previous
+            };
         }
         self.recent.insert(params, bounds);
     }
@@ -1942,6 +1951,19 @@ mod raster_bounds_cache_tests {
         }
         assert_eq!(platform.calls(), calls, "every glyph in the working set stays");
         assert!(text_system.raster_bounds.read().len() <= working_set as usize);
+
+        for new_glyph in 0..3 {
+            text_system
+                .raster_bounds(&params(GlyphId(100 + working_set + new_glyph)))
+                .unwrap();
+            for glyph in 0..working_set {
+                text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+            }
+            assert!(
+                text_system.raster_bounds.read().len() <= working_set as usize,
+                "promotions must not let rotations grow the cache past two generations"
+            );
+        }
     }
 }
 
