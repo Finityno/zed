@@ -381,32 +381,60 @@ impl Scene {
         };
         let pad = self.current_transition;
         self.paint_operations.reserve(prev_operations.len());
-        for operation in prev_operations {
-            match *operation {
-                PaintOperation::MonochromeSprite(index) => {
-                    let mut sprite = prev_scene.painted_monochrome_sprites[index as usize];
-                    sprite.order = order;
-                    sprite.pad = pad;
-                    let index = self.painted_monochrome_sprites.len() as u32;
-                    self.painted_monochrome_sprites.push(sprite);
-                    self.paint_operations
-                        .push(PaintOperation::MonochromeSprite(index));
-                }
-                PaintOperation::SubpixelSprite(index) => {
-                    let mut sprite = prev_scene.painted_subpixel_sprites[index as usize];
-                    sprite.order = order;
-                    sprite.pad = pad;
-                    let index = self.painted_subpixel_sprites.len() as u32;
-                    self.painted_subpixel_sprites.push(sprite);
-                    self.paint_operations
-                        .push(PaintOperation::SubpixelSprite(index));
-                }
+        // A line's sprites were pushed one after another, so they are
+        // replayed a run of consecutive indices at a time, which names each
+        // run's paint operations as a range rather than sprite by sprite.
+        let mut position = 0;
+        while let Some(operation) = prev_operations.get(position) {
+            let (subpixel, first) = match *operation {
+                PaintOperation::MonochromeSprite(index) => (false, index),
+                PaintOperation::SubpixelSprite(index) => (true, index),
                 PaintOperation::Primitive(_)
                 | PaintOperation::StartLayer(_)
                 | PaintOperation::EndLayer => {
                     debug_assert!(false, "only glyph sprites are replayed");
+                    position += 1;
+                    continue;
                 }
+            };
+            let mut run = 1;
+            while let Some(next) = prev_operations.get(position + run) {
+                let next_index = first + run as u32;
+                let continues = match *next {
+                    PaintOperation::MonochromeSprite(index) => !subpixel && index == next_index,
+                    PaintOperation::SubpixelSprite(index) => subpixel && index == next_index,
+                    _ => false,
+                };
+                if !continues {
+                    break;
+                }
+                run += 1;
             }
+            let sources = first as usize..first as usize + run;
+            if subpixel {
+                let start = append_replayed_sprites(
+                    &mut self.painted_subpixel_sprites,
+                    &prev_scene.painted_subpixel_sprites[sources],
+                    |sprite| {
+                        sprite.order = order;
+                        sprite.pad = pad;
+                    },
+                );
+                self.paint_operations
+                    .extend((start..start + run as u32).map(PaintOperation::SubpixelSprite));
+            } else {
+                let start = append_replayed_sprites(
+                    &mut self.painted_monochrome_sprites,
+                    &prev_scene.painted_monochrome_sprites[sources],
+                    |sprite| {
+                        sprite.order = order;
+                        sprite.pad = pad;
+                    },
+                );
+                self.paint_operations
+                    .extend((start..start + run as u32).map(PaintOperation::MonochromeSprite));
+            }
+            position += run;
         }
         true
     }
@@ -1167,32 +1195,74 @@ impl DrawOrderScratch {
     }
 }
 
-/// Sorts `keys` stably by their bits in `bits`, a byte at a time, through
+/// The widest digit [`radix_sort`] sorts by in one pass.
+const RADIX_DIGIT_BITS_MAX: u32 = 11;
+
+/// Sorts `keys` stably by their bits in `bits`, a digit at a time, through
 /// `scratch`.
+///
+/// Each pass costs two sweeps of the keys plus one of the digit's buckets, so
+/// digits are as wide as there are keys to share the buckets among, up to
+/// [`RADIX_DIGIT_BITS_MAX`], and the bits are split evenly between as few
+/// passes as that allows: a frame's few thousand sprites sort in three passes
+/// rather than the four a byte at a time takes.
 fn radix_sort(keys: &mut Vec<u64>, scratch: &mut Vec<u64>, bits: Range<u32>) {
+    let width = bits.end.saturating_sub(bits.start);
+    if width == 0 {
+        return;
+    }
+    let widest_digit =
+        (usize::BITS - keys.len().leading_zeros()).clamp(u8::BITS, RADIX_DIGIT_BITS_MAX);
+    let passes = width.div_ceil(widest_digit);
+    let digit_bits = width.div_ceil(passes);
+    let mask = (1u64 << digit_bits) - 1;
     scratch.clear();
     scratch.resize(keys.len(), 0);
-    for shift in bits.step_by(8) {
-        let mut offsets = [0usize; 256];
+    let mut buckets = [0usize; 1 << RADIX_DIGIT_BITS_MAX];
+    let offsets = &mut buckets[..1 << digit_bits];
+    for pass in 0..passes {
+        let shift = bits.start + pass * digit_bits;
+        offsets.fill(0);
         for &key in keys.iter() {
-            offsets[(key >> shift) as u8 as usize] += 1;
+            offsets[((key >> shift) & mask) as usize] += 1;
         }
-        // A byte every key shares, such as the texture of a frame drawn from
-        // one atlas page, moves nothing.
+        // A digit every key shares, such as the texture of a frame drawn
+        // from one atlas page, moves nothing.
         if offsets.contains(&keys.len()) {
             continue;
         }
         let mut offset = 0;
-        for slot in &mut offsets {
+        for slot in offsets.iter_mut() {
             offset += std::mem::replace(slot, offset);
         }
         for &key in keys.iter() {
-            let slot = &mut offsets[(key >> shift) as u8 as usize];
+            let slot = &mut offsets[((key >> shift) & mask) as usize];
             scratch[*slot] = key;
             *slot += 1;
         }
         std::mem::swap(keys, scratch);
     }
+}
+
+/// Appends `sources` to `painted`, letting `stamp` give each appended sprite
+/// what replaying it changes. Returns the index of the first.
+fn append_replayed_sprites<T: Copy>(
+    painted: &mut Vec<T>,
+    sources: &[T],
+    mut stamp: impl FnMut(&mut T),
+) -> u32 {
+    let start = painted.len();
+    painted.reserve(sources.len());
+    for sprite in sources {
+        // Stamped where it lands rather than on the way: changing a copy in
+        // between keeps the compiler from copying the sprite straight into
+        // place, costing a second copy of every glyph.
+        painted.push(*sprite);
+        if let Some(pushed) = painted.last_mut() {
+            stamp(pushed);
+        }
+    }
+    start as u32
 }
 
 /// Rearranges `items` so position `i` holds what was at `sources[i]`,
@@ -1468,6 +1538,109 @@ mod tests {
         }
     }
 
+    /// What replaying a glyph sprite keeps (its kind, tile and place) and
+    /// what it takes from the scene it is replayed into (draw order and
+    /// transition), for each glyph sprite among `operations`.
+    fn painted_glyphs(
+        scene: &Scene,
+        operations: Range<usize>,
+    ) -> Vec<(bool, u32, ScaledPixels, DrawOrder, u32)> {
+        scene.paint_operations[operations]
+            .iter()
+            .map(|operation| match *operation {
+                PaintOperation::MonochromeSprite(index) => {
+                    let sprite = &scene.painted_monochrome_sprites[index as usize];
+                    (false, sprite.tile.tile_id.0, sprite.bounds.origin.x, sprite.order, sprite.pad)
+                }
+                PaintOperation::SubpixelSprite(index) => {
+                    let sprite = &scene.painted_subpixel_sprites[index as usize];
+                    (true, sprite.tile.tile_id.0, sprite.bounds.origin.x, sprite.order, sprite.pad)
+                }
+                _ => panic!("only glyph sprites are replayed"),
+            })
+            .collect()
+    }
+
+    /// Replaying a line copies its sprites a run of consecutive indices at a
+    /// time. A line whose monochrome and subpixel glyphs interleave, replayed
+    /// into a scene whose sprite vectors already hold other glyphs, still
+    /// comes back glyph for glyph in paint order, each taking the replaying
+    /// layer's draw order and transition.
+    #[test]
+    fn replayed_glyph_sprites_come_back_in_paint_order() {
+        let monochrome = |tile: u32, x: f32| {
+            let mut sprite = shimmering_glyph(0);
+            sprite.effect = SpriteEffect::default();
+            sprite.tile.tile_id = crate::TileId(tile);
+            sprite.bounds.origin.x = ScaledPixels::from(x);
+            sprite.bounds.size.width = ScaledPixels::from(1.);
+            sprite
+        };
+        let subpixel = |tile: u32, x: f32| {
+            let sprite = monochrome(tile, x);
+            SubpixelSprite {
+                order: 0,
+                pad: 0,
+                bounds: sprite.bounds,
+                content_mask: sprite.content_mask,
+                color: sprite.color,
+                effect: sprite.effect,
+                tile: sprite.tile,
+                transformation: sprite.transformation,
+            }
+        };
+
+        let mut source = Scene::default();
+        source.insert_monochrome_sprite(monochrome(90, 9.));
+        let mut lines = Vec::new();
+        for line in [
+            &[(false, 1), (false, 2), (true, 3), (true, 4), (false, 5)][..],
+            &[(true, 6), (false, 7), (false, 8)][..],
+        ] {
+            source.push_layer(unit_bounds());
+            let start = source.glyph_watermark();
+            for &(is_subpixel, tile) in line {
+                if is_subpixel {
+                    source.insert_subpixel_sprite(subpixel(tile, tile as f32));
+                } else {
+                    source.insert_monochrome_sprite(monochrome(tile, tile as f32));
+                }
+            }
+            let Some(operations) = source.glyph_sprites_since(start) else {
+                panic!("a line of glyphs paints only glyph sprites");
+            };
+            lines.push(operations);
+            source.pop_layer();
+        }
+
+        let started_at = std::time::Instant::now();
+        let mut replayed = Scene::default();
+        replayed.insert_subpixel_sprite(subpixel(91, 9.));
+        replayed.insert_monochrome_sprite(monochrome(92, 9.));
+        let Some(transition) = replayed.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition always fits");
+        };
+        replayed.set_current_transition(transition);
+        // In reverse, so neither line lands at the indices it came from.
+        for operations in lines.iter().rev() {
+            replayed.push_layer(unit_bounds());
+            let order = *replayed.layer_stack.last().unwrap_or(&0);
+            let start = replayed.glyph_watermark();
+            assert!(replayed.replay_glyph_sprites(&source, operations.clone()));
+            let Some(replayed_operations) = replayed.glyph_sprites_since(start) else {
+                panic!("replaying paints only glyph sprites");
+            };
+            let expected: Vec<_> = painted_glyphs(&source, operations.clone())
+                .into_iter()
+                .map(|(is_subpixel, tile, x, _, _)| (is_subpixel, tile, x, order, transition))
+                .collect();
+            assert_eq!(painted_glyphs(&replayed, replayed_operations), expected);
+            replayed.pop_layer();
+        }
+        assert_eq!(replayed.painted_monochrome_sprites.len(), 1 + 5);
+        assert_eq!(replayed.painted_subpixel_sprites.len(), 1 + 3);
+    }
+
     fn shimmering_glyph(animation: u32) -> MonochromeSprite {
         MonochromeSprite {
             order: 0,
@@ -1525,14 +1698,19 @@ mod tests {
     }
 
     /// Sprites sort as a stable sort by `(order, texture, tile)` would, both
-    /// when the parts pack into 64 bits and when they are too wide to.
+    /// when the parts pack into 64 bits and when they are too wide to, and
+    /// with enough of them that the radix sort takes digits wider than a byte.
     #[test]
     fn sprite_sort_matches_a_stable_sort() {
         use rand::{Rng, SeedableRng};
         let mut scratch = DrawOrderScratch::default();
         for seed in 0..200u64 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let len = rng.random_range(0..600);
+            let len = if seed % 5 == 1 {
+                rng.random_range(1024..5000)
+            } else {
+                rng.random_range(0..600)
+            };
             let widest = if seed % 4 == 0 { u32::MAX } else { 1 << rng.random_range(0..12) };
             let items: Vec<(u32, u32, u32, usize)> = (0..len)
                 .map(|index| {
