@@ -1073,23 +1073,29 @@ impl X11WindowStatePtr {
             return;
         }
         if mapped {
-            self.restore_surface(&mut state);
+            // The restored surface is empty; render the next frame rather
+            // than rely on something in the window being dirty.
+            if self.restore_surface(&mut state) {
+                state.force_render_after_recovery = true;
+            }
         } else {
             state.renderer.unconfigure_surface();
         }
     }
 
-    fn restore_surface(&self, state: &mut X11WindowState) {
+    /// Returns whether a released surface was restored.
+    fn restore_surface(&self, state: &mut X11WindowState) -> bool {
         if !state.renderer.is_unconfigured() {
-            return;
+            return false;
         }
         let raw_window = self.raw_window(state);
         match state.renderer.restore_surface(&raw_window) {
-            Ok(()) => state.force_render_after_recovery = true,
+            Ok(()) => true,
             Err(error) => {
                 log::warn!(
                     "Failed to restore the window surface, will retry on next frame: {error:#}"
-                )
+                );
+                false
             }
         }
     }
@@ -1810,6 +1816,8 @@ impl PlatformWindow for X11Window {
 
         // A restore that failed when the window was mapped is retried here,
         // so the first frame of a shown window reconfigures before drawing.
+        // The scene drawn next is complete, so a restore here needs no
+        // forced render afterwards.
         if inner.mapped {
             self.0.restore_surface(&mut inner);
         }
