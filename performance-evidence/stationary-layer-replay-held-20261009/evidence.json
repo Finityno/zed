@@ -1,0 +1,254 @@
+{
+  "status": "HELD/unmerged; never unchanged rerun or weaker gates",
+  "qualified": false,
+  "baseline": "df6e7d05b529313ad142f397a4e4ea428c2c01ae",
+  "source": "40debf70cef29838e696b8c75fc2655052c56234",
+  "fincode_main_at_freeze": "012961fdff7579fd464861fa7fdf10e7f7ffd81f",
+  "fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "component_pin": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "valid_children": 1624,
+  "workloads": 58,
+  "failures": [
+    [
+      "bare",
+      "remove-256",
+      "cpu_ns",
+      "control",
+      8311035,
+      2400570
+    ],
+    [
+      "bare",
+      "remove-256",
+      "elapsed_ns",
+      "control",
+      8310221,
+      2405740
+    ],
+    [
+      "bare",
+      "remove-256",
+      "child_cpu_ns",
+      "control",
+      8501000,
+      3260000
+    ],
+    [
+      "bare",
+      "replace-32",
+      "cpu_ns",
+      "control",
+      1109345,
+      602770
+    ],
+    [
+      "bare",
+      "replace-32",
+      "elapsed_ns",
+      "control",
+      1108896,
+      602649
+    ],
+    [
+      "bare",
+      "replace-32",
+      "child_cpu_ns",
+      "control",
+      1223000,
+      822000
+    ],
+    [
+      "bare",
+      "grow-256",
+      "cpu_ns",
+      "control",
+      6587977,
+      3788301
+    ],
+    [
+      "bare",
+      "grow-256",
+      "elapsed_ns",
+      "control",
+      6601565,
+      3782829
+    ],
+    [
+      "bare",
+      "grow-256",
+      "child_cpu_ns",
+      "control",
+      6714000,
+      3632000
+    ],
+    [
+      "bare",
+      "state-remove-32",
+      "cpu_ns",
+      "control",
+      921114,
+      711422
+    ],
+    [
+      "bare",
+      "state-remove-32",
+      "elapsed_ns",
+      "control",
+      915426,
+      711852
+    ],
+    [
+      "bare",
+      "state-disjoint-32",
+      "child_cpu_ns",
+      "control",
+      1536000,
+      940000
+    ],
+    [
+      "bare",
+      "tick-on-512",
+      "cpu_ns",
+      "control",
+      1005150,
+      600576
+    ],
+    [
+      "bare",
+      "tick-on-512",
+      "elapsed_ns",
+      "control",
+      1004609,
+      600618
+    ]
+  ],
+  "all_primary_allocation_gain_fields_pass": true,
+  "all_census_heap_churn_native_RSS_controls_pass": true,
+  "observed_primary_changes": {
+    "redraw-on-200": {
+      "allocation_calls": {
+        "baseline_median": 18014,
+        "candidate_median": 16730,
+        "baseline_min": 18014,
+        "baseline_max": 18014,
+        "candidate_min": 16730,
+        "candidate_max": 16730,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -7.1277894970578455,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "requested_bytes": {
+        "baseline_median": 10245188,
+        "candidate_median": 10234916,
+        "baseline_min": 10245188,
+        "baseline_max": 10245188,
+        "candidate_min": 10234916,
+        "candidate_max": 10234916,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -0.10026170334794804,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "held_bytes": {
+        "baseline_median": 5471718,
+        "candidate_median": 5471718,
+        "baseline_min": 5471718,
+        "baseline_max": 5471718,
+        "candidate_min": 5471718,
+        "candidate_max": 5471718,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": 0.0,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "peak_bytes": {
+        "baseline_median": 5547414,
+        "candidate_median": 5547414,
+        "baseline_min": 5547414,
+        "baseline_max": 5547414,
+        "candidate_min": 5547414,
+        "candidate_max": 5547414,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": 0.0,
+        "allowed_increase": 0,
+        "pass": true
+      }
+    },
+    "redraw-on-512": {
+      "allocation_calls": {
+        "baseline_median": 19359,
+        "candidate_median": 18075,
+        "baseline_min": 19359,
+        "baseline_max": 19359,
+        "candidate_min": 18075,
+        "candidate_max": 18075,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.632573996590729,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "requested_bytes": {
+        "baseline_median": 12677150,
+        "candidate_median": 12666878,
+        "baseline_min": 12677150,
+        "baseline_max": 12677150,
+        "candidate_min": 12666878,
+        "candidate_max": 12666878,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -0.08102767577886638,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "held_bytes": {
+        "baseline_median": 5918986,
+        "candidate_median": 5918986,
+        "baseline_min": 5918986,
+        "baseline_max": 5918986,
+        "candidate_min": 5918986,
+        "candidate_max": 5918986,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": 0.0,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "peak_bytes": {
+        "baseline_median": 6007162,
+        "candidate_median": 6007162,
+        "baseline_min": 6007162,
+        "baseline_max": 6007162,
+        "candidate_min": 6007162,
+        "candidate_max": 6007162,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": 0.0,
+        "allowed_increase": 0,
+        "pass": true
+      }
+    }
+  },
+  "important_gain_not_qualified": "6.63\u20137.13% fewer complete-App allocation calls and0.081\u20130.100% fewer requested bytes in retained redraw200/512. Fourteen normalCPU/elapsed/whole-child fields fail. Every censusheap/churn/RSS and bareRSS control passes. Primaryheld/peak unchanged.",
+  "mechanism": "Do not push false omission flags for stationary layers; stationary EndLayer always pops, moved clipping/tracking unchanged. No fields/timers/cache/renderer resources.",
+  "correctness": "36native contract invocations: Scene24, Subscriber4,3nested/partial/moved layer contracts, independent cursor resize,App4,read/nested/idle/retainedoracle16seeds50steps/wheel/dependency/panel/layout/atomic tests pass. Private warmedtwo-buffer no-scratchallocation contract failsbaseline/passescandidate. All1624paired scene/hitbox/state/owner signatures match.",
+  "protocol": "Foursequential final native builds50.37/47.58/48.83/48.26s,1044alternatingbare children222.96s, then580countingchildren78.68s. Common59immutableexterns/compiler/runtime/source/binary andfrozenmethod reverified aftercohort. Bare256/census128stimuli frozenbeforecandidate. No repeatperformancecohort.",
+  "attribution": "36completecurrent-main nativeApp/Window diagnostics attribute7.11% of retainedredraw200calls to stationary Vec<bool> growth. Existing30transcriptcomponentclocks rankretainedpaint53\u201373us/draw. Countingdiagnostics are not speed gains.",
+  "adverse_setup": "OriginalDebugtest-helper compile failure preserved. Firstcomplete4build contract wrongly warmed onlyone of BoundsTree recorded/previous buffers, leaving320held bytes in BOTH lanes; preservedall4originalbinaries exactgzip roundtrip andallcontracts/identities. Privatehelper warmsboth buffers beforecensus. Productionmechanism/performancefixtures/gates unchanged, allcorrectionsbefore anypaired performance sample.",
+  "not_run": "Strict owning Clippy/guard, PR creation, merge and application adoption withheld because performance gates fail.",
+  "limits": [
+    "Linuxfakeplatform/System completeApp/Window, not app/physicalGPU/macOS/Windows/shippedallocator gains.",
+    "Baretiming excludes setup/4warmups/finalaudits, censusincludescompleteowner setup/warmups/128stimuli/liveowners. Bare256/census128 iterations freezeBEFOREcandidate andgains comparedwithinlaneonly.",
+    "No newrenderer resources/GPUcache or work-skipping; only CPUlayer bookkeeping whenmovedNone. GPUbehavior/correctness beyondnativeScene/frameoracles not measured.",
+    "Previousglyph/timer/observer/statefailuresremainheld; neverrerununchanged orweakentheirgates. IndependentGPUrecovery43preserved butnot qualifiedorclaimedhere."
+  ],
+  "policy_sha256": "8684db7f999ae74f744e7933b01ee7b7e65106c7e21f317cd3dad645d7dbcbaa",
+  "archive_sha256": "1efbb6a5604a3f4d23d0c9996c473e3f0ef31042436d19ea3314485ead7d459c",
+  "archive_bytes": 1332251,
+  "members": 1949
+}

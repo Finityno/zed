@@ -197,3 +197,17 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Stationary layer omission tracking at
+`40debf70cef29838e696b8c75fc2655052c56234` remains held. Its 1,624-child,
+58-workload comparison uses 6.63–7.13% fewer complete-component allocation
+calls in retained transcript redraws and 0.081–0.100% fewer requested bytes.
+Held/peak heap is unchanged and every heap, churn and native RSS control passes,
+but fourteen ordinary CPU/elapsed/whole-child fields fail. The warmed allocation
+contract fails before and passes after; all scene/hitbox/owner signatures match.
+Both original private test setup failures and exact binaries are preserved.
+See `performance-evidence/stationary-layer-replay-held-20261009` on its owned
+branch. Never repeat this design unchanged or weaken the frozen gates.
+Continue with the oversized effect queue using existing idle-window ownership,
+without duplicating active renderer, focus or text work. Cached scrolling still
+needs total renderer-memory accounting, bounded fallback and compositing tests.

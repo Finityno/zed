@@ -679,11 +679,10 @@ impl Scene {
                     }
                     None => {
                         self.push_clipped_layer(layer.bounds, layer.extent, layer.mask);
-                        layers_left_out.push(false);
                     }
                 },
                 PaintOperation::EndLayer => {
-                    if !layers_left_out.pop().unwrap_or(false) {
+                    if moved.is_none() || !layers_left_out.pop().unwrap_or(false) {
                         self.pop_layer();
                     }
                 }
@@ -3249,5 +3248,90 @@ mod glyph_drop_diagnostic_tests {
         // miss. That is the most suspicious geometry of all and must not read as "far away".
         assert_eq!(mask_miss_distances(&bounds(92., 150., 8., 10.), &mask).0, 0.0);
         assert_eq!(mask_miss_distances(&bounds(150., 150., 8., 10.), &mask), (0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod nonmoved_layer_tests {
+    use super::*;
+
+    fn bounds() -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point::default(),
+            size: Size { width: ScaledPixels::from(100.), height: ScaledPixels::from(100.) },
+        }
+    }
+
+    fn layered_scene(depth: usize) -> Scene {
+        let mut scene = Scene::default();
+        for _ in 0..depth { scene.push_layer(bounds()); }
+        scene.insert_primitive(Quad {
+            bounds: bounds(),
+            content_mask: ContentMask { bounds: bounds() },
+            background: Background::from(Hsla::black()),
+            ..Default::default()
+        });
+        for _ in 0..depth { scene.pop_layer(); }
+        scene
+    }
+
+    pub(super) fn assert_same_operations(expected: &Scene, actual: &Scene) {
+        assert_eq!(expected.paint_operations.len(), actual.paint_operations.len());
+        for (expected, actual) in expected.paint_operations.iter().zip(&actual.paint_operations) {
+            match (expected, actual) {
+                (PaintOperation::StartLayer(expected), PaintOperation::StartLayer(actual)) => {
+                    assert_eq!(expected.bounds, actual.bounds);
+                    assert_eq!(expected.extent, actual.extent);
+                    assert_eq!(expected.mask, actual.mask);
+                }
+                (PaintOperation::EndLayer, PaintOperation::EndLayer) => {}
+                (PaintOperation::Primitive(Primitive::Quad(expected)), PaintOperation::Primitive(Primitive::Quad(actual))) => {
+                    assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+                }
+                _ => panic!("layer and quad operation order changed"),
+            }
+        }
+    }
+
+    #[test]
+    fn nested_nonmoved_layers_preserve_paint_operations() {
+        for depth in [1, 4, 16] {
+            let source = layered_scene(depth);
+            let mut replayed = Scene::default();
+            replayed.replay(0..source.len(), &source);
+            assert_same_operations(&source, &replayed);
+            assert!(replayed.layer_stack.is_empty());
+            assert_eq!(source.quads.len(), replayed.quads.len());
+        }
+    }
+
+    #[test]
+    fn a_nonmoved_range_inside_an_outer_layer_preserves_balance() {
+        let source = layered_scene(2);
+        let expected = layered_scene(1);
+        let mut replayed = Scene::default();
+        replayed.replay(1..source.len() - 1, &source);
+        assert_same_operations(&expected, &replayed);
+        assert!(replayed.layer_stack.is_empty());
+    }
+
+    #[test]
+    fn moved_layers_keep_visible_and_omitted_nesting_balanced() {
+        let source = layered_scene(4);
+        for moved_by in [0., 5., 200.] {
+            let moved = SceneMove {
+                delta: Point { x: ScaledPixels::from(moved_by), y: ScaledPixels::from(0.) },
+                old_outer: [0., 0., 100., 100.],
+                new_outer: [0., 0., 100., 100.],
+            };
+            let mut replayed = Scene::default();
+            replayed.replay_inside(0..source.len(), &source, None, Some(&moved));
+            assert!(replayed.layer_stack.is_empty());
+            let starts = replayed.paint_operations.iter().filter(|operation| matches!(operation, PaintOperation::StartLayer(_))).count();
+            let ends = replayed.paint_operations.iter().filter(|operation| matches!(operation, PaintOperation::EndLayer)).count();
+            assert_eq!(starts, ends);
+            assert_eq!(starts, if moved_by == 200. { 0 } else { 4 });
+            assert_eq!(replayed.quads.len(), if moved_by == 200. { 0 } else { 1 });
+        }
     }
 }
