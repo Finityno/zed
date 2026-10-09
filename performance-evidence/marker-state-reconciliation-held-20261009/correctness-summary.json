@@ -1,0 +1,9 @@
+{
+  "children": 62,
+  "suite_and_fixture_passes": 654,
+  "all_pass": true,
+  "matched_complete_Window_frame_histories": 12,
+  "both_owner_thread_census_scope_regressions_pass": true,
+  "scope_expected_foreground1234_worker7777_owner_afterdrop0": true,
+  "no_gain_from_correctness": true
+}

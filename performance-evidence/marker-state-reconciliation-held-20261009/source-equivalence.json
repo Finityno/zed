@@ -1,0 +1,18 @@
+{
+  "source": "003fc8971fe0b905649b81898562c6a4707e0c66",
+  "tree": "b6084fac8abd209d8f8e1cc910aeed6b6609ad66",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/window/view_retention/dependencies.rs": "d8dacb4339feb7a8855882e6bf16fc2096d9e80c6eb40724437c8c489e4cab02"
+  },
+  "normal_checker_byte_exact": true,
+  "original_marker_presence_scan_absent_path_and_small_body_after_guard_byte_exact": true,
+  "held_kernel_body_unchanged_but_reached_only_for64plus_marker_present": true,
+  "no_heap_header_persistent_storage": true,
+  "policy_sha256": "9fc6b565199a36a775464b9f97a91df3a17b7f200c68eb1a782c0ed56d3df879",
+  "all_private_fixtures_and_owner_thread_allocator_identical": true,
+  "different_compiled_files": [
+    "crates/gpui/src/window/view_retention/dependencies.rs"
+  ],
+  "all42_component_and12Window_controls_preserved": true
+}

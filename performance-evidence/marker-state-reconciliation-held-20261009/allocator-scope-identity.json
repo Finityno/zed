@@ -1,0 +1,12 @@
+{
+  "bare": "System",
+  "census": "System with global Counter forwarding and const TLS enable on the checking thread only; live/peak/bytes/calls owner scope",
+  "same_both_lanes": true,
+  "original_process_global_counter_preserved": "/workspace/scratch/gpui-marker-state-loop/pre-owner-scope-dependency-profile.rs",
+  "original144_byte_owner_untraced_not_guessed": true,
+  "all_child_current_peak_RSS_and_CensusCPU_controls_preserved": true,
+  "primary_bare_CPU_gain_only": true,
+  "private_profile_source_sha256": "267bb90a8bc15c6bbc73234b154641f25340b5c59c41d4d713455649f8afd4e9",
+  "no_owner_allocations_cross_threads": "Complete synchronous App checker only creates/drops locally filtered Rc snapshots; no outputs or leases leave the checking thread.",
+  "scope_contract_regression_required_before_pairs": true
+}

@@ -1,0 +1,28 @@
+{
+  "production_source": "003fc8971fe0b905649b81898562c6a4707e0c66",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "archive_sha256": "46a6f9c79480afb76d24c62a895b9f473725a5483ffae582f3a60c0183626b16",
+  "archive_bytes": 8048503,
+  "archive_members": 3120,
+  "identical_member_hardlinks": 454,
+  "all_members_byte_exact_roundtrip": true,
+  "children": 2040,
+  "failed_fields": 4,
+  "all_four_primary_bare_CPU_elapsed_20percent_and_variation_gates_pass": true,
+  "all_primary_census_transient_allocations_eliminated": true,
+  "all12_complete_Window_bare_controls_pass": true,
+  "all_bare_CPU_elapsed_childCPU_current_peak_RSS_controls_pass": true,
+  "all_requested_heap_churn_controls_pass": true,
+  "both_native_owner_scope_regressions_pass": true,
+  "held": true,
+  "merged": false,
+  "never_resample_unchanged": true,
+  "no_app_GPU_platform_shipped_allocator_gain": true,
+  "parts": [
+    {
+      "path": "performance-evidence/marker-state-reconciliation-held-20261009/receipts.tar.gz",
+      "bytes": 8048503,
+      "sha256": "46a6f9c79480afb76d24c62a895b9f473725a5483ffae582f3a60c0183626b16"
+    }
+  ]
+}

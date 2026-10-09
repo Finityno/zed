@@ -1,0 +1,10 @@
+{
+  "source": "003fc8971fe0b905649b81898562c6a4707e0c66",
+  "compiled_candidate_dependencies_file_byte_exact_to_reviewed_source": true,
+  "normal_checker_original_body_byte_exact": true,
+  "small_original_body_after_threshold_byte_exact": true,
+  "different_lane_production_files": [
+    "crates/gpui/src/window/view_retention/dependencies.rs"
+  ],
+  "all_other_final_private_fixtures_identical": true
+}

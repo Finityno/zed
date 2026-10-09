@@ -1,0 +1,5 @@
+{
+  "all_nonzero_samples": [],
+  "counter_scope": "Counting-System with const TLS enable on the checking thread. Both native scope regressions count foreground1234bytes/one call, exclude synchronized worker7777bytes and release all owner bytes. All420 owner samples have zero held bytes. Whole-child current/peak RSS and additional census CPU gates remain required.",
+  "no_resample": true
+}

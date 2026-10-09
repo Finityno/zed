@@ -1,0 +1,12 @@
+{
+  "policy_sha256": "9fc6b565199a36a775464b9f97a91df3a17b7f200c68eb1a782c0ed56d3df879",
+  "frozen_before_first_pairs_unix": 1791576513.9654028,
+  "one_fresh2040_cohort": true,
+  "bare1620_then_census420_separate": true,
+  "all42component_and12Window_controls_preserved": true,
+  "CensusCPU_controls_additional_and_preserved": true,
+  "requested_owner_scope_foreground_completeApp_checker": "Two native owner-thread regressions pass before pairs; worker payload excluded and foreground1234bytes/call captured with zero afterdrop. No attribution claimed for old144-byte outliers. Whole-child RSS covers all child activity.",
+  "host_guard_before_each_child": true,
+  "timing_hashing_builds_compression_separate": true,
+  "no_repeat_old_candidate_or_change_gates": true
+}
