@@ -1239,8 +1239,14 @@ impl X11WindowStatePtr {
         if let Some(mut fun) = callback {
             // Expose events can present a frame before the refresh timer runs,
             // so every frame request must rebuild stale atlas references after recovery.
-            request_frame_options.force_render |=
-                std::mem::take(&mut self.state.borrow_mut().force_render_after_recovery);
+            // A lost device still waiting out its recovery backoff has nothing
+            // to draw, so the request stays latched until the attempt is due.
+            let mut state = self.state.borrow_mut();
+            if state.renderer.recovery_delay().is_none() {
+                request_frame_options.force_render |=
+                    std::mem::take(&mut state.force_render_after_recovery);
+            }
+            drop(state);
             fun(request_frame_options);
             self.callbacks.borrow_mut().request_frame = Some(fun);
         }

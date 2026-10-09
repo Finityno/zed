@@ -553,11 +553,15 @@ impl WaylandClientStatePtr {
     /// retry would spin against the frame-rate throttle that deferred the draw in the
     /// first place.
     pub fn schedule_frame_retry(&self, surface_id: &ObjectId) {
+        self.schedule_frame_retry_after(surface_id, FRAME_RETRY_INTERVAL);
+    }
+
+    pub fn schedule_frame_retry_after(&self, surface_id: &ObjectId, delay: Duration) {
         let client = self.get_client();
         let state = client.borrow();
         let surface_id = surface_id.clone();
         if let Err(err) = state.loop_handle.insert_source(
-            Timer::from_duration(FRAME_RETRY_INTERVAL),
+            Timer::from_duration(delay),
             move |_, _, this| {
                 let client = this.get_client();
                 let window = get_window(&mut client.borrow_mut(), &surface_id);

@@ -608,6 +608,48 @@ enum RendererState {
     Released,
 }
 
+const RECOVERY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+const RECOVERY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Spaces out attempts to recreate a lost device. The platforms call
+/// `recover` from every frame, and an attempt can block the foreground thread
+/// (the settle sleep, adapter enumeration), so a device that stays
+/// unavailable would otherwise stall each frame.
+#[derive(Clone, Copy, Default)]
+struct RecoveryBackoff {
+    failures: u32,
+    next_attempt: Option<std::time::Instant>,
+}
+
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+impl RecoveryBackoff {
+    fn is_due(&self, now: std::time::Instant) -> bool {
+        self.next_attempt.is_none_or(|next_attempt| now >= next_attempt)
+    }
+
+    fn record_failure(&mut self, now: std::time::Instant) {
+        let delay = RECOVERY_INITIAL_DELAY
+            .saturating_mul(1 << self.failures.min(8))
+            .min(RECOVERY_MAX_DELAY);
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt = Some(now + delay);
+    }
+
+    fn remaining(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.next_attempt
+            .and_then(|next_attempt| next_attempt.checked_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+    }
+}
+
+thread_local! {
+    // Every window's renderer on the foreground thread shares one GPU
+    // context, so they share its recovery backoff too: a failed attempt by
+    // one window must also hold back the others that would recreate it.
+    static RECOVERY_BACKOFF: std::cell::Cell<RecoveryBackoff> =
+        std::cell::Cell::new(RecoveryBackoff::default());
+}
+
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
@@ -2810,18 +2852,93 @@ impl WgpuRenderer {
     /// This method coordinates recovery across multiple windows:
     /// - The first window to call this will recreate the shared context
     /// - Subsequent windows will adopt the already-recovered context
+    ///
+    /// After a failed attempt to recreate the context, further attempts wait
+    /// out a backoff that doubles up to a few seconds. A call made before
+    /// the next attempt is due returns `Ok(())` without doing anything and
+    /// `device_lost()` stays true, so the caller keeps requesting frames and
+    /// a later one retries.
     #[cfg(not(target_family = "wasm"))]
     pub fn recover<W>(&mut self, window: &W) -> anyhow::Result<()>
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
-        let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
+        self.recover_with_clock(window, std::time::Instant::now)
+    }
 
+    /// While recovery of a lost device is waiting out its backoff, the time
+    /// until the next attempt is due. Frames in that span have nothing to
+    /// draw, so platforms schedule the retry for then instead of forcing
+    /// renders.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn recovery_delay(&self) -> Option<std::time::Duration> {
+        if !self.device_lost() {
+            return None;
+        }
+        self.recovery_delay_at(std::time::Instant::now())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn recovery_delay_at(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !self.needs_new_context() {
+            return None;
+        }
+        RECOVERY_BACKOFF.with(|backoff| backoff.get().remaining(now))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn needs_new_context(&self) -> bool {
+        self.context.as_ref().is_some_and(|gpu_context| {
+            gpu_context
+                .borrow()
+                .as_ref()
+                .is_none_or(|ctx| ctx.device_lost())
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn recover_with_clock<W>(
+        &mut self,
+        window: &W,
+        now: impl Fn() -> std::time::Instant,
+    ) -> anyhow::Result<()>
+    where
+        W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+    {
+        anyhow::ensure!(self.context.is_some(), "recover requires gpu_context");
         // Check if another window already recovered the context
-        let needs_new_context = gpu_context
-            .borrow()
-            .as_ref()
-            .is_none_or(|ctx| ctx.device_lost());
+        let needs_new_context = self.needs_new_context();
+        if !needs_new_context {
+            // Adopting a context another window recovered is cheap, so only
+            // recreating one waits out the backoff.
+            return self.try_recover(window, false, false);
+        }
+
+        let mut backoff = RECOVERY_BACKOFF.with(|backoff| backoff.get());
+        if !backoff.is_due(now()) {
+            return Ok(());
+        }
+        let result = self.try_recover(window, true, backoff.failures == 0);
+        match result {
+            // Measured from the end of the attempt, which can itself take long.
+            Err(_) => backoff.record_failure(now()),
+            Ok(()) => backoff = RecoveryBackoff::default(),
+        }
+        RECOVERY_BACKOFF.with(|shared| shared.set(backoff));
+        result
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn try_recover<W>(
+        &mut self,
+        window: &W,
+        needs_new_context: bool,
+        first_attempt: bool,
+    ) -> anyhow::Result<()>
+    where
+        W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+    {
+        let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         let window_handle = window
             .window_handle()
@@ -2838,7 +2955,11 @@ impl WgpuRenderer {
             // recreate the context without software renderers. If this fails
             // the caller should request another frame and retry — the real GPU
             // may need more time to come back (e.g. after suspend/resume).
-            std::thread::sleep(std::time::Duration::from_millis(350));
+            // Retries are already spaced out by the backoff, so only the first
+            // attempt sleeps.
+            if first_attempt {
+                std::thread::sleep(RECOVERY_INITIAL_DELAY);
+            }
 
             let instance = WgpuContext::instance(Some(Box::new(window.clone())));
             let surface = create_surface(&instance, window_handle.as_raw())?;
@@ -3587,6 +3708,91 @@ mod tests {
         assert!(hidden.is_unconfigured());
         assert!(hidden.core().is_some());
         assert_eq!(hidden.viewport_size(), device_size(48, 40));
+        Ok(())
+    }
+
+    /// A window whose handle cannot be had, counting how often recovery asks
+    /// for it: every attempt asks first, so the count is the attempt count.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Debug, Default)]
+    struct CountingWindow(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[cfg(target_os = "linux")]
+    impl CountingWindow {
+        fn attempts(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HasWindowHandle for CountingWindow {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HasDisplayHandle for CountingWindow {
+        fn display_handle(
+            &self,
+        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    /// The platforms call `recover` from every frame while the device is
+    /// lost. A failed attempt must not be repeated, nor its settle sleep
+    /// paid, until the backoff has passed, and the backoff must stop growing
+    /// at its cap so a device that comes back is picked up within seconds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_recovery_waits_out_a_capped_backoff() -> anyhow::Result<()> {
+        let mut headless = WgpuHeadlessRenderer::new()?;
+        let mut renderer = unconfigured_renderer(&mut headless);
+        // No shared context: the lost device's context was dropped by the
+        // failed attempt, so recovery has to create a new one.
+        renderer.context = Some(Rc::new(RefCell::new(None)));
+        let window = CountingWindow::default();
+
+        let failed_at = std::time::Instant::now();
+        assert!(renderer.recover_with_clock(&window, || failed_at).is_err());
+        assert_eq!(window.attempts(), 1);
+        for _ in 0..10 {
+            renderer.recover_with_clock(&window, || failed_at)?;
+        }
+        assert_eq!(window.attempts(), 1, "a retry ran inside the backoff");
+        let elapsed = std::time::Duration::from_millis(100);
+        assert_eq!(
+            renderer.recovery_delay_at(failed_at + elapsed),
+            Some(RECOVERY_INITIAL_DELAY - elapsed)
+        );
+
+        // Another window would recreate the same shared context, so it waits
+        // out the same backoff rather than paying for its own attempt.
+        let mut other_renderer = unconfigured_renderer(&mut headless);
+        other_renderer.context = Some(Rc::new(RefCell::new(None)));
+        let other_window = CountingWindow::default();
+        other_renderer.recover_with_clock(&other_window, || failed_at)?;
+        assert_eq!(other_window.attempts(), 0, "another window retried inside the backoff");
+
+        let start = std::time::Instant::now();
+        RECOVERY_BACKOFF.with(|backoff| backoff.set(RecoveryBackoff::default()));
+        assert!(renderer.recover_with_clock(&window, || start).is_err());
+        let mut due = start + RECOVERY_INITIAL_DELAY;
+        let mut delay = RECOVERY_INITIAL_DELAY;
+        for attempt in 2..=10 {
+            let early = due - std::time::Duration::from_millis(1);
+            renderer.recover_with_clock(&window, || early)?;
+            assert_eq!(window.attempts(), attempt, "retried before the backoff passed");
+            assert!(renderer.recover_with_clock(&window, || due).is_err());
+            assert_eq!(window.attempts(), attempt + 1, "no retry once the backoff passed");
+            delay = (delay * 2).min(RECOVERY_MAX_DELAY);
+            due += delay;
+        }
+        assert_eq!(delay, RECOVERY_MAX_DELAY);
         Ok(())
     }
 

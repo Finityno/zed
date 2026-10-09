@@ -679,8 +679,11 @@ impl WaylandWindowState {
     /// A hidden window whose surface was released has nothing to present
     /// to: its frames neither draw nor retry until it is shown again, when
     /// the configure that restores the surface requests a forced redraw.
+    /// A hidden window whose device recovery failed parks the same way
+    /// rather than polling for retries; showing it requests the retry.
     fn surface_parked(&self) -> bool {
-        !self.visibility.is_visible() && self.renderer.is_unconfigured()
+        !self.visibility.is_visible()
+            && (self.renderer.is_unconfigured() || self.renderer.device_lost())
     }
 
     fn restore_surface(&mut self) {
@@ -955,8 +958,10 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
         state.resize_throttle = false;
         // GPUI may throttle this tick without calling draw, so leave the request
-        // latched until a draw actually reaches the renderer.
-        let force_render = state.redraw_requested;
+        // latched until a draw actually reaches the renderer. A lost device
+        // still waiting out its recovery backoff has nothing to draw, so the
+        // request stays latched for the tick when the next attempt is due.
+        let force_render = state.redraw_requested && state.renderer.recovery_delay().is_none();
         let require_presentation = state.presentation.requires_presentation();
         drop(state);
 
@@ -987,6 +992,17 @@ impl WaylandWindowStatePtr {
         // suspended surface gets no frame callback to pace the retries.
         if state.surface_parked() {
             self.frame_loop.set(FrameLoop::Parked);
+            return;
+        }
+
+        // Nothing can present until the lost device is recovered, so the
+        // next tick waits for the recovery attempt to be due.
+        if let Some(delay) = state.renderer.recovery_delay() {
+            self.frame_loop.set(FrameLoop::RetryScheduled);
+            let surface_id = state.surface.id();
+            let client = state.client.clone();
+            drop(state);
+            client.schedule_frame_retry_after(&surface_id, delay);
             return;
         }
 
@@ -1625,6 +1641,7 @@ impl WaylandWindowStatePtr {
             return;
         }
         state.restore_surface();
+        let recovery_pending = state.renderer.device_lost();
         // A compositor may never deliver the callback of a frame presented
         // just before the window was suspended, so the shown window stops
         // waiting on it and schedules its own frame.
@@ -1632,6 +1649,9 @@ impl WaylandWindowStatePtr {
         drop(state);
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame_loop.set(FrameLoop::Parked);
+            self.request_redraw();
+        } else if recovery_pending {
+            // Parked while hidden with its device lost: the draw retries it.
             self.request_redraw();
         }
     }
