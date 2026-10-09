@@ -1,0 +1,342 @@
+{
+  "status": "HELD_UNMERGED",
+  "source": "fb1bf337143204aae1f2a15356a08b42ab2024ad",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "branch": "perf/bounded-layout-constraints-20261009",
+  "native_children": 2352,
+  "bare_children": 1512,
+  "census_children": 840,
+  "workloads": 84,
+  "primary_CPU_gain_percent": [
+    36.61595728434817,
+    41.526765276500996,
+    35.5243830177843,
+    43.614413577824635
+  ],
+  "all_bare_gates_pass": true,
+  "failed_fields": [
+    {
+      "kind": "census",
+      "case": "header-on-80-bare-flat",
+      "field": "current_rss_kib",
+      "baseline_median": 20168,
+      "candidate_median": 20336,
+      "delta": 168,
+      "fraction_gain": -0.008330027766759222,
+      "baseline_range": 64,
+      "candidate_range": 168,
+      "budget": 64,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "header-on-80-bare-flat",
+      "field": "peak_rss_kib",
+      "baseline_median": 21136,
+      "candidate_median": 21240,
+      "delta": 104,
+      "fraction_gain": -0.004920514761544285,
+      "baseline_range": 0,
+      "candidate_range": 232,
+      "budget": 0,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "header-on-80-bare-nested",
+      "field": "peak_rss_kib",
+      "baseline_median": 20880,
+      "candidate_median": 20960,
+      "delta": 80,
+      "fraction_gain": -0.0038314176245210726,
+      "baseline_range": 64,
+      "candidate_range": 228,
+      "budget": 64,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "color-on-80-bare-flat",
+      "field": "current_rss_kib",
+      "baseline_median": 20252,
+      "candidate_median": 20312,
+      "delta": 60,
+      "fraction_gain": -0.002962670353545329,
+      "baseline_range": 4,
+      "candidate_range": 244,
+      "budget": 4,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "color-on-80-bare-flat",
+      "field": "peak_rss_kib",
+      "baseline_median": 21136,
+      "candidate_median": 21260,
+      "delta": 124,
+      "fraction_gain": -0.005866767600302801,
+      "baseline_range": 64,
+      "candidate_range": 308,
+      "budget": 64,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "resize-off-16-bare-flat",
+      "field": "peak_bytes",
+      "baseline_median": 6185098,
+      "candidate_median": 6185170,
+      "delta": 72,
+      "fraction_gain": -1.1640882650525504e-05,
+      "baseline_range": 0,
+      "candidate_range": 0,
+      "budget": 0,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "stream-off-32",
+      "field": "peak_rss_kib",
+      "baseline_median": 16144,
+      "candidate_median": 16352,
+      "delta": 208,
+      "fraction_gain": -0.01288404360753221,
+      "baseline_range": 128,
+      "candidate_range": 288,
+      "budget": 128,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "redraw-on-32",
+      "field": "current_rss_kib",
+      "baseline_median": 16180,
+      "candidate_median": 16540,
+      "delta": 360,
+      "fraction_gain": -0.022249690976514216,
+      "baseline_range": 320,
+      "candidate_range": 196,
+      "budget": 320,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "redraw-on-32",
+      "field": "peak_rss_kib",
+      "baseline_median": 16080,
+      "candidate_median": 16440,
+      "delta": 360,
+      "fraction_gain": -0.022388059701492536,
+      "baseline_range": 320,
+      "candidate_range": 256,
+      "budget": 320,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "panel-keep-256",
+      "field": "peak_rss_kib",
+      "baseline_median": 15628,
+      "candidate_median": 15736,
+      "delta": 108,
+      "fraction_gain": -0.006910673150755055,
+      "baseline_range": 0,
+      "candidate_range": 248,
+      "budget": 0,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "keep-32",
+      "field": "current_rss_kib",
+      "baseline_median": 12588,
+      "candidate_median": 12892,
+      "delta": 304,
+      "fraction_gain": -0.024149984111852558,
+      "baseline_range": 260,
+      "candidate_range": 276,
+      "budget": 260,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "keep-32",
+      "field": "peak_rss_kib",
+      "baseline_median": 12624,
+      "candidate_median": 12796,
+      "delta": 172,
+      "fraction_gain": -0.013624841571609633,
+      "baseline_range": 132,
+      "candidate_range": 216,
+      "budget": 132,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "replace-32",
+      "field": "current_rss_kib",
+      "baseline_median": 12820,
+      "candidate_median": 12908,
+      "delta": 88,
+      "fraction_gain": -0.006864274570982839,
+      "baseline_range": 64,
+      "candidate_range": 56,
+      "budget": 64,
+      "gate": "control",
+      "pass": false
+    },
+    {
+      "kind": "census",
+      "case": "state-bump-32",
+      "field": "current_rss_kib",
+      "baseline_median": 12820,
+      "candidate_median": 12920,
+      "delta": 100,
+      "fraction_gain": -0.0078003120124804995,
+      "baseline_range": 64,
+      "candidate_range": 192,
+      "budget": 64,
+      "gate": "control",
+      "pass": false
+    }
+  ],
+  "pure_tree_owner_comparisons": 18,
+  "pure_tree_footprint_identical": true,
+  "meaningful_regressions": "Three fail on original 0.13 and pass on owned source; fourth contract passes both.",
+  "dependency_default_feature_test_passes": 121,
+  "native_correctness_children": 204,
+  "native_test_passes": 620,
+  "per_frame_audit_children": 168,
+  "zero_test_patterns_no_coverage": [
+    [
+      "baseline",
+      "window::text_glyph_cache_tests::"
+    ],
+    [
+      "candidate",
+      "window::text_glyph_cache_tests::"
+    ]
+  ],
+  "owning_checks": "Full root locked compile, strict owning Clippy and source guards not run after frozen performance controls failed. Isolated Cargo-generated path record matches root seed; 1828 unrelated package records unchanged.",
+  "scope": "Native Linux fake platform/text complete App/Window with System allocator. Counting CPU is not gain evidence; native RSS measured separately. No app, physical GPU, macOS/Windows or shipped allocator gain. Fincode pins unchanged.",
+  "no_unchanged_resampling": true,
+  "compiled_inputs": "All sources/compiler/dependencies/runtime/binaries/policy verified before and after phases. Both Taffy 0.13 externs recompiled with matching flags/metadata/default features and identical three transitive objects; other 58 externs identical, original 59 untouched.",
+  "phase_receipts": {
+    "dependency-build-final": {
+      "command": [
+        "python3",
+        "build_dependencies.py"
+      ],
+      "cwd": "/workspace/scratch/gpui-bounded-layout-loop",
+      "deadline_seconds": 600,
+      "started_unix": 1791540908.048174,
+      "pid": 324226,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 17.731508493423462,
+      "log_sha256": "4c72e312dbe76e1ba063da5b4c3cef11fac91b4bad90c56e4a4cd22d568a0b6d"
+    },
+    "owner-cache-preflight": {
+      "command": [
+        "python3",
+        "preflight.py"
+      ],
+      "cwd": "/workspace/scratch/gpui-bounded-layout-loop",
+      "deadline_seconds": 300,
+      "started_unix": 1791540987.985021,
+      "pid": 324407,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 0.6694614887237549,
+      "log_sha256": "ad89df2ee88d52f4e2686a10050216a554f5712900cf5b937c4421107a8f6d70"
+    },
+    "native-four-build": {
+      "command": [
+        "python3",
+        "build_all.py"
+      ],
+      "cwd": "/workspace/scratch/gpui-bounded-layout-loop",
+      "deadline_seconds": 600,
+      "started_unix": 1791541019.8533037,
+      "pid": 324693,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 193.17481923103333,
+      "log_sha256": "70add161e20385794fe53713f72679354d99897e03e40f2aee3305e80072d906"
+    },
+    "native-correctness": {
+      "command": [
+        "python3",
+        "check_correctness.py"
+      ],
+      "cwd": "/workspace/scratch/gpui-bounded-layout-loop",
+      "deadline_seconds": 600,
+      "started_unix": 1791541251.4023786,
+      "pid": 324946,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 38.66830658912659,
+      "log_sha256": "30f59a6cdfbc5bdd6212f63e7c3a299ee16268dccb0d38929a944dd8155891ba"
+    },
+    "bare-alternation": {
+      "command": [
+        "python3",
+        "measure.py",
+        "bare"
+      ],
+      "cwd": "/workspace/scratch/gpui-bounded-layout-loop",
+      "deadline_seconds": 900,
+      "started_unix": 1791541344.243374,
+      "pid": 325962,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 275.0229833126068,
+      "log_sha256": "9abae48c00eab4b5d665bccbf5517a9329d5b2037f2896e880e37c6afbc23d92"
+    },
+    "census-alternation": {
+      "command": [
+        "python3",
+        "measure.py",
+        "census"
+      ],
+      "cwd": "/workspace/scratch/gpui-bounded-layout-loop",
+      "deadline_seconds": 600,
+      "started_unix": 1791541675.4903688,
+      "pid": 333573,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 83.03902649879456,
+      "log_sha256": "af30d9582064771e07d7e0d60d33c1447c2b4e3a53be525a393002e21574eb86"
+    }
+  },
+  "maintenance_cost": "Local Taffy source ownership imports 50 original source files; only Cache runtime semantics changed. Original MIT/license/authors preserved. This candidate is rejected; no consumer uses the vendored crate.",
+  "setup_error": "First test compile lacked an explicit margin-set import in baseline regression; all source/log/artifacts retained under rejected-dependency-test-setup before corrected builds. Initial supervise CLI mismatch executed no child. No paired performance sample was repeated.",
+  "archive_sha256": "407f403d36fc4d6ff77f63d7d7180700ab77793d18c27cd574d090f50e9cf582",
+  "archive_bytes": 16545279,
+  "archive_members": 3740,
+  "archive_parts": [
+    {
+      "path": "receipts.tar.gz.part000",
+      "bytes": 8388608,
+      "sha256": "142ea262c90169dc08622d09f04e62d558b059543a50b8f252f02802fe53eeea"
+    },
+    {
+      "path": "receipts.tar.gz.part001",
+      "bytes": 8156671,
+      "sha256": "7cca58de21f43b76f2282648b8b8ba7f11bb160823e94de6ba025c1eca64cdf5"
+    }
+  ],
+  "archive_reconstruction": "Concatenate receipts.tar.gz.part000 then part001 to receipts.tar.gz; verify original archive_sha256."
+}

@@ -1,0 +1,11 @@
+Taffy registry release: 0.13.0
+Original source revision: 45a56299d366ddb383e593a1f0372158d00e8530
+Original source authors: Alice Cecile, Johnathan Kelley, Nico Burns and contributors.
+Original copyright and MIT license: LICENSE.
+Owned repository: Finityno/zed.
+Local changes: bounded nine-entry FIFO measurement cache, compatible-axis validation,
+size-only margin metadata guard, source root name and owned packaging.
+Repository hyperlinks in copied documentation are rendered as plain prose.
+Comparison source revision: 77f385683c1d698c91a23a259f87fdddf26925fb.
+Its cache-safety conditions motivate local guards; its layout/leaf/default-feature
+changes and cache ownership are not imported.

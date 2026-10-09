@@ -197,3 +197,13 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Bounded layout-constraint caching at `fb1bf337143204aae1f2a15356a08b42ab2024ad`
+is held and unmerged. It keeps 0.13 layout/leaf/default-feature APIs and the
+original 368-byte cache, with identical pure-tree ownership across 18 children.
+Four nested-panel CPU targets improve 35.52–43.61% across 2352 complete native
+children and 84 workloads; all bare gates pass. Thirteen census RSS fields
+and one 72-byte peak requested-heap control fail their frozen gates. Preserve
+all evidence under `performance-evidence/bounded-layout-cache-held-20261009`;
+never resample unchanged or weaken controls. No consumer adoption or app/GPU
+gain is established. Continue to a distinct transcript rendering bottleneck.
