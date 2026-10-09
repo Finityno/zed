@@ -8379,6 +8379,12 @@ impl Window {
         self.modifiers = modifiers;
     }
 
+    /// For testing: set the cursor position without generating input events.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_mouse_position(&mut self, position: Point<Pixels>) {
+        self.mouse_position = position;
+    }
+
     /// For testing: simulate a mouse move event to the given position.
     /// This dispatches the event through the normal event handling path,
     /// which will trigger hover states and tooltips.

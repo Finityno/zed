@@ -5043,6 +5043,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn default_hover_listener_updates_after_resize_without_mouse_move(cx: &mut TestAppContext) {
+        let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let hover_transitions = hover_transitions.clone();
+            move |_, _| HoverListenerLayoutTestView {
+                target_left: px(0.),
+                hover_transitions,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        let pointer = point(px(10.), px(10.));
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(pointer, cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        cx.simulate_window_resize(any_window, size(px(400.), px(300.)));
+        cx.update_window(any_window, |_, window, cx| {
+            // The test platform reports a default cursor when bounds change.
+            window.set_mouse_position(pointer);
+            window.draw(cx).clear(cx);
+            assert_eq!(window.mouse_position(), pointer);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        window
+            .update(cx, |view, _, cx| {
+                view.target_left = px(40.);
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(window.mouse_position(), pointer);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true, false]);
+    }
+
+    #[gpui::test]
     fn default_hover_listener_ends_after_key_press(cx: &mut TestAppContext) {
         let hover_transitions = Rc::new(RefCell::new(Vec::new()));
         let window = cx.add_window({
