@@ -5073,8 +5073,7 @@ mod tests {
         assert!(initial_mouse_moves > 0);
         cx.simulate_window_resize(any_window, size(px(400.), px(300.)));
         cx.update_window(any_window, |_, window, cx| {
-            // The test platform reports a default cursor when bounds change.
-            window.set_mouse_position(pointer);
+            assert_eq!(window.mouse_position(), pointer);
             window.draw(cx).clear(cx);
             assert_eq!(window.mouse_position(), pointer);
         })
