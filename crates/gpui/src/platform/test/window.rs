@@ -35,6 +35,7 @@ thread_local! {
 pub(crate) struct TestWindowState {
     subpixel_rendering_supported: bool,
     pub(crate) bounds: Bounds<Pixels>,
+    mouse_position: Point<Pixels>,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
     pub(crate) title: Option<String>,
@@ -119,6 +120,7 @@ impl TestWindow {
         Self(Rc::new(Mutex::new(TestWindowState {
             subpixel_rendering_supported: SUBPIXEL_RENDERING_SUPPORTED.get(),
             bounds: params.bounds,
+            mouse_position: Point::default(),
             display,
             platform,
             handle,
@@ -252,6 +254,10 @@ impl TestWindow {
     /// Every text input state change the window reported, in order.
     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
         self.0.lock().text_input_state_changes.clone()
+    }
+
+    pub(crate) fn set_mouse_position(&self, position: Point<Pixels>) {
+        self.0.lock().mouse_position = position;
     }
 
     /// Resizes the window and fires its resize callback, as the platform would.
@@ -402,7 +408,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        Point::default()
+        self.0.lock().mouse_position
     }
 
     fn modifiers(&self) -> crate::Modifiers {

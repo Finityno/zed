@@ -5073,10 +5073,22 @@ mod tests {
         assert!(initial_mouse_moves > 0);
         cx.simulate_window_resize(any_window, size(px(400.), px(300.)));
         cx.update_window(any_window, |_, window, cx| {
-            // The test platform reports a default cursor when bounds change.
-            window.set_mouse_position(pointer);
+            assert_eq!(window.mouse_position(), pointer);
             window.draw(cx).clear(cx);
             assert_eq!(window.mouse_position(), pointer);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+        assert_eq!(mouse_moves.get(), initial_mouse_moves);
+
+        let pointer = point(px(15.), px(10.));
+        cx.update_window(any_window, |_, window, cx| window.simulate_mouse_move(pointer, cx))
+            .unwrap();
+        let initial_mouse_moves = mouse_moves.get();
+        cx.simulate_window_scale_factor_change(any_window, 1.5);
+        cx.update_window(any_window, |_, window, cx| {
+            assert_eq!(window.mouse_position(), pointer);
+            window.draw(cx).clear(cx);
         })
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true]);
