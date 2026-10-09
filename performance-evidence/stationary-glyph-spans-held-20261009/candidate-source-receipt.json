@@ -1,0 +1,9 @@
+{
+  "source": "ee5e8b086de0b82782b2733e662e0d0c24974689",
+  "tree": "d380d3c50d51615dfc36d02b6eadda4aab9da032",
+  "parent": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "a606f866bcfb66fb09d2035a59887c49cce7b650ed7464c65d5154fa15e22206"
+  },
+  "candidate_scope": "scene.rs only; generic scalar movement/transition/animated/layer behavior preserved. Independent bulk contiguous >=8span, exact scalar Vec growth, no new owner/cache/GPU."
+}

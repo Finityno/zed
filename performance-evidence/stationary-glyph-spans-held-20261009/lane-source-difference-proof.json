@@ -1,0 +1,10 @@
+{
+  "native_source_differences": [
+    "crates/gpui/src/scene.rs"
+  ],
+  "production_source": "ee5e8b086de0b82782b2733e662e0d0c24974689",
+  "production_candidate_exact_bytes": true,
+  "private_harness_identical": true,
+  "all59_original_externs_identical": true,
+  "no_alternate_dependency": true
+}

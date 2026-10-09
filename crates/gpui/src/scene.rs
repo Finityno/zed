@@ -693,7 +693,21 @@ impl Scene {
         // Layers moved out from under the mask around them are left out, as
         // painting them there would have; so is the end of each.
         let mut layers_left_out: Vec<bool> = Vec::new();
-        for operation in &prev_scene.paint_operations[range] {
+        let mut operations = prev_scene.paint_operations[range].iter();
+        let mut scalar_glyphs_left = 0;
+        while let Some(operation) = operations.next() {
+            if scalar_glyphs_left != 0 {
+                scalar_glyphs_left -= 1;
+            } else if moved.is_none() && rebase.is_none()
+                && let Some(order) = self.layer_stack.last().copied()
+            {
+                let span = self.replay_regular_glyph_span(operation, operations.as_slice(), prev_scene, order);
+                if span >= 8 {
+                    operations = operations.as_slice()[span - 1..].iter();
+                    continue;
+                }
+                scalar_glyphs_left = span.saturating_sub(1);
+            }
             match operation {
                 PaintOperation::Primitive(_)
                 | PaintOperation::MonochromeSprite(_)
@@ -783,6 +797,70 @@ impl Scene {
                 }
             }
         }
+    }
+
+    fn replay_regular_glyph_span(
+        &mut self,
+        first_operation: &PaintOperation,
+        following: &[PaintOperation],
+        previous: &Scene,
+        order: DrawOrder,
+    ) -> usize {
+        let (subpixel, first) = match first_operation {
+            PaintOperation::MonochromeSprite(index) => (false, *index as usize),
+            PaintOperation::SubpixelSprite(index) => (true, *index as usize),
+            _ => return 0,
+        };
+        let regular = |offset: usize| {
+            if subpixel {
+                previous.painted_subpixel_sprites.get(first + offset)
+                    .is_some_and(|sprite| sprite.pad == 0 && sprite.effect.animation == 0)
+            } else {
+                previous.painted_monochrome_sprites.get(first + offset)
+                    .is_some_and(|sprite| sprite.pad == 0 && sprite.effect.animation == 0)
+            }
+        };
+        if !regular(0) {
+            return 0;
+        }
+        let mut span = 1;
+        for operation in following {
+            let index = match (subpixel, operation) {
+                (false, PaintOperation::MonochromeSprite(index))
+                | (true, PaintOperation::SubpixelSprite(index)) => *index as usize,
+                _ => break,
+            };
+            if index != first + span || !regular(span) {
+                break;
+            }
+            span += 1;
+        }
+        if span < 8 {
+            return span;
+        }
+        // These stored sprites passed insertion's visibility check, and neither
+        // their geometry nor mask changes here. Their enclosing layer supplies
+        // one order, so clipping and enum dispatch need not run per glyph.
+        let pad = self.current_transition;
+        reserve_scalar_growth(&mut self.paint_operations, span);
+        if subpixel {
+            reserve_scalar_growth(&mut self.painted_subpixel_sprites, span);
+            let start = append_replayed_sprites(
+                &mut self.painted_subpixel_sprites,
+                &previous.painted_subpixel_sprites[first..first + span],
+                |sprite| { sprite.order = order; sprite.pad = pad; },
+            );
+            self.paint_operations.extend((start..start + span as u32).map(PaintOperation::SubpixelSprite));
+        } else {
+            reserve_scalar_growth(&mut self.painted_monochrome_sprites, span);
+            let start = append_replayed_sprites(
+                &mut self.painted_monochrome_sprites,
+                &previous.painted_monochrome_sprites[first..first + span],
+                |sprite| { sprite.order = order; sprite.pad = pad; },
+            );
+            self.paint_operations.extend((start..start + span as u32).map(PaintOperation::MonochromeSprite));
+        }
+        span
     }
 
     pub fn finish(&mut self) {
@@ -1243,6 +1321,22 @@ fn radix_sort(keys: &mut Vec<u64>, scratch: &mut Vec<u64>, bits: Range<u32>) {
     }
 }
 
+fn reserve_scalar_growth<T>(painted: &mut Vec<T>, additional: usize) {
+    let required = painted.len().saturating_add(additional);
+    if required <= painted.capacity() {
+        return;
+    }
+    // Both entry types start at four elements and double on scalar pushes.
+    // Reserving the whole span directly could choose a different capacity
+    // sequence and retain more memory after later frames grow the vectors.
+    debug_assert!((1..=1024).contains(&std::mem::size_of::<T>()));
+    let mut capacity = painted.capacity();
+    while capacity < required {
+        capacity = capacity.saturating_mul(2).max(4);
+    }
+    painted.reserve_exact(capacity - painted.len());
+}
+
 fn append_replayed_sprites<T: Copy>(
     painted: &mut Vec<T>,
     sources: &[T],
@@ -1662,6 +1756,175 @@ mod tests {
                 bounds: Bounds::default(),
             },
             transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn span_test_glyph(index: usize) -> MonochromeSprite {
+        let mut glyph = shimmering_glyph(0);
+        glyph.tile.tile_id = crate::TileId((index % 17) as u32);
+        glyph.tile.texture_id.index = (index % 3) as u32;
+        glyph.bounds.origin.x = ScaledPixels((index % 8) as f32);
+        glyph.bounds.size.width = ScaledPixels(1.);
+        glyph.color.a = 0.6;
+        glyph
+    }
+
+    fn span_test_subpixel(glyph: MonochromeSprite) -> SubpixelSprite {
+        SubpixelSprite {
+            order: glyph.order,
+            pad: glyph.pad,
+            bounds: glyph.bounds,
+            content_mask: glyph.content_mask,
+            color: glyph.color,
+            effect: glyph.effect,
+            tile: glyph.tile,
+            transformation: glyph.transformation,
+        }
+    }
+
+    fn span_test_operations(scene: &Scene) -> Vec<String> {
+        scene.paint_operations.iter().map(|operation| match operation {
+            PaintOperation::MonochromeSprite(index) => format!("mono {index}"),
+            PaintOperation::SubpixelSprite(index) => format!("subpixel {index}"),
+            PaintOperation::Primitive(Primitive::Quad(quad)) => format!("quad {quad:?}"),
+            PaintOperation::StartLayer(layer) => format!("start {layer:?}"),
+            PaintOperation::EndLayer => "end".to_owned(),
+            _ => panic!("unexpected fixture operation"),
+        }).collect()
+    }
+
+    struct GlyphSpanReplayCase<'a> {
+        capacity: usize,
+        prefix: usize,
+        outer_layer: bool,
+        current_transition: bool,
+        rebase: Option<(u32, u32)>,
+        moved: Option<&'a SceneMove>,
+        started_at: std::time::Instant,
+    }
+
+    fn assert_span_replay_matches_scalar(mut source: Scene, case: GlyphSpanReplayCase<'_>) {
+        let GlyphSpanReplayCase { capacity, prefix, outer_layer, current_transition, rebase, moved, started_at } = case;
+        let destination = || {
+            let mut scene = Scene {
+                paint_operations: Vec::with_capacity(capacity),
+                painted_monochrome_sprites: Vec::with_capacity(capacity),
+                painted_subpixel_sprites: Vec::with_capacity(capacity),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                scene.push_transition(rolling_in(started_at)).expect("transition fits");
+            }
+            if current_transition { scene.set_current_transition(2); }
+            for index in 0..prefix {
+                scene.insert_monochrome_sprite(span_test_glyph(index));
+                scene.insert_subpixel_sprite(span_test_subpixel(span_test_glyph(index)));
+            }
+            if outer_layer { scene.push_layer(unit_bounds()); }
+            scene
+        };
+        let mut batched = destination();
+        batched.replay_inside(0..source.len(), &source, rebase, moved);
+        // Primitive operations force the original generic insertion path,
+        // independently of span detection and its reserve implementation.
+        for operation in &mut source.paint_operations {
+            *operation = match operation {
+                PaintOperation::MonochromeSprite(index) => PaintOperation::Primitive(
+                    Primitive::MonochromeSprite(source.painted_monochrome_sprites[*index as usize]),
+                ),
+                PaintOperation::SubpixelSprite(index) => PaintOperation::Primitive(
+                    Primitive::SubpixelSprite(source.painted_subpixel_sprites[*index as usize]),
+                ),
+                _ => continue,
+            };
+        }
+        let mut scalar = destination();
+        scalar.replay_inside(0..source.len(), &source, rebase, moved);
+        assert_eq!(span_test_operations(&batched), span_test_operations(&scalar));
+        assert_eq!(batched.paint_operations.capacity(), scalar.paint_operations.capacity());
+        assert_eq!(batched.painted_monochrome_sprites.capacity(), scalar.painted_monochrome_sprites.capacity());
+        assert_eq!(batched.painted_subpixel_sprites.capacity(), scalar.painted_subpixel_sprites.capacity());
+        assert_eq!(format!("{:?}", batched.painted_monochrome_sprites), format!("{:?}", scalar.painted_monochrome_sprites));
+        assert_eq!(format!("{:?}", batched.painted_subpixel_sprites), format!("{:?}", scalar.painted_subpixel_sprites));
+        assert_eq!(format!("{:?}", batched.transitions), format!("{:?}", scalar.transitions));
+        assert_eq!(batched.shimmer_animations, scalar.shimmer_animations);
+        batched.finish();
+        scalar.finish();
+        assert_eq!(format!("{:?}", batched.monochrome_sprites), format!("{:?}", scalar.monochrome_sprites));
+        assert_eq!(format!("{:?}", batched.subpixel_sprites), format!("{:?}", scalar.subpixel_sprites));
+        assert_eq!(format!("{:?}", batched.quads), format!("{:?}", scalar.quads));
+        assert_eq!(format!("{:?}", batched.transitioned), format!("{:?}", scalar.transitioned));
+        assert_eq!(batched.animated_monochrome_sprites, scalar.animated_monochrome_sprites);
+        assert_eq!(batched.animated_subpixel_sprites, scalar.animated_subpixel_sprites);
+        assert_eq!(batched.opaque_quad_indices, scalar.opaque_quad_indices);
+        assert_eq!(batched.blended_quad_indices, scalar.blended_quad_indices);
+    }
+
+    #[test]
+    fn stationary_glyph_spans_match_scalar_payloads_and_capacities() {
+        let started_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for capacity in [0, 1, 3, 4, 5, 16, 31, 64] {
+            for prefix in [0, 1, 3, 9] {
+                for length in [0, 1, 7, 8, 9, 16, 31, 32, 63, 64, 65, 129] {
+                    for subpixel in [false, true] {
+                        let mut source = Scene::default();
+                        source.push_layer(unit_bounds());
+                        for index in 0..length {
+                            let glyph = span_test_glyph(index);
+                            if subpixel { source.insert_subpixel_sprite(span_test_subpixel(glyph)); }
+                            else { source.insert_monochrome_sprite(glyph); }
+                        }
+                        source.pop_layer();
+                        assert_span_replay_matches_scalar(source, GlyphSpanReplayCase {
+                            capacity, prefix, outer_layer: true, current_transition: false,
+                            rebase: None, moved: None, started_at,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_span_boundaries_preserve_clips_layers_animation_and_movement() {
+        let started_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let moves = [
+            SceneMove { delta: point(ScaledPixels(2.), ScaledPixels(3.)), old_outer: [0., 0., 10., 10.], new_outer: [2., 3., 12., 13.] },
+            SceneMove { delta: point(ScaledPixels(20.), ScaledPixels(0.)), old_outer: [0., 0., 10., 10.], new_outer: [0., 0., 10., 10.] },
+        ];
+        for outer_layer in [false, true] {
+            for current_transition in [false, true] {
+                for rebase in [None, Some((0, 0)), Some((0, 1)), Some((1, 2))] {
+                    for moved in [None, Some(&moves[0]), Some(&moves[1])] {
+                        let mut source = Scene::default();
+                        let animation = source.push_shimmer_animation(ShimmerAnimation { band_start: -10., travel: 50., period: std::time::Duration::from_secs(1), hold: 0. });
+                        let transition = source.push_transition(rolling_in(started_at)).expect("transition fits");
+                        for index in 0..16 { source.insert_monochrome_sprite(span_test_glyph(index)); }
+                        source.paint_operations.swap(1, 2);
+                        source.insert_primitive(opaque_quad());
+                        for (run, length) in [7, 8, 9, 16, 8].into_iter().enumerate() {
+                            source.push_layer(unit_bounds());
+                            for index in 0..length {
+                                let mut glyph = span_test_glyph(index);
+                                if index == 4 && run == 1 { glyph.effect.animation = animation; }
+                                if index == 5 && run == 2 { glyph.pad = transition; }
+                                if index == 6 && run == 3 { glyph.content_mask.bounds.origin.x = ScaledPixels(100.); }
+                                if run == 4 { glyph.transformation = TransformationMatrix::unit().translate(point(ScaledPixels(1.), ScaledPixels(2.))); }
+                                if run % 2 == 0 { source.insert_monochrome_sprite(glyph); }
+                                else { source.insert_subpixel_sprite(span_test_subpixel(glyph)); }
+                            }
+                            source.insert_primitive(opaque_quad());
+                            source.pop_layer();
+                        }
+                        source.insert_subpixel_sprite(span_test_subpixel(span_test_glyph(0)));
+                        source.finish();
+                        source.advance_transitions(started_at + std::time::Duration::from_millis(50));
+                        assert_span_replay_matches_scalar(source, GlyphSpanReplayCase {
+                            capacity: 3, prefix: 3, outer_layer, current_transition, rebase, moved, started_at,
+                        });
+                    }
+                }
+            }
         }
     }
 

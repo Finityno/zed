@@ -1,0 +1,36 @@
+{
+  "archive_sha256": "8c97dc50cbe98d2b180119324dac2ef262c3f375200828ffbc2432913d384969",
+  "archive_bytes": 30511741,
+  "archive_members": 5519,
+  "roundtrip_verified": true,
+  "production_source": "ee5e8b086de0b82782b2733e662e0d0c24974689",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "held": true,
+  "merged": false,
+  "no_unchanged_resampling": true,
+  "no_app_GPU_platform_or_shipped_allocator_gain": true,
+  "archive_parts": [
+    {
+      "path": "receipts.tar.gz.part000",
+      "bytes": 8388608,
+      "sha256": "f9d0405e50803ddd6658660310be027efcd861fda39318ff0bbe6b5c295c56de"
+    },
+    {
+      "path": "receipts.tar.gz.part001",
+      "bytes": 8388608,
+      "sha256": "d511bed618b55bee81cada79353257f43e25b30686156de18c54a8532bac0205"
+    },
+    {
+      "path": "receipts.tar.gz.part002",
+      "bytes": 8388608,
+      "sha256": "0556779d0309d6e14fe8578a4d3c60056bf7f42c3f32784b18b09ef623b84a0f"
+    },
+    {
+      "path": "receipts.tar.gz.part003",
+      "bytes": 5345917,
+      "sha256": "cb08a91527a9bf5a9f91c482d2b54597ec25cf1d6f741a35b4808809d7d497d2"
+    }
+  ],
+  "parts_concatenation_roundtrip_verified": true,
+  "transport": "Exact original archive split into 8MiB parts to stay within connector request-body size. No member/source/sample change."
+}

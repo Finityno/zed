@@ -1,0 +1,12 @@
+{
+  "main": "9dc42a07ac73cddfc3ec149831a5e8cb8a5caf1b",
+  "cargo_blob": "3db0afbe19cead9cc618570175e8e7bcec6bff9d",
+  "pins": [
+    "gpui = { git = \"https://github.com/Finityno/zed.git\", rev = \"6b18c87dd5f2d1ccbee1ee641054295f2a78390b\", features = [",
+    "gpui_platform = { git = \"https://github.com/Finityno/zed.git\", rev = \"6b18c87dd5f2d1ccbee1ee641054295f2a78390b\", features = [",
+    "sum_tree = { git = \"https://github.com/Finityno/zed.git\", rev = \"6b18c87dd5f2d1ccbee1ee641054295f2a78390b\" }",
+    "gpui-component = { git = \"https://github.com/Finityno/gpui-component.git\", rev = \"031f54b627333272a8c157cbe4ca1cf591d16172\" }"
+  ],
+  "policy_main_preserved": "c35120065fa0e4a80c1b2521be50ba6555e79c34",
+  "identical_pins": true
+}

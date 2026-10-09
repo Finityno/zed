@@ -197,3 +197,18 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Contiguous stationary glyph-span batching at
+`ee5e8b086de0b82782b2733e662e0d0c24974689` remains held and unmerged. All
+eight retained transcript CPU/elapsed targets exceed both lane ranges with
+24.84–42.97% lower component thread CPU, but 49 frozen controls fail: 16
+ordinary CPU, 16 elapsed, eight whole-child CPU and nine census RSS fields.
+All requested held/peak/total bytes and allocation-call controls pass. The
+3,332-child cohort, 274 correctness children, scalar capacity/payload oracle,
+current-main attribution, exact source and input identities, and adverse
+results are preserved under
+`performance-evidence/stationary-glyph-spans-held-20261009`. Never resample
+this design unchanged or weaken its controls. No consumer or app/GPU gain
+is claimed. Continue with current-main paint-record payload ownership before
+a distinct storage design.

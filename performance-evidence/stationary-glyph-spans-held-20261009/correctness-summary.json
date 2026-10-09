@@ -1,0 +1,21 @@
+{
+  "children": 274,
+  "native_test_passes": 622,
+  "per_frame_audit_cases": 119,
+  "both_lane_audit_children": 238,
+  "zero_test_patterns_no_coverage_claim": [
+    {
+      "lane": "baseline",
+      "pattern": "window::text_glyph_cache_tests::"
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::text_glyph_cache_tests::"
+    }
+  ],
+  "new_scalar_oracle_cases": {
+    "capacity_lengths_kinds_prefixes": 768,
+    "mixed_boundaries_transition_rebase_layer_movement_histories": 48
+  },
+  "all_pass": true
+}

@@ -1,0 +1,53 @@
+{
+  "baseline_revision": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "file_count": 435,
+  "private_changes_to_tracked": [
+    "AGENTS.md",
+    "crates/gpui/src/gpui.rs",
+    "crates/gpui/src/taffy.rs",
+    "crates/gpui/src/window/view_retention/splice_profile.rs",
+    "crates/gpui/src/window/view_retention/tests.rs"
+  ],
+  "private_fixture_additions": [
+    "crates/gpui/src/perf_count.rs",
+    "crates/gpui/src/window/view_retention/color_profile.rs",
+    "crates/gpui/src/window/view_retention/transcript_profile.rs",
+    "crates/gpui/src/window/view_retention/layout_owner_profile.rs"
+  ],
+  "no_production_change_baseline": true,
+  "copied_symlink_licenses": [
+    "crates/gpui_apple/LICENSE-APACHE",
+    "crates/util_macros/LICENSE-APACHE",
+    "crates/ztracing/LICENSE-APACHE",
+    "crates/gpui_platform/LICENSE-APACHE",
+    "crates/gpui_macos/LICENSE-APACHE",
+    "crates/path/LICENSE-APACHE",
+    "crates/gpui_wgpu/LICENSE-APACHE",
+    "crates/collections/LICENSE-APACHE",
+    "crates/http_client_tls/LICENSE-APACHE",
+    "crates/http_client/LICENSE-APACHE",
+    "crates/refineable/LICENSE-APACHE",
+    "crates/ztracing_macro/LICENSE-APACHE",
+    "crates/gpui_windows/LICENSE-APACHE",
+    "crates/zlog/LICENSE-APACHE",
+    "crates/sum_tree/LICENSE-APACHE",
+    "crates/gpui_linux/LICENSE-APACHE",
+    "crates/gpui_macros/LICENSE-APACHE",
+    "crates/gpui/LICENSE-APACHE",
+    "crates/gpui_shared_string/LICENSE-APACHE",
+    "crates/scheduler/LICENSE-APACHE",
+    "crates/gpui_web/LICENSE-APACHE",
+    "crates/reqwest_client/LICENSE-APACHE",
+    "crates/util/LICENSE-APACHE",
+    "crates/gpui_util/LICENSE-APACHE",
+    "crates/refineable/derive_refineable/LICENSE-APACHE",
+    "crates/gpui_web/examples/hello_web/LICENSE-APACHE"
+  ],
+  "note": "Snapshot copies original LICENSE-APACHE symlink targets as their exact full license text; no candidate copyright/license change. AGENTS.md snapshot is instruction evidence, not compiled source.",
+  "compiled_tracked_changes": [
+    "crates/gpui/src/gpui.rs",
+    "crates/gpui/src/taffy.rs",
+    "crates/gpui/src/window/view_retention/splice_profile.rs",
+    "crates/gpui/src/window/view_retention/tests.rs"
+  ]
+}
