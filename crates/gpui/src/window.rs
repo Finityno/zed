@@ -9531,6 +9531,40 @@ mod tests {
         assert!(arena_after < heavy.1);
     }
 
+    /// A window that went quiet on its heavy scene, with no other window
+    /// drawing, kept every chunk of that scene's arena for as long as the app
+    /// sat idle. The idle reclaim gives the arena back down to one chunk.
+    #[gpui::test]
+    fn test_idle_app_releases_the_last_heavy_draws_arena(cx: &mut TestAppContext) {
+        let quads = Rc::new(Cell::new(20_000));
+        let window = cx.add_window(move |_, _| QuadGrid { quads });
+        draw_window(cx, window.into());
+        let arena_retained = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let arena = cx.element_arena.borrow();
+                (
+                    arena.capacity(),
+                    arena.element_list_capacity() * 2 * std::mem::size_of::<usize>(),
+                )
+            })
+        };
+        let (heavy_chunks, heavy_elements) = arena_retained(cx);
+        assert!(heavy_chunks > 1024 * 1024);
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        let (idle_chunks, idle_elements) = arena_retained(cx);
+        eprintln!(
+            "element arena after a heavy draw: chunks {heavy_chunks} B, element list {heavy_elements} B; \
+             after idle: chunks {idle_chunks} B, element list {idle_elements} B"
+        );
+        assert_eq!(idle_chunks, 1024 * 1024);
+        assert_eq!(idle_elements, 0);
+
+        draw_window(cx, window.into());
+        assert_eq!(arena_retained(cx).0, heavy_chunks);
+    }
+
     /// Prints how long the first heavy draw after an idle reclaim takes next
     /// to the same draw with the high-water capacity still retained, three
     /// runs each. Run with `--release -- --ignored --nocapture`.
