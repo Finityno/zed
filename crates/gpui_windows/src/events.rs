@@ -1449,12 +1449,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
-        self.state.direct_manipulation.on_pointer_hit_test(wparam);
         // A gesture may be starting; `draw_window` polls Direct Manipulation
         // and keeps frames coming while it reports one.
-        self.state
-            .frame_demand
-            .store(true, std::sync::atomic::Ordering::Release);
+        if self.state.direct_manipulation.on_pointer_hit_test(wparam) {
+            self.state
+                .frame_demand
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         None
     }
 
@@ -1470,13 +1471,20 @@ impl WindowsWindowInner {
             // loop until the in-progress draw unwinds. Asking for a frame
             // makes the vsync thread re-invalidate this window (see
             // `begin_vsync_thread`), so the deferred frame still gets drawn,
-            // at most one vsync late.
+            // at most one vsync late. Validate before asking: the vsync
+            // thread may invalidate the window as soon as the demand is set,
+            // and validating after that would erase the deferred frame.
+            unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             self.state
                 .frame_demand
                 .store(true, std::sync::atomic::Ordering::Release);
-            unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
+        // Validate up front for the same reason: anything that asks for a
+        // frame during this draw (Direct Manipulation below, or GPUI re-arming
+        // the demand from `request_frame`) lets the vsync thread invalidate the
+        // window, and that invalidation must survive to produce the next paint.
+        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
         self.state.direct_manipulation.update();
@@ -1513,7 +1521,6 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
     }

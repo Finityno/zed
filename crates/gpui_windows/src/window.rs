@@ -185,8 +185,10 @@ impl WindowsWindowState {
         let fullscreen = None;
         let initial_placement = None;
 
-        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
-            .context("initializing Direct Manipulation")?;
+        let frame_demand = Arc::new(AtomicBool::new(true));
+        let direct_manipulation =
+            DirectManipulationHandler::new(hwnd, scale_factor, Arc::clone(&frame_demand))
+                .context("initializing Direct Manipulation")?;
 
         Ok(Self {
             origin: Cell::new(origin),
@@ -212,7 +214,7 @@ impl WindowsWindowState {
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
-            frame_demand: Arc::new(AtomicBool::new(true)),
+            frame_demand,
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,

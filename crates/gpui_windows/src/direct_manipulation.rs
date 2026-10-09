@@ -1,5 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -38,7 +42,7 @@ pub(crate) struct DirectManipulationHandler {
 const CONTACT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 impl DirectManipulationHandler {
-    pub fn new(window: HWND, scale_factor: f32) -> Result<Self> {
+    pub fn new(window: HWND, scale_factor: f32, frame_demand: Arc<AtomicBool>) -> Result<Self> {
         unsafe {
             let manager: IDirectManipulationManager =
                 CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER)?;
@@ -80,6 +84,7 @@ impl DirectManipulationHandler {
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
+                    frame_demand,
                 )
                 .into();
 
@@ -104,7 +109,9 @@ impl DirectManipulationHandler {
         self.scale_factor.set(scale_factor);
     }
 
-    pub fn on_pointer_hit_test(&self, wparam: WPARAM) {
+    /// Returns whether a touchpad contact was handed to Direct Manipulation,
+    /// so a gesture may be starting.
+    pub fn on_pointer_hit_test(&self, wparam: WPARAM) -> bool {
         unsafe {
             let pointer_id = wparam.loword() as u32;
             let mut pointer_type = POINTER_INPUT_TYPE::default();
@@ -113,8 +120,10 @@ impl DirectManipulationHandler {
                 self.viewport.SetContact(pointer_id).log_err();
                 self.contact_grace_until
                     .set(Some(Instant::now() + CONTACT_GRACE_PERIOD));
+                return true;
             }
         }
+        false
     }
 
     pub fn update(&self) {
@@ -126,18 +135,29 @@ impl DirectManipulationHandler {
     /// Whether a gesture may be in progress, so `update` must keep being
     /// called each frame for it (and its inertia) to advance.
     pub fn needs_updates(&self) -> bool {
-        if let Some(grace_until) = self.contact_grace_until.get() {
-            if Instant::now() < grace_until {
-                return true;
+        let in_grace = match self.contact_grace_until.get() {
+            Some(grace_until) if Instant::now() < grace_until => true,
+            Some(_) => {
+                self.contact_grace_until.set(None);
+                false
             }
-            self.contact_grace_until.set(None);
-        }
-        // Err toward polling: an unknown status keeps updates coming.
+            None => false,
+        };
+        // The grace only covers a gesture that has not started yet: once one
+        // is seen running, its own status decides, so a short flick that is
+        // already back to ready stops asking for frames. An unreadable status
+        // polls only within the grace, so a persistent error cannot redraw
+        // the window every vsync forever.
         match unsafe { self.viewport.GetStatus() } {
             Ok(status) => {
-                status == DIRECTMANIPULATION_RUNNING || status == DIRECTMANIPULATION_INERTIA
+                let active =
+                    status == DIRECTMANIPULATION_RUNNING || status == DIRECTMANIPULATION_INERTIA;
+                if active {
+                    self.contact_grace_until.set(None);
+                }
+                active || in_grace
             }
-            Err(_) => true,
+            Err(_) => in_grace,
         }
     }
 
@@ -173,6 +193,7 @@ struct DirectManipulationEventHandler {
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    frame_demand: Arc<AtomicBool>,
 }
 
 impl DirectManipulationEventHandler {
@@ -180,6 +201,7 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+        frame_demand: Arc<AtomicBool>,
     ) -> Self {
         Self {
             window,
@@ -190,6 +212,7 @@ impl DirectManipulationEventHandler {
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
+            frame_demand,
         }
     }
 
@@ -242,6 +265,14 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
     ) -> windows_core::Result<()> {
         if current == previous {
             return Ok(());
+        }
+
+        // A gesture can start long after the contact's grace period, for
+        // example when fingers rest before panning. Ask for frames here so
+        // `draw_window` resumes calling `update`, which the gesture needs to
+        // advance in manual-update mode.
+        if current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA {
+            self.frame_demand.store(true, Ordering::Release);
         }
 
         // A new gesture interrupted inertia, so end the old sequence.
