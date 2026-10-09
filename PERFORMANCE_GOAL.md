@@ -197,3 +197,14 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Direct glyph descriptors at `21dcdcc29a2cc536ea125c64f88c3eef87e5bc0c`
+remain held. All 3,418 native children are preserved; all 20 requested-memory
+primaries pass (10.24–28.77% live, 75–97.92% record capacity reduction), but 36
+CPU/elapsed/whole-child/RSS controls fail. Final native retained correctness
+passes after two preserved pre-metric defects were fixed. Never repeat this
+source unchanged or weaken its frozen gates. See
+`performance-evidence/direct-glyph-records-held-20261009`. Continue with a
+distinct in-place extension kernel motivated by exact native disassembly of
+per-glyph enum reconstruction/drop dispatch. No adoption or app/GPU gain.

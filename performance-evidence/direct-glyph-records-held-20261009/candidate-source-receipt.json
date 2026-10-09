@@ -1,0 +1,10 @@
+{
+  "source": "21dcdcc29a2cc536ea125c64f88c3eef87e5bc0c",
+  "tree": "e6df311cf3de8599aa78e7c767cd4e11f8d1fcfb",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "bcdc8de0900680302971c8316d317816a5a98ac873eacb9f631e4ba4518eaa9b",
+    "crates/gpui/src/window/view_retention/tests.rs": "6d88b07f48170fd92ce153beb8b656192cbb2c4f5eccdde690c66a478c484703"
+  },
+  "scope": "Direct insertion range encoding, 8BScene/16BWindow prefix seal explicitlybudgeted. Text_system/line andwindow/glyph_painting unchanged. Scalar oldvariant replaybody exactapart newenum guard; no closurefactoring orpostpaintscan. Shared normalizedoverlay metadata frozen beforepairs."
+}

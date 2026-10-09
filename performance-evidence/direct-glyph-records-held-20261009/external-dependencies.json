@@ -1,0 +1,356 @@
+[
+  {
+    "name": "accesskit",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libaccesskit-b38bd26f2280b879.rlib",
+    "bytes": 1188280,
+    "sha256": "c3a67c982bdb6977b479392b0e9716cae1362b7f9ebea5dbd382f1df5a41caa1"
+  },
+  {
+    "name": "anyhow",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libanyhow-a3d493dddccbe83b.rlib",
+    "bytes": 660616,
+    "sha256": "ab5f4a98f02588ffe677916fad18382e1a337732da2f4fb458143d95b5a63371"
+  },
+  {
+    "name": "async_channel",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libasync_channel-a7622190e53dca84.rlib",
+    "bytes": 266696,
+    "sha256": "d1417604c8118af7cb65e858bfc672cb6623c9928cff150eb3ae23f223278ed7"
+  },
+  {
+    "name": "async_task",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libasync_task-564845325783fd35.rlib",
+    "bytes": 320172,
+    "sha256": "db4b12f16fa8016e595443905f5017379ec2ab742e6efe4eb0556f8c1ac8215b"
+  },
+  {
+    "name": "backtrace",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libbacktrace-fd3b52f449456bd0.rlib",
+    "bytes": 1330008,
+    "sha256": "cf4a5d322cc20cffb6de45b9af4e92bebe44b99e300cb6cd85cb5535195053b6"
+  },
+  {
+    "name": "bitflags",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libbitflags-982f3c178a85445f.rlib",
+    "bytes": 275444,
+    "sha256": "30648f2739d2da73e76423b78b3a33523c7c81172b3abd661e983bfef2dfb577"
+  },
+  {
+    "name": "chrono",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libchrono-8e96a9d47d39c0e6.rlib",
+    "bytes": 3206546,
+    "sha256": "45661b71acab185bc65355fa74dbb4f6e59cd54e35f0e2ea249cea568e771442"
+  },
+  {
+    "name": "collections",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libcollections-e62d0331cd56205c.rlib",
+    "bytes": 54324,
+    "sha256": "3c3c79fb1f0a276679fcf82595cce0bccbca23efd4a3f9ce53b253e0b742d642"
+  },
+  {
+    "name": "ctor",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libctor-c2496397fb8926bf.rlib",
+    "bytes": 398014,
+    "sha256": "0f34b94fd73376f85efa2c871314fc3e25efe145b1f083d7c087e5ea04302aa2"
+  },
+  {
+    "name": "derive_more",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libderive_more-dedcf2f0d58ce203.rlib",
+    "bytes": 68288,
+    "sha256": "dfa7eccd87812377e45a598cfa5ef89873f33932d787da3e57703eea8c701ff8"
+  },
+  {
+    "name": "env_logger",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libenv_logger-bf1b09490d29f5ee.rlib",
+    "bytes": 582380,
+    "sha256": "a87b4b7a74accf009c0b51f6d9d7d56e3983fbb212ce352b202250e4c0b140c6"
+  },
+  {
+    "name": "etagere",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libetagere-6038fe0f0cf7c972.rlib",
+    "bytes": 205662,
+    "sha256": "1f52d96f42eff02a7cb45ef0ab41dca08ed2bbbfc58059eefc681e70a4f7aac7"
+  },
+  {
+    "name": "futures",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libfutures-c5d62e3b6dd650a0.rlib",
+    "bytes": 21748,
+    "sha256": "8919c59d4c30c06bf6717899e3eb4ed7a9a508faf7417de314f095c4b93a50d2"
+  },
+  {
+    "name": "futures_concurrency",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libfutures_concurrency-4c3a958dc6517d6c.rlib",
+    "bytes": 12297580,
+    "sha256": "051bd3e853df83c64fd55d9d26df430f8fdb8ee81cd4754c73944d2fa9f5a6bd"
+  },
+  {
+    "name": "gpui_macros",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libgpui_macros-364ab6c3866fa52c.so",
+    "bytes": 15645424,
+    "sha256": "118adac4177d4ff731a0d5a2b386df9105df19e3e5d850f0a023db3559c55947"
+  },
+  {
+    "name": "gpui_platform",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libgpui_platform-5096fb57e0d7baf0.rlib",
+    "bytes": 29648,
+    "sha256": "23203d583e49949db0e5ea86dd04a033f4ca0ddaec2474daf0a8f86fe1689519"
+  },
+  {
+    "name": "gpui_shared_string",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libgpui_shared_string-d5329c8a4755c8b3.rlib",
+    "bytes": 46920,
+    "sha256": "1e6472e87a6f8cc6d08c80dd746f75b70f90772b3bb92dffe934efeeca50f4f7"
+  },
+  {
+    "name": "gpui_util",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libgpui_util-b532bae7bc08d202.rlib",
+    "bytes": 178070,
+    "sha256": "a4e08bc2a844d12324ef997f473435fc710c2cd4152dba1d59ed354fab5007d8"
+  },
+  {
+    "name": "heapless",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libheapless-3a7af651ca6be5c7.rlib",
+    "bytes": 1667074,
+    "sha256": "ae5fa6e7160a000c671acb6706bd0253e0d6ed07c9a6f24ab691ffeb73fb4379"
+  },
+  {
+    "name": "http_client",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libhttp_client-1d81357459d44411.rlib",
+    "bytes": 663638,
+    "sha256": "71c46f5f06ff3ff89de92a097fee9c6a9e789bd54e1d73b9acf7e6f5000a13bc"
+  },
+  {
+    "name": "image",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libimage-51b39814db60c2a5.rlib",
+    "bytes": 11770574,
+    "sha256": "8e5c4c6e343a915704be730a8099216181d59ea621d84bf01831a8b5e7d39c93"
+  },
+  {
+    "name": "inventory",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libinventory-ca318e8b06e27acb.rlib",
+    "bytes": 37686,
+    "sha256": "6ac58e7ef199d74cde64250c575f4c4bfd2194b584266bf0d252fb995cf23702"
+  },
+  {
+    "name": "itertools",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libitertools-b4ca1e09acb71635.rlib",
+    "bytes": 3217496,
+    "sha256": "f1a788390d3d4f1f5a31f47e6f444355b70e6887bb1c465df1b6ab21e7189ad4"
+  },
+  {
+    "name": "log",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/liblog-8a5437405373275d.rlib",
+    "bytes": 698232,
+    "sha256": "e021fc452be3f74e9ec4029a32b1911b667078ee0a08a956507896c6479fdba6"
+  },
+  {
+    "name": "lyon",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/liblyon-fbe52db6936e90b7.rlib",
+    "bytes": 15478,
+    "sha256": "c7ba101cf1cc2ac7569ea0361a54b77b03f2867a5b7fb691a967eea4ef18e654"
+  },
+  {
+    "name": "num_cpus",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libnum_cpus-b0b09d579da87a4f.rlib",
+    "bytes": 183046,
+    "sha256": "7b68bc92a51d622b84995f8b82ac1ea75029f98c2fae11f97c678039feea44ac"
+  },
+  {
+    "name": "parking",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libparking-e7909af1270a577a.rlib",
+    "bytes": 53174,
+    "sha256": "ba3158dafc09315ea4eac2fcef9d06c79bdcef9f4cf1abd8ebf649eed00f6034"
+  },
+  {
+    "name": "parking_lot",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libparking_lot-6652e931494c9c94.rlib",
+    "bytes": 413246,
+    "sha256": "9e388682d91ff3aa91bf946e2b1fbbfccfb82863709a72a4f682778eeb9883d4"
+  },
+  {
+    "name": "pin_project",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libpin_project-6d5c2743ad71fb1f.rlib",
+    "bytes": 24044,
+    "sha256": "86ec44f0de831dfc17f26044e76e2a96488b654163094cc9ee53b063bc1710f1"
+  },
+  {
+    "name": "pollster",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libpollster-5b86812e10482480.rlib",
+    "bytes": 43916,
+    "sha256": "52ad64a583b5f12864293d75fd77ae5a5ef6c5410f3f1565bf8556f0111e16e7"
+  },
+  {
+    "name": "postage",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libpostage-d9858a6098229299.rlib",
+    "bytes": 798976,
+    "sha256": "5cee3e2527297544d8f8b44955970bc7f8752dd3026b5f13d3dd3c85414b5d45"
+  },
+  {
+    "name": "profiling",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libprofiling-bd21c3a2f3863d57.rlib",
+    "bytes": 9616,
+    "sha256": "62d0927dc68ad12b0016930807226b7763ca45c6ddfa61196215989a428fd7cd"
+  },
+  {
+    "name": "proptest",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libproptest-d155af41dc8bc455.rlib",
+    "bytes": 7468298,
+    "sha256": "a115ea83b01dc7d44bae936bdcae6c33b27a7dd5201e81d7d38ebfbc97116c77"
+  },
+  {
+    "name": "rand",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/librand-5ba16b8526702143.rlib",
+    "bytes": 1272896,
+    "sha256": "8f0ebc8924ee92b5425cd09cafaee59e4a7a4ff32537d14c64260db44a983132"
+  },
+  {
+    "name": "raw_window_handle",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libraw_window_handle-cd7445e7686b93fc.rlib",
+    "bytes": 459910,
+    "sha256": "5025e36646c539826f216540767e3ece186131902bdf8ff8db3ecfa12f47e6d2"
+  },
+  {
+    "name": "refineable",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/librefineable-0c209f38f35a7106.rlib",
+    "bytes": 24714,
+    "sha256": "641a8fadec11f2ca1e1fdef75dda800d2b0be2961968b96e714841009b0f135b"
+  },
+  {
+    "name": "regex",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libregex-1fa07e1fa86c393b.rlib",
+    "bytes": 1172492,
+    "sha256": "640f041c0db375026d030136b52ca1fed5d5d08868b8d60c561b3e8e4ce9189f"
+  },
+  {
+    "name": "reqwest_client",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libreqwest_client-1720a4e0521fa8cc.rlib",
+    "bytes": 400578,
+    "sha256": "7bfd0771fc980c70c778d9dad96f755363c73fc884a6d206dbbdd76eea35635d"
+  },
+  {
+    "name": "resvg",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libresvg-16ce569606234b4f.rlib",
+    "bytes": 1264308,
+    "sha256": "7abff97ca3ae403842672d79acb080fb520380ff137c1adbcb4bb994b07ecb2b"
+  },
+  {
+    "name": "scheduler",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libscheduler-70135b29ab966859.rlib",
+    "bytes": 1023380,
+    "sha256": "636f7012a33759f3d933ec96e712dbf9fbaef166e15107b20650a6ba716b58dc"
+  },
+  {
+    "name": "schemars",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libschemars-9ff6137b63f1980b.rlib",
+    "bytes": 2694566,
+    "sha256": "bde0c67abfeb653e6fc5fcb121033ef58337598ac728b58d3315353f1925b087"
+  },
+  {
+    "name": "seahash",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libseahash-1f615e6e067d6a22.rlib",
+    "bytes": 82216,
+    "sha256": "4466bd9d04e1843113133c29bb4b94a2767029b6e44670f9db2d27a8b1ddeb42"
+  },
+  {
+    "name": "serde",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libserde-d49d050147d36fd1.rlib",
+    "bytes": 1028224,
+    "sha256": "b0e9cbe06351f2279b94e14dc48665095ee269f7e004616fce0ed1d6cbb54921"
+  },
+  {
+    "name": "serde_json",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libserde_json-27f275bdf82ac746.rlib",
+    "bytes": 2573510,
+    "sha256": "16f4b33b9dd3c59e0eece2c34fcc7e3b1f7d97488b97e52a87d8582622966f81"
+  },
+  {
+    "name": "slotmap",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libslotmap-92e841a7c499ea28.rlib",
+    "bytes": 1088668,
+    "sha256": "9c2b1149bcc17c6dd05f38a71615c264bb194062f4ce11898ea3de28568e30ef"
+  },
+  {
+    "name": "smallvec",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libsmallvec-6ab6e046cc28c04b.rlib",
+    "bytes": 294972,
+    "sha256": "78cc3f10805c5487122881354fd8f72a8378369773c54b8cd24359f0b9e4d043"
+  },
+  {
+    "name": "spin",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libspin-51d74b325d225727.rlib",
+    "bytes": 321026,
+    "sha256": "0f7c613e185115a22404bd91c4c5acff50b41ab5ac80b797f43357193eca1a78"
+  },
+  {
+    "name": "strum",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libstrum-fd6f50cfe775d394.rlib",
+    "bytes": 32538,
+    "sha256": "d6ce6daf36eeb968323d5bf7d26af7616fcb97a0b8aed7e9f5aa637a1c141ad4"
+  },
+  {
+    "name": "sum_tree",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libsum_tree-fed3abdf3e83160d.rlib",
+    "bytes": 617918,
+    "sha256": "f52ff6cf5df0bdc183c62b7adb69c6bc92c09e41601ac42a9e39a1e0c2691ea0"
+  },
+  {
+    "name": "taffy",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libtaffy-7edc9eea8d7e7c2d.rlib",
+    "bytes": 3558826,
+    "sha256": "4754182a449a46a7f189a63f6368ec9dd7998e4ed1c1f3ec113974c75353af6c"
+  },
+  {
+    "name": "thiserror",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libthiserror-733f54dccc8804cf.rlib",
+    "bytes": 35456,
+    "sha256": "9a76564ef147ed3eddf902e9a27422d854e08fef89985b3051bd1e23a97c391a"
+  },
+  {
+    "name": "ttf_parser",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libttf_parser-a4df20eabb64bdce.rlib",
+    "bytes": 4269558,
+    "sha256": "1891ce18354a6ad765dbf745c54b64a5081221fba20e0e0985ab977b2896e8ce"
+  },
+  {
+    "name": "unicode_segmentation",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libunicode_segmentation-bcacb7d8ef655b6c.rlib",
+    "bytes": 1330558,
+    "sha256": "47de9318d7cb6ab9a98d24039714957b2b2204eac3be1dab9462dd1bb41aa872"
+  },
+  {
+    "name": "url",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/liburl-c142cef5f77c45c8.rlib",
+    "bytes": 1001282,
+    "sha256": "4a2b8acd87212789ffceb2e9cf2058296f6b033092b75ef36886fe48af5306fd"
+  },
+  {
+    "name": "usvg",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libusvg-5a1cc6b4bca92916.rlib",
+    "bytes": 4194848,
+    "sha256": "8eecada1acb6300935bdf7a37dd4dffe34a1e54e2eccd07ba19e71b6399746af"
+  },
+  {
+    "name": "util_macros",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libutil_macros-bd5678776ce3fb9a.so",
+    "bytes": 12501544,
+    "sha256": "dca3851105dc1e2ec793fc35c54c9d80e880c8474548b0747dedb91affc26583"
+  },
+  {
+    "name": "uuid",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libuuid-2a8a627a5f8be249.rlib",
+    "bytes": 751976,
+    "sha256": "97c31dabd60f113f8e973fa540a535bcd93ab7b93ec334c4fcc12df8e16b23da"
+  },
+  {
+    "name": "waker_fn",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libwaker_fn-d7a9ebc5b82833e7.rlib",
+    "bytes": 10142,
+    "sha256": "bc93b059dd8266a13adff5f143187cd9690a0bbd1557a347c0c93c95df58c067"
+  },
+  {
+    "name": "web_time",
+    "path": "/workspace/scratch/gpui-splice-state-loop/baseline-workspace/target/debug/deps/libweb_time-a12fbd950332827a.rlib",
+    "bytes": 13742,
+    "sha256": "5f52afee1c6840b31c91b404dd9231ed71ea4bf1db8aff1b5222d1f96b40f489"
+  }
+]

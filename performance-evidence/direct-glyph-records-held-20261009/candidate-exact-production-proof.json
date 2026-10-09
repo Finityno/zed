@@ -1,0 +1,251 @@
+{
+  "source": "21dcdcc29a2cc536ea125c64f88c3eef87e5bc0c",
+  "files": [
+    {
+      "path": "crates/gpui/src/scene.rs",
+      "production_sha256": "bcdc8de0900680302971c8316d317816a5a98ac873eacb9f631e4ba4518eaa9b",
+      "exact_after_named_getters_stripped": true,
+      "test_suffix_bytes": 0
+    },
+    {
+      "path": "crates/gpui/src/window/view_retention/tests.rs",
+      "production_sha256": "6d88b07f48170fd92ce153beb8b656192cbb2c4f5eccdde690c66a478c484703",
+      "exact_after_named_getters_stripped": true,
+      "test_suffix_bytes": 280
+    }
+  ],
+  "baseline_production_exact_except_same_added_tests_and_named_getters": true,
+  "shared_test_definition_order_matches": true,
+  "common_suites": [
+    {
+      "lane": "baseline",
+      "pattern": "taffy::",
+      "passed": 9,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::layout_retention_tests::",
+      "passed": 14,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::view_retention::tests::",
+      "passed": 57,
+      "ignored": 9
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::view_retention::dependencies::",
+      "passed": 8,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::layout_keys::",
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "text_system::",
+      "passed": 47,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "pattern": "scene::tests::",
+      "passed": 27,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::glyph_painting::tests::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "app::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "arena::tests::",
+      "passed": 15,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "elements::div::tests::",
+      "passed": 44,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "elements::list::test::",
+      "passed": 38,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "elements::uniform_list::test::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "elements::text::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "elements::deferred::tests::",
+      "passed": 3,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "pattern": "window::tests::",
+      "passed": 33,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "pattern": "subscription::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "taffy::",
+      "passed": 9,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::layout_retention_tests::",
+      "passed": 14,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::view_retention::tests::",
+      "passed": 57,
+      "ignored": 9
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::view_retention::dependencies::",
+      "passed": 8,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::layout_keys::",
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "text_system::",
+      "passed": 47,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "pattern": "scene::tests::",
+      "passed": 27,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::glyph_painting::tests::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "app::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "arena::tests::",
+      "passed": 15,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "elements::div::tests::",
+      "passed": 44,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "elements::list::test::",
+      "passed": 38,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "elements::uniform_list::test::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "elements::text::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "elements::deferred::tests::",
+      "passed": 3,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::tests::",
+      "passed": 33,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "pattern": "subscription::tests::",
+      "passed": 4,
+      "ignored": 0
+    }
+  ],
+  "zero_test_filters_explicit": [
+    {
+      "lane": "baseline",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    }
+  ]
+}
