@@ -1661,7 +1661,7 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
-/// How many drawn frames a glyph or SVG tile may go unreferenced before an atlas
+/// How many drawn frames a glyph, SVG or image tile may go unreferenced before an atlas
 /// is allowed to reclaim it (about ten seconds at 60Hz). Shared by the atlas that
 /// retires tiles and by [`Window`](crate::Window), which redraws without cached
 /// views when its retained scene is older than this and so may still name them.
@@ -1685,10 +1685,13 @@ pub trait PlatformAtlas {
     /// Atlases that never retire tiles ignore it.
     fn note_frame_drawn(&self, _scene: &Scene) {}
 
-    /// Frees glyph and SVG tiles that no drawn frame has referenced for at least
+    /// Frees tiles that no drawn frame has referenced for at least
     /// `max_idle_frames` frames, and the page they sat on once it holds nothing.
-    /// Image tiles are owned by [`Window::drop_image`](crate::Window::drop_image)
-    /// and are never touched. Amortised: examines at most one page per call.
+    /// Image tiles included: an image is painted from its [`RenderImage`],
+    /// which uploads it again if it comes back, and most images are never
+    /// passed to [`Window::drop_image`](crate::Window::drop_image), so keeping
+    /// them until then kept every image a window ever showed. Amortised:
+    /// examines at most one page per call.
     fn retire_unused(&self, _max_idle_frames: u64) {}
 
     /// The number of frames passed to [`note_frame_drawn`](Self::note_frame_drawn)
@@ -1924,10 +1927,7 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
         let frame = self.frame;
         let idle: Vec<AtlasKey> = records
             .values()
-            .filter(|record| {
-                matches!(record.key, AtlasKey::Glyph(_) | AtlasKey::Svg(_))
-                    && frame.saturating_sub(record.last_used_frame) >= max_idle_frames
-            })
+            .filter(|record| frame.saturating_sub(record.last_used_frame) >= max_idle_frames)
             .map(|record| record.key.clone())
             .collect();
         let retired = idle.len();
@@ -3959,10 +3959,8 @@ mod atlas_tests {
     }
 
     #[test]
-    fn lookups_keep_a_tile_alive_and_images_are_never_retired() -> Result<()> {
+    fn lookups_keep_a_tile_alive() -> Result<()> {
         let mut state = AtlasState::new(PagedAtlasBackend::default());
-        let image = image_key(7);
-        insert_sized(&mut state, image.clone(), glyph_size())?;
         let looked_up = glyph_key(0, 3, 14.0);
         insert_sized(&mut state, looked_up.clone(), glyph_size())?;
         for _ in 0..IDLE * 3 {
@@ -3970,15 +3968,46 @@ mod atlas_tests {
             state.note_frame_drawn(&Scene::default());
             state.retire_unused(IDLE);
         }
-        assert!(state.contains(&image));
         assert!(state.contains(&looked_up));
 
         run_frames(&mut state, IDLE * 3, &Scene::default());
-        assert!(state.contains(&image), "only drop_image releases an image");
         assert!(!state.contains(&looked_up));
+        Ok(())
+    }
 
-        state.remove(&image);
-        assert_eq!(state.backend.page_count(), 0);
+    /// Images scrolled out of a long transcript are rarely passed to
+    /// `drop_image`; keeping their tiles until then kept every image the window
+    /// ever showed, a polychrome page or more each.
+    #[test]
+    fn images_no_frame_draws_retire_and_drawn_ones_stay() -> Result<()> {
+        let mut state = AtlasState::new(PagedAtlasBackend::default());
+        let large = size(DevicePixels(1200), DevicePixels(900));
+        let shown = image_key(1);
+        let scrolled_away = image_key(2);
+        let shown_tile = insert_sized(&mut state, shown.clone(), large)?;
+        let scrolled_away_tile = insert_sized(&mut state, scrolled_away.clone(), large)?;
+        assert_ne!(shown_tile.texture_id, scrolled_away_tile.texture_id);
+        let mut scene = Scene::default();
+        scene.polychrome_sprites.push(crate::PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: Default::default(),
+            opacity: 1.0,
+            bounds: Default::default(),
+            content_mask: Default::default(),
+            corner_radii: Default::default(),
+            tile: shown_tile,
+        });
+
+        run_frames(&mut state, IDLE * 2 + 2, &scene);
+
+        assert!(state.contains(&shown));
+        assert!(!state.contains(&scrolled_away));
+        assert!(!state.backend.page_is_live(scrolled_away_tile.texture_id));
+        assert_eq!(state.backend.page_count(), 1);
+        // Drawn again, it is uploaded again.
+        insert_sized(&mut state, scrolled_away.clone(), large)?;
+        assert!(state.contains(&scrolled_away));
         Ok(())
     }
 

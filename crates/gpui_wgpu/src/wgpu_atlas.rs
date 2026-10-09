@@ -82,7 +82,7 @@ impl WgpuAtlas {
 
     /// The renderer's once-per-frame hook, called once a frame has been
     /// submitted: marks every tile `scene` draws as used this frame, then lets
-    /// one page's idle glyph and SVG tiles go. Marking comes first so a tile
+    /// one page's idle tiles go. Marking comes first so a tile
     /// drawn this very frame can never be the one retired.
     pub fn on_frame_drawn(&self, scene: &Scene) {
         let mut lock = self.0.lock();

@@ -36,7 +36,7 @@ impl MetalAtlas {
     }
 
     /// The renderer's once-per-frame hook: marks every tile `scene` draws as used
-    /// this frame, then lets one page's idle glyph and SVG tiles go. Marking must
+    /// this frame, then lets one page's idle tiles go. Marking must
     /// come first so a tile drawn this very frame can never be the one retired.
     pub fn on_frame_drawn(&self, scene: &Scene) {
         self.note_frame_drawn(scene);
@@ -162,10 +162,7 @@ impl PlatformAtlas for MetalAtlas {
         let idle_keys: Vec<AtlasKey> = texture
             .tiles
             .values()
-            .filter(|record| {
-                matches!(record.key, AtlasKey::Glyph(_) | AtlasKey::Svg(_))
-                    && frame.saturating_sub(record.last_used_frame) >= max_idle_frames
-            })
+            .filter(|record| frame.saturating_sub(record.last_used_frame) >= max_idle_frames)
             .map(|record| record.key.clone())
             .collect();
         if idle_keys.is_empty() {
@@ -733,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_tiles_are_never_retired() {
+    fn test_idle_image_tiles_are_retired() {
         let Some(atlas) = create_atlas() else {
             return;
         };
@@ -748,14 +745,10 @@ mod tests {
 
         run_frames(&atlas, IDLE * 3, &[]);
 
-        assert!(atlas.contains_key(&image_key));
-        assert!(atlas.texture_is_live(image.texture_id));
-        assert!(!atlas.contains_key(&glyph_key));
-        assert!(!atlas.texture_is_live(glyph.texture_id));
-
-        // Only `drop_image` releases it.
-        atlas.remove(&image_key);
+        // Nothing draws either: both retire, images like glyphs.
         assert!(!atlas.contains_key(&image_key));
         assert!(!atlas.texture_is_live(image.texture_id));
+        assert!(!atlas.contains_key(&glyph_key));
+        assert!(!atlas.texture_is_live(glyph.texture_id));
     }
 }
