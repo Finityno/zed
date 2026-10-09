@@ -1,0 +1,255 @@
+{
+  "status": "HELD/unmerged. No unchanged repeat or weaker gates.",
+  "baseline": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "source": "9740bae5e1a4a4230414442616e37ba39600a736",
+  "fincode_gpui": "4661be26e8da24bda712cd9096bf9fabfe351d5b",
+  "fincode_component": "de14de8f92c6ade7ca616cd1861135f04185d170",
+  "valid_children": 784,
+  "workloads": 28,
+  "diagnostic_children": 20,
+  "qualified": false,
+  "failures": [
+    [
+      "bare",
+      "remove-32",
+      "cpu_ns",
+      "control",
+      1164658,
+      861646
+    ],
+    [
+      "bare",
+      "remove-32",
+      "elapsed_ns",
+      "control",
+      1169614,
+      1057864
+    ],
+    [
+      "bare",
+      "replace-32",
+      "cpu_ns",
+      "control",
+      1876659,
+      1053572
+    ],
+    [
+      "bare",
+      "replace-32",
+      "elapsed_ns",
+      "control",
+      1876190,
+      1053553
+    ],
+    [
+      "bare",
+      "replace-32",
+      "child_cpu_ns",
+      "control",
+      1803000,
+      979000
+    ],
+    [
+      "bare",
+      "grow-256",
+      "cpu_ns",
+      "control",
+      17576099,
+      15484305
+    ],
+    [
+      "bare",
+      "grow-256",
+      "elapsed_ns",
+      "control",
+      17564826,
+      15502069
+    ],
+    [
+      "bare",
+      "grow-256",
+      "child_cpu_ns",
+      "control",
+      17760000,
+      15377000
+    ],
+    [
+      "bare",
+      "state-panel-keep-256",
+      "cpu_ns",
+      "primary gain",
+      2214703,
+      5188218,
+      3185731
+    ],
+    [
+      "bare",
+      "state-panel-keep-256",
+      "elapsed_ns",
+      "primary gain",
+      2215227,
+      5187842,
+      3192434
+    ],
+    [
+      "bare",
+      "state-keep-256",
+      "cpu_ns",
+      "primary gain",
+      1031208,
+      1935598,
+      1000041
+    ],
+    [
+      "bare",
+      "state-keep-256",
+      "elapsed_ns",
+      "primary gain",
+      1031680,
+      1934988,
+      999943
+    ],
+    [
+      "bare",
+      "state-remove-32",
+      "cpu_ns",
+      "control",
+      1284897,
+      867423
+    ],
+    [
+      "bare",
+      "state-remove-32",
+      "elapsed_ns",
+      "control",
+      1289735,
+      867133
+    ],
+    [
+      "bare",
+      "state-remove-32",
+      "child_cpu_ns",
+      "control",
+      1360000,
+      941000
+    ],
+    [
+      "bare",
+      "state-remove-256",
+      "cpu_ns",
+      "control",
+      9485588,
+      6098966
+    ],
+    [
+      "bare",
+      "state-remove-256",
+      "elapsed_ns",
+      "control",
+      9490900,
+      6188205
+    ],
+    [
+      "bare",
+      "state-remove-256",
+      "child_cpu_ns",
+      "control",
+      9461000,
+      5961000
+    ],
+    [
+      "bare",
+      "state-grow-256",
+      "cpu_ns",
+      "control",
+      19575109,
+      12329870
+    ],
+    [
+      "bare",
+      "state-grow-256",
+      "elapsed_ns",
+      "control",
+      18956007,
+      12334164
+    ],
+    [
+      "bare",
+      "state-grow-256",
+      "child_cpu_ns",
+      "control",
+      18976000,
+      12397000
+    ],
+    [
+      "bare",
+      "state-bump-32",
+      "cpu_ns",
+      "control",
+      2559939,
+      1085570
+    ],
+    [
+      "bare",
+      "state-bump-32",
+      "elapsed_ns",
+      "control",
+      2578748,
+      1089541
+    ],
+    [
+      "bare",
+      "state-bump-32",
+      "child_cpu_ns",
+      "control",
+      2693000,
+      1359000
+    ],
+    [
+      "bare",
+      "state-bump-256",
+      "cpu_ns",
+      "control",
+      10551397,
+      8965412
+    ],
+    [
+      "bare",
+      "state-bump-256",
+      "elapsed_ns",
+      "control",
+      10555984,
+      8965907
+    ],
+    [
+      "bare",
+      "state-bump-256",
+      "child_cpu_ns",
+      "control",
+      10629000,
+      9252000
+    ]
+  ],
+  "observed_primary_cpu_difference_percent": [
+    1.8374469081896772,
+    2.1986831243957394
+  ],
+  "important_gain_not_qualified": "1.84/2.20% targetCPU differences are below frozen5% goal and baseline full ranges. Twenty-three normalCPU/elapsed/whole-child fields also fail, plus four targetCPU/elapsed gain fields. No accepted performance gain.",
+  "requested_heap_and_churn": "All28 held/peak/bytes/calls medians exactly identical. All nativeRSS controls pass. 4096temporary stack bytes on64-bit, no retained cache.",
+  "mechanism": "Only RHS>=64 and total<=512 enters non-inlined stack identity membership. Exact ordered left duplicates/first saved versions/first right occurrence preserved, original Vec growth/allocation and small/empty loop retained. No changed checker, fields, recorder or GPU.",
+  "correctness": "1728ordered arbitrary identity/version/length combinations and changed-after-first-read native contract pass in both lanes; retained oracle16seeds50steps, dependency/wheel/panel/layout/atomic-claim/read/nested contracts pass.",
+  "not_run": "Strict owningClippy and application adoption not run: performance unqualified; no PR created or merge permitted.",
+  "protocol": "Four sequential native builds completed before one alternating504bare+280census cohort; bare completed before census. Allraw784samples plus20diagnosticchildren verified. No failed valid cohort rerun.",
+  "adverse_preparation": "Initial copied symlinks rejected/restored exactly before source use; first private diagnostic compile rejected duplicate fixture attachment, source/hashes/output retained; corrected native fixture before any samples. No failed timing retry.",
+  "identities": "Rust1.99 System bare/countingSystem separate lanes;59identicalexterns, compiler/runtime/stdlibrary/source/binary hashes frozen. Current main8ceb independent hidden-surface changes preserved.",
+  "coverage_limits": [
+    "Linux native complete App/Window fake-platform component; not app/physicalGPU/macOS/Windows/shippedallocator gains.",
+    "CPU timers exclude App/setup/4warmups and postloop audits. Census includes App/setup/warmups/finalheldsnapshot.",
+    "Diagnostic shape counts include setup/warmups/counter overhead, never used to claim timing gains.",
+    "Other independent component/Fincode work preserved; current app still coherent4661/de14."
+  ],
+  "policy_sha256": "5149f8dc74ef9dd429855228c02530014b5aa1a6b2b9083ba60a95e403a60a44",
+  "archive_sha256": "205c7f4d59792ba9ea2b1c87779db0aa8b7c8866cb913341a4b511d8af38cc3f",
+  "archive_bytes": 557891,
+  "members": 917
+}

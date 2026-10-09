@@ -623,9 +623,13 @@ impl RenderDependencies {
     /// earlier of the two.
     pub(crate) fn union(&self, other: &Self) -> Self {
         let mut states = self.states.to_vec();
-        for state in other.states.iter() {
-            if !states.iter().any(|(version, _)| version.same_state(&state.0)) {
-                states.push(state.clone());
+        if other.states.len() >= 64 && states.len() + other.states.len() <= 512 {
+            append_indexed_states(&mut states, &other.states);
+        } else {
+            for state in other.states.iter() {
+                if !states.iter().any(|(version, _)| version.same_state(&state.0)) {
+                    states.push(state.clone());
+                }
             }
         }
         Self {
@@ -639,6 +643,27 @@ impl RenderDependencies {
             generation: self.generation.min(other.generation),
             updates: self.updates.min(other.updates),
             floor: 0,
+        }
+    }
+}
+
+#[inline(never)]
+fn append_indexed_states(states: &mut Vec<(StateVersion, u64)>, other: &[(StateVersion, u64)]) {
+    // Sorting the output would change which saved version a later recording
+    // keeps first. Index only identities, with no extra heap or retained owner.
+    let mut identities = [std::ptr::null(); 512];
+    let mut length = states.len();
+    for (identity, (version, _)) in identities.iter_mut().zip(states.iter()) {
+        *identity = Rc::as_ptr(&version.0);
+    }
+    identities[..length].sort_unstable();
+    for state in other {
+        let identity = Rc::as_ptr(&state.0.0);
+        if let Err(index) = identities[..length].binary_search(&identity) {
+            identities.copy_within(index..length, index + 1);
+            identities[index] = identity;
+            length += 1;
+            states.push(state.clone());
         }
     }
 }
@@ -731,6 +756,73 @@ fn unique_states(states: &[(StateVersion, u64)]) -> Rc<[(StateVersion, u64)]> {
         }
     }
     unique.into()
+}
+
+#[cfg(test)]
+mod state_union_tests {
+    use super::*;
+
+    #[test]
+    fn state_unions_preserve_order_duplicates_and_first_versions() {
+        let versions: Vec<_> = (0..1024).map(|_| StateVersion::default()).collect();
+        let lengths = [0, 1, 31, 32, 63, 64, 65, 255, 256, 511, 512, 513];
+        for left_length in lengths {
+            for right_length in lengths {
+                for population in [1, 7, 23, 1024] {
+                    for offset in [0, 29, 511] {
+                        let left = RenderDependencies {
+                            states: (0..left_length)
+                                .map(|index| (versions[(index * 11) % population].clone(), u64::MAX - index as u64))
+                                .collect(),
+                            ..RenderDependencies::default()
+                        };
+                        let right = RenderDependencies {
+                            states: (0..right_length)
+                                .map(|index| (versions[(index * 37 + offset) % population].clone(), index as u64))
+                                .collect(),
+                            ..RenderDependencies::default()
+                        };
+                        let mut expected = left.states.to_vec();
+                        for state in right.states.iter() {
+                            if !expected.iter().any(|(version, _)| version.same_state(&state.0)) {
+                                expected.push(state.clone());
+                            }
+                        }
+                        let actual = left.union(&right);
+                        assert_eq!(actual.states.len(), expected.len());
+                        for (actual, expected) in actual.states.iter().zip(&expected) {
+                            assert!(actual.0.same_state(&expected.0));
+                            assert_eq!(actual.1, expected.1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn state_union_still_detects_a_write_after_the_first_read() {
+        let cx = crate::TestAppContext::single();
+        let version = StateVersion::default();
+        let left = RenderDependencies {
+            states: (0..64).map(|_| (version.clone(), version.get())).collect(),
+            ..RenderDependencies::default()
+        };
+        version.bump();
+        let right = RenderDependencies {
+            states: (0..64).map(|_| (version.clone(), version.get())).collect(),
+            ..RenderDependencies::default()
+        };
+        let actual = left.union(&right);
+        cx.update(|cx| {
+            assert_eq!(
+                cx.dependencies_changed(&actual, false, Instant::now()),
+                Some(DependencyChange::State),
+            );
+        });
+        assert_eq!(actual.states.len(), left.states.len());
+        assert!(actual.states.iter().all(|(_, read_at)| *read_at == 0));
+    }
 }
 
 impl App {
