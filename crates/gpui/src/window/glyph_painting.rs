@@ -355,6 +355,14 @@ pub(crate) struct LineGlyphCache {
 }
 
 impl LineGlyphCache {
+    pub(crate) fn shrink_idle(&mut self) {
+        // Preserve the live frame's records and room for the next draw,
+        // while releasing tables grown by text that is no longer on screen.
+        let capacity = self.previous.len().max(self.current.len()).saturating_mul(2).max(128);
+        self.previous.shrink_to(capacity);
+        self.current.shrink_to(capacity);
+    }
+
     /// Ends a draw: the lines it painted become those the next one can
     /// paint again.
     pub(crate) fn finish_draw(&mut self) {

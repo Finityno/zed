@@ -4176,6 +4176,7 @@ impl Window {
             return;
         }
         self.next_frame.shrink_idle(&self.rendered_frame);
+        self.line_glyph_cache.shrink_idle();
         if let Some(layout_engine) = self.layout_engine.as_mut()
             && layout_engine.reclaim_idle_capacity()
         {

@@ -197,3 +197,23 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Idle line-replay table cleanup at `dabb94e5272dcc474e0a918f8131f501d51f6a39`
+remains held. Across 3,108 native children and 111 complete App/Window workloads,
+all four large idle targets pass: requested held heap 3.36-4.42% lower,
+empty-table ownership 87.497% lower, and native current RSS 2.84-4.39% lower,
+each above both full lane ranges. Thirty-five ordinary CPU/elapsed/whole-child,
+RSS and cold-refill peak-heap fields fail. Refill raises requested peak by
+259,944-262,996 bytes. Preserve the source and all raw results under
+`performance-evidence/idle-line-cache-held-20261009`; never repeat it unchanged
+or weaken its frozen gates. No PR, merge or consumer adoption qualifies.
+
+The distinct next investigation is retained layout cache reuse. The comparison
+source advanced to `412191f0124236f6b98480cadb90d746931e492e` and adopts Taffy
+0.14's multiple constraint-size cache; the owned fork still uses 0.13. Published
+instruction claims motivate owned complete-component attribution, not adoption
+or an app gain claim. Measure per-node cache memory, native RSS and leaf-layout
+semantics, preserving fast/retained, grid/flex/wrapping/baseline/independent-root
+and production consumer controls. Preserve independent atlas, frame-demand,
+sprite replay, arena, focus and text ownership changes.
