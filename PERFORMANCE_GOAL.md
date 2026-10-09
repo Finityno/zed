@@ -154,3 +154,46 @@ Report verified improvements, meaningful failures and blockers requiring action.
 Stay quiet when nothing actionable has changed. Public-facing repository links
 must use owned forks. Preserve copyright, license and required attribution;
 record comparison provenance with plain revisions and prose.
+
+Fincode adopted zero-read stretch omission coherently in
+`b9c8335e1b2258894e063488829f81045e47bb74`, with owned component
+`1c23db7f78e41440acddb2ee7174b0bd431f6dd9`. Scoped native integration,
+retention on/off, strict UI/component checks and original registry-lock records
+pass; merged changed bytes and the combined tree are verified. Subsequent
+independent adoption currently pins rendering `b64fd9389c58a28048fa7c52d56447e73feffd89`
+and component `d8e4aa36aebaee078574ea83e9b630ca5b0e6a80`; preserve those changes.
+
+Empty-right state sharing at `b5bd9e8fae0809bf9af4da0b96798b78e316ae40`
+remains held: eight allocation targets improve 7.02–9.05%, but three native RSS
+controls fail. Unbounded linear read merging at
+`12fdb142f4db5be22b8c5ffbcd0e871ef836011f` also remains held: four CPU targets
+improve 11.42–13.13%, but nine normal CPU/RSS fields fail. Its 560 valid children
+and 560 invalid children from an earlier overlapping measurement are preserved
+under `performance-evidence/linear-read-union-held-20261008` on its branch.
+Never repeat these designs unchanged or weaken their frozen gates.
+
+Bounded out-of-line read merging at `eff2bd53e09225062f725f3e84c564445b7444c0`
+qualifies across 560 native children and 20 complete App/Window workloads. Four
+256-row changed-component cases use 9.41–11.96% less thread CPU and 9.47–11.98%
+less elapsed time, exceeding both full lane ranges and the frozen 5% target.
+All normal CPU/elapsed/whole-child, requested heap/churn and native RSS
+controls pass. Every held/peak/requested-byte/allocation-call median is
+unchanged; no memory or RSS percentage gain is established.
+
+The original small-list algorithm and empty-input sharing are retained;
+only unions of 64 or more combined reads enter a non-inlined linear kernel.
+438,048 read/floor combinations, boundary cases, native retained output,
+dependency changes, wheel scrolling, live-row panels, layout/atomic-claim and
+nested contracts pass. Strict actual owning Clippy and benchmark isolation
+pass. Both lanes use the same 59 immutable native external objects, with
+separate bare and counting-allocator measurements. Receipts prove sequential
+phases; no failed cohort was repeated unchanged. See
+`performance-evidence/bounded-read-union-20261009` for all raw samples,
+identities, variation and coverage limits.
+
+These are Linux complete-component results with a fake renderer and System
+allocator, not application, physical GPU, macOS/Windows or shipped-allocator
+percentages. Qualify coherent component/Fincode adoption separately, then
+continue with representative transcript/streaming, scrolling, editor/Review,
+multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
+still needs renderer-memory, compositing and reclamation evidence.
