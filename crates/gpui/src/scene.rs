@@ -1244,8 +1244,6 @@ fn radix_sort(keys: &mut Vec<u64>, scratch: &mut Vec<u64>, bits: Range<u32>) {
     }
 }
 
-/// Appends `sources` to `painted`, letting `stamp` give each appended sprite
-/// what replaying it changes. Returns the index of the first.
 fn append_replayed_sprites<T: Copy>(
     painted: &mut Vec<T>,
     sources: &[T],
