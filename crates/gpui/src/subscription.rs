@@ -22,9 +22,14 @@ struct SubscriberSetState<EmitterKey, Callback> {
 }
 
 struct Subscriber<Callback> {
-    active: Rc<Cell<bool>>,
-    dropped: Rc<Cell<bool>>,
+    control: Rc<SubscriberControl>,
     callback: Callback,
+}
+
+#[derive(Default)]
+struct SubscriberControl {
+    active: Cell<bool>,
+    dropped: Cell<bool>,
 }
 
 impl<EmitterKey, Callback> SubscriberSet<EmitterKey, Callback>
@@ -48,8 +53,7 @@ where
         emitter_key: EmitterKey,
         callback: Callback,
     ) -> (Subscription, impl FnOnce() + use<EmitterKey, Callback>) {
-        let active = Rc::new(Cell::new(false));
-        let dropped = Rc::new(Cell::new(false));
+        let control = Rc::new(SubscriberControl::default());
         let mut lock = self.0.borrow_mut();
         let subscriber_id = post_inc(&mut lock.next_subscriber_id);
         lock.subscribers
@@ -59,16 +63,16 @@ where
             .insert(
                 subscriber_id,
                 Subscriber {
-                    active: active.clone(),
-                    dropped: dropped.clone(),
+                    control: control.clone(),
                     callback,
                 },
             );
         let this = self.0.clone();
+        let cancellation = control.clone();
 
         let subscription = Subscription {
             unsubscribe: Some(Box::new(move || {
-                dropped.set(true);
+                cancellation.dropped.set(true);
 
                 let mut lock = this.borrow_mut();
                 let Some(subscribers) = lock.subscribers.get_mut(&emitter_key) else {
@@ -83,7 +87,7 @@ where
                 }
             })),
         };
-        (subscription, move || active.set(true))
+        (subscription, move || control.active.set(true))
     }
 
     pub fn remove(
@@ -97,7 +101,7 @@ where
             .into_iter()
             .flatten()
             .filter_map(|subscriber| {
-                if subscriber.active.get() {
+                if subscriber.control.active.get() {
                     Some(subscriber.callback)
                 } else {
                     None
@@ -122,14 +126,14 @@ where
         };
 
         subscribers.retain(|_, subscriber| {
-            if !subscriber.active.get() {
+            if !subscriber.control.active.get() {
                 return true;
             }
-            if subscriber.dropped.get() {
+            if subscriber.control.dropped.get() {
                 return false;
             }
             let keep = f(&mut subscriber.callback);
-            keep && !subscriber.dropped.get()
+            keep && !subscriber.control.dropped.get()
         });
         let mut lock = self.0.borrow_mut();
 
@@ -347,5 +351,66 @@ mod tests {
 
         app.update(|cx| cx.set_global(TestGlobal));
         assert_eq!(count.get(), 0, "should not fire after drop");
+    }
+}
+
+#[cfg(test)]
+mod control_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn canceled_inert_subscription_cannot_be_reactivated() {
+        let subscribers = SubscriberSet::new();
+        let callback_owner = Rc::new(Cell::new(0usize));
+        let (subscription, activate) = subscribers.insert(7usize, {
+            let callback_owner = callback_owner.clone();
+            move || callback_owner.set(callback_owner.get() + 1)
+        });
+        drop(subscription);
+        assert_eq!(Rc::strong_count(&callback_owner), 1);
+        activate();
+        subscribers.retain(&7, |callback| {
+            callback();
+            true
+        });
+        assert_eq!(callback_owner.get(), 0);
+    }
+
+    #[test]
+    fn inert_removal_releases_callback_while_control_handles_remain() {
+        let subscribers = SubscriberSet::new();
+        let callback_owner = Rc::new(Cell::new(0usize));
+        let (subscription, activate) = subscribers.insert(7usize, {
+            let callback_owner = callback_owner.clone();
+            move || callback_owner.set(callback_owner.get() + 1)
+        });
+        assert_eq!(subscribers.remove(&7).into_iter().count(), 0);
+        assert_eq!(Rc::strong_count(&callback_owner), 1);
+        activate();
+        drop(subscription);
+        assert_eq!(callback_owner.get(), 0);
+    }
+
+    #[test]
+    fn old_subscription_control_cannot_cancel_a_replacement() {
+        let subscribers = SubscriberSet::new();
+        let callback_owner = Rc::new(Cell::new(0usize));
+        let make_callback = || {
+            let callback_owner = callback_owner.clone();
+            move || callback_owner.set(callback_owner.get() + 1)
+        };
+        let (old_subscription, old_activate) = subscribers.insert(7usize, make_callback());
+        old_activate();
+        drop(subscribers.remove(&7).into_iter().next());
+        let (new_subscription, new_activate) = subscribers.insert(7usize, make_callback());
+        new_activate();
+        drop(old_subscription);
+        subscribers.retain(&7, |callback| {
+            callback();
+            true
+        });
+        assert_eq!(callback_owner.get(), 1);
+        drop(new_subscription);
+        assert_eq!(Rc::strong_count(&callback_owner), 1);
     }
 }

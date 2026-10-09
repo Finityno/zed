@@ -143,9 +143,9 @@ that Fincode has not adopted.
 
 ## Continuation
 
-An hourly continuation is enabled in the working chat. Read its current handoff
-and active processes before beginning; continue an existing iteration without
-launching a duplicate. Never overlap native timing with compilation or other
+Read the working chat’s current handoff and active processes before beginning;
+continue an existing iteration without launching a duplicate. The previously
+recorded hourly automation is unavailable; active work continues in this chat. Never overlap native timing with compilation or other
 profiling. After a qualified merge, select the next distinct important owner.
 Keep failed designs held with evidence; do not rerun them unchanged to seek a
 passing sample or weaken their acceptance gates.
@@ -197,3 +197,20 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Idle effects reclamation at `06e96d96609b20bf9afec0e140678eb2e5617bdc`
+remains held: all four controlled memory targets pass, but 35 CPU, allocation
+and RSS fields fail in its 2,100-child cohort. Its complete evidence remains
+on `perf/idle-effect-capacity-20261009`; no unchanged resampling or weaker gates.
+
+Shared subscription controls at `db0c75766f22f43313731c42307b93a075742531`
+also remain held. One 2,016-child comparison across 72 complete native App/Window
+workloads passes all four observer memory targets: 19.21–19.23% fewer calls,
+5.86–6.09% fewer requested bytes and 6.68–6.97% less held heap. Eleven ordinary
+transcript CPU/elapsed/whole-child fields and nine census RSS fields fail;
+normal requested-memory/churn and native correctness controls pass. Preserve
+all raw samples, frozen gates and exact common 59 extern/source/compiler/runtime
+identities under `performance-evidence/subscriber-control-owners-held-20261009`.
+No PR, merge or application gain is qualified. Do not rerun this design unchanged
+or weaken its gates. Continue with attribution of per-replay paint-layer
+tracking before choosing a distinct candidate.

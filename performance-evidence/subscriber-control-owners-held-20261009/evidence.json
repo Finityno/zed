@@ -1,0 +1,356 @@
+{
+  "status": "HELD/unmerged; no unchanged rerun or weaker gates",
+  "qualified": false,
+  "baseline": "95114473898ea198175ab1d4fbb72d6e66de39ca",
+  "source": "db0c75766f22f43313731c42307b93a075742531",
+  "fincode_main_at_freeze": "6f8d62b4e9d5e98db7f78b1e429aecf1b550933b",
+  "fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "component_pin": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "valid_children": 2016,
+  "workloads": 72,
+  "failures": [
+    [
+      "bare",
+      "scroll-on-32",
+      "cpu_ns",
+      "control",
+      372986,
+      315190
+    ],
+    [
+      "bare",
+      "scroll-on-32",
+      "elapsed_ns",
+      "control",
+      372746,
+      318665
+    ],
+    [
+      "bare",
+      "stream-on-512",
+      "cpu_ns",
+      "control",
+      1381712,
+      455244
+    ],
+    [
+      "bare",
+      "stream-on-512",
+      "elapsed_ns",
+      "control",
+      1381020,
+      449746
+    ],
+    [
+      "bare",
+      "stream-on-512",
+      "child_cpu_ns",
+      "control",
+      1530000,
+      709000
+    ],
+    [
+      "bare",
+      "tick-on-32",
+      "cpu_ns",
+      "control",
+      1577813,
+      1512165
+    ],
+    [
+      "bare",
+      "tick-on-32",
+      "elapsed_ns",
+      "control",
+      1578044,
+      1512335
+    ],
+    [
+      "bare",
+      "tick-on-200",
+      "cpu_ns",
+      "control",
+      2107073,
+      1591033
+    ],
+    [
+      "bare",
+      "tick-on-200",
+      "elapsed_ns",
+      "control",
+      2107614,
+      1592044
+    ],
+    [
+      "bare",
+      "redraw-on-512",
+      "cpu_ns",
+      "control",
+      794635,
+      597861
+    ],
+    [
+      "bare",
+      "redraw-on-512",
+      "elapsed_ns",
+      "control",
+      794445,
+      602319
+    ],
+    [
+      "census",
+      "panel-keep-32",
+      "peak_rss_kib",
+      "control",
+      276,
+      260
+    ],
+    [
+      "census",
+      "panel-keep-256",
+      "peak_rss_kib",
+      "control",
+      208,
+      192
+    ],
+    [
+      "census",
+      "grow-32",
+      "peak_rss_kib",
+      "control",
+      196,
+      128
+    ],
+    [
+      "census",
+      "grow-256",
+      "peak_rss_kib",
+      "control",
+      276,
+      128
+    ],
+    [
+      "census",
+      "state-panel-keep-256",
+      "peak_rss_kib",
+      "control",
+      204,
+      192
+    ],
+    [
+      "census",
+      "state-replace-32",
+      "peak_rss_kib",
+      "control",
+      392,
+      128
+    ],
+    [
+      "census",
+      "state-replace-256",
+      "peak_rss_kib",
+      "control",
+      192,
+      128
+    ],
+    [
+      "census",
+      "state-bump-256",
+      "peak_rss_kib",
+      "control",
+      200,
+      192
+    ],
+    [
+      "census",
+      "stream-on-32",
+      "peak_rss_kib",
+      "control",
+      156,
+      152
+    ]
+  ],
+  "all_primary_memory_gain_fields_pass": true,
+  "observed_primary_changes": {
+    "observer-entity-live-off-8192": {
+      "allocation_calls": {
+        "baseline_median": 42592,
+        "candidate_median": 34400,
+        "baseline_min": 42592,
+        "baseline_max": 42592,
+        "candidate_min": 34400,
+        "candidate_max": 34400,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -19.233658903080386,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "requested_bytes": {
+        "baseline_median": 5397406,
+        "candidate_median": 5080678,
+        "baseline_min": 5397406,
+        "baseline_max": 5397406,
+        "candidate_min": 5080678,
+        "candidate_max": 5080678,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -5.868152219788547,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "held_bytes": {
+        "baseline_median": 4737874,
+        "candidate_median": 4421146,
+        "baseline_min": 4737874,
+        "baseline_max": 4737874,
+        "candidate_min": 4421146,
+        "candidate_max": 4421146,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.685023704724946,
+        "allowed_increase": 0,
+        "pass": true
+      }
+    },
+    "observer-entity-live-on-8192": {
+      "allocation_calls": {
+        "baseline_median": 42643,
+        "candidate_median": 34451,
+        "baseline_min": 42643,
+        "baseline_max": 42643,
+        "candidate_min": 34451,
+        "candidate_max": 34451,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -19.21065591070047,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "requested_bytes": {
+        "baseline_median": 5401806,
+        "candidate_median": 5085078,
+        "baseline_min": 5401806,
+        "baseline_max": 5401806,
+        "candidate_min": 5085078,
+        "candidate_max": 5085078,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -5.863372361021479,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "held_bytes": {
+        "baseline_median": 4741554,
+        "candidate_median": 4424826,
+        "baseline_min": 4741554,
+        "baseline_max": 4741554,
+        "candidate_min": 4424826,
+        "candidate_max": 4424826,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.679835345121033,
+        "allowed_increase": 0,
+        "pass": true
+      }
+    },
+    "observer-global-live-off-8192": {
+      "allocation_calls": {
+        "baseline_median": 42591,
+        "candidate_median": 34399,
+        "baseline_min": 42591,
+        "baseline_max": 42591,
+        "candidate_min": 34399,
+        "candidate_max": 34399,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -19.234110492827128,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "requested_bytes": {
+        "baseline_median": 5200834,
+        "candidate_median": 4884106,
+        "baseline_min": 5200834,
+        "baseline_max": 5200834,
+        "candidate_min": 4884106,
+        "candidate_max": 4884106,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.089946343221109,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "held_bytes": {
+        "baseline_median": 4541302,
+        "candidate_median": 4224574,
+        "baseline_min": 4541302,
+        "baseline_max": 4541302,
+        "candidate_min": 4224574,
+        "candidate_max": 4224574,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.974387521464109,
+        "allowed_increase": 0,
+        "pass": true
+      }
+    },
+    "observer-global-live-on-8192": {
+      "allocation_calls": {
+        "baseline_median": 42643,
+        "candidate_median": 34451,
+        "baseline_min": 42643,
+        "baseline_max": 42643,
+        "candidate_min": 34451,
+        "candidate_max": 34451,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -19.21065591070047,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "requested_bytes": {
+        "baseline_median": 5205450,
+        "candidate_median": 4888722,
+        "baseline_min": 5205450,
+        "baseline_max": 5205450,
+        "candidate_min": 4888722,
+        "candidate_max": 4888722,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.08454600466819,
+        "allowed_increase": 0,
+        "pass": true
+      },
+      "held_bytes": {
+        "baseline_median": 4545082,
+        "candidate_median": 4228354,
+        "baseline_min": 4545082,
+        "baseline_max": 4545082,
+        "candidate_min": 4228354,
+        "candidate_max": 4228354,
+        "baseline_range": 0,
+        "candidate_range": 0,
+        "change_percent": -6.968587145402438,
+        "allowed_increase": 0,
+        "pass": true
+      }
+    }
+  },
+  "important_gain_not_qualified": "19.21\u201319.23% fewer completeApp allocationcalls,5.86\u20136.09% fewer requestedbytes,6.68\u20136.97% less heldheap;20 frozen transcriptCPU/elapsed/wholechild and censusnativeRSS controls fail. Eleven CPUfields and nineRSSfields. No normal requestedheap/churn field fails.",
+  "mechanism": "Subscriber activation and cancellation Cells share one Rc control owner; removes one allocation and8bytes from every subscriber node entry. Existing cancellation/activation order, callback ownership and removal semantics preserved. No new App fields, timers, GPU/renderer resources or caches.",
+  "correctness": "34 native contract invocations pass. All7SubscriberSet callback/selfdrop/inertactivation/removal/replacement tests pass in4bare/census lanes. ExistingApp/Scene/windowidle/read/nested/retainedoracle16seeds50steps/wheel/dependency/panel/layout/atomic and independentcursorresize tests pass.56fourlane functional checks and2016pairwise callback/owner/window/state/scene/hitbox signatures match.",
+  "protocol": "Four sequential builds,1296alternatingbare children252.75s, then720separatecounting children33.89s. Identical59immutableexterns/Rust1.99/System/source/compiler/runtime/binary identities and frozenmethod reverified aftercohort. No restart or repeatedfailed samples.",
+  "attribution": "Existing owned sampled largeclosed heap ranks7.9MB observers; currentnative30realApp registration/notification/removal children preservecallbackcount/order/ownership. CountingCPU diagnostics are not gain evidence.",
+  "not_run": "Strict owning Clippy, PR creation, merge and coherent application adoption withheld because performance gates fail.",
+  "limits": [
+    "Linuxfakeplatform/System complete App ownerfixtures, not app/physicalGPU/macOS/Windows/shippedallocator claims.",
+    "Timerincludes registration plusnotify/removal, excludes App/window/4warmups/finalaudits; countingincludesallsetup/warmups/App owners/heldVec/currentcapacity.",
+    "Observercensus includes8or256notificationiterations accordingtolane (primaryallocatedowners identical), timing/clocks are nevermixedwithcountinggainclaims.",
+    "Allpriorfailedtimer/read/glyph/statecohorts preserved; no unchangedresampling. No formatting, installedapp,Actionsdispatch orprotectionbypass. Existingmaincursorfixes andindependentGPU/component/Fincodework preserved."
+  ],
+  "policy_sha256": "a86895b6007057d524ddec1f11280a2112be52d4bc998f232c71d5d2849dd808",
+  "archive_sha256": "90a4e957bc57f73afe2b6708fdcb1381f05cf1eee2b4ede271065cebd29c001f",
+  "archive_bytes": 1287286,
+  "members": 2270
+}
