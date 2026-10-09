@@ -4,7 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios, quad_depth,
+    RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    quad_depth,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -19,6 +20,12 @@ use std::sync::{Arc, OnceLock};
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
+
+/// Consecutive frames whose instance data fits in a quarter of the instance
+/// buffer after which it is reallocated smaller. The buffer only grew before,
+/// so one large frame (a huge scroll, a burst of paths) kept up to 256 MiB for
+/// the life of the window.
+const INSTANCE_SHRINK_FRAMES: u32 = 120;
 
 /// Consecutive path-free frames after which the window-sized path targets are
 /// released, the Metal renderer's count (DirectX uses 300). Frames, not time:
@@ -402,6 +409,7 @@ struct WgpuResources {
     path_tile_texture: Option<wgpu::Texture>,
     path_tile_view: Option<wgpu::TextureView>,
     path_free_frames: u32,
+    render_memory: RenderMemoryLedger,
 }
 
 struct CachedTextureBindGroup {
@@ -416,6 +424,24 @@ impl WgpuResources {
         self.release_path_targets();
     }
 
+    /// Reported wherever the targets change, not only per frame, so a release
+    /// that happens without a draw (resize, hidden window) is seen at once.
+    fn publish_target_memory(&mut self) {
+        let depth = texture_bytes(self.depth_texture.as_ref());
+        let paths = [
+            &self.path_intermediate_texture,
+            &self.path_msaa_texture,
+            &self.path_tile_texture,
+        ]
+        .into_iter()
+        .map(|texture| texture_bytes(texture.as_ref()))
+        .sum();
+        self.render_memory
+            .publish(RenderMemoryGauge::DepthTextures, depth);
+        self.render_memory
+            .publish(RenderMemoryGauge::PathTextures, paths);
+    }
+
     /// Dropping is enough: wgpu keeps a texture alive until the submitted work
     /// that references it has finished.
     fn release_path_targets(&mut self) {
@@ -425,7 +451,18 @@ impl WgpuResources {
         self.path_msaa_view = None;
         self.path_tile_texture = None;
         self.path_tile_view = None;
+        self.publish_target_memory();
     }
+}
+
+fn texture_bytes(texture: Option<&wgpu::Texture>) -> u64 {
+    texture.map_or(0, |texture| {
+        let bytes_per_texel = texture.format().block_copy_size(None).unwrap_or(4);
+        u64::from(texture.width())
+            * u64::from(texture.height())
+            * u64::from(bytes_per_texel)
+            * u64::from(texture.sample_count())
+    })
 }
 
 /// Paths with different draw orders are composited through one rect spanning
@@ -506,12 +543,44 @@ fn path_tiles(
         .collect()
 }
 
+/// The instance usage of the frames since the last frame that used a quarter
+/// or more of the instance buffer.
+#[derive(Debug, Default)]
+struct InstanceUsageWindow {
+    low_frames: u32,
+    peak: u64,
+}
+
+impl InstanceUsageWindow {
+    /// Records a frame that used `usage` bytes of a `capacity`-byte instance
+    /// buffer and returns the capacity to reallocate to, once usage has stayed
+    /// under a quarter of the capacity for `INSTANCE_SHRINK_FRAMES` frames:
+    /// twice the window's peak, rounded up to a power of two so the next growth
+    /// step lands where it started, and never below `initial`.
+    fn record_frame(&mut self, usage: u64, capacity: u64, initial: u64) -> Option<u64> {
+        if usage.saturating_mul(4) >= capacity {
+            *self = Self::default();
+            return None;
+        }
+        self.low_frames += 1;
+        self.peak = self.peak.max(usage);
+        if self.low_frames < INSTANCE_SHRINK_FRAMES {
+            return None;
+        }
+        let target = self.peak.saturating_mul(2).next_power_of_two().max(initial);
+        *self = Self::default();
+        (target < capacity).then_some(target)
+    }
+}
+
 struct WgpuRendererCore {
     resources: WgpuResources,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_data_capacity: u64,
+    initial_instance_data_capacity: u64,
+    instance_usage: InstanceUsageWindow,
     max_instance_data_size: u64,
     instance_data_alignment: u64,
     uses_webgl_instance_data: bool,
@@ -1570,6 +1639,8 @@ impl WgpuRendererCore {
             ],
         });
         let max_texture_size = device.limits().max_texture_dimension_2d;
+        let mut render_memory = RenderMemoryLedger::default();
+        render_memory.publish(RenderMemoryGauge::InstanceBuffers, instance_data_capacity);
 
         Self {
             resources: WgpuResources {
@@ -1592,11 +1663,14 @@ impl WgpuRendererCore {
                 path_tile_texture: None,
                 path_tile_view: None,
                 path_free_frames: 0,
+                render_memory,
             },
             atlas,
             path_globals_offset,
             gamma_offset,
             instance_data_capacity,
+            initial_instance_data_capacity: instance_data_capacity,
+            instance_usage: InstanceUsageWindow::default(),
             max_instance_data_size,
             instance_data_alignment,
             uses_webgl_instance_data,
@@ -1705,6 +1779,7 @@ impl WgpuRendererCore {
 
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size, !scene.paths.is_empty());
+        self.resources.publish_target_memory();
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1769,6 +1844,7 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset: u64 = 0;
+        let starting_capacity = self.instance_data_capacity;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
@@ -1817,7 +1893,7 @@ impl WgpuRendererCore {
 
             self.draw_instances(
                 &instance_bindings.quads,
-                &self.resources().pipelines.opaque_quads,
+                |pipelines| &pipelines.opaque_quads,
                 scene.blended_quad_indices.len() as u32
                     ..(scene.blended_quad_indices.len() + scene.opaque_quad_indices.len()) as u32,
                 &mut pass,
@@ -1843,14 +1919,14 @@ impl WgpuRendererCore {
                         quad_cursor += range.len() as u32;
                         self.draw_instances(
                             &instance_bindings.quads,
-                            &self.resources().pipelines.quads,
+                            |pipelines| &pipelines.quads,
                             instance_range(blended_range),
                             &mut pass,
                         );
                     }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
-                        self.resources().pipelines.shadows(),
+                        WgpuPipelines::shadows,
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1905,7 +1981,7 @@ impl WgpuRendererCore {
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
                         &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
+                        |pipelines| &pipelines.underlines,
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1913,21 +1989,21 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.monochrome_sprites,
                             texture_id,
-                            &self.resources().pipelines.mono_sprites,
+                            |pipelines| &pipelines.mono_sprites,
                             instance_range(range),
                             &mut pass,
                         )?;
                     }
                     PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let resources = self.resources();
                         self.draw_sprites(
                             &instance_bindings.subpixel_sprites,
                             texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
+                            |pipelines| {
+                                pipelines
+                                    .subpixel_sprites
+                                    .as_ref()
+                                    .unwrap_or(&pipelines.mono_sprites)
+                            },
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -1936,7 +2012,7 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.polychrome_sprites,
                             texture_id,
-                            self.resources().pipelines.poly_sprites(),
+                            WgpuPipelines::poly_sprites,
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -1952,6 +2028,27 @@ impl WgpuRendererCore {
             .resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
+
+        // A frame that grew the buffer restarted its offsets in the new one,
+        // so its final offset understates its usage; it counts as a full frame.
+        let usage = if self.instance_data_capacity == starting_capacity {
+            instance_offset
+        } else {
+            self.instance_data_capacity
+        };
+        if let Some(capacity) = self.instance_usage.record_frame(
+            usage,
+            self.instance_data_capacity,
+            self.initial_instance_data_capacity,
+        ) {
+            log::debug!(
+                "instance data shrunk from {} to {capacity}",
+                self.instance_data_capacity
+            );
+            // The submitted frame's bind groups keep the old allocation alive
+            // until the GPU has finished with it.
+            self.reallocate_instance_data(capacity);
+        }
         Ok(submission)
     }
 
@@ -2161,17 +2258,19 @@ impl WgpuRendererCore {
         );
     }
 
+    /// The pipeline is requested only once the draw is known to happen, so a
+    /// lazily compiled pipeline is not built for a batch that draws nothing.
     fn draw_instances(
         &self,
         instances: &InstanceBinding,
-        pipeline: &wgpu::RenderPipeline,
+        pipeline: impl FnOnce(&WgpuPipelines) -> &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
         if range.is_empty() {
             return;
         }
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(pipeline(&self.resources().pipelines));
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.draw(
@@ -2180,11 +2279,13 @@ impl WgpuRendererCore {
         );
     }
 
+    /// Like [`Self::draw_instances`], the pipeline is requested after the
+    /// early returns.
     fn draw_sprites(
         &self,
         sprite_instances: &InstanceBinding,
         texture_id: AtlasTextureId,
-        pipeline: &wgpu::RenderPipeline,
+        pipeline: impl FnOnce(&WgpuPipelines) -> &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
@@ -2197,7 +2298,7 @@ impl WgpuRendererCore {
         let Some(texture) = resources.atlas_texture_bind_groups.get(&texture_id) else {
             return Ok(());
         };
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(pipeline(&resources.pipelines));
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
@@ -2545,6 +2646,11 @@ impl WgpuRendererCore {
         // Bind groups created earlier in the frame keep the previous buffer or
         // texture alive, so allocations written before the grow remain valid;
         // only subsequent writes land in the new allocation.
+        self.reallocate_instance_data(capacity);
+        Ok(())
+    }
+
+    fn reallocate_instance_data(&mut self, capacity: u64) {
         let uses_webgl_instance_data = self.uses_webgl_instance_data;
         let resources = self.resources_mut();
         if uses_webgl_instance_data {
@@ -2563,7 +2669,10 @@ impl WgpuRendererCore {
                 }));
             self.instance_data_capacity = capacity;
         }
-        Ok(())
+        self.resources.render_memory.publish(
+            RenderMemoryGauge::InstanceBuffers,
+            self.instance_data_capacity,
+        );
     }
 }
 
@@ -2644,6 +2753,37 @@ impl WgpuRenderer {
         self.state = RendererState::Ready { surface, core };
 
         Ok(())
+    }
+
+    /// Whether [`unconfigure_surface`](Self::unconfigure_surface) left the
+    /// renderer waiting for a surface. Draws are no-ops until one is restored.
+    pub fn is_unconfigured(&self) -> bool {
+        matches!(self.state, RendererState::Unconfigured { .. })
+    }
+
+    /// Creates and configures a surface for `window` again after
+    /// [`unconfigure_surface`](Self::unconfigure_surface), at the last
+    /// recorded drawable size, transparency and present mode. Used to give a
+    /// hidden window's swapchain and size-dependent targets back while it is
+    /// not shown; the targets are rebuilt by the next draw.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn restore_surface<W: HasWindowHandle>(&mut self, window: &W) -> anyhow::Result<()> {
+        let instance = self
+            .context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .borrow()
+                    .as_ref()
+                    .map(|context| context.instance.clone())
+            })
+            .context("Cannot restore the surface: no GPU context")?;
+        let config = WgpuSurfaceConfig {
+            size: self.viewport_size(),
+            transparent: self.surface_config.alpha_mode != self.opaque_alpha_mode,
+            preferred_present_mode: Some(self.surface_config.present_mode),
+        };
+        self.replace_surface(window, config, &instance)
     }
 
     pub fn destroy(&mut self) {
@@ -3102,7 +3242,7 @@ mod tests {
         linear_gradient,
     };
     #[cfg(target_os = "linux")]
-    use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+    use gpui::{DevicePixels, PlatformAtlas, PlatformHeadlessRenderer, Scene};
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -3262,8 +3402,23 @@ mod tests {
                 resources.path_tile_texture.is_some(),
                 resources.path_intermediate_texture.is_some()
             );
+            let published = resources
+                .render_memory
+                .published(RenderMemoryGauge::PathTextures);
+            assert_eq!(
+                published > 0,
+                resources.path_intermediate_texture.is_some(),
+                "path texture gauge reads {published} bytes"
+            );
             resources.path_intermediate_texture.is_some()
         };
+        let published = |renderer: &WgpuHeadlessRenderer, gauge| {
+            renderer.core.resources.render_memory.published(gauge)
+        };
+        assert_eq!(
+            published(&renderer, RenderMemoryGauge::InstanceBuffers),
+            renderer.core.instance_data_capacity
+        );
         let mut path_scene = Scene::default();
         path_scene.insert_primitive(red_square_path(16.0));
         path_scene.finish();
@@ -3272,9 +3427,14 @@ mod tests {
         renderer.render_scene(&empty_scene, device_size(32, 32))?;
         assert!(!path_targets_resident(&renderer));
         assert!(renderer.core.resources.depth_texture.is_some());
+        assert!(published(&renderer, RenderMemoryGauge::DepthTextures) >= 32 * 32 * 2);
 
         let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
         assert!(path_targets_resident(&renderer));
+        // The intermediate alone is 32x32 at four bytes per texel.
+        let path_bytes = published(&renderer, RenderMemoryGauge::PathTextures);
+        assert!(path_bytes >= 32 * 32 * 4);
+        assert!(gpui::render_memory_gauges().path_texture_bytes >= path_bytes);
         assert_pixel(&image, 12, 4, RED);
         assert_pixel(&image, 4, 12, RED);
         assert_pixel(&image, 24, 24, BLACK);
@@ -3292,6 +3452,181 @@ mod tests {
 
         renderer.render_scene(&empty_scene, device_size(32, 33))?;
         assert!(!path_targets_resident(&renderer));
+
+        // A release without a draw is seen at once.
+        renderer.render_scene(&path_scene, device_size(32, 33))?;
+        assert!(path_targets_resident(&renderer));
+        renderer.core.resources.invalidate_intermediate_textures();
+        assert!(!path_targets_resident(&renderer));
+        assert_eq!(published(&renderer, RenderMemoryGauge::DepthTextures), 0);
+        Ok(())
+    }
+
+    /// A hidden window's renderer: no surface, the core of `headless` moved in
+    /// and a fresh one left behind. There is no window to create a real
+    /// surface for, so the core is handed back to draw the re-shown frame.
+    #[cfg(target_os = "linux")]
+    fn unconfigured_renderer(headless: &mut WgpuHeadlessRenderer) -> WgpuRenderer {
+        let atlas = headless.core.atlas.clone();
+        let format = headless.core.target_format;
+        let spare = WgpuRendererCore::new(
+            &headless.context,
+            atlas.clone(),
+            format,
+            wgpu::CompositeAlphaMode::Opaque,
+        );
+        let core = std::mem::replace(&mut headless.core, spare);
+        WgpuRenderer {
+            context: None,
+            compositor_gpu: None,
+            max_texture_size: core.max_texture_size,
+            state: RendererState::Unconfigured { core },
+            surface_config: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: 32,
+                height: 32,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                view_formats: vec![],
+            },
+            atlas,
+            transparent_alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            opaque_alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            is_bgr: false,
+            failed_frame_count: 0,
+            device_errors: Arc::clone(headless.context.errors()),
+            observed_error_generation: 0,
+            last_surface_error: None,
+            needs_redraw: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_window_releases_targets_and_draws_again_when_shown() -> anyhow::Result<()> {
+        let mut headless = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(16.0, 0.0, 16.0, 32.0, gpui::blue()));
+        scene.insert_primitive(red_square_path(16.0));
+        scene.finish();
+        headless.render_scene(&scene, device_size(32, 32))?;
+
+        let mut hidden = unconfigured_renderer(&mut headless);
+        hidden.unconfigure_surface();
+        assert!(hidden.is_unconfigured());
+        let resident_bytes = |renderer: &WgpuRenderer| {
+            let ledger = &renderer
+                .core()
+                .expect("core is kept")
+                .resources
+                .render_memory;
+            ledger.published(RenderMemoryGauge::DepthTextures)
+                + ledger.published(RenderMemoryGauge::PathTextures)
+        };
+        assert_eq!(resident_bytes(&hidden), 0);
+
+        // A frame requested while hidden draws nothing and allocates nothing.
+        assert!(!hidden.draw(&scene));
+        assert_eq!(resident_bytes(&hidden), 0);
+        let resources = &hidden.core().expect("core is kept").resources;
+        assert!(resources.depth_texture.is_none());
+        assert!(resources.path_intermediate_texture.is_none());
+
+        let RendererState::Unconfigured { core } =
+            std::mem::replace(&mut hidden.state, RendererState::Released)
+        else {
+            anyhow::bail!("the hidden renderer lost its core");
+        };
+        headless.core = core;
+        let image = headless.render_scene_to_image(&scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, RED);
+        assert_pixel(&image, 24, 8, BLUE);
+        assert_pixel(&image, 8, 24, BLACK);
+        assert!(headless.core.resources.depth_texture.is_some());
+        assert!(headless.core.resources.path_intermediate_texture.is_some());
+        Ok(())
+    }
+
+    /// A window whose native handle cannot be had, standing in for one whose
+    /// surface cannot be created: wgpu has no surface without a real window.
+    #[cfg(target_os = "linux")]
+    struct UnavailableWindow;
+
+    #[cfg(target_os = "linux")]
+    impl HasWindowHandle for UnavailableWindow {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    /// The platforms retry a failed restore on the next frame, which needs
+    /// the renderer to stay unconfigured with its core, at the size recorded
+    /// by a resize while hidden.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_restore_keeps_the_hidden_renderer_and_its_resized_config() -> anyhow::Result<()> {
+        let mut headless = WgpuHeadlessRenderer::new()?;
+        let mut hidden = unconfigured_renderer(&mut headless);
+        assert!(hidden.restore_surface(&UnavailableWindow).is_err());
+        assert!(hidden.is_unconfigured());
+
+        let WgpuHeadlessRenderer { context, .. } = headless;
+        hidden.context = Some(Rc::new(RefCell::new(Some(context))));
+        hidden.update_drawable_size(device_size(48, 40));
+        assert!(hidden.is_unconfigured());
+        assert_eq!(hidden.viewport_size(), device_size(48, 40));
+        let resources = &hidden.core().expect("core is kept").resources;
+        assert!(resources.depth_texture.is_none());
+        assert!(resources.path_intermediate_texture.is_none());
+
+        assert!(hidden.restore_surface(&UnavailableWindow).is_err());
+        assert!(hidden.is_unconfigured());
+        assert!(hidden.core().is_some());
+        assert_eq!(hidden.viewport_size(), device_size(48, 40));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn instance_buffer_returns_to_its_initial_size_after_a_large_frame() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let initial = renderer.core.instance_data_capacity;
+        let quad_count = initial as usize / std::mem::size_of::<Quad>() + 1;
+        let mut large_scene = Scene::default();
+        for _ in 0..quad_count {
+            large_scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::red()));
+        }
+        large_scene.finish();
+        let image = renderer.render_scene_to_image(&large_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, RED);
+        let grown = renderer.core.instance_data_capacity;
+        assert!(grown > initial);
+
+        let mut small_scene = Scene::default();
+        small_scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::blue()));
+        small_scene.finish();
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            renderer.render_scene(&small_scene, device_size(32, 32))?;
+        }
+        assert_eq!(renderer.core.instance_data_capacity, grown);
+        renderer.render_scene(&small_scene, device_size(32, 32))?;
+        assert_eq!(renderer.core.instance_data_capacity, initial);
+        assert_eq!(
+            renderer
+                .core
+                .resources
+                .render_memory
+                .published(RenderMemoryGauge::InstanceBuffers),
+            initial
+        );
+
+        let image = renderer.render_scene_to_image(&small_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, BLUE);
+        assert_pixel(&image, 24, 24, BLACK);
         Ok(())
     }
 
@@ -3324,6 +3659,93 @@ mod tests {
         assert_pixel(&image, 8, 8, RED);
         assert_pixel(&image, 24, 24, BLACK);
         assert_eq!(compiled(&renderer), [false, true, true, false]);
+
+        let sprite = |tile: gpui::AtlasTile| {
+            let bounds = Bounds {
+                origin: gpui::point(gpui::px(16.), gpui::px(16.)),
+                size: Size {
+                    width: gpui::px(16.),
+                    height: gpui::px(16.),
+                },
+            }
+            .scale(1.0);
+            PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                corner_radii: Corners::default(),
+                tile,
+            }
+        };
+
+        // A batch from a stale paint whose texture the atlas has released
+        // draws nothing, so it must not build the pipeline either.
+        let mut stale_scene = Scene::default();
+        stale_scene.insert_primitive(sprite(gpui::AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 99,
+                kind: gpui::AtlasTextureKind::Polychrome,
+            },
+            tile_id: gpui::TileId(0),
+            padding: 0,
+            bounds: Bounds::default(),
+        }));
+        stale_scene.finish();
+        let image = renderer.render_scene_to_image(&stale_scene, device_size(32, 32))?;
+        assert_pixel(&image, 24, 24, BLACK);
+        assert_eq!(compiled(&renderer), [false, true, true, false]);
+
+        // Polychrome uploads are BGRA; green reads the same either way.
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        let tile_size = Size {
+            width: DevicePixels(4),
+            height: DevicePixels(4),
+        };
+        let tile = renderer
+            .core
+            .atlas
+            .get_or_insert_with(
+                gpui::AtlasKey::Image(gpui::RenderImageParams {
+                    image_id: gpui::ImageId(1),
+                    frame_index: 0,
+                }),
+                &mut || Ok(Some((tile_size, std::borrow::Cow::Owned(GREEN.repeat(16))))),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("polychrome tile was not allocated"))?;
+        let mut shadow_and_sprite_scene = Scene::default();
+        let shadow_bounds = Bounds {
+            origin: gpui::point(gpui::px(0.), gpui::px(16.)),
+            size: Size {
+                width: gpui::px(16.),
+                height: gpui::px(16.),
+            },
+        }
+        .scale(1.0);
+        shadow_and_sprite_scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: shadow_bounds,
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: shadow_bounds,
+            },
+            color: gpui::red(),
+            element_bounds: shadow_bounds,
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+        });
+        shadow_and_sprite_scene.insert_primitive(sprite(tile));
+        shadow_and_sprite_scene.finish();
+        let image =
+            renderer.render_scene_to_image(&shadow_and_sprite_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 24, RED);
+        assert_pixel(&image, 24, 24, GREEN);
+        assert_pixel(&image, 24, 8, BLACK);
+        assert_eq!(compiled(&renderer), [true; 4]);
         Ok(())
     }
 
@@ -3480,6 +3902,41 @@ mod tests {
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
         Ok(())
+    }
+
+    #[test]
+    fn instance_buffer_shrinks_after_a_window_of_low_usage() {
+        const MIB: u64 = 1024 * 1024;
+        let initial = 2 * MIB;
+        let mut window = InstanceUsageWindow::default();
+
+        // Usage at a quarter of the capacity or more never shrinks it.
+        for _ in 0..INSTANCE_SHRINK_FRAMES * 2 {
+            assert_eq!(window.record_frame(16 * MIB, 64 * MIB, initial), None);
+        }
+
+        // A frame back at a quarter restarts the window.
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            assert_eq!(window.record_frame(3 * MIB, 64 * MIB, initial), None);
+        }
+        assert_eq!(window.record_frame(16 * MIB, 64 * MIB, initial), None);
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            assert_eq!(window.record_frame(MIB, 64 * MIB, initial), None);
+        }
+        // Twice the window's peak (3 MiB), rounded up to a power of two.
+        assert_eq!(
+            window.record_frame(3 * MIB, 64 * MIB, initial),
+            Some(8 * MIB)
+        );
+
+        // Never below the initial capacity, and no reallocation to the same size.
+        for _ in 1..INSTANCE_SHRINK_FRAMES {
+            assert_eq!(window.record_frame(1024, 16 * MIB, initial), None);
+        }
+        assert_eq!(window.record_frame(1024, 16 * MIB, initial), Some(initial));
+        for _ in 0..INSTANCE_SHRINK_FRAMES * 2 {
+            assert_eq!(window.record_frame(1024, initial, initial), None);
+        }
     }
 
     #[test]

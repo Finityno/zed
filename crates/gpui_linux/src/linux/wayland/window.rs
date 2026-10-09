@@ -675,6 +675,35 @@ impl WaylandWindowState {
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
     }
+
+    /// A hidden window whose surface was released has nothing to present
+    /// to: its frames neither draw nor retry until it is shown again, when
+    /// the configure that restores the surface requests a forced redraw.
+    fn surface_parked(&self) -> bool {
+        !self.visibility.is_visible() && self.renderer.is_unconfigured()
+    }
+
+    fn restore_surface(&mut self) {
+        if !self.renderer.is_unconfigured() {
+            return;
+        }
+        let Some(backend) = self.surface.backend().upgrade() else {
+            log::warn!("Failed to restore the window surface: the Wayland connection is gone");
+            return;
+        };
+        let raw_window = RawWindow {
+            window: self.surface.id().as_ptr().cast::<c_void>(),
+            display: backend.display_ptr().cast::<c_void>(),
+        };
+        match self.renderer.restore_surface(&raw_window) {
+            Ok(()) => self.redraw_requested = true,
+            Err(error) => {
+                log::warn!(
+                    "Failed to restore the window surface, will retry on next frame: {error:#}"
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -954,6 +983,13 @@ impl WaylandWindowStatePtr {
             return;
         }
 
+        // Retrying would fail the same way until the window is shown, and a
+        // suspended surface gets no frame callback to pace the retries.
+        if state.surface_parked() {
+            self.frame_loop.set(FrameLoop::Parked);
+            return;
+        }
+
         if state.presentation.requires_presentation() {
             // Before the first present, or when throttling skipped draw, a
             // callback may never arrive. Otherwise let the compositor pace
@@ -1109,6 +1145,7 @@ impl WaylandWindowStatePtr {
                     }
                     drop(state);
                     if visibility_changed {
+                        self.update_surface_residency(configure.visibility);
                         self.report_visibility(configure.visibility);
                     }
                     if throttled {
@@ -1576,6 +1613,29 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    /// A suspended toplevel holds no swapchain or window-sized targets: the
+    /// compositor stops frame callbacks, so no frame would release them.
+    /// `suspended` is the conservative signal, set only while the surface is
+    /// not visible at all (minimized, on another workspace, fully covered or
+    /// the output off), never for a window that is merely unfocused.
+    fn update_surface_residency(&self, visibility: WindowVisibility) {
+        let mut state = self.state.borrow_mut();
+        if !visibility.is_visible() {
+            state.renderer.unconfigure_surface();
+            return;
+        }
+        state.restore_surface();
+        // A compositor may never deliver the callback of a frame presented
+        // just before the window was suspended, so the shown window stops
+        // waiting on it and schedules its own frame.
+        state.pending_frame_callback = None;
+        drop(state);
+        if self.frame_loop.get() == FrameLoop::AwaitingCallback {
+            self.frame_loop.set(FrameLoop::Parked);
+            self.request_redraw();
+        }
+    }
+
     fn report_visibility(&self, visibility: WindowVisibility) {
         let callback = self.callbacks.borrow_mut().visibility_change.take();
         if let Some(mut callback) = callback {
@@ -1949,6 +2009,9 @@ impl PlatformWindow for WaylandWindow {
                     .cast::<std::ffi::c_void>(),
             };
             match state.renderer.recover(&raw_window) {
+                // Recovery recreates the surface configured; a hidden window
+                // releases it again rather than holding it until it is shown.
+                Ok(()) if !state.visibility.is_visible() => state.renderer.unconfigure_surface(),
                 Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
@@ -1956,6 +2019,19 @@ impl PlatformWindow for WaylandWindow {
             }
 
             state.redraw_requested = true;
+            return;
+        }
+
+        // A restore that failed when the window was shown is retried here, so
+        // the first frame of a shown window reconfigures before drawing.
+        if state.visibility.is_visible() {
+            state.restore_surface();
+        } else if state.surface_parked() {
+            // Not a failed presentation, so the presentation state is kept.
+            // The redraw request is dropped rather than latched: a latched one
+            // would force a full render on every frame while hidden, and the
+            // configure that shows the window requests its own.
+            state.redraw_requested = false;
             return;
         }
 

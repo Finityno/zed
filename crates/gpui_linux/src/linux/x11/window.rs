@@ -282,6 +282,8 @@ pub struct X11WindowState {
     /// Owned by the client's `WindowRef`, which combines the mapped state with
     /// `VisibilityNotify`; this is the last value it reported.
     visibility: WindowVisibility,
+    /// Whether the client last saw `MapNotify` rather than `UnmapNotify`.
+    mapped: bool,
     hovered: bool,
     force_render_after_recovery: bool,
     fullscreen: bool,
@@ -834,6 +836,7 @@ impl X11WindowState {
                 active: false,
                 // The window is not mapped until the client sees `MapNotify`.
                 visibility: WindowVisibility::Hidden,
+                mapped: false,
                 hovered: false,
                 force_render_after_recovery: false,
                 fullscreen: false,
@@ -1049,6 +1052,56 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    fn raw_window(&self, state: &X11WindowState) -> RawWindow {
+        RawWindow {
+            connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(&*self.xcb)
+                as *mut _,
+            screen_id: state.x_screen_index,
+            window_id: self.x_window,
+            visual_id: state.visual_id,
+        }
+    }
+
+    /// An unmapped window holds no swapchain or window-sized targets: no
+    /// frames are drawn while it is hidden, so nothing would release them.
+    /// Unmapping is the conservative signal: window managers unmap a minimized
+    /// (iconic) window, while one that is only obscured or unfocused stays
+    /// mapped and keeps its surface.
+    pub fn set_mapped(&self, mapped: bool) {
+        let mut state = self.state.borrow_mut();
+        if std::mem::replace(&mut state.mapped, mapped) == mapped || state.destroyed {
+            return;
+        }
+        if mapped {
+            // The restored surface is empty; render the next frame rather
+            // than rely on something in the window being dirty. A failed
+            // restore needs that frame too: its draw retries the restore.
+            if state.renderer.is_unconfigured() {
+                self.restore_surface(&mut state);
+                state.force_render_after_recovery = true;
+            }
+        } else {
+            state.renderer.unconfigure_surface();
+        }
+    }
+
+    /// Returns whether a released surface was restored.
+    fn restore_surface(&self, state: &mut X11WindowState) -> bool {
+        if !state.renderer.is_unconfigured() {
+            return false;
+        }
+        let raw_window = self.raw_window(state);
+        match state.renderer.restore_surface(&raw_window) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!(
+                    "Failed to restore the window surface, will retry on next frame: {error:#}"
+                );
+                false
+            }
+        }
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1748,15 +1801,11 @@ impl PlatformWindow for X11Window {
         let mut inner = self.0.state.borrow_mut();
 
         if inner.renderer.device_lost() {
-            let raw_window = RawWindow {
-                connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
-                    &*self.0.xcb,
-                ) as *mut _,
-                screen_id: inner.x_screen_index,
-                window_id: self.0.x_window,
-                visual_id: inner.visual_id,
-            };
+            let raw_window = self.0.raw_window(&inner);
             match inner.renderer.recover(&raw_window) {
+                // Recovery recreates the surface configured; an unmapped
+                // window releases it again rather than holding it until mapped.
+                Ok(()) if !inner.mapped => inner.renderer.unconfigure_surface(),
                 Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
@@ -1767,6 +1816,19 @@ impl PlatformWindow for X11Window {
             return;
         }
 
+        // A restore that failed when the window was mapped is retried here,
+        // so the first frame of a shown window reconfigures before drawing.
+        // The scene drawn next is complete, so a restore here needs no
+        // forced render afterwards.
+        if inner.mapped {
+            self.0.restore_surface(&mut inner);
+            if inner.renderer.is_unconfigured() {
+                // Still released: force the next frame so it retries, since an
+                // idle window would otherwise never draw again.
+                inner.force_render_after_recovery = true;
+                return;
+            }
+        }
         inner.renderer.draw(scene);
 
         if inner.renderer.needs_redraw() {

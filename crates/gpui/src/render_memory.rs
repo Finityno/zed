@@ -13,11 +13,16 @@ pub struct RenderMemoryGauges {
     pub atlas_polychrome_bytes: u64,
     /// Instance buffers waiting in the renderers' shared pool. Buffers in
     /// flight for a frame being drawn return to the pool when the frame
-    /// completes and are not counted until then.
+    /// completes and are not counted until then. The wgpu renderer keeps one
+    /// instance buffer per window and reports its capacity.
     pub instance_buffer_bytes: u64,
     /// Drawable-sized depth attachments. One kept in tile memory (memoryless,
     /// on Apple GPUs) has no allocation and reports nothing.
     pub depth_texture_bytes: u64,
+    /// Targets paths are rasterized and composited through: the drawable-sized
+    /// intermediate, the tile paths rasterize into and its multisampled
+    /// companion. Reported by the wgpu renderer.
+    pub path_texture_bytes: u64,
 }
 
 /// One of the gauges in [`RenderMemoryGauges`].
@@ -31,13 +36,16 @@ pub enum RenderMemoryGauge {
     InstanceBuffers,
     /// [`RenderMemoryGauges::depth_texture_bytes`].
     DepthTextures,
+    /// [`RenderMemoryGauges::path_texture_bytes`].
+    PathTextures,
 }
 
-const ALL_GAUGES: [RenderMemoryGauge; 4] = [
+const ALL_GAUGES: [RenderMemoryGauge; 5] = [
     RenderMemoryGauge::AtlasMonochrome,
     RenderMemoryGauge::AtlasPolychrome,
     RenderMemoryGauge::InstanceBuffers,
     RenderMemoryGauge::DepthTextures,
+    RenderMemoryGauge::PathTextures,
 ];
 
 static GAUGES: [AtomicU64; ALL_GAUGES.len()] = [const { AtomicU64::new(0) }; ALL_GAUGES.len()];
@@ -79,7 +87,7 @@ impl Drop for RenderMemoryLedger {
     }
 }
 
-/// The device memory every live renderer holds, summed across windows. Four
+/// The device memory every live renderer holds, summed across windows. Five
 /// atomic loads; callable from any thread with no `App` at hand.
 pub fn render_memory_gauges() -> RenderMemoryGauges {
     let load = |gauge: RenderMemoryGauge| GAUGES[gauge as usize].load(Ordering::Relaxed);
@@ -88,6 +96,7 @@ pub fn render_memory_gauges() -> RenderMemoryGauges {
         atlas_polychrome_bytes: load(RenderMemoryGauge::AtlasPolychrome),
         instance_buffer_bytes: load(RenderMemoryGauge::InstanceBuffers),
         depth_texture_bytes: load(RenderMemoryGauge::DepthTextures),
+        path_texture_bytes: load(RenderMemoryGauge::PathTextures),
     }
 }
 
@@ -121,6 +130,7 @@ mod tests {
         );
         assert_eq!(during.atlas_monochrome_bytes, before.atlas_monochrome_bytes);
         assert_eq!(during.instance_buffer_bytes, before.instance_buffer_bytes);
+        assert_eq!(during.path_texture_bytes, before.path_texture_bytes);
 
         drop(renderer);
         let without_renderer = render_memory_gauges();
