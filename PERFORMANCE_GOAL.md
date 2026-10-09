@@ -197,3 +197,13 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+In-place glyph ranges at `e18490e74befe5c2bd24de8137aae5b58235b177`
+remain held. All 3,418 native children and 20 memory targets pass, but 18
+CPU/elapsed/whole-child/census RSS fields fail. All bare RSS controls pass.
+Native output, retained histories and owner release pass. Never resample the
+source unchanged or weaken its frozen gates. See
+`performance-evidence/in-place-glyph-ranges-held-20261009`. Continue with a
+distinct publication marker inside glyph descriptors to remove the Scene-wide
+header and unnecessary non-glyph sealing. No consumer or app/GPU gain.

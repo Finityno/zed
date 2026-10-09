@@ -1,0 +1,10 @@
+{
+  "source": "e18490e74befe5c2bd24de8137aae5b58235b177",
+  "tree": "bd738b54822f1a6c2d67def02c734dbd5f6372eb",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "5bc12e6381a10a3ffce06892c335a66736f8142eb679c2e1d4cfe844834b8157",
+    "crates/gpui/src/window/view_retention/tests.rs": "6d88b07f48170fd92ce153beb8b656192cbb2c4f5eccdde690c66a478c484703"
+  },
+  "scope": "In-place glyph range end extension, 8BScene/16BWindow prefix seal explicitlybudgeted. Text_system/line andwindow/glyph_painting unchanged. Scalar oldvariant replaybody exactapart newenum guard; no closurefactoring orpostpaintscan. Shared normalizedoverlay metadata frozen beforepairs."
+}
