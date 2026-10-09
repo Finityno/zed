@@ -5217,3 +5217,22 @@ fn frame_work_transcript() {
         }
     }
 }
+
+#[test]
+fn a_cold_long_line_does_not_keep_one_wide_record_per_glyph() {
+    struct LongLine;
+    impl Render for LongLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(1600.)).h(px(40.)).child("A".repeat(128))
+        }
+    }
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let window = cx.add_window(|_, _| LongLine);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        let scene = &window.rendered_frame.scene;
+        let glyphs = scene.monochrome_sprites.len() + scene.subpixel_sprites.len();
+        assert!(glyphs >= 32);
+        assert!(scene.len() * 2 < glyphs, "a cold line keeps one record for a glyph run");
+    }).expect("window");
+}

@@ -1,0 +1,429 @@
+{
+  "children": 20,
+  "all_outputs_match_currentmain_complete_baseline": true,
+  "all_inputs_unchanged": true,
+  "production_candidate_exists": false,
+  "not_gain_evidence": true,
+  "rows": [
+    {
+      "case": "scroll-off-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5900654,
+      "record_fraction_of_completeheld": 0.1277255029696708,
+      "operations": 1477,
+      "glyphs": 1351,
+      "potential_operations": 169,
+      "potential_operation_reduction_fraction": 0.8855788761002031,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "scroll-off-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 6349434,
+      "record_fraction_of_completeheld": 0.11869782408951728,
+      "operations": 1477,
+      "glyphs": 1351,
+      "potential_operations": 169,
+      "potential_operation_reduction_fraction": 0.8855788761002031,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "scroll-on-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5938354,
+      "record_fraction_of_completeheld": 0.1269146298789193,
+      "operations": 1422,
+      "glyphs": 1299,
+      "potential_operations": 164,
+      "potential_operation_reduction_fraction": 0.8846694796061885,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "scroll-on-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 6386190,
+      "record_fraction_of_completeheld": 0.11801465349449358,
+      "operations": 1422,
+      "glyphs": 1299,
+      "potential_operations": 164,
+      "potential_operation_reduction_fraction": 0.8846694796061885,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "stream-off-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5706518,
+      "record_fraction_of_completeheld": 0.1320707303472976,
+      "operations": 1834,
+      "glyphs": 1719,
+      "potential_operations": 161,
+      "potential_operation_reduction_fraction": 0.9122137404580153,
+      "max_consecutive_glyph_run": 50,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "stream-off-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 6154274,
+      "record_fraction_of_completeheld": 0.12246188583738715,
+      "operations": 1834,
+      "glyphs": 1719,
+      "potential_operations": 161,
+      "potential_operation_reduction_fraction": 0.9122137404580153,
+      "max_consecutive_glyph_run": 50,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "stream-on-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5776550,
+      "record_fraction_of_completeheld": 0.13046957093767042,
+      "operations": 1834,
+      "glyphs": 1719,
+      "potential_operations": 161,
+      "potential_operation_reduction_fraction": 0.9122137404580153,
+      "max_consecutive_glyph_run": 50,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "stream-on-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 6224306,
+      "record_fraction_of_completeheld": 0.12108402125473908,
+      "operations": 1834,
+      "glyphs": 1719,
+      "potential_operations": 161,
+      "potential_operation_reduction_fraction": 0.9122137404580153,
+      "max_consecutive_glyph_run": 50,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "tick-off-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5444878,
+      "record_fraction_of_completeheld": 0.1384170591150068,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "tick-off-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5892146,
+      "record_fraction_of_completeheld": 0.1279099329853673,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "tick-on-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5522958,
+      "record_fraction_of_completeheld": 0.136460208460756,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "tick-on-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5970226,
+      "record_fraction_of_completeheld": 0.1262370972221152,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "redraw-off-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5444446,
+      "record_fraction_of_completeheld": 0.1384280420817839,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "redraw-off-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5891714,
+      "record_fraction_of_completeheld": 0.1279193117656424,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "redraw-on-200",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5522838,
+      "record_fraction_of_completeheld": 0.13646317346262918,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "redraw-on-512",
+      "record_owner_bytes": 753664,
+      "held_bytes": 5970106,
+      "record_fraction_of_completeheld": 0.12623963460615273,
+      "operations": 1425,
+      "glyphs": 1302,
+      "potential_operations": 165,
+      "potential_operation_reduction_fraction": 0.8842105263157894,
+      "max_consecutive_glyph_run": 49,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "color-redraw-off-200-32",
+      "record_owner_bytes": 3273728,
+      "held_bytes": 12683010,
+      "record_fraction_of_completeheld": 0.25811916887237335,
+      "operations": 4800,
+      "glyphs": 4700,
+      "potential_operations": 150,
+      "potential_operation_reduction_fraction": 0.96875,
+      "max_consecutive_glyph_run": 94,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "color-redraw-on-200-32",
+      "record_owner_bytes": 3273728,
+      "held_bytes": 12853802,
+      "record_fraction_of_completeheld": 0.25468946853234553,
+      "operations": 4800,
+      "glyphs": 4700,
+      "potential_operations": 150,
+      "potential_operation_reduction_fraction": 0.96875,
+      "max_consecutive_glyph_run": 94,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "color-decorated-off-200-32",
+      "record_owner_bytes": 3568128,
+      "held_bytes": 13079394,
+      "record_fraction_of_completeheld": 0.2728052996950776,
+      "operations": 5600,
+      "glyphs": 4700,
+      "potential_operations": 1700,
+      "potential_operation_reduction_fraction": 0.6964285714285714,
+      "max_consecutive_glyph_run": 6,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    },
+    {
+      "case": "color-decorated-on-200-32",
+      "record_owner_bytes": 3568128,
+      "held_bytes": 13282186,
+      "record_fraction_of_completeheld": 0.26864011692051293,
+      "operations": 5600,
+      "glyphs": 4700,
+      "potential_operations": 1700,
+      "potential_operation_reduction_fraction": 0.6964285714285714,
+      "max_consecutive_glyph_run": 6,
+      "scene_widths": [
+        1632,
+        1632
+      ],
+      "fixed_prefix_seal_bytes_per_scene": [
+        8,
+        8
+      ],
+      "not_gain_evidence": true,
+      "callback_index_seals_not_captured": true
+    }
+  ]
+}

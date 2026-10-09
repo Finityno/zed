@@ -1,0 +1,10 @@
+{
+  "source": "b706c55f84ac00c4fa44176742df5cb439f847d8",
+  "tree": "4ab0b0506ad2b7bfc1cd98eaf0f626e9661e1925",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "f18e0f0e814e7d8e67ea6e5a0ff3b315abfd3978baaf8333300992419686f6c0",
+    "crates/gpui/src/window/view_retention/tests.rs": "6d88b07f48170fd92ce153beb8b656192cbb2c4f5eccdde690c66a478c484703"
+  },
+  "scope": "Padding-resident two-byte tail state, original Scene/Window/record widths required, no publication heap-tail lookup and zero fixed heap budget. Text_system/line andwindow/glyph_painting unchanged. Non-glyph replay body exact; uniform glyph ranges retain movement/remap/animation semantics, seal only source glyph boundaries. No postpaint scan. Shared normalizedoverlay metadata frozen beforepairs."
+}

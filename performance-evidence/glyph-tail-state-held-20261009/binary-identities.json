@@ -1,0 +1,26 @@
+{
+  "baseline": {
+    "bare": {
+      "path": "/workspace/scratch/gpui-glyph-tail-state-loop/comparison/baseline-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "623a439680cf032beda1ee58bb8434912dd8d7867dc0154f847a8b904c2e9afd",
+      "bytes": 35040072
+    },
+    "census": {
+      "path": "/workspace/scratch/gpui-glyph-tail-state-loop/comparison/baseline-census-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "e9b509af42f59515cc53bb57c2f8ae39ec4225848835afd50c68ac159567b0bd",
+      "bytes": 34929032
+    }
+  },
+  "candidate": {
+    "bare": {
+      "path": "/workspace/scratch/gpui-glyph-tail-state-loop/comparison/candidate-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "39335466a2ffbf7c41a5d0da39c6380d63d1a80a57972950ee8b7837d9c37f75",
+      "bytes": 35021232
+    },
+    "census": {
+      "path": "/workspace/scratch/gpui-glyph-tail-state-loop/comparison/candidate-census-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "95c8c00eb50e05f06c13f3fb6a70eab8aa1befeda63420dbf6e9503f79bc5618",
+      "bytes": 34840816
+    }
+  }
+}

@@ -197,3 +197,14 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Padding-resident glyph tail state at `b706c55f84ac00c4fa44176742df5cb439f847d8`
+remains held. Across 3,418 native children all 20 memory targets pass: 10.24–28.77%
+less complete requested live heap and 75–97.92% less record capacity, with exact
+original object widths, zero fixed overhead and every requested heap/churn control
+passing. Nineteen CPU/elapsed/whole-child/current/peak-RSS fields fail. Native output
+and retained/release contracts pass; preserve all failures and coverage limits in
+`performance-evidence/glyph-tail-state-held-20261009`. Never repeat this source
+unchanged. Continue with distinct line-local coalescing that leaves ordinary Scene
+index capture/insertion unchanged. No application or GPU gain is established.
