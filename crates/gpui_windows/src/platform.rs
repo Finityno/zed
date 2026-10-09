@@ -39,7 +39,6 @@ use windows::{
 use crate::*;
 use gpui::*;
 
-/// A window the platform routes messages to and the vsync thread paces.
 pub(crate) struct RegisteredWindow {
     hwnd: SafeHwnd,
     /// The window's [`WindowsWindowState::frame_demand`].
