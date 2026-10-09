@@ -522,5 +522,16 @@
   ],
   "archive_sha256": "767135a00e1d8fbf53ca4532340a27cd840c46ec21e86eed1a9ffb6d5bb23b0b",
   "archive_bytes": 516322,
-  "members": 685
+  "members": 685,
+  "review_followup": {
+    "additional_one_sided_and_asymmetric_floor_cases": 54,
+    "native_exact_helper_tests_pass": true,
+    "actual_owning_strict_clippy_pass": true,
+    "strict_clippy_seconds": 19.42905592918396,
+    "production_bytes_unchanged": true,
+    "performance_cohort_not_repeated": true,
+    "archive_sha256": "4cfe1b26bdd8d6b2637e4b615babb337f656c23fd9cfc99ac681dff161bf3d20",
+    "archive_bytes": 4579,
+    "coverage": "Additional native std-only helper oracle plus actual owning full-test Clippy; previous native GPUI correctness and performance receipts retained unchanged."
+  }
 }

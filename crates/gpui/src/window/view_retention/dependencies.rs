@@ -1087,6 +1087,25 @@ mod read_union_tests {
         }
     }
 
+    #[test]
+    fn large_read_unions_preserve_empty_sides_and_long_tails() {
+        for (left_length, right_length) in [(0, 64), (64, 0), (1, 256), (256, 1), (7, 256), (256, 7)] {
+            let left: Rc<[(u32, u64)]> = (0..left_length).map(|key| (key * 2, 3 + u64::from(key % 3))).collect();
+            let right: Rc<[(u32, u64)]> = (0..right_length).map(|key| (key, 2 + u64::from(key % 5))).collect();
+            for left_floor in [0, 5, 12] {
+                for right_floor in [0, 7, 14] {
+                    let actual = merge_reads(&left, left_floor, &right, right_floor);
+                    let mut expected: Vec<_> = left.iter().map(|(key, read)| (*key, (*read).max(left_floor)))
+                        .chain(right.iter().map(|(key, read)| (*key, (*read).max(right_floor))))
+                        .collect();
+                    expected.sort_unstable();
+                    expected.dedup_by_key(|(key, _)| *key);
+                    assert_eq!(actual.as_ref(), expected.as_slice(), "lengths={left_length}/{right_length} floors={left_floor}/{right_floor}");
+                }
+            }
+        }
+    }
+
     thread_local! {
         static COMPARISONS: Cell<usize> = const { Cell::new(0) };
     }

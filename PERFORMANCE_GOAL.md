@@ -168,13 +168,13 @@ remains held: eight allocation targets improve 7.02–9.05%, but three native RS
 controls fail. Unbounded linear read merging at
 `12fdb142f4db5be22b8c5ffbcd0e871ef836011f` also remains held: four CPU targets
 improve 11.42–13.13%, but nine normal CPU/RSS fields fail. Its 560 valid children
-and560 invalid children from an earlier overlapping measurement are preserved
+and 560 invalid children from an earlier overlapping measurement are preserved
 under `performance-evidence/linear-read-union-held-20261008` on its branch.
 Never repeat these designs unchanged or weaken their frozen gates.
 
 Bounded out-of-line read merging at `eff2bd53e09225062f725f3e84c564445b7444c0`
-qualifies across560 native children and20 complete App/Window workloads. Four
-256-row changed-component cases use 9.41–11.96% less thread CPU and9.47–11.98%
+qualifies across 560 native children and 20 complete App/Window workloads. Four
+256-row changed-component cases use 9.41–11.96% less thread CPU and 9.47–11.98%
 less elapsed time, exceeding both full lane ranges and the frozen 5% target.
 All normal CPU/elapsed/whole-child, requested heap/churn and native RSS
 controls pass. Every held/peak/requested-byte/allocation-call median is
