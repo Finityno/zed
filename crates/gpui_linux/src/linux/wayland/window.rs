@@ -1620,10 +1620,19 @@ impl WaylandWindowStatePtr {
     /// the output off), never for a window that is merely unfocused.
     fn update_surface_residency(&self, visibility: WindowVisibility) {
         let mut state = self.state.borrow_mut();
-        if visibility.is_visible() {
-            state.restore_surface();
-        } else {
+        if !visibility.is_visible() {
             state.renderer.unconfigure_surface();
+            return;
+        }
+        state.restore_surface();
+        // A compositor may never deliver the callback of a frame presented
+        // just before the window was suspended, so the shown window stops
+        // waiting on it and schedules its own frame.
+        state.pending_frame_callback = None;
+        drop(state);
+        if self.frame_loop.get() == FrameLoop::AwaitingCallback {
+            self.frame_loop.set(FrameLoop::Parked);
+            self.request_redraw();
         }
     }
 

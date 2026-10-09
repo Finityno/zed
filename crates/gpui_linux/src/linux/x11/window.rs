@@ -1074,8 +1074,10 @@ impl X11WindowStatePtr {
         }
         if mapped {
             // The restored surface is empty; render the next frame rather
-            // than rely on something in the window being dirty.
-            if self.restore_surface(&mut state) {
+            // than rely on something in the window being dirty. A failed
+            // restore needs that frame too: its draw retries the restore.
+            if state.renderer.is_unconfigured() {
+                self.restore_surface(&mut state);
                 state.force_render_after_recovery = true;
             }
         } else {
@@ -1820,6 +1822,12 @@ impl PlatformWindow for X11Window {
         // forced render afterwards.
         if inner.mapped {
             self.0.restore_surface(&mut inner);
+            if inner.renderer.is_unconfigured() {
+                // Still released: force the next frame so it retries, since an
+                // idle window would otherwise never draw again.
+                inner.force_render_after_recovery = true;
+                return;
+            }
         }
         inner.renderer.draw(scene);
 
