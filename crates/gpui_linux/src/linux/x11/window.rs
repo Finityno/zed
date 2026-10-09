@@ -1795,6 +1795,9 @@ impl PlatformWindow for X11Window {
         if inner.renderer.device_lost() {
             let raw_window = self.0.raw_window(&inner);
             match inner.renderer.recover(&raw_window) {
+                // Recovery recreates the surface configured; an unmapped
+                // window releases it again rather than holding it until mapped.
+                Ok(()) if !inner.mapped => inner.renderer.unconfigure_surface(),
                 Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");

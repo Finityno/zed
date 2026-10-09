@@ -1986,6 +1986,9 @@ impl PlatformWindow for WaylandWindow {
                     .cast::<std::ffi::c_void>(),
             };
             match state.renderer.recover(&raw_window) {
+                // Recovery recreates the surface configured; a hidden window
+                // releases it again rather than holding it until it is shown.
+                Ok(()) if !state.visibility.is_visible() => state.renderer.unconfigure_surface(),
                 Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
