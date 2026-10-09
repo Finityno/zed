@@ -1131,13 +1131,38 @@ impl DrawOrderScratch {
             sorted.extend_from_slice(items);
             return;
         }
-        self.sort_sprite_indices(items, key);
-        sorted.extend(self.permutation.iter().map(|&index| items[index as usize]));
+        match self.sort_sprite_keys(items, key) {
+            Some(index_mask) => {
+                sorted.extend(self.keys.iter().map(|&key| items[(key & index_mask) as usize]));
+            }
+            None => {
+                sorted.extend(self.sprite_keys.iter().map(|&key| items[key as u32 as usize]));
+            }
+        }
     }
 
     /// Leaves the indices of `items` in `permutation`, sorted as
     /// [`Self::sort_sprites`] sorts them.
     fn sort_sprite_indices<T>(&mut self, items: &[T], key: impl Fn(&T) -> (u32, u32, u32)) {
+        let index_mask = self.sort_sprite_keys(items, key);
+        self.permutation.clear();
+        match index_mask {
+            Some(index_mask) => {
+                self.permutation
+                    .extend(self.keys.iter().map(|&key| (key & index_mask) as u32));
+            }
+            None => {
+                self.permutation
+                    .extend(self.sprite_keys.iter().map(|&key| key as u32));
+            }
+        }
+    }
+
+    fn sort_sprite_keys<T>(
+        &mut self,
+        items: &[T],
+        key: impl Fn(&T) -> (u32, u32, u32),
+    ) -> Option<u64> {
         let (mut orders, mut textures, mut tiles) = (0, 0, 0);
         for item in items {
             let (order, texture, tile) = key(item);
@@ -1150,7 +1175,6 @@ impl DrawOrderScratch {
         let texture_shift = tile_shift + width(tiles);
         let order_shift = texture_shift + width(textures);
         let key_width = order_shift + width(orders);
-        self.permutation.clear();
         // Each part packed only as wide as this frame needs usually fits all
         // four in 64 bits, which sort in a few linear passes instead of a
         // comparison sort of 128-bit keys.
@@ -1166,9 +1190,7 @@ impl DrawOrderScratch {
             // The keys start in index order and the sort is stable, so the
             // index bits need no pass of their own.
             radix_sort(&mut self.keys, &mut self.radix_scratch, tile_shift..key_width);
-            let index_mask = (1 << tile_shift) - 1;
-            self.permutation
-                .extend(self.keys.iter().map(|&key| (key & index_mask) as u32));
+            Some((1 << tile_shift) - 1)
         } else {
             self.sprite_keys.clear();
             self.sprite_keys.extend(items.iter().enumerate().map(|(index, item)| {
@@ -1179,8 +1201,7 @@ impl DrawOrderScratch {
                     | index as u128
             }));
             self.sprite_keys.sort_unstable();
-            self.permutation
-                .extend(self.sprite_keys.iter().map(|&key| key as u32));
+            None
         }
     }
 
@@ -1512,6 +1533,32 @@ mod tests {
         replayed.replay(0..source.len(), &source);
 
         assert!(replayed.is_empty());
+    }
+
+    #[test]
+    fn copied_sprite_sort_preserves_source_without_a_permutation_owner() {
+        for widest in [31, u32::MAX] {
+            let items: Vec<_> = (0..2048u32)
+                .map(|index| (widest - index % 32, index % 3, widest - index % 16, index))
+                .collect();
+            let original = items.clone();
+            let mut expected = items.clone();
+            expected.sort_by_key(|item| (item.0, item.1, item.2));
+            let mut scratch = DrawOrderScratch::default();
+            let mut copied = Vec::new();
+            scratch.sort_sprites_into(&items, &mut copied, |item| (item.0, item.1, item.2));
+            assert_eq!(copied, expected);
+            assert_eq!(items, original);
+            assert_eq!(scratch.permutation.capacity(), 0);
+            let mut in_place = items.clone();
+            scratch.sort_sprites(&mut in_place, |item| (item.0, item.1, item.2));
+            assert_eq!(in_place, expected);
+            assert!(scratch.permutation.capacity() >= items.len());
+            let capacity = scratch.permutation.capacity();
+            scratch.sort_sprites_into(&items, &mut copied, |item| (item.0, item.1, item.2));
+            assert_eq!(copied, expected);
+            assert_eq!(scratch.permutation.capacity(), capacity);
+        }
     }
 
     fn unit_bounds() -> Bounds<ScaledPixels> {

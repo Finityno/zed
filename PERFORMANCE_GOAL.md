@@ -197,3 +197,16 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Direct packed-key glyph copying at `43ea16c93782ee5f2b86cf34c37795b9cbcf4632`
+remains held and unmerged. Across4,060 children no primarycontrolledScene.finish
+case meets its5%CPU/elapsed target. Scratchowner storage reduces20%; requested
+live reduces0.774–0.979%, with four coloredcases below frozen0.8%. Twelve
+ordinaryCPU/elapsed/wholechildCPU and27RSSfields also fail;83totalfields fail.
+All145 requestedheap/churn nonincreasecontrols and326native correctnesschildren
+pass. Preserve allfailedfields/source/setup failures; never unchangedrerun or
+weaken gates. See `performance-evidence/scene-sort-indices-held-20261009`.
+No app/GPU/nativeplatform/shippedallocator gain or consumeradoption is claimed.
+Continue with measured line-sized paint-record ownership and retainedindex
+boundaries; preserve allother independentwork.

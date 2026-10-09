@@ -1,0 +1,33 @@
+{
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "fincode_main": "1db05b87837ca90f42e4714e0f43593967cc9cb3",
+  "fincode_pin": "6b18c87dd5f2d1ccbee1ee641054295f2a78390b",
+  "component_pin": "031f54b627333272a8c157cbe4ca1cf591d16172",
+  "production_candidate_exists": false,
+  "cases": [
+    "scroll-off-200",
+    "scroll-off-512",
+    "scroll-on-200",
+    "scroll-on-512",
+    "stream-off-200",
+    "stream-off-512",
+    "stream-on-200",
+    "stream-on-512",
+    "tick-off-200",
+    "tick-off-512",
+    "tick-on-200",
+    "tick-on-512",
+    "redraw-off-200",
+    "redraw-off-512",
+    "redraw-on-200",
+    "redraw-on-512",
+    "color-redraw-off-200-32",
+    "color-redraw-on-200-32",
+    "color-decorated-off-200-32",
+    "color-decorated-on-200-32"
+  ],
+  "iterations": 128,
+  "purpose": "Current-main measured completeWindow owner/captured-sortkey attribution. Existing independent40child trace shows Scene.finish11.15-13.82us/frame. Stored key/index duplicate may permit direct sortedcopy without permutationVec. Capture actual ordering/key bits/counts/staticanimation eligibility and capacities after timers/census. No hypothetical source gains claimed.",
+  "measurement_limits": "CountingSystem CPU notgain evidence. Captured keys/array counts are actual native fakeplatform scenes. Geometry/texture resource bytes notcaptured; any reconstructed finishfixture must be labeled controlled key-and-payload-size fixture, not fullphysicalrenderer/app scene. No GPU/platform/app claims.",
+  "no_failed_candidate_repeated": "Baseline originalmain08d source; neither heldglyphspan norcompactrecord code reused."
+}

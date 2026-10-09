@@ -1,0 +1,2308 @@
+{
+  "all_pass": true,
+  "children": 326,
+  "common_native_test_passes": 620,
+  "matched_window_frame_audits": 119,
+  "matched_controlledSceneSignatures": 26,
+  "expected_red_owner_regression": "separatebaseline101/candidate0,one test each",
+  "zero_test_filters": [
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    }
+  ],
+  "tests": [
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "taffy::",
+      "passed": 9,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::layout_retention_tests::",
+      "passed": 14,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::view_retention::tests::",
+      "passed": 57,
+      "ignored": 7
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::view_retention::dependencies::",
+      "passed": 8,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::layout_keys::",
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "text_system::",
+      "passed": 47,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "scene::tests::",
+      "passed": 25,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::glyph_painting::tests::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "app::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "arena::tests::",
+      "passed": 15,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "elements::div::tests::",
+      "passed": 44,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "elements::list::test::",
+      "passed": 38,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "elements::uniform_list::test::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "elements::text::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "elements::deferred::tests::",
+      "passed": 3,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "window::tests::",
+      "passed": 33,
+      "ignored": 1
+    },
+    {
+      "lane": "baseline",
+      "case": null,
+      "pattern": "subscription::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "taffy::",
+      "passed": 9,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::layout_retention_tests::",
+      "passed": 14,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::view_retention::tests::",
+      "passed": 57,
+      "ignored": 7
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::view_retention::dependencies::",
+      "passed": 8,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::layout_keys::",
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "text_system::",
+      "passed": 47,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "scene::tests::",
+      "passed": 25,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::glyph_painting::tests::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "app::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "arena::tests::",
+      "passed": 15,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "elements::div::tests::",
+      "passed": 44,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "elements::list::test::",
+      "passed": 38,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "elements::uniform_list::test::",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "elements::text::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "elements::deferred::tests::",
+      "passed": 3,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "window::tests::",
+      "passed": 33,
+      "ignored": 1
+    },
+    {
+      "lane": "candidate",
+      "case": null,
+      "pattern": "subscription::tests::",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "value-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "value-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "header-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "header-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "resize-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "resize-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-16-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-16-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-80-bare-flat",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-80-bare-nested",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "scroll-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "scroll-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "scroll-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "scroll-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "scroll-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "scroll-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "scroll-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "scroll-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "scroll-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "scroll-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "scroll-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "scroll-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "stream-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "stream-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "stream-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "stream-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "stream-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "stream-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "stream-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "stream-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "stream-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "stream-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "stream-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "stream-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "tick-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "tick-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "tick-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "tick-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "tick-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "tick-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "tick-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "tick-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "tick-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "tick-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "tick-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "tick-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "redraw-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "redraw-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "rebuild-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "rebuild-off-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "rebuild-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "rebuild-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "rebuild-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "rebuild-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "rebuild-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "rebuild-on-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "rebuild-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "rebuild-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "rebuild-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "rebuild-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "panel-keep-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "panel-keep-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "panel-keep-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "panel-keep-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "keep-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "keep-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "keep-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "keep-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "remove-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "remove-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "remove-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "remove-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "off-remove-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "off-remove-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "off-remove-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "off-remove-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "replace-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "replace-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "replace-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "replace-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "grow-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "grow-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "grow-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "grow-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "state-bump-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "state-bump-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "state-bump-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "state-bump-256",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-32-4",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-32-4",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-32-8",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-32-8",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-32-9",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-32-9",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-32-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-32-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-32-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-32-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-on-32-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-on-32-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-on-32-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-on-32-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-redraw-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-redraw-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-stream-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-stream-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-stream-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-stream-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-stream-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-stream-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-stream-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-stream-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-scroll-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-scroll-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-scroll-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-scroll-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-scroll-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-scroll-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-scroll-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-scroll-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-recolor-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-recolor-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-recolor-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-recolor-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-recolor-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-recolor-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-recolor-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-recolor-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-resize-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-resize-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-resize-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-resize-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-resize-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-resize-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-resize-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-resize-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-rebuild-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-rebuild-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-rebuild-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-rebuild-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-rebuild-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-rebuild-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-rebuild-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-rebuild-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-decorated-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-decorated-off-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-decorated-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-decorated-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-decorated-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-decorated-on-200-16",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "color-decorated-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "color-decorated-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-scroll-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-scroll-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-scroll-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-scroll-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-scroll-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-scroll-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-scroll-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-scroll-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-stream-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-stream-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-stream-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-stream-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-stream-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-stream-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-stream-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-stream-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-tick-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-tick-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-tick-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-tick-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-tick-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-tick-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-tick-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-tick-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-redraw-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-redraw-off-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-redraw-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-redraw-off-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-redraw-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-redraw-on-200",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-redraw-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-redraw-on-512",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-color-redraw-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-color-redraw-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-color-redraw-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-color-redraw-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-color-decorated-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-color-decorated-off-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-color-decorated-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-color-decorated-on-200-32",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-control-empty",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-control-empty",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-control-sorted",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-control-sorted",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-control-equal",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-control-equal",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-control-wide",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-control-wide",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-control-reverse",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-control-reverse",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "baseline",
+      "case": "finish-control-mixed",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "case": "finish-control-mixed",
+      "pattern": null,
+      "passed": 1,
+      "ignored": 0
+    }
+  ]
+}

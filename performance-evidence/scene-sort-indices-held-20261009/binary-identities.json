@@ -1,0 +1,26 @@
+{
+  "baseline": {
+    "bare": {
+      "path": "/workspace/scratch/gpui-sort-indices-loop/comparison/baseline-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "5b149754bcb5264f179aae7fe114e53bca6034036f5cc2f738bbc96f84c78abf",
+      "bytes": 35562936
+    },
+    "census": {
+      "path": "/workspace/scratch/gpui-sort-indices-loop/comparison/baseline-census-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "508aac8f446702dd81f219c1594bc89e0817429f3b498cfda6f9072f83aa7a89",
+      "bytes": 35471672
+    }
+  },
+  "candidate": {
+    "bare": {
+      "path": "/workspace/scratch/gpui-sort-indices-loop/comparison/candidate-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "167fba928d1909bf8150da3e22f2f0395198739f7263efe3347004dab24eb82a",
+      "bytes": 35558048
+    },
+    "census": {
+      "path": "/workspace/scratch/gpui-sort-indices-loop/comparison/candidate-census-artifacts/gpui-ada3fb4d7b1cfe56",
+      "sha256": "60e3b90a63fb4c0379100f24a597e28fac362487d8f8b6fc63b17c578db50343",
+      "bytes": 35476936
+    }
+  }
+}

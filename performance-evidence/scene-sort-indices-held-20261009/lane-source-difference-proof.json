@@ -1,0 +1,11 @@
+{
+  "source_difference": [
+    "crates/gpui/src/scene.rs"
+  ],
+  "all_private_helpers_fixtures_and_tests_identical": true,
+  "all59_original_externs_identical": true,
+  "production_source": "43ea16c93782ee5f2b86cf34c37795b9cbcf4632",
+  "fixture_setup_corrections_before_builds": "Use localclock; parse immutablefixturecapture before requestedcensus; originalsetupfile preserved. No gates changed. Frozenpolicy memory_budget_reason describes priorbatchappend in error; zeroowner/heap/churn gate actually enforced here.",
+  "candidate_compiled_source_exact_production_except_named_private_include": true,
+  "setup_corrected_fixture_sha256": "c358431c1381cbb2bb040b134e0c3209c4a446d03a8e520a5d3bbbdd86e12f76"
+}

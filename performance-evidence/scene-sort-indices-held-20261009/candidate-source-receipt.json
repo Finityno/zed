@@ -1,0 +1,9 @@
+{
+  "source": "43ea16c93782ee5f2b86cf34c37795b9cbcf4632",
+  "tree": "4b8cd8106452318b64e6b14eb7281800cb3ee9fe",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "218f7a3101b19629f010e21135616d7e36037500acf275a7d156c6cc521071b7"
+  },
+  "scope": "Direct64/128 packed index copying; no failedspan/flatrecord logic reused; same inplace algorithm. Private measured fullScene.finish scope includes Scene construction+warm requestedheap; immutablecapture JSON parsed before census; alltimers afterwarmup."
+}

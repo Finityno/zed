@@ -1,0 +1,26 @@
+[
+  {
+    "lane": "baseline",
+    "command": [
+      "/workspace/scratch/gpui-sort-indices-loop/comparison/baseline-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "copied_sprite_sort_preserves_source_without_a_permutation_owner",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 101,
+    "log": "/workspace/scratch/gpui-sort-indices-loop/comparison/copy-owner-regression/baseline.log",
+    "log_sha256": "8dd0bd42170a0b97f3485427644f3fe1253839df0591b46515ac8c90ba1b25bc"
+  },
+  {
+    "lane": "candidate",
+    "command": [
+      "/workspace/scratch/gpui-sort-indices-loop/comparison/candidate-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "copied_sprite_sort_preserves_source_without_a_permutation_owner",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/workspace/scratch/gpui-sort-indices-loop/comparison/copy-owner-regression/candidate.log",
+    "log_sha256": "96fd618cc1c3f9e1446772ad35f96f96b98aa1306c3f003d823b78cbcc92e35c"
+  }
+]
