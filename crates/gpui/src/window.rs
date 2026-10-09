@@ -4251,6 +4251,21 @@ impl Window {
         profiling::finish_frame!();
     }
 
+    /// Has the window draw with `atlas` from now on, as if it last presented
+    /// at the atlas's current frame.
+    #[cfg(test)]
+    pub(crate) fn replace_sprite_atlas(&mut self, atlas: Arc<dyn PlatformAtlas>) {
+        self.atlas_frame_at_last_present = atlas.frame_index();
+        self.sprite_atlas = atlas;
+    }
+
+    /// What [`Self::present`] records once the platform has drawn the
+    /// rendered scene, marking its tiles in the atlas.
+    #[cfg(test)]
+    pub(crate) fn note_rendered_scene_presented(&mut self) {
+        self.atlas_frame_at_last_present = self.sprite_atlas.frame_index();
+    }
+
     /// Whether the retained scene was last presented so long ago, in sprite-atlas
     /// frames, that glyph or SVG tiles it references may since have been retired
     /// by [`PlatformAtlas::retire_unused`]. The atlas can be shared by several

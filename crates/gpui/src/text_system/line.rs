@@ -2200,6 +2200,151 @@ mod pre_cull_regression_tests {
         assert_eq!(again, recoloured);
     }
 
+    /// Tracks the tiles an atlas still holds, so a scene naming one it has
+    /// retired is caught.
+    #[derive(Default)]
+    struct LiveTiles {
+        backend: crate::HeadlessAtlasBackend,
+        live: collections::FxHashSet<(u32, crate::TileId)>,
+        retired: usize,
+    }
+
+    impl crate::AtlasBackend for LiveTiles {
+        fn insert(
+            &mut self,
+            kind: crate::AtlasTextureKind,
+            size: Size<DevicePixels>,
+            bytes: &[u8],
+        ) -> Result<AtlasTile> {
+            let tile = self.backend.insert(kind, size, bytes)?;
+            self.live.insert((tile.texture_id.index, tile.tile_id));
+            Ok(tile)
+        }
+
+        fn remove(&mut self, tile: AtlasTile) {
+            if self.live.remove(&(tile.texture_id.index, tile.tile_id)) {
+                self.retired += 1;
+            }
+        }
+    }
+
+    /// An atlas that counts frames and retires idle tiles as a renderer's
+    /// does once a frame is drawn.
+    #[derive(Default)]
+    struct RetiringAtlas(parking_lot::Mutex<crate::AtlasState<LiveTiles>>);
+
+    impl RetiringAtlas {
+        fn on_frame_drawn(&self, scene: &crate::Scene) {
+            let mut state = self.0.lock();
+            state.note_frame_drawn(scene);
+            state.retire_unused(crate::ATLAS_TILE_MAX_IDLE_FRAMES);
+        }
+
+        fn retired(&self) -> usize {
+            self.0.lock().backend.retired
+        }
+
+        fn assert_holds_tiles_of(&self, scene: &crate::Scene) {
+            let state = self.0.lock();
+            for sprite in &scene.monochrome_sprites {
+                assert!(
+                    state
+                        .backend
+                        .live
+                        .contains(&(sprite.tile.texture_id.index, sprite.tile.tile_id)),
+                    "the scene names a retired tile"
+                );
+            }
+        }
+    }
+
+    impl crate::PlatformAtlas for RetiringAtlas {
+        fn get_or_insert_with<'a>(
+            &self,
+            key: crate::AtlasKey,
+            build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+        ) -> Result<Option<AtlasTile>> {
+            self.0.lock().get_or_insert_with(key, build)
+        }
+
+        fn remove(&self, key: &crate::AtlasKey) {
+            self.0.lock().remove(key);
+        }
+
+        fn frame_index(&self) -> u64 {
+            self.0.lock().frame_index()
+        }
+
+        fn generation(&self) -> u64 {
+            self.0.lock().generation()
+        }
+    }
+
+    /// Replayed sprites name the tiles of the frame they were copied from
+    /// without looking them up again. Presenting a scene marks its tiles in
+    /// use, so a window presenting only replayed lines keeps them however
+    /// long it runs; a window that stops presenting while another sharing
+    /// the atlas runs past the idle limit paints its lines afresh once, then
+    /// replays them again.
+    #[test]
+    fn replayed_lines_never_name_a_retired_tile() {
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(InkedTextSystem(NoopTextSystem)),
+        );
+        let window = cx.add_window(|_, _| ReplayedLine {
+            origin: Rc::new(Cell::new(point(px(10.), px(20.)))),
+            color: Rc::new(Cell::new(black())),
+            line: Rc::default(),
+        });
+        let atlas = Arc::new(RetiringAtlas::default());
+        cx.update_window(window.into(), |_, window, _| {
+            window.replace_sprite_atlas(atlas.clone())
+        })
+        .unwrap();
+        type Painted = Vec<(Bounds<ScaledPixels>, AtlasTile, DrawOrder)>;
+        let mut draw = |from_scratch: bool| -> (Painted, usize) {
+            cx.update_window(window.into(), |_, window, cx| {
+                if from_scratch {
+                    window.line_glyph_cache.forget_previous();
+                }
+                let replayed = window.line_glyph_cache.replayed_lines;
+                window.refresh();
+                window.draw(cx).clear(cx);
+                let scene = &window.rendered_frame.scene;
+                atlas.assert_holds_tiles_of(scene);
+                atlas.on_frame_drawn(scene);
+                let painted = scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| (sprite.bounds, sprite.tile, sprite.order))
+                    .collect();
+                window.note_rendered_scene_presented();
+                (painted, window.line_glyph_cache.replayed_lines - replayed)
+            })
+            .unwrap()
+        };
+
+        let (first, _) = draw(true);
+        assert!(!first.is_empty());
+        for _ in 0..crate::ATLAS_TILE_MAX_IDLE_FRAMES * 2 {
+            assert_eq!(draw(false).1, 1);
+        }
+        assert_eq!(atlas.retired(), 0);
+        assert_eq!(draw(false).0, first);
+
+        for _ in 0..crate::ATLAS_TILE_MAX_IDLE_FRAMES + 64 {
+            atlas.on_frame_drawn(&crate::Scene::default());
+        }
+        assert!(atlas.retired() > 0);
+        let (repainted, replayed) = draw(false);
+        assert_eq!(replayed, 0);
+        assert_ne!(repainted, first);
+        assert_eq!(draw(false), (repainted.clone(), 1));
+        assert_eq!(draw(true).0, repainted);
+    }
+
     /// Every glyph whose ink lands inside the content mask has to reach the scene. The mask here
     /// is a band that contains the painted ink but sits entirely BELOW the old pre-cull box, so
     /// the old box and the mask do not intersect at all: the old code discarded the whole line
