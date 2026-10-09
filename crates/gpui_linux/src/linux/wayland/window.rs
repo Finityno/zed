@@ -958,8 +958,10 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
         state.resize_throttle = false;
         // GPUI may throttle this tick without calling draw, so leave the request
-        // latched until a draw actually reaches the renderer.
-        let force_render = state.redraw_requested;
+        // latched until a draw actually reaches the renderer. A lost device
+        // still waiting out its recovery backoff has nothing to draw, so the
+        // request stays latched for the tick when the next attempt is due.
+        let force_render = state.redraw_requested && state.renderer.recovery_delay().is_none();
         let require_presentation = state.presentation.requires_presentation();
         drop(state);
 
@@ -990,6 +992,17 @@ impl WaylandWindowStatePtr {
         // suspended surface gets no frame callback to pace the retries.
         if state.surface_parked() {
             self.frame_loop.set(FrameLoop::Parked);
+            return;
+        }
+
+        // Nothing can present until the lost device is recovered, so the
+        // next tick waits for the recovery attempt to be due.
+        if let Some(delay) = state.renderer.recovery_delay() {
+            self.frame_loop.set(FrameLoop::RetryScheduled);
+            let surface_id = state.surface.id();
+            let client = state.client.clone();
+            drop(state);
+            client.schedule_frame_retry_after(&surface_id, delay);
             return;
         }
 
