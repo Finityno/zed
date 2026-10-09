@@ -3549,6 +3549,47 @@ mod tests {
         Ok(())
     }
 
+    /// A window whose native handle cannot be had, standing in for one whose
+    /// surface cannot be created: wgpu has no surface without a real window.
+    #[cfg(target_os = "linux")]
+    struct UnavailableWindow;
+
+    #[cfg(target_os = "linux")]
+    impl HasWindowHandle for UnavailableWindow {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    /// The platforms retry a failed restore on the next frame, which needs
+    /// the renderer to stay unconfigured with its core, at the size recorded
+    /// by a resize while hidden.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_restore_keeps_the_hidden_renderer_and_its_resized_config() -> anyhow::Result<()> {
+        let mut headless = WgpuHeadlessRenderer::new()?;
+        let mut hidden = unconfigured_renderer(&mut headless);
+        assert!(hidden.restore_surface(&UnavailableWindow).is_err());
+        assert!(hidden.is_unconfigured());
+
+        let WgpuHeadlessRenderer { context, .. } = headless;
+        hidden.context = Some(Rc::new(RefCell::new(Some(context))));
+        hidden.update_drawable_size(device_size(48, 40));
+        assert!(hidden.is_unconfigured());
+        assert_eq!(hidden.viewport_size(), device_size(48, 40));
+        let resources = &hidden.core().expect("core is kept").resources;
+        assert!(resources.depth_texture.is_none());
+        assert!(resources.path_intermediate_texture.is_none());
+
+        assert!(hidden.restore_surface(&UnavailableWindow).is_err());
+        assert!(hidden.is_unconfigured());
+        assert!(hidden.core().is_some());
+        assert_eq!(hidden.viewport_size(), device_size(48, 40));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn instance_buffer_returns_to_its_initial_size_after_a_large_frame() -> anyhow::Result<()> {
