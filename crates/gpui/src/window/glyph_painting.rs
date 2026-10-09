@@ -118,7 +118,7 @@ const FONT_EXTENTS_KEPT: usize = 16;
 /// What a window keeps of the glyphs and fonts it painted lately.
 ///
 /// A glyph's raster bounds depend only on its [`RenderGlyphParams`], and the
-/// text system remembers them forever (except the empty bounds of a glyph
+/// text system remembers them while they are drawn (except the empty bounds of a glyph
 /// that has ink, which it asks again; those are not kept here either). Each
 /// glyph has one slot, chosen by a hash of its parameters; a glyph needing a
 /// slot another holds takes it over.

@@ -236,12 +236,68 @@ enum FontLookup {
     },
 }
 
+/// Glyph raster bounds the platform has computed, kept in two generations so
+/// that a long session (zoom steps, many scripts, several displays) cannot
+/// grow it past two generations: once `recent` holds [`Self::GENERATION`]
+/// entries, or both together hold two generations, the next new glyph turns
+/// `recent` into `older` and the previous `older` is dropped. A glyph found in `older` moves
+/// back to `recent`, so whatever is still being drawn survives.
+#[derive(Default)]
+struct RasterBoundsCache {
+    recent: FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>,
+    older: FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>,
+}
+
+impl RasterBoundsCache {
+    /// Entries per generation: just under the 7168 an 8192-bucket table
+    /// holds, which, at 49 bytes a bucket, caps the cache near 800 KiB. What
+    /// a window draws at once is a few thousand glyph variants at most, and
+    /// each window's own glyph cache answers most lookups before this one.
+    const GENERATION: usize = 7_000;
+
+    fn get(&self, params: &RenderGlyphParams) -> Option<Bounds<DevicePixels>> {
+        self.recent.get(params).copied()
+    }
+
+    /// Never rotates: rotating here would drop the rest of `older` while a
+    /// working set spanning both generations is part way through being
+    /// revisited, and moving an entry leaves the total unchanged anyway.
+    fn take_older(&mut self, params: &RenderGlyphParams) -> Option<Bounds<DevicePixels>> {
+        let (params, bounds) = self.older.remove_entry(params)?;
+        self.recent.insert(params, bounds);
+        Some(bounds)
+    }
+
+    fn insert(&mut self, params: RenderGlyphParams, bounds: Bounds<DevicePixels>) {
+        if self.recent.len() >= Self::GENERATION
+            || self.recent.len() + self.older.len() >= 2 * Self::GENERATION
+        {
+            let previous = std::mem::take(&mut self.recent);
+            // Promotions can fill `recent` past one generation. Keeping it
+            // whole once it reaches two would let the total creep past the
+            // bound by one entry per rotation; a working set that size no
+            // longer fits anyway.
+            self.older = if previous.len() >= 2 * Self::GENERATION {
+                FxHashMap::default()
+            } else {
+                previous
+            };
+        }
+        self.recent.insert(params, bounds);
+    }
+
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    fn len(&self) -> usize {
+        self.recent.len() + self.older.len()
+    }
+}
+
 /// The GPUI text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, FontLookup>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
-    raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
+    raster_bounds: RwLock<RasterBoundsCache>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
@@ -597,6 +653,13 @@ impl TextSystem {
         }
     }
 
+    /// How many glyphs' raster bounds are remembered, for memory harnesses.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    pub fn remembered_raster_bounds_count(&self) -> usize {
+        self.raster_bounds.read().len()
+    }
+
     /// Get the rasterized size and location of a specific, rendered glyph.
     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         self.remembered_raster_bounds(params).map(|(bounds, _)| bounds)
@@ -611,18 +674,21 @@ impl TextSystem {
     ) -> Result<(Bounds<DevicePixels>, bool)> {
         let raster_bounds = self.raster_bounds.upgradable_read();
         if let Some(bounds) = raster_bounds.get(params) {
-            Ok((*bounds, true))
+            Ok((bounds, true))
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
+            if let Some(bounds) = raster_bounds.take_older(params) {
+                return Ok((bounds, true));
+            }
             let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
 
             // `Window::paint_glyph` skips a glyph entirely when its raster bounds are empty,
             // with no error and nothing drawn, while shaping keeps the advance — the glyph
-            // just vanishes from the middle of a word. This cache is never evicted and is
-            // keyed partly on the subpixel variant, so caching an empty result for a glyph
-            // that genuinely has ink would drop that character at that fractional position
-            // for the lifetime of the process, and leave it rendering correctly everywhere
-            // else. Refuse to make that permanent: an empty result for an inked glyph is
+            // just vanishes from the middle of a word. This cache keeps a glyph for as long as
+            // it stays in use and is keyed partly on the subpixel variant, so caching an empty
+            // result for a glyph that genuinely has ink would drop that character at that
+            // fractional position for as long as it is drawn, and leave it rendering correctly
+            // everywhere else. Refuse to make that stick: an empty result for an inked glyph is
             // returned but not remembered, so the next frame asks the platform again.
             //
             // Legitimately blank glyphs (space and friends) still get cached, so the common
@@ -651,10 +717,10 @@ impl TextSystem {
     /// path.
     ///
     /// Deliberately answers `true` when the metrics cannot be read at all. The two ways of
-    /// being wrong here are not symmetric: guessing "no ink" caches an empty raster forever,
-    /// in a cache that is never evicted and is keyed on the subpixel variant, so the character
-    /// goes permanently invisible at that one fractional position while rendering correctly
-    /// everywhere else on the same line. Guessing "has ink" costs one extra platform call per
+    /// being wrong here are not symmetric: guessing "no ink" caches an empty raster for as
+    /// long as the glyph stays in use, keyed on the subpixel variant, so the character goes
+    /// invisible at that one fractional position while rendering correctly everywhere else
+    /// on the same line. Guessing "has ink" costs one extra platform call per
     /// frame for a glyph that is genuinely blank. Only the second is recoverable, and a
     /// `typographic_bounds` failure is exactly the moment the first would be chosen.
     fn glyph_may_have_ink(&self, params: &RenderGlyphParams) -> bool {
@@ -1802,8 +1868,8 @@ mod raster_bounds_cache_tests {
     /// When the design metrics cannot be read, the empty raster must NOT be cached.
     ///
     /// This is the fail-safe direction, and the asymmetry is the whole point. Caching decides
-    /// the character's fate permanently: the raster-bounds cache is never evicted and is keyed
-    /// on the subpixel variant, so one unreadable-metrics answer makes that character invisible
+    /// the character's fate permanently: the raster-bounds cache keeps it while the glyph is
+    /// drawn and is keyed on the subpixel variant, so one unreadable-metrics answer makes that character invisible
     /// at that one fractional x for the life of the process while every other instance of it on
     /// the same line renders correctly. Not caching costs one platform call per frame.
     #[test]
@@ -1840,6 +1906,64 @@ mod raster_bounds_cache_tests {
             1,
             "a glyph with no design ink rasterizes empty legitimately and must stay cached"
         );
+    }
+
+    /// A long session meets ever more glyph variants (zoom steps, scripts,
+    /// displays); the cache must stay bounded without forgetting what is
+    /// still being drawn.
+    #[test]
+    fn raster_bounds_stay_bounded_and_keep_glyphs_in_use() {
+        let platform = Arc::new(AlwaysEmptyRasterizer::new());
+        let text_system = TextSystem::new(platform.clone());
+        let generation = super::RasterBoundsCache::GENERATION;
+        let hot = params(GlyphId(4));
+        text_system.raster_bounds(&hot).unwrap();
+        for glyph in 0..generation as u32 * 3 {
+            text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+            if glyph % 1000 == 0 {
+                text_system.raster_bounds(&hot).unwrap();
+            }
+        }
+        assert!(text_system.raster_bounds.read().len() <= 2 * generation);
+
+        let calls = platform.calls();
+        text_system.raster_bounds(&hot).unwrap();
+        assert_eq!(platform.calls(), calls, "a glyph still drawn is not asked again");
+        text_system.raster_bounds(&params(GlyphId(100))).unwrap();
+        assert_eq!(platform.calls(), calls + 1, "a glyph long out of use was let go");
+    }
+
+    /// Revisiting a working set that fills both generations, in the order it
+    /// was first drawn, must not rotate away the half still waiting in `older`.
+    #[test]
+    fn a_working_set_spanning_both_generations_is_kept() {
+        let platform = Arc::new(AlwaysEmptyRasterizer::new());
+        let text_system = TextSystem::new(platform.clone());
+        let working_set = 2 * super::RasterBoundsCache::GENERATION as u32;
+        for glyph in 0..working_set {
+            text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+        }
+        let calls = platform.calls();
+        for _ in 0..3 {
+            for glyph in 0..working_set {
+                text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+            }
+        }
+        assert_eq!(platform.calls(), calls, "every glyph in the working set stays");
+        assert!(text_system.raster_bounds.read().len() <= working_set as usize);
+
+        for new_glyph in 0..3 {
+            text_system
+                .raster_bounds(&params(GlyphId(100 + working_set + new_glyph)))
+                .unwrap();
+            for glyph in 0..working_set {
+                text_system.raster_bounds(&params(GlyphId(100 + glyph))).unwrap();
+            }
+            assert!(
+                text_system.raster_bounds.read().len() <= working_set as usize,
+                "promotions must not let rotations grow the cache past two generations"
+            );
+        }
     }
 }
 

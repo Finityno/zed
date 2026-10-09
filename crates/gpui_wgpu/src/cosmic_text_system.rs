@@ -46,6 +46,11 @@ struct LoadedFontKey {
     font: FontKey,
 }
 
+/// Glyph images rendered for their raster bounds and not yet rasterized into
+/// an atlas. A frame paints a glyph's bounds and tile back to back, so a
+/// handful are ever waiting; more than this means some were never collected.
+const MAX_PENDING_GLYPH_IMAGES: usize = 256;
+
 struct CosmicTextSystemState {
     font_system: FontSystem,
     scratch: ShapeBuffer,
@@ -484,6 +489,13 @@ impl CosmicTextSystemState {
             size: size(image.placement.width.into(), image.placement.height.into()),
         };
         if !bounds.is_zero() {
+            // Handed to the `rasterize_glyph` that normally follows, which
+            // never comes when the atlas already holds the glyph (its raster
+            // bounds were asked again after the text system let them go), so
+            // what nobody collected is dropped rather than kept for good.
+            if self.pending_glyph_images.len() >= MAX_PENDING_GLYPH_IMAGES {
+                self.pending_glyph_images.clear();
+            }
             self.pending_glyph_images.insert(params.clone(), image);
         }
         Ok(bounds)
@@ -1277,6 +1289,30 @@ mod tests {
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         Ok(text_system)
+    }
+
+    /// A glyph's image waits from `glyph_raster_bounds` for the
+    /// `rasterize_glyph` that follows, which never comes when the atlas
+    /// already holds the tile; those must not pile up.
+    #[test]
+    fn uncollected_glyph_images_stay_bounded() -> Result<()> {
+        let text_system = text_system()?;
+        let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        for glyph in 0..MAX_PENDING_GLYPH_IMAGES as u32 * 2 {
+            text_system.glyph_raster_bounds(&RenderGlyphParams {
+                font_id,
+                glyph_id: GlyphId(36),
+                font_size: gpui::px(8. + glyph as f32 * 0.25),
+                subpixel_variant: gpui::Point::default(),
+                scale_factor: 1.,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation: 0,
+            })?;
+        }
+        let pending = text_system.0.read().pending_glyph_images.len();
+        assert!(pending > 0 && pending <= MAX_PENDING_GLYPH_IMAGES, "{pending} waiting");
+        Ok(())
     }
 
     #[test]
