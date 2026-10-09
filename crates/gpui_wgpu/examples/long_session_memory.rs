@@ -126,13 +126,12 @@ impl Render for Stream {
 }
 
 fn rss_kib() -> u64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: u64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|field| field.parse().ok())
-        .unwrap_or(0);
-    pages * 4
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -206,6 +205,7 @@ fn main() -> anyhow::Result<()> {
             stream.update(cx, |stream, cx| {
                 if step.is_multiple_of(zoom_every) {
                     stream.zoom += 1.;
+                    stream.list.remeasure();
                 }
                 stream.step(step, cx);
             })
