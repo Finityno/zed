@@ -1,0 +1,16 @@
+{
+  "archive_sha256": "014d14a1af7cad1be3242709285246fb41202017f1103c1f1ae3b23298129fd4",
+  "parts": [
+    {
+      "path": "receipts.tar.gz.part-00",
+      "sha256": "7dd1887c8f400fc34f98b47c500a255ee58ee9077848371cb420a54aa7d7ea6e",
+      "bytes": 8388608
+    },
+    {
+      "path": "receipts.tar.gz.part-01",
+      "sha256": "c11dbae07105c9e7c1f5dcb09cc23e2fed0a8bfd9e2875df07e3810b5633299d",
+      "bytes": 11314
+    }
+  ],
+  "byte_exact_join_verified": true
+}

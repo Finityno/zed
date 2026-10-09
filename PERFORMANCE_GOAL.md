@@ -197,3 +197,15 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Line-local glyph coalescing at `014f9332ca1a468520da0a0ba80f2fb53b4bd015`
+remains held. Its first 3,418 native children pass all CPU/elapsed/whole-child and
+requested heap/churn controls and all 20 memory targets, with original object
+widths and zero fixed overhead. Eight current/peak RSS fields fail. Native retained
+output, callback-prefix stability and owner releases pass. All adverse results,
+pre-metric link recovery and the unavailable bare outer supervisor receipt remain
+explicit in `performance-evidence/line-local-glyph-records-held-20261009`. Never
+repeat this source unchanged. Investigate a distinct smaller descriptor layout
+with line-local ranges, retaining meaningful gains and every CPU/heap/RSS control.
+No adoption, application or GPU gain is established.

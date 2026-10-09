@@ -1,0 +1,12 @@
+{
+  "source": "014f9332ca1a468520da0a0ba80f2fb53b4bd015",
+  "tree": "14f93ec72231e3914d1281e3a815ec9a082b6611",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "97fa17245ea21ee58c249db0e7ba7747c3d2300fdc5ca19d62c49ca602d5b520",
+    "crates/gpui/src/window/view_retention/tests.rs": "7675a1766d7cf07d8b8613ac67819e11c3042b8ef1f8e3776c3df46aa6dd38a6",
+    "crates/gpui/src/text_system/line.rs": "44b392e95ddfe33afc4c8998e78877f7c6b896e1c6c710ff39cefc5971fdbfb0",
+    "crates/gpui/src/window/glyph_painting.rs": "90f799fcc3db538c3e9391857fb99a1b908fb6bdea0291563146e6d856f9cdc3"
+  },
+  "scope": "Line-local range emission uses a stack floor reset after arbitrary underline callbacks; ordinary Scene len/clear/insertion/header and original variant discriminants unchanged. Generic scalar/non-glyph replay body exact, ranges preserve source boundaries, movement/remap/animation. No publication state or postpaint scan. Original native widths and allzeroheap controls frozen beforeprototype; same normalized overlay observers."
+}

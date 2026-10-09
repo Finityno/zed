@@ -563,7 +563,7 @@ fn paint_line(
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
         let content_mask = window.content_mask();
-        let mut glyph_painter = LineGlyphPainter::new(window);
+        let mut glyph_painter = LineGlyphPainter::for_line(window);
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
@@ -615,6 +615,7 @@ fn paint_line(
                             underline_style,
                             window,
                         );
+                        glyph_painter.resume_after_callback(window);
                         if glyph.index < run_end {
                             underline_origin.x = origin.x;
                             underline_origin.y += line_height;
@@ -730,6 +731,7 @@ fn paint_line(
                         &underline_style,
                         window,
                     );
+                    glyph_painter.resume_after_callback(window);
                 }
 
                 if let Some((mut strikethrough_origin, strikethrough_style)) =
@@ -841,6 +843,7 @@ fn paint_line(
                 &underline_style,
                 window,
             );
+            glyph_painter.resume_after_callback(window);
         }
 
         if let Some((mut strikethrough_start, strikethrough_style)) = current_strikethrough.take() {

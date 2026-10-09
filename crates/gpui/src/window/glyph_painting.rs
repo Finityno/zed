@@ -35,6 +35,7 @@ pub(crate) struct LineGlyphPainter {
     effect: SpriteEffect,
     element_opacity: f32,
     run: Option<GlyphRun>,
+    operation_floor: Option<usize>,
 }
 
 /// What the glyphs of a run share while its font, size and colour stay the
@@ -59,7 +60,21 @@ impl LineGlyphPainter {
             effect: window.current_text_effect(),
             element_opacity: window.element_opacity(),
             run: None,
+            operation_floor: None,
         }
+    }
+
+    /// Starts a line segment in which no callback can publish a paint index.
+    pub(crate) fn for_line(window: &Window) -> Self {
+        let mut painter = Self::new(window);
+        painter.operation_floor = Some(window.next_frame.scene.len());
+        painter
+    }
+
+    /// A decoration callback may capture retained indices without painting
+    /// anything; records it observed must never grow after the callback.
+    pub(crate) fn resume_after_callback(&mut self, window: &Window) {
+        self.operation_floor = Some(window.next_frame.scene.len());
     }
 
     /// Paints a monochrome glyph, as [`Window::paint_glyph`] does.
@@ -605,7 +620,7 @@ impl Window {
         };
         let color = run.sprite_color;
         if subpixel_rendering {
-            self.next_frame.scene.insert_subpixel_sprite(SubpixelSprite {
+            let sprite = SubpixelSprite {
                 order: 0,
                 pad: 0,
                 bounds,
@@ -614,9 +629,14 @@ impl Window {
                 effect: line.effect,
                 tile,
                 transformation: TransformationMatrix::unit(),
-            });
+            };
+            if let Some(floor) = line.operation_floor {
+                self.next_frame.scene.insert_line_subpixel_sprite(sprite, floor);
+            } else {
+                self.next_frame.scene.insert_subpixel_sprite(sprite);
+            }
         } else {
-            self.next_frame.scene.insert_monochrome_sprite(MonochromeSprite {
+            let sprite = MonochromeSprite {
                 order: 0,
                 pad: 0,
                 bounds,
@@ -625,7 +645,12 @@ impl Window {
                 effect: line.effect,
                 tile,
                 transformation: TransformationMatrix::unit(),
-            });
+            };
+            if let Some(floor) = line.operation_floor {
+                self.next_frame.scene.insert_line_monochrome_sprite(sprite, floor);
+            } else {
+                self.next_frame.scene.insert_monochrome_sprite(sprite);
+            }
         }
         Ok(())
     }

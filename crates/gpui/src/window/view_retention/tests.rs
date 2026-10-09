@@ -5217,3 +5217,81 @@ fn frame_work_transcript() {
         }
     }
 }
+
+#[test]
+fn a_cold_long_line_does_not_keep_one_wide_record_per_glyph() {
+    struct LongLine;
+    impl Render for LongLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(1600.)).h(px(40.)).child("A".repeat(128))
+        }
+    }
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let window = cx.add_window(|_, _| LongLine);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        let scene = &window.rendered_frame.scene;
+        let glyphs = scene.monochrome_sprites.len() + scene.subpixel_sprites.len();
+        assert!(glyphs >= 32);
+        assert!(scene.len() * 2 < glyphs, "a cold line keeps one record for a glyph run");
+    }).expect("window");
+}
+
+#[test]
+fn underline_callbacks_keep_the_paint_prefix_they_capture() {
+    struct CallbackLine(Rc<Cell<bool>>);
+    impl Render for CallbackLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let checked = self.0.clone();
+            div().w(px(500.)).h(px(40.)).child(
+                crate::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| {
+                        let first = crate::TextRun {
+                            len: 2,
+                            font: window.text_style().font(),
+                            color: crate::black(),
+                            underline: Some(crate::UnderlineStyle {
+                                thickness: px(1.),
+                                color: Some(crate::black()),
+                                wavy: false,
+                            }),
+                            ..Default::default()
+                        };
+                        let second = crate::TextRun { len: 6, underline: None, ..first.clone() };
+                        let line = window.text_system().shape_line(
+                            "abcdefgh".into(), px(14.), &[first, second], None,
+                        );
+                        let mut captured = None;
+                        line.paint_with_underline_handler(
+                            bounds.origin, px(24.), crate::TextAlign::Left, None, window, cx,
+                            |_, _, _, _, window| {
+                                let index = window.paint_index().scene_index;
+                                let mut prefix = crate::Scene::default();
+                                prefix.replay(0..index, &window.next_frame.scene);
+                                prefix.finish();
+                                let count = prefix.monochrome_sprites.len() + prefix.subpixel_sprites.len();
+                                assert_eq!(count, 2, "the callback is between glyph two and three");
+                                captured = Some((index, count));
+                            },
+                        ).expect("paint the callback line");
+                        let Some((index, count)) = captured else { panic!("underline callback ran"); };
+                        let mut prefix = crate::Scene::default();
+                        prefix.replay(0..index, &window.next_frame.scene);
+                        prefix.finish();
+                        assert_eq!(prefix.monochrome_sprites.len() + prefix.subpixel_sprites.len(), count,
+                            "glyphs painted after the callback cannot enter its retained prefix");
+                        checked.set(true);
+                    },
+                ).size_full(),
+            )
+        }
+    }
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    let checked = Rc::new(Cell::new(false));
+    let window = cx.add_window({ let checked = checked.clone(); move |_, _| CallbackLine(checked) });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+    }).expect("window");
+    assert!(checked.get());
+}
