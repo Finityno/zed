@@ -1,0 +1,10 @@
+{
+  "source": "7b351af5175206fb3727cd02fa2eca277f56e249",
+  "different_compiled_files": [
+    "crates/gpui/src/scene.rs"
+  ],
+  "all_other_shared_fixture_bytes_identical": true,
+  "typed_logical_overlay_getter": true,
+  "baseline_production_unchanged_except_shared_positive_tests_and_observers": true,
+  "no_compaction_shim": true
+}

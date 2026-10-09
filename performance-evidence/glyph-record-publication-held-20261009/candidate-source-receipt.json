@@ -1,0 +1,10 @@
+{
+  "source": "7b351af5175206fb3727cd02fa2eca277f56e249",
+  "tree": "1f2fbdf1399cd31f7a5eb9dddbe7361168782596",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "8859951d8f0a794456c10d60de944c4c24a3f0fc2dbb71295d594cb5fdf8b7ec",
+    "crates/gpui/src/window/view_retention/tests.rs": "6d88b07f48170fd92ce153beb8b656192cbb2c4f5eccdde690c66a478c484703"
+  },
+  "scope": "Publication state within glyph descriptors, exact original Scene/Window widths and zero fixed heap budget. Text_system/line andwindow/glyph_painting unchanged. Non-glyph replay body exact; uniform glyph ranges retain movement/remap/animation semantics, seal only source glyph boundaries. No postpaint scan. Shared normalizedoverlay metadata frozen beforepairs."
+}

@@ -197,3 +197,14 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Per-record glyph publication at `7b351af5175206fb3727cd02fa2eca277f56e249`
+remains held. All 3,418 children and 20 memory targets pass with original native
+Scene/Window/record widths and zero fixed heap overhead, but 31 CPU/elapsed/
+whole-child/current-RSS controls fail. All requested heap/churn and peak RSS
+controls pass. Native output, retained histories and release contracts pass.
+See `performance-evidence/glyph-record-publication-held-20261009`. Never repeat
+this source unchanged or weaken gates. Continue with distinct padding-resident
+tail publication state to avoid heap-tail lookup while preserving exact widths.
+No adoption or application/GPU gain is claimed.

@@ -1,0 +1,14 @@
+{
+  "archive_sha256": "f5a935720a417728f2cefe85fcb7a55c150b1d6fe7a943c18f15dba20712dafd",
+  "archive_bytes": 8326763,
+  "archive_members": 4664,
+  "byte_exact_roundtrip": true,
+  "identical_member_hardlinks": 468,
+  "hardlink_note": "Tar links deduplicate members only when bytes, size, mode and nanosecond modification time match; all members resolve to original exact bytes. No raw sample/source removed.",
+  "held": true,
+  "merged": false,
+  "production_source": "7b351af5175206fb3727cd02fa2eca277f56e249",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "never_resample_unchanged": true,
+  "no_app_GPU_platform_or_shipped_allocator_gain": true
+}
