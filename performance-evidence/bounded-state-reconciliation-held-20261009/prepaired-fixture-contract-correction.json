@@ -1,0 +1,8 @@
+{
+  "before_any_paired_sample": true,
+  "production_source_unchanged": "9244e2fcd9611a5e8950f2fd3abed6dba65fcaa9",
+  "frozen_policy_unchanged": "42b41123b302048292cfac2c6861ebb10b1287657c2f854c9740504f82d42ef9",
+  "audit_finding": "Initial supplemental module lacked concrete Window resize/state-bump/off-keep case implementation, and initial state profile omitted current RSS. All four successful unpaired binaries and their complete receipts are preserved with gzip roundtrip hashes. Add a shared explicit complete-Window fixture for all twelve frozen cases and current RSS outside component timed/counting interval. These fixture changes require new binaries before first paired cohort; no experiment resampling or gate weakening.",
+  "preserved_at": "/workspace/scratch/gpui-bounded-state-loop/comparison/initial-supplement-compiled-fixtures",
+  "time_unix": 1791574940.3142772
+}

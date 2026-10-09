@@ -1,0 +1,42 @@
+{
+  "all_nonzero_samples": [
+    {
+      "lane": "candidate",
+      "case": "except-only",
+      "pair": 1,
+      "held_bytes": 144,
+      "peak_bytes": 144,
+      "requested_bytes": 524432,
+      "allocation_calls": 32770
+    },
+    {
+      "lane": "baseline",
+      "case": "except-first-65",
+      "pair": 4,
+      "held_bytes": 144,
+      "peak_bytes": 2208,
+      "requested_bytes": 99090576,
+      "allocation_calls": 196610
+    },
+    {
+      "lane": "baseline",
+      "case": "except-unchanged-63",
+      "pair": 1,
+      "held_bytes": 144,
+      "peak_bytes": 2176,
+      "requested_bytes": 98042000,
+      "allocation_calls": 196610
+    },
+    {
+      "lane": "candidate",
+      "case": "except-absent-256",
+      "pair": 1,
+      "held_bytes": 144,
+      "peak_bytes": 144,
+      "requested_bytes": 144,
+      "allocation_calls": 2
+    }
+  ],
+  "counter_scope": "Process-global counting-System allocator, includes other child threads while enabled. Two extra allocations totaling144 bytes occur in four children; their allocating thread/owner was not traced. No attribution to the checker or removal from gates. Preserve as adverse and retain the two candidate all-samples-zero failures.",
+  "no_resample": true
+}

@@ -1,0 +1,9 @@
+{
+  "children": 60,
+  "suite_and_fixture_passes": 652,
+  "ignored_fixture_instances": 30,
+  "matched_complete_Window_frame_histories": 12,
+  "all_pass": true,
+  "exact_state_oracle_and_boundary_checks_in_both_lanes": true,
+  "no_gain_from_correctness": true
+}

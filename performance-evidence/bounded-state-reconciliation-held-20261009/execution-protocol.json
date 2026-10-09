@@ -1,0 +1,16 @@
+{
+  "policy_sha256": "42b41123b302048292cfac2c6861ebb10b1287657c2f854c9740504f82d42ef9",
+  "no_paired_sample_yet": true,
+  "planned_children": 2040,
+  "bare_components": 1260,
+  "bare_complete_Window": 360,
+  "census_components_only": 420,
+  "primary_gain_claims_from_bare_timing_only": true,
+  "census_cpu_fields_preserved_and_additionally_required_within_full_baseline_ranges": true,
+  "no_requested_heap_fields_from_Window_bare_fixtures": true,
+  "perchild_host_guard": true,
+  "hashes_only_before_and_after_timing_or_between_completed_children": true,
+  "source_and_correctness_checks_before_any_pair": true,
+  "no_gates_weakened": true,
+  "time_unix": 1791574891.1134017
+}

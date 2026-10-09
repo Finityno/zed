@@ -1,0 +1,16 @@
+{
+  "source": "9244e2fcd9611a5e8950f2fd3abed6dba65fcaa9",
+  "tree": "6b59c455e24ccd2954f30005c9fc9bb73f7ea6fd",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/window/view_retention/dependencies.rs": "a25bd98d9bb3ff7c825ea49110e1ec9fb33d7a7688859ef82441e0a1ff80d62a"
+  },
+  "normal_checker_byte_exact": true,
+  "small_state_body_byte_exact_after_guard": true,
+  "threshold64_frozen": true,
+  "large_state_kernel_inline_never": true,
+  "normal_checker_sha256": "7d07d9e13bf6b3f83d9e6b3eb9a4f5685cd350c303e9e6471a9030ec2478adff",
+  "original_small_body_sha256": "1c5b10dd2dab9358713c84667a948d19aa7390a62d5c067d6e86ecb45be28522",
+  "owned_held_large_kernel_body_sha256": "49bb4178df2ef21d8d286f74a2d42f5d70fcec3d16c0f468b781c067d9b58cd5",
+  "no_heap_header_persistent_storage": true
+}

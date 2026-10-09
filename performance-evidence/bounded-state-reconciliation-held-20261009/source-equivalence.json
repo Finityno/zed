@@ -1,0 +1,21 @@
+{
+  "source": "9244e2fcd9611a5e8950f2fd3abed6dba65fcaa9",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "different_compiled_files": [
+    "crates/gpui/src/window/view_retention/dependencies.rs"
+  ],
+  "same_full_current_owned_GPUI_source_except_candidate_method": true,
+  "all_added_fixtures_identical": true,
+  "normal_checker_byte_exact": true,
+  "small_body_byte_exact_after_threshold_guard": true,
+  "owned_large_kernel_body_unchanged_but_routed_only64plus_and_not_inlined": true,
+  "numerical_goals_frozen_before_source": true,
+  "identical_named_scene_observer_and_window_controls_added_to_both_lanes": true,
+  "different_compiled_files_remains_dependencies_only": true,
+  "all_final_private_support_fixtures_and_current_RSS_identical": true,
+  "new_shared_complete_Window_cases": 12,
+  "shared_source_inventory_differences": [
+    "crates/gpui/src/window/view_retention/dependencies.rs"
+  ],
+  "proof_unix": 1791574968.700003
+}

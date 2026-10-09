@@ -1,0 +1,25 @@
+{
+  "production_source": "9244e2fcd9611a5e8950f2fd3abed6dba65fcaa9",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "archive_sha256": "76d8172798d867f2afb46c4f8a91e7778b02ac8292fa3f56dbda7bea13bb777d",
+  "archive_bytes": 8284483,
+  "archive_members": 3300,
+  "identical_member_hardlinks": 465,
+  "all_members_byte_exact_roundtrip": true,
+  "children": 2040,
+  "failed_fields": 21,
+  "all_four_primary_bare_CPU_elapsed_20percent_and_variation_gates_pass": true,
+  "all_primary_census_transient_allocations_eliminated": true,
+  "all12_complete_Window_bare_controls_pass": true,
+  "held": true,
+  "merged": false,
+  "never_resample_unchanged": true,
+  "no_app_GPU_platform_shipped_allocator_gain": true,
+  "parts": [
+    {
+      "path": "performance-evidence/bounded-state-reconciliation-held-20261009/receipts.tar.gz",
+      "bytes": 8284483,
+      "sha256": "76d8172798d867f2afb46c4f8a91e7778b02ac8292fa3f56dbda7bea13bb777d"
+    }
+  ]
+}
