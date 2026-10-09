@@ -4980,12 +4980,16 @@ mod tests {
     struct HoverListenerLayoutTestView {
         target_left: Pixels,
         hover_transitions: Rc<RefCell<Vec<bool>>>,
+        mouse_moves: Rc<Cell<usize>>,
     }
 
     impl Render for HoverListenerLayoutTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let hover_transitions = self.hover_transitions.clone();
-            div().relative().size_full().child(
+            let mouse_moves = self.mouse_moves.clone();
+            div().relative().size_full().on_mouse_move(move |_, _, _| {
+                mouse_moves.set(mouse_moves.get() + 1);
+            }).child(
                 div()
                     .id("hover-target")
                     .absolute()
@@ -5010,6 +5014,7 @@ mod tests {
             move |_, _| HoverListenerLayoutTestView {
                 target_left: px(40.),
                 hover_transitions,
+                mouse_moves: Rc::new(Cell::new(0)),
             }
         });
         let any_window = AnyWindowHandle::from(window);
@@ -5045,11 +5050,14 @@ mod tests {
     #[gpui::test]
     fn default_hover_listener_updates_after_resize_without_mouse_move(cx: &mut TestAppContext) {
         let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+        let mouse_moves = Rc::new(Cell::new(0));
         let window = cx.add_window({
             let hover_transitions = hover_transitions.clone();
+            let mouse_moves = mouse_moves.clone();
             move |_, _| HoverListenerLayoutTestView {
                 target_left: px(0.),
                 hover_transitions,
+                mouse_moves,
             }
         });
         let any_window = AnyWindowHandle::from(window);
@@ -5061,6 +5069,8 @@ mod tests {
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true]);
 
+        let initial_mouse_moves = mouse_moves.get();
+        assert!(initial_mouse_moves > 0);
         cx.simulate_window_resize(any_window, size(px(400.), px(300.)));
         cx.update_window(any_window, |_, window, cx| {
             // The test platform reports a default cursor when bounds change.
@@ -5070,6 +5080,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true]);
+        assert_eq!(mouse_moves.get(), initial_mouse_moves);
 
         window
             .update(cx, |view, _, cx| {
@@ -5083,6 +5094,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true, false]);
+        assert_eq!(mouse_moves.get(), initial_mouse_moves);
     }
 
     #[gpui::test]
@@ -5093,6 +5105,7 @@ mod tests {
             move |_, _| HoverListenerLayoutTestView {
                 target_left: px(0.),
                 hover_transitions,
+                mouse_moves: Rc::new(Cell::new(0)),
             }
         });
         let any_window = AnyWindowHandle::from(window);
@@ -5200,6 +5213,7 @@ mod tests {
             move |_, _| HoverListenerLayoutTestView {
                 target_left: px(0.),
                 hover_transitions,
+                mouse_moves: Rc::new(Cell::new(0)),
             }
         });
         let any_window = AnyWindowHandle::from(window);
