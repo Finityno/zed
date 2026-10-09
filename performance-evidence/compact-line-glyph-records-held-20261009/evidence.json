@@ -1,0 +1,30 @@
+{
+  "production_source": "4adabd4b460631759311acb71d12321a6ef0813c",
+  "initial_algorithm_source": "af007447537531e9597dac0e725576fc3b9e6a42",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "archive_sha256": "d74cb6ce4d1336dd6caca2003eea55081020aba4dc089f60e7130dce94985769",
+  "archive_bytes": 8469814,
+  "archive_members": 4703,
+  "identical_member_hardlinks": 468,
+  "all_members_byte_exact_roundtrip": true,
+  "children": 3418,
+  "failed_fields": 4,
+  "all20_memory_primaries_pass": true,
+  "all_CPU_and_requested_heap_churn_controls_pass": true,
+  "held": true,
+  "merged": false,
+  "never_resample_unchanged": true,
+  "no_app_GPU_platform_shipped_allocator_gain": true,
+  "parts": [
+    {
+      "path": "performance-evidence/compact-line-glyph-records-held-20261009/receipts.tar.gz.part-000",
+      "bytes": 8388608,
+      "sha256": "8a51c2c9f0d64b78bba4d09c94e0ea228620a451356f65061f9662ef60275318"
+    },
+    {
+      "path": "performance-evidence/compact-line-glyph-records-held-20261009/receipts.tar.gz.part-001",
+      "bytes": 81206,
+      "sha256": "33855135074511fd4a1e0bf7aac8f56b99b38952e79f61f52b4ea195bd8c0801"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "source": "4adabd4b460631759311acb71d12321a6ef0813c",
+  "tree": "832ca3ca420dfa46f3c2debb6b2ec14829f98a51",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "4bafb32a7d4b6d619a5779d3b296c57e7b4dfd25bda2c406720f42057cffba20",
+    "crates/gpui/src/window/view_retention/tests.rs": "7675a1766d7cf07d8b8613ac67819e11c3042b8ef1f8e3776c3df46aa6dd38a6",
+    "crates/gpui/src/text_system/line.rs": "44b392e95ddfe33afc4c8998e78877f7c6b896e1c6c710ff39cefc5971fdbfb0",
+    "crates/gpui/src/window/glyph_painting.rs": "90f799fcc3db538c3e9391857fb99a1b908fb6bdea0291563146e6d856f9cdc3"
+  },
+  "scope": "Compact168-byte flat descriptors with line-local range floors; no header/newheap overhead, callbacks/source range boundaries preserved. Original public GPU primitives/payload vectors unchanged. Native184baseline/168candidate descriptor widths required; same zero CPU/heap/RSS numerical controls and20 gain targets, same normalized observers.",
+  "initial_production_algorithm_source": "af007447537531e9597dac0e725576fc3b9e6a42",
+  "only_test_body_strengthened_before_first_paired_metric": true
+}

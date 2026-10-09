@@ -1,0 +1,21 @@
+{
+  "initial_source": "af007447537531e9597dac0e725576fc3b9e6a42",
+  "source": "4adabd4b460631759311acb71d12321a6ef0813c",
+  "tree": "832ca3ca420dfa46f3c2debb6b2ec14829f98a51",
+  "path": "crates/gpui/src/scene.rs",
+  "outside_named_test_body_byte_exact": true,
+  "initial_test_body_sha256": "bfcc2a1c434fc1ecf442990a40de11cabd10cfb3fcae29aa704b1907190eeae9",
+  "strengthened_test_body_sha256": "6d05e8a0b66e3a2e9ddc058c28e8946792a4c6375b0a4ff0725930873b02d2f4",
+  "scalar_operations_required": 22,
+  "range_operations_required": 5,
+  "coverage": [
+    "monochrome and subpixel ranges",
+    "clipping",
+    "move",
+    "transition rebasing",
+    "shimmer remapping"
+  ],
+  "baseline_original_scalar_test_preserved": true,
+  "numerical_gates_unchanged": true,
+  "no_paired_samples_before_change": true
+}

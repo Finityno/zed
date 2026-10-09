@@ -345,6 +345,59 @@ impl Scene {
             .push(PaintOperation::SubpixelSprite(index));
     }
 
+    /// Inserts a glyph within a callback-free segment of one line. Operations
+    /// before `floor` may already be named by retained output and stay immutable.
+    pub(crate) fn insert_line_monochrome_sprite(&mut self, mut sprite: MonochromeSprite, floor: usize) {
+        let Some(order) =
+            self.glyph_sprite_order(&sprite.bounds, &sprite.content_mask.bounds, &mut sprite.pad)
+        else {
+            return;
+        };
+        sprite.order = order;
+        let index = self.painted_monochrome_sprites.len();
+        self.painted_monochrome_sprites.push(sprite);
+        self.append_line_glyph_record(false, index, floor);
+    }
+
+    /// See [`Self::insert_line_monochrome_sprite`].
+    pub(crate) fn insert_line_subpixel_sprite(&mut self, mut sprite: SubpixelSprite, floor: usize) {
+        let Some(order) =
+            self.glyph_sprite_order(&sprite.bounds, &sprite.content_mask.bounds, &mut sprite.pad)
+        else {
+            return;
+        };
+        sprite.order = order;
+        let index = self.painted_subpixel_sprites.len();
+        self.painted_subpixel_sprites.push(sprite);
+        self.append_line_glyph_record(true, index, floor);
+    }
+
+    #[inline]
+    fn append_line_glyph_record(&mut self, subpixel: bool, index: usize, floor: usize) {
+        if self.paint_operations.len() > floor
+            && let Some(last) = self.paint_operations.last_mut()
+        {
+            match last {
+                PaintOperation::MonochromeSprites(indices) if !subpixel && indices.end == index => {
+                    indices.end = index + 1;
+                    return;
+                }
+                PaintOperation::SubpixelSprites(indices) if subpixel && indices.end == index => {
+                    indices.end = index + 1;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // The first glyph already has a range, so continuing it changes only
+        // the end instead of replacing the wide paint-operation enum.
+        self.paint_operations.push(if subpixel {
+            PaintOperation::SubpixelSprites(index..index + 1)
+        } else {
+            PaintOperation::MonochromeSprites(index..index + 1)
+        });
+    }
+
     /// The number of paint operations and of painted glyph sprites so far,
     /// which tell what a line painted when taken before and after it.
     pub(crate) fn glyph_watermark(&self) -> GlyphWatermark {
@@ -358,8 +411,12 @@ impl Scene {
     /// sprite.
     pub(crate) fn glyph_sprites_since(&self, start: GlyphWatermark) -> Option<Range<usize>> {
         let end = self.glyph_watermark();
-        (end.operations - start.operations == end.sprites - start.sprites)
-            .then_some(start.operations..end.operations)
+        let operations = start.operations..end.operations;
+        let mut glyphs = 0usize;
+        for operation in self.paint_operations.get(operations.clone())? {
+            glyphs += operation.glyph_indices()?.1.len();
+        }
+        (Some(glyphs) == end.sprites.checked_sub(start.sprites)).then_some(operations)
     }
 
     /// Paints again the glyph sprites `operations` names in `prev_scene`, all
@@ -386,31 +443,20 @@ impl Scene {
         // run's paint operations as a range rather than sprite by sprite.
         let mut position = 0;
         while let Some(operation) = prev_operations.get(position) {
-            let (subpixel, first) = match *operation {
-                PaintOperation::MonochromeSprite(index) => (false, index),
-                PaintOperation::SubpixelSprite(index) => (true, index),
-                PaintOperation::Primitive(_)
-                | PaintOperation::StartLayer(_)
-                | PaintOperation::EndLayer => {
-                    debug_assert!(false, "only glyph sprites are replayed");
-                    position += 1;
-                    continue;
-                }
+            let Some((subpixel, mut sources)) = operation.glyph_indices() else {
+                debug_assert!(false, "only glyph sprites are replayed");
+                position += 1;
+                continue;
             };
             let mut run = 1;
-            while let Some(next) = prev_operations.get(position + run) {
-                let next_index = first + run as u32;
-                let continues = match *next {
-                    PaintOperation::MonochromeSprite(index) => !subpixel && index == next_index,
-                    PaintOperation::SubpixelSprite(index) => subpixel && index == next_index,
-                    _ => false,
-                };
-                if !continues {
+            while let Some((next_subpixel, next)) = prev_operations.get(position + run).and_then(PaintOperation::glyph_indices) {
+                if next_subpixel != subpixel || next.start != sources.end {
                     break;
                 }
+                sources.end = next.end;
                 run += 1;
             }
-            let sources = first as usize..first as usize + run;
+            let count = sources.len();
             if subpixel {
                 let start = append_replayed_sprites(
                     &mut self.painted_subpixel_sprites,
@@ -420,8 +466,7 @@ impl Scene {
                         sprite.pad = pad;
                     },
                 );
-                self.paint_operations
-                    .extend((start..start + run as u32).map(PaintOperation::SubpixelSprite));
+                self.paint_operations.push(PaintOperation::glyphs(true, start as usize..start as usize + count));
             } else {
                 let start = append_replayed_sprites(
                     &mut self.painted_monochrome_sprites,
@@ -431,8 +476,7 @@ impl Scene {
                         sprite.pad = pad;
                     },
                 );
-                self.paint_operations
-                    .extend((start..start + run as u32).map(PaintOperation::MonochromeSprite));
+                self.paint_operations.push(PaintOperation::glyphs(false, start as usize..start as usize + count));
             }
             position += run;
         }
@@ -511,51 +555,54 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
+        let operation = match primitive {
+            Primitive::Shadow(mut shadow) => {
                 shadow.order = order;
-                self.shadows.push(*shadow);
+                self.shadows.push(shadow);
+                PaintOperation::Shadow(shadow)
             }
-            Primitive::Quad(quad) => {
+            Primitive::Quad(mut quad) => {
                 quad.order = order;
-                self.quads.push(*quad);
+                self.quads.push(quad);
+                PaintOperation::Quad(quad)
             }
-            Primitive::Path(path) => {
+            Primitive::Path(mut path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
                 self.paths.push(path.clone());
+                PaintOperation::Path(path)
             }
-            Primitive::Underline(underline) => {
+            Primitive::Underline(mut underline) => {
                 underline.order = order;
-                self.underlines.push(*underline);
+                self.underlines.push(underline);
+                PaintOperation::Underline(underline)
             }
-            Primitive::MonochromeSprite(sprite) => {
+            Primitive::MonochromeSprite(mut sprite) => {
                 sprite.order = order;
                 let index = self.painted_monochrome_sprites.len() as u32;
-                self.painted_monochrome_sprites.push(*sprite);
-                self.paint_operations
-                    .push(PaintOperation::MonochromeSprite(index));
+                self.painted_monochrome_sprites.push(sprite);
+                self.paint_operations.push(PaintOperation::MonochromeSprite(index));
                 return;
             }
-            Primitive::SubpixelSprite(sprite) => {
+            Primitive::SubpixelSprite(mut sprite) => {
                 sprite.order = order;
                 let index = self.painted_subpixel_sprites.len() as u32;
-                self.painted_subpixel_sprites.push(*sprite);
-                self.paint_operations
-                    .push(PaintOperation::SubpixelSprite(index));
+                self.painted_subpixel_sprites.push(sprite);
+                self.paint_operations.push(PaintOperation::SubpixelSprite(index));
                 return;
             }
-            Primitive::PolychromeSprite(sprite) => {
+            Primitive::PolychromeSprite(mut sprite) => {
                 sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
+                self.polychrome_sprites.push(sprite);
+                PaintOperation::PolychromeSprite(sprite)
             }
-            Primitive::Surface(surface) => {
+            Primitive::Surface(mut surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
+                PaintOperation::Surface(surface)
             }
-        }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        };
+        self.paint_operations.push(operation);
     }
 
     /// Registers an opacity cycle for one quad, returning the value its
@@ -647,9 +694,14 @@ impl Scene {
             clipped_only_inside(scaled_edges(extent), scaled_edges(&mask.bounds), outer)
         };
         self.paint_operations[range].iter().all(|operation| match operation {
-            PaintOperation::Primitive(primitive) => {
-                clipped(&primitive_extent(primitive), primitive.content_mask())
-            }
+            PaintOperation::Shadow(shadow) => clipped(
+                &shadow.bounds.dilate(shadow.blur_radius * 3.), &shadow.content_mask,
+            ),
+            PaintOperation::Quad(quad) => clipped(&quad.bounds, &quad.content_mask),
+            PaintOperation::Path(path) => clipped(&path.bounds, &path.content_mask),
+            PaintOperation::Underline(underline) => clipped(&underline.bounds, &underline.content_mask),
+            PaintOperation::PolychromeSprite(sprite) => clipped(&sprite.bounds, &sprite.content_mask),
+            PaintOperation::Surface(surface) => clipped(&surface.bounds, &surface.content_mask),
             PaintOperation::MonochromeSprite(index) => {
                 let sprite = &self.painted_monochrome_sprites[*index as usize];
                 clipped(&sprite.bounds, &sprite.content_mask)
@@ -658,6 +710,10 @@ impl Scene {
                 let sprite = &self.painted_subpixel_sprites[*index as usize];
                 clipped(&sprite.bounds, &sprite.content_mask)
             }
+            PaintOperation::MonochromeSprites(indices) => self.painted_monochrome_sprites[indices.clone()]
+                .iter().all(|sprite| clipped(&sprite.bounds, &sprite.content_mask)),
+            PaintOperation::SubpixelSprites(indices) => self.painted_subpixel_sprites[indices.clone()]
+                .iter().all(|sprite| clipped(&sprite.bounds, &sprite.content_mask)),
             // A layer is clipped again where it is drawn moved (see
             // `replay_inside`).
             PaintOperation::StartLayer(_) | PaintOperation::EndLayer => true,
@@ -695,7 +751,12 @@ impl Scene {
         let mut layers_left_out: Vec<bool> = Vec::new();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(_)
+                PaintOperation::Shadow(_)
+                | PaintOperation::Quad(_)
+                | PaintOperation::Path(_)
+                | PaintOperation::Underline(_)
+                | PaintOperation::PolychromeSprite(_)
+                | PaintOperation::Surface(_)
                 | PaintOperation::MonochromeSprite(_)
                 | PaintOperation::SubpixelSprite(_) => {
                     let mut primitive = match operation {
@@ -705,8 +766,14 @@ impl Scene {
                         PaintOperation::SubpixelSprite(index) => Primitive::SubpixelSprite(
                             prev_scene.painted_subpixel_sprites[*index as usize],
                         ),
-                        PaintOperation::Primitive(primitive) => primitive.clone(),
-                        PaintOperation::StartLayer(_) | PaintOperation::EndLayer => continue,
+                        PaintOperation::Shadow(shadow) => Primitive::Shadow(*shadow),
+                        PaintOperation::Quad(quad) => Primitive::Quad(*quad),
+                        PaintOperation::Path(path) => Primitive::Path(path.clone()),
+                        PaintOperation::Underline(underline) => Primitive::Underline(*underline),
+                        PaintOperation::PolychromeSprite(sprite) => Primitive::PolychromeSprite(*sprite),
+                        PaintOperation::Surface(surface) => Primitive::Surface(surface.clone()),
+                        PaintOperation::StartLayer(_) | PaintOperation::EndLayer
+                        | PaintOperation::MonochromeSprites(_) | PaintOperation::SubpixelSprites(_) => continue,
                     };
                     if let Some(moved) = moved {
                         moved.move_primitive(&mut primitive);
@@ -747,6 +814,61 @@ impl Scene {
                         effect.animation = remapped_animation.1;
                     }
                     self.insert_primitive(primitive)
+                }
+                PaintOperation::MonochromeSprites(indices)
+                | PaintOperation::SubpixelSprites(indices) => {
+                    let subpixel = matches!(operation, PaintOperation::SubpixelSprites(_));
+                    let floor = self.paint_operations.len();
+                    for index in indices.clone() {
+                        let mut primitive = if subpixel {
+                            Primitive::SubpixelSprite(prev_scene.painted_subpixel_sprites[index])
+                        } else {
+                            Primitive::MonochromeSprite(prev_scene.painted_monochrome_sprites[index])
+                        };
+                        if let Some(moved) = moved {
+                            moved.move_primitive(&mut primitive);
+                        }
+                        let transition = primitive_transition(&primitive);
+                        if let Some((from, to)) = rebase
+                            && transition == from
+                        {
+                            set_primitive_transition(&mut primitive, to);
+                        } else if transition != 0 {
+                            let remapped = self.remap_transition(
+                                prev_scene,
+                                transition,
+                                &mut remapped_transitions,
+                                landed_before,
+                            );
+                            set_primitive_transition(&mut primitive, remapped);
+                        }
+                        if let Primitive::Quad(quad) = &mut primitive
+                            && quad.background.time_animation() != 0
+                        {
+                            let animation = self.push_quad_animation(
+                                prev_scene.quad_animations
+                                    [quad.background.time_animation() as usize - 1],
+                            );
+                            quad.background = quad.background.with_time_animation(animation);
+                        }
+                        if let Primitive::MonochromeSprite(MonochromeSprite { effect, .. })
+                        | Primitive::SubpixelSprite(SubpixelSprite { effect, .. }) = &mut primitive
+                            && effect.animation != 0
+                        {
+                            if remapped_animation.0 != effect.animation {
+                                let animation =
+                                    prev_scene.shimmer_animations[effect.animation as usize - 1];
+                                remapped_animation =
+                                    (effect.animation, self.push_shimmer_animation(animation));
+                            }
+                            effect.animation = remapped_animation.1;
+                        }
+                        match primitive {
+                            Primitive::MonochromeSprite(sprite) => self.insert_line_monochrome_sprite(sprite, floor),
+                            Primitive::SubpixelSprite(sprite) => self.insert_line_subpixel_sprite(sprite, floor),
+                            _ => unreachable!("a glyph range contains glyphs"),
+                        }
+                    }
                 }
                 PaintOperation::StartLayer(layer) => match moved {
                     Some(moved) => {
@@ -1514,6 +1636,132 @@ mod tests {
         assert!(replayed.is_empty());
     }
 
+    #[test]
+    fn direct_records_preserve_published_prefixes_and_independent_sources() {
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<Scene>();
+        let mut source = Scene::default();
+        source.push_layer(unit_bounds());
+        let line = source.glyph_watermark();
+        for tile in 1..=2 {
+            let mut sprite = shimmering_glyph(0);
+            sprite.effect = SpriteEffect::default();
+            sprite.tile.tile_id = crate::TileId(tile);
+            source.insert_monochrome_sprite(sprite);
+        }
+        let published = source.len();
+        for tile in 3..=8 {
+            let mut sprite = shimmering_glyph(0);
+            sprite.effect = SpriteEffect::default();
+            sprite.tile.tile_id = crate::TileId(tile);
+            source.insert_monochrome_sprite(sprite);
+        }
+        let second = source.glyph_watermark();
+        for tile in 9..=12 {
+            let mut sprite = shimmering_glyph(0);
+            sprite.effect = SpriteEffect::default();
+            sprite.tile.tile_id = crate::TileId(tile);
+            source.insert_monochrome_sprite(sprite);
+        }
+        let Some(second_operations) = source.glyph_sprites_since(second) else {
+            panic!("the second published range still names its glyphs");
+        };
+        let first = painted_glyphs(&source, line.operations..published);
+        let middle = painted_glyphs(&source, published..second.operations);
+        let last = painted_glyphs(&source, second_operations.clone());
+        assert_eq!(first.iter().map(|glyph| glyph.1).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(middle.iter().map(|glyph| glyph.1).collect::<Vec<_>>(), [3, 4, 5, 6, 7, 8]);
+        assert_eq!(last.iter().map(|glyph| glyph.1).collect::<Vec<_>>(), [9, 10, 11, 12]);
+        let source_operations = source.len();
+        let mut whole_copy = Scene::default();
+        whole_copy.replay(0..source_operations, &source);
+        assert_eq!(whole_copy.len(), source_operations, "nested retained ranges keep their operation offsets");
+        assert_eq!(painted_glyphs(&whole_copy, 1..whole_copy.len()), painted_glyphs(&source, 1..source_operations));
+        source.finish();
+        for sprite in &mut source.monochrome_sprites {
+            sprite.tile.tile_id = crate::TileId(999);
+        }
+        let mut copied = Scene::default();
+        copied.push_layer(unit_bounds());
+        let start = copied.glyph_watermark();
+        assert!(copied.replay_glyph_sprites(&source, second_operations));
+        let Some(operations) = copied.glyph_sprites_since(start) else {
+            panic!("the copied range still names its glyphs");
+        };
+        assert_eq!(painted_glyphs(&copied, operations), last);
+        source.clear();
+        source.push_layer(unit_bounds());
+        let start = source.glyph_watermark();
+        source.insert_monochrome_sprite(shimmering_glyph(0));
+        source.insert_monochrome_sprite(shimmering_glyph(0));
+        assert!(source.glyph_sprites_since(start).is_some());
+    }
+
+    #[test]
+    fn direct_records_replay_like_scalar_glyphs_when_moved_or_rebased() {
+        let started_at = std::time::Instant::now();
+        let build = |compact: bool| {
+            let mut source = Scene::default();
+            let Some(transition) = source.push_transition(rolling_in(started_at)) else {
+                panic!("a first transition always fits");
+            };
+            let animation = source.push_shimmer_animation(ShimmerAnimation {
+                band_start: -40., travel: 1000.,
+                period: std::time::Duration::from_secs(1), hold: 0.,
+            });
+            let bounds = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), Size { width: ScaledPixels(400.), height: ScaledPixels(80.) });
+            source.push_layer(bounds);
+            source.set_current_transition(transition);
+            let floor = source.len();
+            for index in 0..20 {
+                let mut sprite = shimmering_glyph(if index < 16 { animation } else { 0 });
+                sprite.bounds.origin.x = ScaledPixels(index as f32 * 20.);
+                sprite.content_mask.bounds = bounds;
+                sprite.tile.tile_id = crate::TileId(index);
+                if (8..16).contains(&index) {
+                    let sprite = SubpixelSprite {
+                        order: sprite.order, pad: sprite.pad, bounds: sprite.bounds,
+                        content_mask: sprite.content_mask, color: sprite.color,
+                        effect: sprite.effect, tile: sprite.tile, transformation: sprite.transformation,
+                    };
+                    if compact {
+                        source.insert_line_subpixel_sprite(sprite, floor);
+                    } else {
+                        source.insert_subpixel_sprite(sprite);
+                    }
+                } else if compact {
+                    source.insert_line_monochrome_sprite(sprite, floor);
+                } else {
+                    source.insert_monochrome_sprite(sprite);
+                }
+            }
+            source.pop_layer();
+            source.set_current_transition(0);
+            source.finish();
+            source
+        };
+        let scalar = build(false);
+        let compact = build(true);
+        assert_eq!(scalar.len(), 22);
+        assert_eq!(compact.len(), 5, "the comparison must exercise three glyph ranges");
+        assert_eq!(scalar.clipped_only_inside(0..scalar.len(), [0., 0., 400., 80.]), compact.clipped_only_inside(0..compact.len(), [0., 0., 400., 80.]));
+        let moved = SceneMove { delta: point(ScaledPixels(4.), ScaledPixels(20.)), old_outer: [0., 0., 400., 80.], new_outer: [0., 0., 400., 60.] };
+        for rebase in [None, Some((1, 2))] {
+            for moving in [None, Some(&moved)] {
+                let render = |source: &Scene| {
+                    let mut result = Scene::default();
+                    result.push_transition(rolling_in(started_at));
+                    result.push_transition(rolling_in(started_at));
+                    result.replay_inside(0..source.len(), source, rebase, moving);
+                    result.finish();
+                    result.advance_transitions(started_at + std::time::Duration::from_millis(50));
+                    format!("{:?}{:?}{:?}", result.monochrome_sprites, result.subpixel_sprites, result.transitions)
+                };
+                assert_eq!(render(&scalar), render(&compact));
+            }
+        }
+    }
+
     fn unit_bounds() -> Bounds<ScaledPixels> {
         Bounds {
             origin: Point::default(),
@@ -1544,16 +1792,19 @@ mod tests {
     ) -> Vec<(bool, u32, ScaledPixels, DrawOrder, u32)> {
         scene.paint_operations[operations]
             .iter()
-            .map(|operation| match *operation {
-                PaintOperation::MonochromeSprite(index) => {
-                    let sprite = &scene.painted_monochrome_sprites[index as usize];
-                    (false, sprite.tile.tile_id.0, sprite.bounds.origin.x, sprite.order, sprite.pad)
-                }
-                PaintOperation::SubpixelSprite(index) => {
-                    let sprite = &scene.painted_subpixel_sprites[index as usize];
-                    (true, sprite.tile.tile_id.0, sprite.bounds.origin.x, sprite.order, sprite.pad)
-                }
-                _ => panic!("only glyph sprites are replayed"),
+            .flat_map(|operation| {
+                let Some((subpixel, indices)) = operation.glyph_indices() else {
+                    panic!("only glyph sprites are replayed");
+                };
+                indices.map(move |index| {
+                    if subpixel {
+                        let sprite = &scene.painted_subpixel_sprites[index];
+                        (true, sprite.tile.tile_id.0, sprite.bounds.origin.x, sprite.order, sprite.pad)
+                    } else {
+                        let sprite = &scene.painted_monochrome_sprites[index];
+                        (false, sprite.tile.tile_id.0, sprite.bounds.origin.x, sprite.order, sprite.pad)
+                    }
+                })
             })
             .collect()
     }
@@ -2297,15 +2548,42 @@ pub(crate) struct Layer {
 }
 
 pub(crate) enum PaintOperation {
-    Primitive(Primitive),
-    /// Indices into [`Scene::painted_monochrome_sprites`] and
-    /// [`Scene::painted_subpixel_sprites`]: glyphs are most of a frame, and
-    /// copying each into a paint operation as well cost as much as the rest
-    /// of inserting it.
+    // Wrapping this metadata in Primitive reserved a full glyph payload even
+    // for indexed glyphs and layers; non-glyph records keep their payload directly.
+    Quad(Quad),
     MonochromeSprite(u32),
     SubpixelSprite(u32),
     StartLayer(Layer),
     EndLayer,
+    Shadow(Shadow),
+    Path(Path<ScaledPixels>),
+    Underline(Underline),
+    PolychromeSprite(PolychromeSprite),
+    Surface(PaintSurface),
+    MonochromeSprites(Range<usize>),
+    SubpixelSprites(Range<usize>),
+}
+
+impl PaintOperation {
+    fn glyph_indices(&self) -> Option<(bool, Range<usize>)> {
+        match self {
+            Self::MonochromeSprite(index) => Some((false, *index as usize..*index as usize + 1)),
+            Self::SubpixelSprite(index) => Some((true, *index as usize..*index as usize + 1)),
+            Self::MonochromeSprites(indices) => Some((false, indices.clone())),
+            Self::SubpixelSprites(indices) => Some((true, indices.clone())),
+            Self::Shadow(_) | Self::Quad(_) | Self::Path(_) | Self::Underline(_)
+            | Self::PolychromeSprite(_) | Self::Surface(_) | Self::StartLayer(_) | Self::EndLayer => None,
+        }
+    }
+
+    fn glyphs(subpixel: bool, indices: Range<usize>) -> Self {
+        match (subpixel, indices.len() == 1) {
+            (false, true) => Self::MonochromeSprite(indices.start as u32),
+            (true, true) => Self::SubpixelSprite(indices.start as u32),
+            (false, false) => Self::MonochromeSprites(indices),
+            (true, false) => Self::SubpixelSprites(indices),
+        }
+    }
 }
 
 #[derive(Clone)]

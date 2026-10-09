@@ -1,0 +1,15 @@
+{
+  "source": "4adabd4b460631759311acb71d12321a6ef0813c",
+  "different_compiled_files": [
+    "crates/gpui/src/scene.rs",
+    "crates/gpui/src/text_system/line.rs",
+    "crates/gpui/src/window/glyph_painting.rs"
+  ],
+  "all_other_shared_fixture_bytes_identical": true,
+  "typed_logical_overlay_getter": true,
+  "baseline_production_unchanged_except_shared_positive_tests_and_observers": true,
+  "no_compaction_shim": true,
+  "candidate_only_named_movement_test_strengthened": true,
+  "baseline_original_added_scalar_test_preserved": true,
+  "strengthening_proof": "/workspace/scratch/gpui-compact-line-records-loop/range-regression-strengthening-proof.json"
+}

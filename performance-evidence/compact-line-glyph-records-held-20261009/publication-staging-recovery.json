@@ -1,0 +1,11 @@
+{
+  "initial_packaging_failed_only_at_git_add_due_to_sparse_paths": true,
+  "all_archive_member_checks_already_passed": true,
+  "completed_binaries_already_roundtrip_preserved": true,
+  "resume_with_explicit_git_add_sparse_for_owned_evidence_directory": true,
+  "supplemental_note_helper_initial_NameError_before_note_write": true,
+  "shell_initial_missing_set_e_did_not_prevent_reviewed_commit_stage": true,
+  "corrected_note_written_and_all_later_dependent_shells_set_e": true,
+  "archive_and_measurements_unchanged": true,
+  "no_build_or_cohort_repeated": true
+}
