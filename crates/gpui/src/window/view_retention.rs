@@ -1885,6 +1885,9 @@ impl Window {
         let rebuilds = std::mem::take(&mut self.view_retention.rebuilds);
         culprits::suspend(true);
         self.refreshing = true;
+        // Painting lines again from the frame before would copy its glyphs
+        // into the frame meant to show what drawing from scratch paints.
+        self.line_glyph_cache.forget_previous();
         let arena_clear_needed = self.draw_frame(cx);
         culprits::suspend(false);
         self.frame_work.stats = stats;

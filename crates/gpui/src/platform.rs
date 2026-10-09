@@ -1697,6 +1697,13 @@ pub trait PlatformAtlas {
         0
     }
 
+    /// Changes whenever the atlas drops every tile at once, as it does when
+    /// its device is lost, so that a tile handed out before may name nothing;
+    /// `0` for atlases that never do.
+    fn generation(&self) -> u64 {
+        0
+    }
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
@@ -1727,6 +1734,8 @@ pub struct AtlasState<Backend> {
     frame: u64,
     /// The page the previous `retire_unused` call examined.
     retire_cursor: Option<AtlasPageKey>,
+    /// Counts `clear` calls; see [`PlatformAtlas::generation`].
+    generation: u64,
     pub backend: Backend,
 }
 
@@ -1749,6 +1758,7 @@ impl<Backend> AtlasState<Backend> {
             pages: BTreeMap::new(),
             frame: 0,
             retire_cursor: None,
+            generation: 0,
             backend,
         }
     }
@@ -1761,7 +1771,13 @@ impl<Backend> AtlasState<Backend> {
         self.tiles_by_key.clear();
         self.pages.clear();
         self.retire_cursor = None;
+        self.generation += 1;
         reset_backend(&mut self.backend);
+    }
+
+    /// See [`PlatformAtlas::generation`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// See [`PlatformAtlas::frame_index`].
@@ -3973,6 +3989,7 @@ mod atlas_tests {
         run_frames(&mut state, 5, &scene_drawing(&[tile]));
         state.clear(|backend| *backend = PagedAtlasBackend::default());
         assert_eq!(state.frame_index(), 5);
+        assert_eq!(state.generation(), 1);
         // Nothing left to examine: retirement is a no-op, not a panic.
         assert_eq!(state.retire_unused(IDLE), 0);
         run_frames(&mut state, 1, &scene_drawing(&[tile]));

@@ -8,13 +8,15 @@
 
 use super::Window;
 use crate::{
-    AtlasTile, Bounds, ContentMask, DevicePixels, FontId, GlyphId, Hsla, IsZero, MonochromeSprite,
-    Pixels, Point, RenderGlyphParams, ScaledPixels, SpriteEffect, SubpixelSprite,
-    TransformationMatrix, TextRenderingMode, WindowBackgroundAppearance,
+    AtlasTile, Bounds, ContentMask, DecorationRun, DevicePixels, FontId, GlyphId, Hsla, IsZero,
+    LineLayout, MonochromeSprite, Pixels, Point, RenderGlyphParams, ScaledPixels, SpriteEffect,
+    SubpixelSprite, TextAlign, TextRenderingMode, TransformationMatrix,
+    WindowBackgroundAppearance, WrappedLineLayout, scene::GlyphWatermark,
 };
 use anyhow::Result;
-use collections::FxBuildHasher;
-use std::{borrow::Cow, hash::BuildHasher};
+use collections::{FxBuildHasher, FxHashMap};
+use smallvec::SmallVec;
+use std::{borrow::Cow, hash::BuildHasher, mem, ops::Range, sync::Arc};
 
 /// How the glyphs of one run are rasterized: the part of a glyph's
 /// [`RenderGlyphParams`] that depends on its font, size and colour rather
@@ -133,6 +135,9 @@ pub(crate) struct GlyphRasterCache {
     /// looked up in an earlier one.
     draw: u64,
     font_extents: Vec<(FontId, Pixels, FontExtents)>,
+    /// Counts glyphs whose raster bounds the text system did not remember,
+    /// which are asked again every time they are painted.
+    unremembered_glyphs: u64,
 }
 
 #[derive(Clone)]
@@ -239,7 +244,241 @@ impl GlyphRasterCache {
     }
 }
 
+/// The layout a painted line was shaped into, held so that a line painted
+/// again is told apart from another that took over its allocation.
+#[derive(Clone)]
+pub(crate) enum LineGlyphsLayout {
+    Shaped(Arc<LineLayout>),
+    Wrapped(Arc<WrappedLineLayout>),
+}
+
+impl LineGlyphsLayout {
+    fn address(&self) -> usize {
+        match self {
+            Self::Shaped(layout) => Arc::as_ptr(layout) as usize,
+            Self::Wrapped(layout) => Arc::as_ptr(layout) as usize,
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Shaped(this), Self::Shaped(other)) => Arc::ptr_eq(this, other),
+            (Self::Wrapped(this), Self::Wrapped(other)) => Arc::ptr_eq(this, other),
+            _ => false,
+        }
+    }
+}
+
+/// Everything the glyph sprites of a line without underlines or
+/// strikethroughs depend on: its layout (and wrapping), where and how it is
+/// placed, the colour of each run, and what the window paints glyphs with.
+/// Two lines that agree on all of it paint the same sprites.
+pub(crate) struct LineGlyphsKey {
+    layout: LineGlyphsLayout,
+    origin: (u32, u32),
+    line_height: u32,
+    align: TextAlign,
+    align_width: Option<u32>,
+    colors: SmallVec<[(u32, Hsla); 8]>,
+    /// As painting asked for it, before snapping: painting culls by both.
+    content_mask: ContentMask<Pixels>,
+    element_opacity: u32,
+    scale_factor: u32,
+    rendering: (WindowBackgroundAppearance, bool, TextRenderingMode),
+}
+
+impl LineGlyphsKey {
+    fn slot(&self) -> (usize, (u32, u32)) {
+        (self.layout.address(), self.origin)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.layout.same(&other.layout)
+            && self.origin == other.origin
+            && self.line_height == other.line_height
+            && self.align == other.align
+            && self.align_width == other.align_width
+            && self.content_mask == other.content_mask
+            && self.element_opacity == other.element_opacity
+            && self.scale_factor == other.scale_factor
+            && self.rendering == other.rendering
+            && self.colors.len() == other.colors.len()
+            && self
+                .colors
+                .iter()
+                .zip(&other.colors)
+                .all(|((len, color), (other_len, other_color))| {
+                    len == other_len && same_color(color, other_color)
+                })
+    }
+}
+
+fn same_color(this: &Hsla, other: &Hsla) -> bool {
+    this.h.to_bits() == other.h.to_bits()
+        && this.s.to_bits() == other.s.to_bits()
+        && this.l.to_bits() == other.l.to_bits()
+        && this.a.to_bits() == other.a.to_bits()
+}
+
+/// A line whose glyphs are being painted, to be kept for the next frame once
+/// they are.
+pub(crate) struct LineGlyphsRecording {
+    key: LineGlyphsKey,
+    start: GlyphWatermark,
+    unremembered_glyphs: u64,
+}
+
+struct PaintedLineGlyphs {
+    key: LineGlyphsKey,
+    /// The line's sprites among the paint operations of the frame it was
+    /// painted in.
+    operations: Range<usize>,
+}
+
+/// The glyph sprites of the lines painted in the last frame, by layout and
+/// origin, and those of the lines painted so far in this one.
+///
+/// Painting a line again where it was, unchanged, in a window painting glyphs
+/// as it was, paints the same sprites, so they are copied from the frame the
+/// window last drew rather than worked out a glyph at a time. That frame's
+/// tiles are as live as a cached view's replayed ones: the window draws
+/// without either once its rendered frame is old enough for the atlas to
+/// have retired them.
+#[derive(Default)]
+pub(crate) struct LineGlyphCache {
+    previous: FxHashMap<(usize, (u32, u32)), PaintedLineGlyphs>,
+    current: FxHashMap<(usize, (u32, u32)), PaintedLineGlyphs>,
+    /// The atlas generation the last frame's tiles were handed out in.
+    atlas_generation: u64,
+    #[cfg(test)]
+    pub(crate) replayed_lines: usize,
+}
+
+impl LineGlyphCache {
+    /// Ends a draw: the lines it painted become those the next one can
+    /// paint again.
+    pub(crate) fn finish_draw(&mut self) {
+        mem::swap(&mut self.previous, &mut self.current);
+        self.current.clear();
+    }
+
+    /// Forgets the lines of the last frame, whose sprites may name tiles the
+    /// atlas has retired.
+    pub(crate) fn forget_previous(&mut self) {
+        self.previous.clear();
+    }
+
+    /// Starts a draw with the atlas at `atlas_generation`, forgetting the
+    /// lines of the last frame if the atlas dropped their tiles since.
+    pub(crate) fn start_draw(&mut self, atlas_generation: u64) {
+        if self.atlas_generation != atlas_generation {
+            self.atlas_generation = atlas_generation;
+            self.forget_previous();
+        }
+    }
+}
+
 impl Window {
+    /// What the glyph sprites of a line depend on, or `None` when it cannot
+    /// be painted again from the last frame: one with an underline or
+    /// strikethrough, or one painted with a text effect.
+    pub(crate) fn line_glyphs_key(
+        &self,
+        layout: LineGlyphsLayout,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        decoration_runs: &[DecorationRun],
+    ) -> Option<LineGlyphsKey> {
+        if !self.text_shimmer_stack.is_empty() && !super::text_shimmer_disabled() {
+            return None;
+        }
+        let mut colors = SmallVec::new();
+        for run in decoration_runs {
+            if run.underline.is_some() || run.strikethrough.is_some() {
+                return None;
+            }
+            colors.push((run.len, run.color));
+        }
+        Some(LineGlyphsKey {
+            layout,
+            origin: (origin.x.0.to_bits(), origin.y.0.to_bits()),
+            line_height: line_height.0.to_bits(),
+            align,
+            align_width: align_width.map(|width| width.0.to_bits()),
+            colors,
+            content_mask: self.content_mask(),
+            element_opacity: self.element_opacity().to_bits(),
+            scale_factor: self.scale_factor().to_bits(),
+            rendering: (
+                self.platform_window.background_appearance(),
+                self.platform_window.is_subpixel_rendering_supported(),
+                self.text_rendering_mode.get(),
+            ),
+        })
+    }
+
+    /// Paints the glyphs of the line `key` describes by copying the sprites
+    /// the last frame painted for it, if it painted that line. Returns false,
+    /// having painted nothing, when it did not.
+    pub(crate) fn replay_line_glyphs(&mut self, key: &LineGlyphsKey) -> bool {
+        let slot = key.slot();
+        let Some(mut painted) = self.line_glyph_cache.previous.remove(&slot) else {
+            return false;
+        };
+        if !painted.key.matches(key) {
+            return false;
+        }
+        let start = self.next_frame.scene.glyph_watermark();
+        if !self
+            .next_frame
+            .scene
+            .replay_glyph_sprites(&self.rendered_frame.scene, painted.operations.clone())
+        {
+            return false;
+        }
+        let Some(operations) = self.next_frame.scene.glyph_sprites_since(start) else {
+            return true;
+        };
+        painted.operations = operations;
+        self.line_glyph_cache.current.insert(slot, painted);
+        #[cfg(test)]
+        {
+            self.line_glyph_cache.replayed_lines += 1;
+        }
+        true
+    }
+
+    /// Starts painting the glyphs of the line `key` describes glyph by glyph.
+    pub(crate) fn record_line_glyphs(&self, key: LineGlyphsKey) -> LineGlyphsRecording {
+        LineGlyphsRecording {
+            key,
+            start: self.next_frame.scene.glyph_watermark(),
+            unremembered_glyphs: self.glyph_raster_cache.unremembered_glyphs,
+        }
+    }
+
+    /// Keeps the sprites a line painted since [`Self::record_line_glyphs`]
+    /// for the next frame to paint again, unless it painted something other
+    /// than glyph sprites, or a glyph whose raster bounds are asked again
+    /// each time it is painted.
+    pub(crate) fn finish_line_glyphs(&mut self, recording: LineGlyphsRecording) {
+        if recording.unremembered_glyphs != self.glyph_raster_cache.unremembered_glyphs {
+            return;
+        }
+        let Some(operations) = self.next_frame.scene.glyph_sprites_since(recording.start) else {
+            return;
+        };
+        self.line_glyph_cache.current.insert(
+            recording.key.slot(),
+            PaintedLineGlyphs {
+                key: recording.key,
+                operations,
+            },
+        );
+    }
+
     /// The extents of `font_id` at `font_size`, which painting a line asks
     /// for once a run: the text system takes a lock and hashes the font to
     /// find them, where a window paints in a handful of fonts and sizes.
@@ -337,6 +576,8 @@ impl Window {
                     self.text_system().remembered_raster_bounds(&params)?;
                 if remembered {
                     self.glyph_raster_cache.insert(slot, &params, raster_bounds);
+                } else {
+                    self.glyph_raster_cache.unremembered_glyphs += 1;
                 }
                 (raster_bounds, None)
             }

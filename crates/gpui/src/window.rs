@@ -84,7 +84,7 @@ pub use a11y::A11ySubtreeBuilder;
 pub use frame_work::{FrameWorkStats, ViewRebuildCounts};
 pub use view_retention::{DrawDependency, ViewRebuildReason};
 pub(crate) use frame_work::add_elapsed;
-pub(crate) use glyph_painting::LineGlyphPainter;
+pub(crate) use glyph_painting::{LineGlyphPainter, LineGlyphsLayout};
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1459,6 +1459,7 @@ pub struct Window {
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
     glyph_raster_cache: glyph_painting::GlyphRasterCache,
+    pub(crate) line_glyph_cache: glyph_painting::LineGlyphCache,
     pub(crate) frame_work: frame_work::FrameWorkCounters,
     pub(crate) opacity_cycle_stack: Vec<OpacityCycle>,
     pub(crate) view_retention: view_retention::ViewRetention,
@@ -2428,6 +2429,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             text_shimmer_stack: Vec::new(),
             glyph_raster_cache: glyph_painting::GlyphRasterCache::default(),
+            line_glyph_cache: glyph_painting::LineGlyphCache::default(),
             frame_work: frame_work::FrameWorkCounters::default(),
             opacity_cycle_stack: Vec::new(),
             view_retention: view_retention::ViewRetention::new(cx),
@@ -3956,7 +3958,9 @@ impl Window {
             // going back to the atlas. If that frame is older than the atlas's idle
             // window those tiles may be gone, so bypass reuse for this draw.
             self.refresh();
+            self.line_glyph_cache.forget_previous();
         }
+        self.line_glyph_cache.start_draw(self.sprite_atlas.generation());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
 
@@ -4032,6 +4036,7 @@ impl Window {
         self.layout_keys.end_frame();
         self.text_system().finish_frame();
         self.glyph_raster_cache.finish_draw();
+        self.line_glyph_cache.finish_draw();
         self.global_element_ids.finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -4244,6 +4249,21 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Has the window draw with `atlas` from now on, as if it last presented
+    /// at the atlas's current frame.
+    #[cfg(test)]
+    pub(crate) fn replace_sprite_atlas(&mut self, atlas: Arc<dyn PlatformAtlas>) {
+        self.atlas_frame_at_last_present = atlas.frame_index();
+        self.sprite_atlas = atlas;
+    }
+
+    /// What [`Self::present`] records once the platform has drawn the
+    /// rendered scene, marking its tiles in the atlas.
+    #[cfg(test)]
+    pub(crate) fn note_rendered_scene_presented(&mut self) {
+        self.atlas_frame_at_last_present = self.sprite_atlas.frame_index();
     }
 
     /// Whether the retained scene was last presented so long ago, in sprite-atlas
