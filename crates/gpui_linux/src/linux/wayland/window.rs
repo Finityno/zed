@@ -679,8 +679,11 @@ impl WaylandWindowState {
     /// A hidden window whose surface was released has nothing to present
     /// to: its frames neither draw nor retry until it is shown again, when
     /// the configure that restores the surface requests a forced redraw.
+    /// A hidden window whose device recovery failed parks the same way
+    /// rather than polling for retries; showing it requests the retry.
     fn surface_parked(&self) -> bool {
-        !self.visibility.is_visible() && self.renderer.is_unconfigured()
+        !self.visibility.is_visible()
+            && (self.renderer.is_unconfigured() || self.renderer.device_lost())
     }
 
     fn restore_surface(&mut self) {
@@ -1625,6 +1628,7 @@ impl WaylandWindowStatePtr {
             return;
         }
         state.restore_surface();
+        let recovery_pending = state.renderer.device_lost();
         // A compositor may never deliver the callback of a frame presented
         // just before the window was suspended, so the shown window stops
         // waiting on it and schedules its own frame.
@@ -1632,6 +1636,9 @@ impl WaylandWindowStatePtr {
         drop(state);
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame_loop.set(FrameLoop::Parked);
+            self.request_redraw();
+        } else if recovery_pending {
+            // Parked while hidden with its device lost: the draw retries it.
             self.request_redraw();
         }
     }
