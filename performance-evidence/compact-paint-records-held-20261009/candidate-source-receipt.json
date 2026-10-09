@@ -1,0 +1,9 @@
+{
+  "source": "f71a4eba34a6dc288e8180dc61945d8be4fcbb95",
+  "tree": "a6c4fc68ce74e876533aeef9649d6771520921c5",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "e3a1ba3de67c4004b5bf9635014dc488f74f5ccdab6d7baed73af6547f56af3c"
+  },
+  "scope": "FlattenPaintOperation only; no failed span code copied. Native payload-width/rest-snapshot regressions included."
+}

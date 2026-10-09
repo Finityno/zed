@@ -1,0 +1,32 @@
+[
+  {
+    "lane": "baseline",
+    "command": [
+      "/workspace/scratch/gpui-paint-records-loop/comparison/native-run",
+      "/workspace/scratch/gpui-paint-records-loop/comparison/baseline-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "indexed_glyph_records_do_not_reserve_full_glyph_payloads",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 101,
+    "expected_exit_code": 101,
+    "log": "/workspace/scratch/gpui-paint-records-loop/comparison/footprint-regression/baseline.log",
+    "log_sha256": "e6be1261122d27f3508fc63d12fbc0b5af7f3d01c940987f70cc6609edab9670",
+    "passed_expected_behavior": true
+  },
+  {
+    "lane": "candidate",
+    "command": [
+      "/workspace/scratch/gpui-paint-records-loop/comparison/native-run",
+      "/workspace/scratch/gpui-paint-records-loop/comparison/candidate-bare-artifacts/gpui-ada3fb4d7b1cfe56",
+      "indexed_glyph_records_do_not_reserve_full_glyph_payloads",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "expected_exit_code": 0,
+    "log": "/workspace/scratch/gpui-paint-records-loop/comparison/footprint-regression/candidate.log",
+    "log_sha256": "f1313767ce91251fed180cf0180398de6a7c4b64c704c050a41bfe8a93f8bada",
+    "passed_expected_behavior": true
+  }
+]

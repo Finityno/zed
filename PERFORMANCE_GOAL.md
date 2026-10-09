@@ -197,3 +197,18 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Private paint-record flattening at
+`f71a4eba34a6dc288e8180dc61945d8be4fcbb95` remains held and unmerged. Its
+3,332 native children meet all20 declared memory targets:8.6957% lower record
+owner storage,64 KiB lower held bytes in transcript fixtures and384 KiB in
+colored fixtures, with1.017–1.191%/2.500–2.555% less completecomponent live
+requested heap. All CPU/elapsed/wholechildCPU and requested held/peak/total
+byte/call gates pass. Six current RSS fields exceed their frozen baseline
+ranges. Preserve all adverse results and do not resample unchanged or weaken
+gates. Complete pairedframe/native snapshot/path/shadowclip correctness and
+before-red/after-green footprint tests pass. See
+`performance-evidence/compact-paint-records-held-20261009`. No adoption or
+app/GPU/nativeplatform/shippedallocator gain is claimed. Continue with measured
+currentmain scene-sort scratch ownership and intermediate permutation copies.

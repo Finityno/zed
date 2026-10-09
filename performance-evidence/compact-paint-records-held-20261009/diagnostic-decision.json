@@ -1,0 +1,209 @@
+{
+  "children": 20,
+  "all_outputs_match_currentmain_complete_baseline": true,
+  "all_inputs_unchanged": true,
+  "production_candidate_exists": false,
+  "not_gain_evidence": true,
+  "rows": [
+    {
+      "case": "scroll-off-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1277255029696708,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.01110656547562355
+    },
+    {
+      "case": "scroll-off-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.11869782408951728,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.010321549920827589
+    },
+    {
+      "case": "scroll-on-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1269146298789193,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.01103605477207994
+    },
+    {
+      "case": "scroll-on-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.11801465349449358,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.010262143782129878
+    },
+    {
+      "case": "stream-off-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1320707303472976,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.011484411334547617
+    },
+    {
+      "case": "stream-off-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.12246188583738715,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.010648859638033666
+    },
+    {
+      "case": "stream-on-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.13046957093767042,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.011345180081536557
+    },
+    {
+      "case": "stream-on-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.12108402125473908,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.01052904532649905
+    },
+    {
+      "case": "tick-off-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1384170591150068,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.012036266010000591
+    },
+    {
+      "case": "tick-off-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1279099329853673,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.011122602868292808
+    },
+    {
+      "case": "tick-on-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.136460208460756,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.011866105083544
+    },
+    {
+      "case": "tick-on-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1262370972221152,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.010977138888879584
+    },
+    {
+      "case": "redraw-off-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1384280420817839,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.012037221050589905
+    },
+    {
+      "case": "redraw-off-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.1279193117656424,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.011123418414403686
+    },
+    {
+      "case": "redraw-on-200",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.13646317346262918,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.011866362909793841
+    },
+    {
+      "case": "redraw-on-512",
+      "record_owner_bytes": 753664,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.12623963460615273,
+      "projected_live_byte_reduction": 65536,
+      "projected_live_fraction_reduction": 0.010977359530969802
+    },
+    {
+      "case": "color-redraw-off-200-32",
+      "record_owner_bytes": 3273728,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.25811916887237335,
+      "projected_live_byte_reduction": 284672,
+      "projected_live_fraction_reduction": 0.022445145119336814
+    },
+    {
+      "case": "color-redraw-on-200-32",
+      "record_owner_bytes": 3273728,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.25468946853234553,
+      "projected_live_byte_reduction": 284672,
+      "projected_live_fraction_reduction": 0.02214691030716048
+    },
+    {
+      "case": "color-decorated-off-200-32",
+      "record_owner_bytes": 3568128,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.2728052996950776,
+      "projected_live_byte_reduction": 310272,
+      "projected_live_fraction_reduction": 0.02372219997348501
+    },
+    {
+      "case": "color-decorated-on-200-32",
+      "record_owner_bytes": 3568128,
+      "record_width": 184,
+      "hypothetical_flat_width": 168,
+      "width_fraction_reduction": 0.08695652173913043,
+      "record_owner_fraction_of_live": 0.26864011692051293,
+      "projected_live_byte_reduction": 310272,
+      "projected_live_fraction_reduction": 0.023360010167001125
+    }
+  ]
+}

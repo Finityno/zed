@@ -389,9 +389,7 @@ impl Scene {
             let (subpixel, first) = match *operation {
                 PaintOperation::MonochromeSprite(index) => (false, index),
                 PaintOperation::SubpixelSprite(index) => (true, index),
-                PaintOperation::Primitive(_)
-                | PaintOperation::StartLayer(_)
-                | PaintOperation::EndLayer => {
+                _ => {
                     debug_assert!(false, "only glyph sprites are replayed");
                     position += 1;
                     continue;
@@ -511,51 +509,54 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
+        let operation = match primitive {
+            Primitive::Shadow(mut shadow) => {
                 shadow.order = order;
-                self.shadows.push(*shadow);
+                self.shadows.push(shadow);
+                PaintOperation::Shadow(shadow)
             }
-            Primitive::Quad(quad) => {
+            Primitive::Quad(mut quad) => {
                 quad.order = order;
-                self.quads.push(*quad);
+                self.quads.push(quad);
+                PaintOperation::Quad(quad)
             }
-            Primitive::Path(path) => {
+            Primitive::Path(mut path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
                 self.paths.push(path.clone());
+                PaintOperation::Path(path)
             }
-            Primitive::Underline(underline) => {
+            Primitive::Underline(mut underline) => {
                 underline.order = order;
-                self.underlines.push(*underline);
+                self.underlines.push(underline);
+                PaintOperation::Underline(underline)
             }
-            Primitive::MonochromeSprite(sprite) => {
+            Primitive::MonochromeSprite(mut sprite) => {
                 sprite.order = order;
                 let index = self.painted_monochrome_sprites.len() as u32;
-                self.painted_monochrome_sprites.push(*sprite);
-                self.paint_operations
-                    .push(PaintOperation::MonochromeSprite(index));
+                self.painted_monochrome_sprites.push(sprite);
+                self.paint_operations.push(PaintOperation::MonochromeSprite(index));
                 return;
             }
-            Primitive::SubpixelSprite(sprite) => {
+            Primitive::SubpixelSprite(mut sprite) => {
                 sprite.order = order;
                 let index = self.painted_subpixel_sprites.len() as u32;
-                self.painted_subpixel_sprites.push(*sprite);
-                self.paint_operations
-                    .push(PaintOperation::SubpixelSprite(index));
+                self.painted_subpixel_sprites.push(sprite);
+                self.paint_operations.push(PaintOperation::SubpixelSprite(index));
                 return;
             }
-            Primitive::PolychromeSprite(sprite) => {
+            Primitive::PolychromeSprite(mut sprite) => {
                 sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
+                self.polychrome_sprites.push(sprite);
+                PaintOperation::PolychromeSprite(sprite)
             }
-            Primitive::Surface(surface) => {
+            Primitive::Surface(mut surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
+                PaintOperation::Surface(surface)
             }
-        }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        };
+        self.paint_operations.push(operation);
     }
 
     /// Registers an opacity cycle for one quad, returning the value its
@@ -647,9 +648,14 @@ impl Scene {
             clipped_only_inside(scaled_edges(extent), scaled_edges(&mask.bounds), outer)
         };
         self.paint_operations[range].iter().all(|operation| match operation {
-            PaintOperation::Primitive(primitive) => {
-                clipped(&primitive_extent(primitive), primitive.content_mask())
-            }
+            PaintOperation::Shadow(shadow) => clipped(
+                &shadow.bounds.dilate(shadow.blur_radius * 3.), &shadow.content_mask,
+            ),
+            PaintOperation::Quad(quad) => clipped(&quad.bounds, &quad.content_mask),
+            PaintOperation::Path(path) => clipped(&path.bounds, &path.content_mask),
+            PaintOperation::Underline(underline) => clipped(&underline.bounds, &underline.content_mask),
+            PaintOperation::PolychromeSprite(sprite) => clipped(&sprite.bounds, &sprite.content_mask),
+            PaintOperation::Surface(surface) => clipped(&surface.bounds, &surface.content_mask),
             PaintOperation::MonochromeSprite(index) => {
                 let sprite = &self.painted_monochrome_sprites[*index as usize];
                 clipped(&sprite.bounds, &sprite.content_mask)
@@ -695,7 +701,12 @@ impl Scene {
         let mut layers_left_out: Vec<bool> = Vec::new();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(_)
+                PaintOperation::Shadow(_)
+                | PaintOperation::Quad(_)
+                | PaintOperation::Path(_)
+                | PaintOperation::Underline(_)
+                | PaintOperation::PolychromeSprite(_)
+                | PaintOperation::Surface(_)
                 | PaintOperation::MonochromeSprite(_)
                 | PaintOperation::SubpixelSprite(_) => {
                     let mut primitive = match operation {
@@ -705,7 +716,12 @@ impl Scene {
                         PaintOperation::SubpixelSprite(index) => Primitive::SubpixelSprite(
                             prev_scene.painted_subpixel_sprites[*index as usize],
                         ),
-                        PaintOperation::Primitive(primitive) => primitive.clone(),
+                        PaintOperation::Shadow(shadow) => Primitive::Shadow(*shadow),
+                        PaintOperation::Quad(quad) => Primitive::Quad(*quad),
+                        PaintOperation::Path(path) => Primitive::Path(path.clone()),
+                        PaintOperation::Underline(underline) => Primitive::Underline(*underline),
+                        PaintOperation::PolychromeSprite(sprite) => Primitive::PolychromeSprite(*sprite),
+                        PaintOperation::Surface(surface) => Primitive::Surface(surface.clone()),
                         PaintOperation::StartLayer(_) | PaintOperation::EndLayer => continue,
                     };
                     if let Some(moved) = moved {
@@ -1514,6 +1530,78 @@ mod tests {
         assert!(replayed.is_empty());
     }
 
+    #[test]
+    fn indexed_glyph_records_do_not_reserve_full_glyph_payloads() {
+        assert!(std::mem::size_of::<PaintOperation>() < std::mem::size_of::<Primitive>());
+    }
+
+    #[test]
+    fn replayed_records_keep_snapshots_and_owned_path_vertices() {
+        let paint = |scene: &mut Scene| {
+            let bounds = unit_bounds();
+            let mask = ContentMask { bounds };
+            scene.push_layer(bounds);
+            scene.insert_primitive(opaque_quad());
+            scene.insert_primitive(Shadow {
+                order: 0, blur_radius: ScaledPixels(1.), bounds,
+                corner_radii: Corners::default(), content_mask: mask, color: crate::white(),
+                element_bounds: bounds, element_corner_radii: Corners::default(), inset: 0, pad: 0,
+            });
+            let mut path = Path::new(point(px(0.), px(0.)));
+            path.line_to(point(px(4.), px(0.)));
+            path.line_to(point(px(4.), px(4.)));
+            let mut path = path.scale(1.);
+            path.bounds = bounds;
+            path.content_mask = mask;
+            assert!(!path.vertices.is_empty());
+            scene.insert_primitive(path);
+            scene.insert_primitive(Underline {
+                order: 0, pad: 0, bounds, content_mask: mask, color: crate::white(),
+                thickness: ScaledPixels(1.), wavy: false.into(),
+            });
+            let mut tile = shimmering_glyph(0).tile;
+            tile.texture_id.kind = crate::AtlasTextureKind::Polychrome;
+            scene.insert_primitive(PolychromeSprite {
+                order: 0, pad: 0, grayscale: false.into(), opacity: 0.5, bounds,
+                content_mask: mask, corner_radii: Corners::default(), tile,
+            });
+            #[cfg(not(target_os = "macos"))]
+            scene.insert_primitive(PaintSurface { order: 0, bounds, content_mask: mask });
+            scene.insert_monochrome_sprite(shimmering_glyph(0));
+            scene.pop_layer();
+        };
+        let mut source = Scene::default();
+        paint(&mut source);
+        assert!(!source.clipped_only_inside(0..source.len(), [0., 0., 10., 10.]));
+        source.finish();
+        // Presenting changes renderer arrays. Replay must still recover the
+        // rest snapshot, including the separately owned path vertex buffer.
+        source.quads[0].background = Background::from(crate::white());
+        source.shadows[0].bounds.origin.x = ScaledPixels(100.);
+        source.paths[0].vertices.clear();
+        source.underlines[0].bounds.origin.y = ScaledPixels(100.);
+        source.polychrome_sprites[0].opacity = 0.;
+        let destination = || {
+            let mut scene = Scene::default();
+            scene.insert_primitive(opaque_quad());
+            scene
+        };
+        let mut replayed = destination();
+        replayed.replay(0..source.len(), &source);
+        replayed.finish();
+        let mut fresh = destination();
+        paint(&mut fresh);
+        fresh.finish();
+        assert_eq!(format!("{:?}", replayed.quads), format!("{:?}", fresh.quads));
+        assert_eq!(format!("{:?}", replayed.shadows), format!("{:?}", fresh.shadows));
+        assert_eq!(format!("{:?}", replayed.paths), format!("{:?}", fresh.paths));
+        assert_eq!(format!("{:?}", replayed.underlines), format!("{:?}", fresh.underlines));
+        assert_eq!(format!("{:?}", replayed.polychrome_sprites), format!("{:?}", fresh.polychrome_sprites));
+        assert_eq!(format!("{:?}", replayed.monochrome_sprites), format!("{:?}", fresh.monochrome_sprites));
+        assert_eq!(format!("{:?}", replayed.surfaces), format!("{:?}", fresh.surfaces));
+        assert_eq!(replayed.paint_operations.len(), fresh.paint_operations.len());
+    }
+
     fn unit_bounds() -> Bounds<ScaledPixels> {
         Bounds {
             origin: Point::default(),
@@ -2297,7 +2385,15 @@ pub(crate) struct Layer {
 }
 
 pub(crate) enum PaintOperation {
-    Primitive(Primitive),
+    // Glyph records below already name the painted arrays by index. Keeping
+    // another Primitive enum here reserved its full glyph payload in every
+    // record, including layer operations and the indexed glyphs themselves.
+    Shadow(Shadow),
+    Quad(Quad),
+    Path(Path<ScaledPixels>),
+    Underline(Underline),
+    PolychromeSprite(PolychromeSprite),
+    Surface(PaintSurface),
     /// Indices into [`Scene::painted_monochrome_sprites`] and
     /// [`Scene::painted_subpixel_sprites`]: glyphs are most of a frame, and
     /// copying each into a paint operation as well cost as much as the rest

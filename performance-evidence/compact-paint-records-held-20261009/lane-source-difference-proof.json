@@ -1,0 +1,9 @@
+{
+  "source_difference": [
+    "crates/gpui/src/scene.rs"
+  ],
+  "all_private_helpers_fixtures_and_tests_identical": true,
+  "candidate_exact_production_bytes_except_named_scene_owner_getters": true,
+  "all59_original_externs_identical": true,
+  "production_source": "f71a4eba34a6dc288e8180dc61945d8be4fcbb95"
+}

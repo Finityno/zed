@@ -1,0 +1,19 @@
+{
+  "common_children": 274,
+  "native_common_test_passes": 622,
+  "paired_frame_audits": 119,
+  "before_after_footprint_expected_before_failure": true,
+  "after_footprint_pass": true,
+  "expected_red_test_skipped_in_both_common_suites": true,
+  "zero_test_patterns_no_coverage_claim": [
+    {
+      "lane": "baseline",
+      "pattern": "window::text_glyph_cache_tests::"
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::text_glyph_cache_tests::"
+    }
+  ],
+  "all_common_correctness_pass": true
+}
