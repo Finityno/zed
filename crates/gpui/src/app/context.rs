@@ -877,7 +877,7 @@ impl<T> Context<'_, T> {
             .event_arena
             .alloc(|| event)
             .map(|it| it as &mut dyn Any);
-        self.app.pending_effects.push_back(Effect::Emit {
+        self.app.queue_effect(Effect::Emit {
             emitter: self.entity_state.entity_id,
             event_type: TypeId::of::<Evt>(),
             event,

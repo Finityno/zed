@@ -143,9 +143,9 @@ that Fincode has not adopted.
 
 ## Continuation
 
-An hourly continuation is enabled in the working chat. Read its current handoff
-and active processes before beginning; continue an existing iteration without
-launching a duplicate. Never overlap native timing with compilation or other
+Read the working chat’s current handoff and active processes before beginning;
+continue an existing iteration without launching a duplicate. The previously
+recorded hourly automation is unavailable; active work continues in this chat. Never overlap native timing with compilation or other
 profiling. After a qualified merge, select the next distinct important owner.
 Keep failed designs held with evidence; do not rerun them unchanged to seek a
 passing sample or weaken their acceptance gates.
@@ -197,3 +197,17 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Idle effects-queue reclamation at `06e96d96609b20bf9afec0e140678eb2e5617bdc`
+remains held. Its one 2,100-child comparison across 75 complete native App/Window
+workloads releases 99.61–99.80% of queue storage, lowers complete held requested
+heap 67.35–80.54% and current RSS 24.58–35.76% in four controlled memory fixtures.
+Thirty-five frozen CPU, RSS and allocation controls fail, including 9.75% higher
+long-idle refill CPU and 21 extra calls for one reclaim against 8 allowed. Native
+queue/event/no-redraw/lifetime and retained-output contracts pass; no PR, merge
+or Fincode gain is qualified. Preserve every original sample and adverse setup
+under `performance-evidence/idle-effect-capacity-held-20261009`. A cloud attach
+removed supervising parents; the original bare process completed successfully
+inside its deadline with no restarted samples, then census ran separately.
+Do not rerun this design unchanged or weaken its gates. Continue with a distinct
+observer allocation design from owned live-heap evidence.

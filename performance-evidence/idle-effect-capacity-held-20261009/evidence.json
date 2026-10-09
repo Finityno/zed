@@ -1,0 +1,492 @@
+{
+  "status": "HELD/unmerged; no unchanged rerun or weaker gates",
+  "qualified": false,
+  "baseline": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "source": "06e96d96609b20bf9afec0e140678eb2e5617bdc",
+  "fincode_main_at_freeze": "6c59d0a9af192c82c4d6cd6a8e1c7413734f2188",
+  "fincode_gpui": "8ceb46cd79dc910bf709b561727bb42e7e9ae2da",
+  "component_pin": "df4ef88228bdad00b830a8fdfb286be84d07b5aa",
+  "valid_children": 2100,
+  "workloads": 75,
+  "failures": [
+    [
+      "bare",
+      "tick-off-32",
+      "peak_rss_kib",
+      "control",
+      260,
+      232
+    ],
+    [
+      "bare",
+      "redraw-off-512",
+      "cpu_ns",
+      "control",
+      772942,
+      748707
+    ],
+    [
+      "bare",
+      "redraw-off-512",
+      "elapsed_ns",
+      "control",
+      772645,
+      748868
+    ],
+    [
+      "bare",
+      "effect-idle-off-131072",
+      "child_cpu_ns",
+      "control",
+      902000,
+      801000
+    ],
+    [
+      "bare",
+      "effect-boundary-off-8193",
+      "cpu_ns",
+      "control",
+      36785,
+      31086
+    ],
+    [
+      "bare",
+      "effect-boundary-off-8193",
+      "elapsed_ns",
+      "control",
+      36785,
+      31156
+    ],
+    [
+      "bare",
+      "effect-long_refault-on-131072",
+      "cpu_ns",
+      "control",
+      3562122,
+      912400
+    ],
+    [
+      "bare",
+      "effect-long_refault-on-131072",
+      "elapsed_ns",
+      "control",
+      3561795,
+      912100
+    ],
+    [
+      "bare",
+      "effect-long_refault-on-131072",
+      "child_cpu_ns",
+      "control",
+      3195000,
+      1317000
+    ],
+    [
+      "bare",
+      "effect-no_window-on-131072",
+      "cpu_ns",
+      "control",
+      1112129,
+      571702
+    ],
+    [
+      "bare",
+      "effect-no_window-on-131072",
+      "elapsed_ns",
+      "control",
+      1111908,
+      572064
+    ],
+    [
+      "census",
+      "state-panel-keep-32",
+      "peak_rss_kib",
+      "control",
+      456,
+      384
+    ],
+    [
+      "census",
+      "state-disjoint-32",
+      "peak_rss_kib",
+      "control",
+      264,
+      188
+    ],
+    [
+      "census",
+      "state-bump-32",
+      "peak_rss_kib",
+      "control",
+      140,
+      128
+    ],
+    [
+      "census",
+      "stream-off-512",
+      "peak_rss_kib",
+      "control",
+      164,
+      128
+    ],
+    [
+      "census",
+      "stream-on-200",
+      "peak_rss_kib",
+      "control",
+      272,
+      264
+    ],
+    [
+      "census",
+      "stream-on-512",
+      "peak_rss_kib",
+      "control",
+      200,
+      128
+    ],
+    [
+      "census",
+      "tick-on-32",
+      "peak_rss_kib",
+      "control",
+      320,
+      132
+    ],
+    [
+      "census",
+      "redraw-off-32",
+      "peak_rss_kib",
+      "control",
+      132,
+      128
+    ],
+    [
+      "census",
+      "redraw-on-512",
+      "peak_rss_kib",
+      "control",
+      324,
+      256
+    ],
+    [
+      "census",
+      "rebuild-off-512",
+      "peak_rss_kib",
+      "control",
+      228,
+      64
+    ],
+    [
+      "census",
+      "rebuild-on-200",
+      "peak_rss_kib",
+      "control",
+      420,
+      260
+    ],
+    [
+      "census",
+      "effect-idle-off-65536",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-off-131072",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-on-65536",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-on-65536",
+      "peak_rss_kib",
+      "control",
+      168,
+      128
+    ],
+    [
+      "census",
+      "effect-idle-on-131072",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-idle-on-131072",
+      "peak_rss_kib",
+      "control",
+      224,
+      128
+    ],
+    [
+      "census",
+      "effect-boundary-off-8193",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-boundary-on-8193",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-short_refault-on-131072",
+      "allocation_calls",
+      "control",
+      33,
+      32
+    ],
+    [
+      "census",
+      "effect-long_refault-on-131072",
+      "allocation_calls",
+      "control",
+      105,
+      59
+    ],
+    [
+      "census",
+      "effect-reentrant-on-16384",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-no_window-on-131072",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ],
+    [
+      "census",
+      "effect-close_window-on-131072",
+      "allocation_calls",
+      "control",
+      21,
+      8
+    ]
+  ],
+  "all_primary_gain_fields_pass": true,
+  "observed_primary_changes": {
+    "effect-idle-off-65536": {
+      "bare": {
+        "current_rss_kib": {
+          "baseline_median": 18172,
+          "candidate_median": 13520,
+          "baseline_min": 17888,
+          "baseline_max": 18320,
+          "candidate_min": 13300,
+          "candidate_max": 13784,
+          "baseline_range": 432,
+          "candidate_range": 484,
+          "change_percent": -25.599823904908646,
+          "allowed_increase": 432,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 6975178,
+          "candidate_median": 2275122,
+          "baseline_min": 6975178,
+          "baseline_max": 6975178,
+          "candidate_min": 2275122,
+          "candidate_max": 2275122,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -67.38259582766204,
+          "allowed_increase": 64,
+          "pass": true
+        },
+        "owner_bytes": {
+          "baseline_median": 4718592,
+          "candidate_median": 18432,
+          "baseline_min": 4718592,
+          "baseline_max": 4718592,
+          "candidate_min": 18432,
+          "candidate_max": 18432,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -99.609375,
+          "allowed_increase": 0,
+          "pass": true
+        }
+      }
+    },
+    "effect-idle-off-131072": {
+      "bare": {
+        "current_rss_kib": {
+          "baseline_median": 25828,
+          "candidate_median": 16592,
+          "baseline_min": 25440,
+          "baseline_max": 25980,
+          "candidate_min": 16368,
+          "candidate_max": 16988,
+          "baseline_range": 540,
+          "candidate_range": 620,
+          "change_percent": -35.75964070001548,
+          "allowed_increase": 540,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 11693770,
+          "candidate_median": 2275122,
+          "baseline_min": 11693770,
+          "baseline_max": 11693770,
+          "candidate_min": 2275122,
+          "candidate_max": 2275122,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -80.54415299770733,
+          "allowed_increase": 64,
+          "pass": true
+        },
+        "owner_bytes": {
+          "baseline_median": 9437184,
+          "candidate_median": 18432,
+          "baseline_min": 9437184,
+          "baseline_max": 9437184,
+          "candidate_min": 18432,
+          "candidate_max": 18432,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -99.8046875,
+          "allowed_increase": 0,
+          "pass": true
+        }
+      }
+    },
+    "effect-idle-on-65536": {
+      "bare": {
+        "current_rss_kib": {
+          "baseline_median": 18468,
+          "candidate_median": 13928,
+          "baseline_min": 18292,
+          "baseline_max": 18676,
+          "candidate_min": 13680,
+          "candidate_max": 14328,
+          "baseline_range": 384,
+          "candidate_range": 648,
+          "change_percent": -24.5830625947585,
+          "allowed_increase": 384,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 6978858,
+          "candidate_median": 2278802,
+          "baseline_min": 6978858,
+          "baseline_max": 6978858,
+          "candidate_min": 2278802,
+          "candidate_max": 2278802,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -67.34706451972514,
+          "allowed_increase": 64,
+          "pass": true
+        },
+        "owner_bytes": {
+          "baseline_median": 4718592,
+          "candidate_median": 18432,
+          "baseline_min": 4718592,
+          "baseline_max": 4718592,
+          "candidate_min": 18432,
+          "candidate_max": 18432,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -99.609375,
+          "allowed_increase": 0,
+          "pass": true
+        }
+      }
+    },
+    "effect-idle-on-131072": {
+      "bare": {
+        "current_rss_kib": {
+          "baseline_median": 26204,
+          "candidate_median": 17012,
+          "baseline_min": 25948,
+          "baseline_max": 26368,
+          "candidate_min": 16884,
+          "candidate_max": 17344,
+          "baseline_range": 420,
+          "candidate_range": 460,
+          "change_percent": -35.07861395206838,
+          "allowed_increase": 420,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 11697450,
+          "candidate_median": 2278802,
+          "baseline_min": 11697450,
+          "baseline_max": 11697450,
+          "candidate_min": 2278802,
+          "candidate_max": 2278802,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -80.51881392953165,
+          "allowed_increase": 64,
+          "pass": true
+        },
+        "owner_bytes": {
+          "baseline_median": 9437184,
+          "candidate_median": 18432,
+          "baseline_min": 9437184,
+          "baseline_max": 9437184,
+          "candidate_min": 18432,
+          "candidate_max": 18432,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -99.8046875,
+          "allowed_increase": 0,
+          "pass": true
+        }
+      }
+    }
+  },
+  "important_gain_not_qualified": "67.35\u201380.54% less complete held requested heap,99.61\u201399.80% queue storage release,24.58\u201335.76% less native current RSS;35 frozen CPU/RSS/allocation controls fail. Four-cycle long-idle refilling uses9.75% more CPU; a single reclaim adds21allocation calls against8allowed.",
+  "mechanism": "All six effect-enqueue paths share a threshold flag; once after a large flush one weak-App task waits30s since the last large queue, keeps256effects and ends. Ordinary small updates do not extend the quiet period. Fixed App census increase40bytes is within64byte declared budget.",
+  "correctness": "32 native contract invocations pass their declared results. Nine new lifecycle tests baseline2pass/7fail, candidate9pass in both bare/census lanes. Current App/Scene/window idle/retained-frame/wheel/dependency/panel/layout/atomic/read/nested checks pass.68four-lane functional children and all2100measured outputs preserve callback order/checksum/closure release and window/state signatures.",
+  "environment_recovery": "Cloud attachment removed supervising parents. Original1350-child bare process continued and exited0 at241.58s, before900s deadline, with every raw sample and final summary intact. Same kernel/host/source/compiler/runtime/binary/extern identities reverified. No duplicate/restarted samples;750census children follow sequentially under600s PGID deadline. Initial reattach helper rejected empty cmdline of already-exited zombie; corrected helper and original preserved.",
+  "adverse_preparation": "Original refresh API and AsyncApp result build failures retained; bootstrap-boundary native test failure and all four earlier native identities/binaries preserved. Only correctness setup helper changed, with original and corrected hashes. Every performance fixture and acceptance policy remains exactly frozen before production candidate.",
+  "not_run": "Strict owning Clippy, PR creation, merge and coherent application adoption withheld because performance gates fail.",
+  "limits": [
+    "Linux fake-platform completeApp/Window/queuecomponent withSystem; notFincode wholeapp/macOS/Windows/shippedallocator/GPU percentage.",
+    "NativecurrentRSS fromprocstatm afterloop/censusfinish; peakRSS/wholechildCPU fromnativewait4. Virtualscheduler advances testquiet time; timing measures actualCPU work, not a real30s idle appCPU recording.",
+    "Timers exclude App/window/4warmups/finalaudits; census includes completeowner setup/finalheldmemory. Extra cold-refill allocationchurn is explicitlybudgeted, never claimedreduced.",
+    "No oldfailed candidate resampling, no formatting, noinstalledapp orActions. Source current-main independentGPU/style/atlas andownedapp changes preserved."
+  ],
+  "policy_sha256": "a99cd5e209808cccaf9ddca094e8ed33561297a0cf32b3a4b6f756efccd5aaee",
+  "archive_sha256": "f5a42405b2218323f51e388e6c442b99099329b99d38d067c258581ecff0a854",
+  "archive_bytes": 1153121,
+  "members": 2416
+}

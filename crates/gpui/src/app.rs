@@ -74,6 +74,10 @@ mod visual_test_context;
 /// [Context::on_app_quit] before fully quitting.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 
+const LARGE_EFFECT_QUEUE_THRESHOLD: usize = 8192;
+const RETAINED_EFFECT_QUEUE_CAPACITY: usize = 256;
+const EFFECT_QUEUE_IDLE_DURATION: Duration = Duration::from_secs(30);
+
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
 #[doc(hidden)]
@@ -764,6 +768,9 @@ pub struct App {
     pub(crate) global_action_listeners:
         TypeIdHashMap<Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
     pending_effects: VecDeque<Effect>,
+    large_effect_queue_used: bool,
+    last_large_effect_queue_use: Option<Instant>,
+    idle_effect_queue_reclaim: Option<Task<()>>,
 
     pub(crate) observers: SubscriberSet<EntityId, Handler>,
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
@@ -910,6 +917,9 @@ impl App {
                 keyboard_mapper,
                 global_action_listeners: Default::default(),
                 pending_effects: VecDeque::new(),
+                large_effect_queue_used: false,
+                last_large_effect_queue_use: None,
+                idle_effect_queue_reclaim: None,
                 pending_notifications: FxHashSet::default(),
                 pending_global_notifications: Default::default(),
                 observers: SubscriberSet::new(),
@@ -1173,7 +1183,7 @@ impl App {
     /// Schedules all windows in the application to be redrawn. This can be called
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {
-        self.pending_effects.push_back(Effect::RefreshWindows);
+        self.queue_effect(Effect::RefreshWindows);
     }
 
     #[inline(always)]
@@ -1794,7 +1804,31 @@ impl App {
             _ => {}
         };
 
+        self.queue_effect(effect);
+    }
+
+    #[inline]
+    fn queue_effect(&mut self, effect: Effect) {
         self.pending_effects.push_back(effect);
+        if self.pending_effects.len() == LARGE_EFFECT_QUEUE_THRESHOLD + 1 {
+            self.large_effect_queue_used = true;
+        }
+    }
+
+    fn reclaim_idle_effect_queue(&mut self) -> Option<Duration> {
+        if let Some(last_used) = self.last_large_effect_queue_use {
+            let quiet_for = self.background_executor.now().saturating_duration_since(last_used);
+            if quiet_for < EFFECT_QUEUE_IDLE_DURATION {
+                return Some(EFFECT_QUEUE_IDLE_DURATION - quiet_for);
+            }
+        }
+        if !self.pending_effects.is_empty() || self.large_effect_queue_used {
+            return Some(EFFECT_QUEUE_IDLE_DURATION);
+        }
+        self.pending_effects.shrink_to(RETAINED_EFFECT_QUEUE_CAPACITY);
+        self.last_large_effect_queue_use = None;
+        self.idle_effect_queue_reclaim = None;
+        None
     }
 
     /// Called at the end of [`App::update`] to complete any side effects
@@ -1865,6 +1899,25 @@ impl App {
                     self.event_arena.clear();
                     break;
                 }
+            }
+        }
+        if self.large_effect_queue_used {
+            self.large_effect_queue_used = false;
+            self.last_large_effect_queue_use = Some(self.background_executor.now());
+            if self.idle_effect_queue_reclaim.is_none() {
+                // A closed transcript can leave a large, empty queue behind.
+                // Keep it through short bursts, then release it without drawing
+                // or making unrelated small updates retain its high-water mark.
+                self.idle_effect_queue_reclaim = Some(self.spawn(async move |cx| {
+                    let mut delay = EFFECT_QUEUE_IDLE_DURATION;
+                    loop {
+                        cx.background_executor.timer(delay).await;
+                        let Some(next_delay) = cx.update(|cx| cx.reclaim_idle_effect_queue()) else {
+                            break;
+                        };
+                        delay = next_delay;
+                    }
+                }));
             }
         }
     }
@@ -2420,13 +2473,13 @@ impl App {
     /// Register key bindings.
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
         self.keymap.borrow_mut().add_bindings(bindings);
-        self.pending_effects.push_back(Effect::RefreshWindows);
+        self.queue_effect(Effect::RefreshWindows);
     }
 
     /// Clear all key bindings in the app.
     pub fn clear_key_bindings(&mut self) {
         self.keymap.borrow_mut().clear();
-        self.pending_effects.push_back(Effect::RefreshWindows);
+        self.queue_effect(Effect::RefreshWindows);
     }
 
     /// Get all key bindings in the app.
@@ -2897,8 +2950,7 @@ impl App {
 
         if live_invalidators.is_empty() {
             if self.pending_notifications.insert(entity_id) {
-                self.pending_effects
-                    .push_back(Effect::Notify { emitter: entity_id });
+                self.queue_effect(Effect::Notify { emitter: entity_id });
             }
         } else {
             for invalidator in &live_invalidators {
@@ -3530,5 +3582,198 @@ mod test {
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
         MissingGlyph::new(grapheme.into(), FallbackFontClass::Proportional)
+    }
+}
+
+#[cfg(test)]
+mod idle_effect_queue_tests {
+    use super::*;
+
+    struct DrawCount(Rc<Cell<usize>>);
+
+    impl Render for DrawCount {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl crate::IntoElement {
+            self.0.set(self.0.get() + 1);
+            crate::Empty
+        }
+    }
+
+    fn enqueue(cx: &mut TestAppContext, count: usize) -> Rc<Cell<usize>> {
+        cx.update(|_| {});
+        let completed = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            for _ in 0..count {
+                let completed = completed.clone();
+                cx.defer(move |_| completed.set(completed.get() + 1));
+            }
+        });
+        assert_eq!(completed.get(), count);
+        assert_eq!(Rc::strong_count(&completed), 1);
+        completed
+    }
+
+    fn capacity(cx: &mut TestAppContext) -> usize {
+        cx.update(|cx| {
+            assert!(cx.pending_effects.is_empty());
+            cx.pending_effects.capacity()
+        })
+    }
+
+    #[gpui::test]
+    fn large_queue_releases_after_quiet_without_drawing(cx: &mut TestAppContext) {
+        let draws = Rc::new(Cell::new(0));
+        cx.add_window({
+            let draws = draws.clone();
+            move |_, _| DrawCount(draws)
+        });
+        enqueue(cx, 8193);
+        assert!(capacity(cx) >= 8193);
+        let before = draws.get();
+        cx.executor().advance_clock(Duration::from_secs(31));
+        cx.run_until_parked();
+        assert!(capacity(cx) <= 256);
+        assert_eq!(draws.get(), before, "reclaiming must not redraw a window");
+    }
+
+    #[gpui::test]
+    fn effects_queued_during_a_flush_also_release(cx: &mut TestAppContext) {
+        let completed = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            let completed = completed.clone();
+            cx.defer(move |cx| {
+                for _ in 0..8193 {
+                    let completed = completed.clone();
+                    cx.defer(move |_| completed.set(completed.get() + 1));
+                }
+            });
+        });
+        assert_eq!(completed.get(), 8193);
+        assert_eq!(Rc::strong_count(&completed), 1);
+        assert!(capacity(cx) >= 8193);
+        cx.executor().advance_clock(Duration::from_secs(31));
+        cx.run_until_parked();
+        assert!(capacity(cx) <= 256);
+    }
+
+    #[gpui::test]
+    fn another_large_burst_restarts_the_quiet_period(cx: &mut TestAppContext) {
+        enqueue(cx, 8193);
+        let high_water = capacity(cx);
+        cx.executor().advance_clock(Duration::from_secs(20));
+        enqueue(cx, 8193);
+        cx.executor().advance_clock(Duration::from_secs(15));
+        cx.run_until_parked();
+        assert_eq!(capacity(cx), high_water);
+        cx.executor().advance_clock(Duration::from_secs(16));
+        cx.run_until_parked();
+        assert!(capacity(cx) <= 256);
+        enqueue(cx, 32);
+        assert!(capacity(cx) >= 32);
+    }
+
+    #[gpui::test]
+    fn small_background_updates_do_not_keep_a_large_buffer(cx: &mut TestAppContext) {
+        enqueue(cx, 8193);
+        cx.executor().advance_clock(Duration::from_secs(20));
+        enqueue(cx, 32);
+        cx.executor().advance_clock(Duration::from_secs(11));
+        cx.run_until_parked();
+        assert!(capacity(cx) <= 256);
+    }
+
+    #[gpui::test]
+    fn ordinary_queue_capacity_is_preserved(cx: &mut TestAppContext) {
+        enqueue(cx, 8192);
+        let before = capacity(cx);
+        cx.executor().advance_clock(Duration::from_secs(31));
+        cx.run_until_parked();
+        assert_eq!(capacity(cx), before);
+    }
+
+    #[gpui::test]
+    fn notification_only_queue_also_releases(cx: &mut TestAppContext) {
+        let entities: Vec<_> = (0..8193).map(|_| cx.new(|_| 0usize)).collect();
+        cx.update(|cx| {
+            for entity in &entities {
+                cx.notify(entity.entity_id());
+            }
+        });
+        assert!(capacity(cx) >= 8193);
+        cx.executor().advance_clock(Duration::from_secs(31));
+        cx.run_until_parked();
+        assert!(capacity(cx) <= 256);
+        for entity in &entities {
+            assert_eq!(entity.read_with(cx, |value, _| *value), 0);
+        }
+    }
+
+    #[test]
+    fn an_armed_idle_task_does_not_keep_the_app_alive() {
+        let mut cx = TestAppContext::single();
+        let app = Rc::downgrade(&cx.app);
+        let executor = cx.executor();
+        enqueue(&mut cx, 8193);
+        cx.run_until_parked();
+        drop(cx);
+        executor.advance_clock(Duration::from_secs(31));
+        executor.run_until_parked();
+        assert!(app.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod idle_effect_refresh_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn refresh_only_queue_also_releases(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            for _ in 0..8193 {
+                cx.refresh_windows();
+            }
+        });
+        cx.update(|cx| assert!(cx.pending_effects.capacity() >= 8193));
+        cx.executor().advance_clock(Duration::from_secs(31));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(cx.pending_effects.is_empty());
+            assert!(cx.pending_effects.capacity() <= 256);
+        });
+    }
+}
+
+#[cfg(test)]
+mod idle_effect_emit_tests {
+    use super::*;
+
+    struct Emitter;
+    impl EventEmitter<usize> for Emitter {}
+
+    #[gpui::test]
+    fn emitted_events_also_release_their_queue(cx: &mut TestAppContext) {
+        let emitter = cx.new(|_| Emitter);
+        let completed = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            cx.subscribe(&emitter, {
+                let completed = completed.clone();
+                move |_, index: &usize, _| {
+                    assert_eq!(completed.get(), *index);
+                    completed.set(completed.get() + 1);
+                }
+            }).detach();
+        });
+        emitter.update(cx, |_, cx| {
+            for index in 0..8193 {
+                cx.emit(index);
+            }
+        });
+        assert_eq!(completed.get(), 8193);
+        cx.update(|cx| assert!(cx.pending_effects.capacity() >= 8193));
+        cx.executor().advance_clock(Duration::from_secs(31));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(cx.pending_effects.is_empty());
+            assert!(cx.pending_effects.capacity() <= 256);
+        });
     }
 }
