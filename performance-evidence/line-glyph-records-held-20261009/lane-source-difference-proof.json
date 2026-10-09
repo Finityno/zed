@@ -1,0 +1,13 @@
+{
+  "source_difference": [
+    "crates/gpui/src/scene.rs",
+    "crates/gpui/src/text_system/line.rs",
+    "crates/gpui/src/window/glyph_painting.rs"
+  ],
+  "all_shared_private_fixtures_getters_profile_bodies_identical": true,
+  "scene_type_aware_logical_overlay_helper": "baseline physicalindex equals logical; candidate expands range lengths. Rawpositions retained. Predeclared beforecandidate.",
+  "baseline_noop_compaction_shim": "cfg(test) only, forpositive semantic tests. Productionbaseline unchanged.",
+  "candidate_production_bytes_except_named_getters_exact": true,
+  "original59_externs_identical": true,
+  "source": "74c131c3c0185ce1f1955f44e7ac2809b13745a9"
+}

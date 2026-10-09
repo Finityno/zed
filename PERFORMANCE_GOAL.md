@@ -197,3 +197,14 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+
+Line-sized glyph record compaction at `74c131c3c0185ce1f1955f44e7ac2809b13745a9`
+remains held. All 3,418 children preserve output and primary owner/live targets
+reduce 75–96.875% and 10.235–28.466%, but 49 ordinary CPU/elapsed/whole-child/RSS
+fields fail. Requested heap/churn controls pass, including the frozen eight-byte
+Scene header budget and standalone owner release. Preserve all evidence under
+`performance-evidence/line-glyph-records-held-20261009`; never rerun this design
+unchanged or weaken gates. No consumer adoption or app/GPU/platform gain is
+claimed. Continue with distinct cached-line-only grouping, preserving cold and
+decorated painting, independent sprite ownership and published range indices.

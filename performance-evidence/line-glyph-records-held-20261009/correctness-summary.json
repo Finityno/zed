@@ -1,0 +1,24 @@
+{
+  "common_native_passes": 624,
+  "common_children": 278,
+  "matched_frame_audit_cases": 121,
+  "separate_empty_scene_release_children": 6,
+  "expected_red_green_children": 2,
+  "zero_test_filters_explicit": [
+    {
+      "lane": "baseline",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "lane": "candidate",
+      "pattern": "window::text_glyph_cache_tests::",
+      "passed": 0,
+      "ignored": 0
+    }
+  ],
+  "cold_long_line_before_exit": 101,
+  "cold_long_line_after_exit": 0,
+  "app_GPU_platform_or_shipped_allocator_gain": false
+}

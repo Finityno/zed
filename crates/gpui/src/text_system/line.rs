@@ -553,6 +553,7 @@ fn paint_line(
             }
             None => None,
         };
+        let glyph_record_start = window.line_glyph_record_start();
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
@@ -854,6 +855,7 @@ fn paint_line(
             );
         }
 
+        window.compact_line_glyph_records(glyph_record_start);
         if let Some(recording) = recording {
             window.finish_line_glyphs(recording);
         }

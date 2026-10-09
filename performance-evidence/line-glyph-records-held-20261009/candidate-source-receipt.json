@@ -1,0 +1,12 @@
+{
+  "source": "74c131c3c0185ce1f1955f44e7ac2809b13745a9",
+  "tree": "c033378c256c831b2d25236502e207aee37f9c32",
+  "baseline": "08d5555709d7afab3936c7afcd9f7f0ff9ecbd65",
+  "files": {
+    "crates/gpui/src/scene.rs": "61d0637693e890bbf16078bba49e0905c00036a58fc3082e6ad2a24104254e21",
+    "crates/gpui/src/window/glyph_painting.rs": "b0a3f352ab62c1c20894ab5a327ada8df5ae9dd21583d3c1215c8e7d8a4f5eef",
+    "crates/gpui/src/text_system/line.rs": "f4535f8de747756acb80acc098a0efd9caab5345ad30dfd48df60541bc8fcc20",
+    "crates/gpui/src/window/view_retention/tests.rs": "6d88b07f48170fd92ce153beb8b656192cbb2c4f5eccdde690c66a478c484703"
+  },
+  "scope": "Logical glyph-range record count only, publishedprefix Atomic<=8B/Scene fixed16B/Window predeclared. Namedprivate getters normalize overlayboundary to logicalglyph operation count andpreserve originalraw metadata. Baseline no-op compaction shim onlyfor new semantic tests; not called from baselineproduction. No renderer/unsafe/heldspan orsort/flat code reused."
+}

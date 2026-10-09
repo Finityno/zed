@@ -450,6 +450,14 @@ impl Window {
         true
     }
 
+    pub(crate) fn line_glyph_record_start(&self) -> GlyphWatermark {
+        self.next_frame.scene.glyph_watermark()
+    }
+
+    pub(crate) fn compact_line_glyph_records(&mut self, start: GlyphWatermark) {
+        self.next_frame.scene.compact_line_glyph_records(start);
+    }
+
     /// Starts painting the glyphs of the line `key` describes glyph by glyph.
     pub(crate) fn record_line_glyphs(&self, key: LineGlyphsKey) -> LineGlyphsRecording {
         LineGlyphsRecording {
