@@ -197,3 +197,11 @@ percentages. Qualify coherent component/Fincode adoption separately, then
 continue with representative transcript/streaming, scrolling, editor/Review,
 multiple-panel and background-window bottlenecks. Bounded GPU scroll caching
 still needs renderer-memory, compositing and reclamation evidence.
+
+Borrowed line-color probes at `892b5e219c424e298af28a52500a1a465e9c8f77`
+remain held:2,604children/93complete App workloads meet all four churn goals
+(15.65-27.32% fewer calls;3.46-5.57% fewer requested bytes), but six retained
+highlighted CPU/elapsed/whole-child fields and two census RSS fields fail.
+Primary held/peak are unchanged; no CPU/App/GPU gain established. Preserve
+`performance-evidence/line-color-probes-held-20261009`, never rerun this design
+unchanged or weaken gates. Continue with idle replay-map retained capacity.

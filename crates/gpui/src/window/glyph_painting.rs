@@ -273,13 +273,13 @@ impl LineGlyphsLayout {
 /// strikethroughs depend on: its layout (and wrapping), where and how it is
 /// placed, the colour of each run, and what the window paints glyphs with.
 /// Two lines that agree on all of it paint the same sprites.
-pub(crate) struct LineGlyphsKey {
+pub(crate) struct LineGlyphsKey<Colors = SmallVec<[(u32, Hsla); 8]>> {
     layout: LineGlyphsLayout,
     origin: (u32, u32),
     line_height: u32,
     align: TextAlign,
     align_width: Option<u32>,
-    colors: SmallVec<[(u32, Hsla); 8]>,
+    colors: Colors,
     /// As painting asked for it, before snapping: painting culls by both.
     content_mask: ContentMask<Pixels>,
     element_opacity: u32,
@@ -287,12 +287,14 @@ pub(crate) struct LineGlyphsKey {
     rendering: (WindowBackgroundAppearance, bool, TextRenderingMode),
 }
 
-impl LineGlyphsKey {
+impl<Colors> LineGlyphsKey<Colors> {
     fn slot(&self) -> (usize, (u32, u32)) {
         (self.layout.address(), self.origin)
     }
+}
 
-    fn matches(&self, other: &Self) -> bool {
+impl LineGlyphsKey {
+    fn matches(&self, other: &LineGlyphsKey<&[DecorationRun]>) -> bool {
         self.layout.same(&other.layout)
             && self.origin == other.origin
             && self.line_height == other.line_height
@@ -306,10 +308,8 @@ impl LineGlyphsKey {
             && self
                 .colors
                 .iter()
-                .zip(&other.colors)
-                .all(|((len, color), (other_len, other_color))| {
-                    len == other_len && same_color(color, other_color)
-                })
+                .zip(other.colors)
+                .all(|((len, color), run)| *len == run.len && same_color(color, &run.color))
     }
 }
 
@@ -382,24 +382,22 @@ impl Window {
     /// What the glyph sprites of a line depend on, or `None` when it cannot
     /// be painted again from the last frame: one with an underline or
     /// strikethrough, or one painted with a text effect.
-    pub(crate) fn line_glyphs_key(
+    pub(crate) fn line_glyphs_key<'a>(
         &self,
         layout: LineGlyphsLayout,
         origin: Point<Pixels>,
         line_height: Pixels,
         align: TextAlign,
         align_width: Option<Pixels>,
-        decoration_runs: &[DecorationRun],
-    ) -> Option<LineGlyphsKey> {
+        decoration_runs: &'a [DecorationRun],
+    ) -> Option<LineGlyphsKey<&'a [DecorationRun]>> {
         if !self.text_shimmer_stack.is_empty() && !super::text_shimmer_disabled() {
             return None;
         }
-        let mut colors = SmallVec::new();
         for run in decoration_runs {
             if run.underline.is_some() || run.strikethrough.is_some() {
                 return None;
             }
-            colors.push((run.len, run.color));
         }
         Some(LineGlyphsKey {
             layout,
@@ -407,7 +405,7 @@ impl Window {
             line_height: line_height.0.to_bits(),
             align,
             align_width: align_width.map(|width| width.0.to_bits()),
-            colors,
+            colors: decoration_runs,
             content_mask: self.content_mask(),
             element_opacity: self.element_opacity().to_bits(),
             scale_factor: self.scale_factor().to_bits(),
@@ -422,7 +420,7 @@ impl Window {
     /// Paints the glyphs of the line `key` describes by copying the sprites
     /// the last frame painted for it, if it painted that line. Returns false,
     /// having painted nothing, when it did not.
-    pub(crate) fn replay_line_glyphs(&mut self, key: &LineGlyphsKey) -> bool {
+    pub(crate) fn replay_line_glyphs(&mut self, key: &LineGlyphsKey<&[DecorationRun]>) -> bool {
         let slot = key.slot();
         let Some(mut painted) = self.line_glyph_cache.previous.remove(&slot) else {
             return false;
@@ -451,9 +449,25 @@ impl Window {
     }
 
     /// Starts painting the glyphs of the line `key` describes glyph by glyph.
-    pub(crate) fn record_line_glyphs(&self, key: LineGlyphsKey) -> LineGlyphsRecording {
+    pub(crate) fn record_line_glyphs(
+        &self,
+        key: LineGlyphsKey<&[DecorationRun]>,
+    ) -> LineGlyphsRecording {
         LineGlyphsRecording {
-            key,
+            // A replay only needs to compare the caller's colors. Keep an owned
+            // copy once fresh sprites need a key that outlives this paint.
+            key: LineGlyphsKey {
+                layout: key.layout,
+                origin: key.origin,
+                line_height: key.line_height,
+                align: key.align,
+                align_width: key.align_width,
+                colors: key.colors.iter().map(|run| (run.len, run.color)).collect(),
+                content_mask: key.content_mask,
+                element_opacity: key.element_opacity,
+                scale_factor: key.scale_factor,
+                rendering: key.rendering,
+            },
             start: self.next_frame.scene.glyph_watermark(),
             unremembered_glyphs: self.glyph_raster_cache.unremembered_glyphs,
         }

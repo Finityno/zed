@@ -1,0 +1,5 @@
+{
+  "stage": "Git evidence staging",
+  "error": "Evidence files are outside sparse checkout; git add rejected them without --sparse. No commit/ref mutation or performance rerun occurred.",
+  "correction": "Explicit --sparse staging for these new owned evidence files only. Archive bytes unchanged."
+}

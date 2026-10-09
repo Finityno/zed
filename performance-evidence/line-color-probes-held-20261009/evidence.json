@@ -1,0 +1,584 @@
+{
+  "status": "HELD/unmerged; never repeat unchanged or weaken gates",
+  "qualified": false,
+  "baseline": "6b18c87dd5f2d1ccbee1ee641054295f2a78390b",
+  "source": "892b5e219c424e298af28a52500a1a465e9c8f77",
+  "fincode_main_at_freeze": "f0eb8eaaae85b9834bfe670a2b0b84e0b479b767",
+  "fincode_gpui": "95114473898ea198175ab1d4fbb72d6e66de39ca",
+  "component_pin": "3eafbc7543f04e2760644e068837d86a6dc1e030",
+  "valid_children": 2604,
+  "workloads": 93,
+  "failures": [
+    [
+      "bare",
+      "color-stream-on-200-16",
+      "cpu_ns",
+      "control",
+      5904246,
+      4032694
+    ],
+    [
+      "bare",
+      "color-stream-on-200-16",
+      "elapsed_ns",
+      "control",
+      5904149,
+      4032256
+    ],
+    [
+      "bare",
+      "color-stream-on-200-16",
+      "child_cpu_ns",
+      "control",
+      5797000,
+      5648000
+    ],
+    [
+      "bare",
+      "color-recolor-on-200-16",
+      "cpu_ns",
+      "control",
+      125157909,
+      83460768
+    ],
+    [
+      "bare",
+      "color-recolor-on-200-16",
+      "elapsed_ns",
+      "control",
+      125168891,
+      82939233
+    ],
+    [
+      "bare",
+      "color-recolor-on-200-16",
+      "child_cpu_ns",
+      "control",
+      124338000,
+      84519000
+    ],
+    [
+      "census",
+      "state-panel-keep-256",
+      "peak_rss_kib",
+      "control",
+      188,
+      68
+    ],
+    [
+      "census",
+      "state-remove-256",
+      "peak_rss_kib",
+      "control",
+      188,
+      116
+    ]
+  ],
+  "all_four_primary_churn_targets_pass": true,
+  "observed_primary": {
+    "color-redraw-off-32-16": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 103031135,
+          "candidate_median": 102491460,
+          "baseline_min": 102137932,
+          "baseline_max": 106322183,
+          "candidate_min": 101783223,
+          "candidate_max": 104940533,
+          "baseline_range": 4184251,
+          "candidate_range": 3157310,
+          "change_percent": -0.5237979762136913,
+          "allowed_increase": 4184251,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 103033098,
+          "candidate_median": 102493131,
+          "baseline_min": 102145292,
+          "baseline_max": 106876282,
+          "candidate_min": 101790483,
+          "candidate_max": 104942607,
+          "baseline_range": 4730990,
+          "candidate_range": 3152124,
+          "change_percent": -0.5240714008230674,
+          "allowed_increase": 4730990,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 114333000,
+          "candidate_median": 113532000,
+          "baseline_min": 113284000,
+          "baseline_max": 117961000,
+          "candidate_min": 112814000,
+          "candidate_max": 115588000,
+          "baseline_range": 4677000,
+          "candidate_range": 2774000,
+          "change_percent": -0.7005851329012658,
+          "allowed_increase": 4677000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 19500,
+          "candidate_median": 19316,
+          "baseline_min": 19168,
+          "baseline_max": 19576,
+          "candidate_min": 18952,
+          "candidate_max": 19776,
+          "baseline_range": 408,
+          "candidate_range": 824,
+          "change_percent": -0.9435897435897456,
+          "allowed_increase": 408,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 7082446,
+          "candidate_median": 7082446,
+          "baseline_min": 7082446,
+          "baseline_max": 7082446,
+          "candidate_min": 7082446,
+          "candidate_max": 7082446,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 7152198,
+          "candidate_median": 7152198,
+          "baseline_min": 7152198,
+          "baseline_max": 7152198,
+          "candidate_min": 7152198,
+          "candidate_max": 7152198,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 73977546,
+          "candidate_median": 71315146,
+          "baseline_min": 73977546,
+          "baseline_max": 73977546,
+          "candidate_min": 71315146,
+          "candidate_max": 71315146,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -3.5989298698824057,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 53148,
+          "candidate_median": 44828,
+          "baseline_min": 53148,
+          "baseline_max": 53148,
+          "candidate_min": 44828,
+          "candidate_max": 44828,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -15.654399036652366,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 19180,
+          "candidate_median": 19296,
+          "baseline_min": 19132,
+          "baseline_max": 19432,
+          "candidate_min": 19112,
+          "candidate_max": 19456,
+          "baseline_range": 300,
+          "candidate_range": 344,
+          "change_percent": 0.6047966631908208,
+          "allowed_increase": 300,
+          "pass": true
+        }
+      }
+    },
+    "color-redraw-off-32-32": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 123026088,
+          "candidate_median": 123564242,
+          "baseline_min": 122403709,
+          "baseline_max": 126106102,
+          "candidate_min": 121825908,
+          "candidate_max": 126973185,
+          "baseline_range": 3702393,
+          "candidate_range": 5147277,
+          "change_percent": 0.43743079923015404,
+          "allowed_increase": 3702393,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 123028208,
+          "candidate_median": 123571570,
+          "baseline_min": 122405589,
+          "baseline_max": 126107983,
+          "candidate_min": 121827747,
+          "candidate_max": 126982028,
+          "baseline_range": 3702394,
+          "candidate_range": 5154281,
+          "change_percent": 0.4416564370343323,
+          "allowed_increase": 3702394,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 135516000,
+          "candidate_median": 136079000,
+          "baseline_min": 134488000,
+          "baseline_max": 138439000,
+          "candidate_min": 133603000,
+          "candidate_max": 139185000,
+          "baseline_range": 3951000,
+          "candidate_range": 5582000,
+          "change_percent": 0.4154490982614556,
+          "allowed_increase": 3951000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 21292,
+          "candidate_median": 21180,
+          "baseline_min": 21024,
+          "baseline_max": 21344,
+          "candidate_min": 20612,
+          "candidate_max": 21420,
+          "baseline_range": 320,
+          "candidate_range": 808,
+          "change_percent": -0.526019162126623,
+          "allowed_increase": 320,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 8603550,
+          "candidate_median": 8603550,
+          "baseline_min": 8603550,
+          "baseline_max": 8603550,
+          "candidate_min": 8603550,
+          "candidate_max": 8603550,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 9522710,
+          "candidate_median": 9522710,
+          "baseline_min": 9522710,
+          "baseline_max": 9522710,
+          "candidate_min": 9522710,
+          "candidate_max": 9522710,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 143799158,
+          "candidate_median": 135791478,
+          "baseline_min": 143799158,
+          "baseline_max": 143799158,
+          "candidate_min": 135791478,
+          "candidate_max": 135791478,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -5.568655694075764,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 61572,
+          "candidate_median": 44868,
+          "baseline_min": 61572,
+          "baseline_max": 61572,
+          "candidate_min": 44868,
+          "candidate_max": 44868,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -27.12921457805496,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 20988,
+          "candidate_median": 21092,
+          "baseline_min": 20820,
+          "baseline_max": 21092,
+          "candidate_min": 20700,
+          "candidate_max": 21308,
+          "baseline_range": 272,
+          "candidate_range": 608,
+          "change_percent": 0.49552125023824,
+          "allowed_increase": 272,
+          "pass": true
+        }
+      }
+    },
+    "color-redraw-off-200-16": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 170445986,
+          "candidate_median": 169199148,
+          "baseline_min": 169736418,
+          "baseline_max": 172391308,
+          "candidate_min": 166069059,
+          "candidate_max": 169918620,
+          "baseline_range": 2654890,
+          "candidate_range": 3849561,
+          "change_percent": -0.7315150267017678,
+          "allowed_increase": 2654890,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 170447776,
+          "candidate_median": 169208600,
+          "baseline_min": 169741845,
+          "baseline_max": 172400001,
+          "candidate_min": 166070718,
+          "candidate_max": 170204566,
+          "baseline_range": 2658156,
+          "candidate_range": 4133848,
+          "change_percent": -0.7270121259898343,
+          "allowed_increase": 2658156,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 186486000,
+          "candidate_median": 184833000,
+          "baseline_min": 185329000,
+          "baseline_max": 188646000,
+          "candidate_min": 181920000,
+          "candidate_max": 185946000,
+          "baseline_range": 3317000,
+          "candidate_range": 4026000,
+          "change_percent": -0.8863936166790043,
+          "allowed_increase": 3317000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 23512,
+          "candidate_median": 23484,
+          "baseline_min": 23352,
+          "baseline_max": 23528,
+          "candidate_min": 23008,
+          "candidate_max": 23676,
+          "baseline_range": 176,
+          "candidate_range": 668,
+          "change_percent": -0.11908812521265189,
+          "allowed_increase": 176,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 11860562,
+          "candidate_median": 11860562,
+          "baseline_min": 11860562,
+          "baseline_max": 11860562,
+          "candidate_min": 11860562,
+          "candidate_max": 11860562,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 11997114,
+          "candidate_median": 11997114,
+          "baseline_min": 11997114,
+          "baseline_max": 11997114,
+          "candidate_min": 11997114,
+          "candidate_max": 11997114,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 120374830,
+          "candidate_median": 116214830,
+          "baseline_min": 120374830,
+          "baseline_max": 120374830,
+          "candidate_min": 116214830,
+          "candidate_max": 116214830,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -3.455871962602153,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 82358,
+          "candidate_median": 69358,
+          "baseline_min": 82358,
+          "baseline_max": 82358,
+          "candidate_min": 69358,
+          "candidate_max": 69358,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -15.784744651399985,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 23124,
+          "candidate_median": 23268,
+          "baseline_min": 23124,
+          "baseline_max": 23340,
+          "candidate_min": 23140,
+          "candidate_max": 23404,
+          "baseline_range": 216,
+          "candidate_range": 264,
+          "change_percent": 0.6227296315516329,
+          "allowed_increase": 216,
+          "pass": true
+        }
+      }
+    },
+    "color-redraw-off-200-32": {
+      "bare": {
+        "cpu_ns": {
+          "baseline_median": 197678175,
+          "candidate_median": 199455625,
+          "baseline_min": 197058350,
+          "baseline_max": 203561484,
+          "candidate_min": 197101134,
+          "candidate_max": 201610976,
+          "baseline_range": 6503134,
+          "candidate_range": 4509842,
+          "change_percent": 0.899163501484157,
+          "allowed_increase": 6503134,
+          "pass": true
+        },
+        "elapsed_ns": {
+          "baseline_median": 197691451,
+          "candidate_median": 199461716,
+          "baseline_min": 197063989,
+          "baseline_max": 203575078,
+          "candidate_min": 197108100,
+          "candidate_max": 201624974,
+          "baseline_range": 6511089,
+          "candidate_range": 4516874,
+          "change_percent": 0.8954686664725875,
+          "allowed_increase": 6511089,
+          "pass": true
+        },
+        "child_cpu_ns": {
+          "baseline_median": 215046000,
+          "candidate_median": 215955000,
+          "baseline_min": 213762000,
+          "baseline_max": 220458000,
+          "candidate_min": 213989000,
+          "candidate_max": 219351000,
+          "baseline_range": 6696000,
+          "candidate_range": 5362000,
+          "change_percent": 0.4227002594793694,
+          "allowed_increase": 6696000,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 25784,
+          "candidate_median": 25844,
+          "baseline_min": 25456,
+          "baseline_max": 25848,
+          "candidate_min": 25412,
+          "candidate_max": 25972,
+          "baseline_range": 392,
+          "candidate_range": 560,
+          "change_percent": 0.23270245113249377,
+          "allowed_increase": 392,
+          "pass": true
+        }
+      },
+      "census": {
+        "held_bytes": {
+          "baseline_median": 12682898,
+          "candidate_median": 12682898,
+          "baseline_min": 12682898,
+          "baseline_max": 12682898,
+          "candidate_min": 12682898,
+          "candidate_max": 12682898,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_bytes": {
+          "baseline_median": 15540582,
+          "candidate_median": 15540582,
+          "baseline_min": 15540582,
+          "baseline_max": 15540582,
+          "candidate_min": 15540582,
+          "candidate_max": 15540582,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": 0.0,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "requested_bytes": {
+          "baseline_median": 227480210,
+          "candidate_median": 214969810,
+          "baseline_min": 227480210,
+          "baseline_max": 227480210,
+          "candidate_min": 214969810,
+          "candidate_max": 214969810,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -5.49955532395543,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "allocation_calls": {
+          "baseline_median": 95515,
+          "candidate_median": 69420,
+          "baseline_min": 95515,
+          "baseline_max": 95515,
+          "candidate_min": 69420,
+          "candidate_max": 69420,
+          "baseline_range": 0,
+          "candidate_range": 0,
+          "change_percent": -27.32031618070461,
+          "allowed_increase": 0,
+          "pass": true
+        },
+        "peak_rss_kib": {
+          "baseline_median": 25504,
+          "candidate_median": 25580,
+          "baseline_min": 25468,
+          "baseline_max": 25632,
+          "candidate_min": 25384,
+          "candidate_max": 25692,
+          "baseline_range": 164,
+          "candidate_range": 308,
+          "change_percent": 0.29799247176913735,
+          "allowed_increase": 164,
+          "pass": true
+        }
+      }
+    }
+  },
+  "important_gain_not_qualified": "15.65-27.32% fewer complete App allocation calls,3.46-5.57% fewer requested bytes. Four primary held/peak medians unchanged; CPU below variation. Six retained highlighted stream/recolor CPU/elapsed/whole-child controls and two census RSS controls fail. No merge/adoption qualified.",
+  "mechanism": "Borrow DecorationRun colors for existing sprite-replay probe; keep owned SmallVec only when recording fresh sprites. No added App/Window/owned-key fields or GPU resources. Existing atlas safety and glyph-only rules unchanged. This differs from held earlier whole-cache designs: current main owns independent replay already.",
+  "correctness": "38 final native invocations pass expected baseline red/candidate green. Real canvas paint allocation test baseline960 requested bytes/two calls versus candidatezero; original invalid idle-phase failures never counted as red. App1896/Window12944/owned-key232 exactly equal.140colored four-lane functional children and all2604paired scene/state/replay outputs match; text,1200frame retirement guard, Scene/App/Subscriber/cursor/read/nested/retained/wheel/layout contracts preserved.",
+  "protocol": "Four final sequential native builds48.68/49.18/49.54/48.35s, then1674alternating bare children678.68s, then930counting children211.18s. Same59immutableexterns/compiler/System/root/lock/source/runtime/binary identities reverified after phases. No performance rerun. Frozen gain goals and timed fixtures unchanged throughout.",
+  "attribution": "16 current-main complete colored App/Window owner children:9/16run key allocatesonce per probe,32run twice,<=8runszero. Scoped3200/6400calls13.61/23.65%ofcomplete32iteration fixturecalls; typical retained unchanged views skip paint. Owned editor builds arbitrary consecutive highlight spans. No app ownership projection from these component counts.",
+  "adverse_setup": "Source materialization/sparse .cargo/symlink recopies preserved. First diagnostic parser rejected successful child because harness prefix preceded owner marker; exact original child was reparsed, never rerun. Private census regression initially lacked AppContext import, then incorrectly queried mask outside paint; all invalid source/binaries/contracts preserved. Corrected real-paint helper before any paired performance sample. Production892b5e2 and policy/timed fixtures unchanged; original and corrected helper hashes retained.",
+  "coverage_limit": "Recolor fixture notifies200rows individually, causing many more draws than a batched theme change; keep costs as notification-burst control. Four warmups and whole App creation included in census; native timing loop separate. All results Linux fake platform/text/renderer and System, not Fincode whole app, GPU, macOS/Windows or shipped allocator. Existing merged replay itself not qualified against previous main by this comparison.",
+  "not_run": "Owning strict Clippy, guards, PR, merge and coherent consumer adoption withheld because performance controls fail.",
+  "policy_sha256": "f1c419a535044f453b409ed56b49b6f44984f6f9d39e0eb8a232833e58cba742",
+  "archive_sha256": "10e7aecc95878e92e4c4efd5899d3c50db2fb51586d3dbe5827fad610be7913b",
+  "archive_bytes": 1050620,
+  "members": 3064
+}
