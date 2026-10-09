@@ -1195,7 +1195,6 @@ impl DrawOrderScratch {
     }
 }
 
-/// The widest digit [`radix_sort`] sorts by in one pass.
 const RADIX_DIGIT_BITS_MAX: u32 = 11;
 
 /// Sorts `keys` stably by their bits in `bits`, a digit at a time, through
