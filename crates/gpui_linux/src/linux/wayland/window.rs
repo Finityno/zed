@@ -676,6 +676,13 @@ impl WaylandWindowState {
         }
     }
 
+    /// A hidden window whose surface was released has nothing to present
+    /// to: its frames neither draw nor retry until it is shown again, when
+    /// the configure that restores the surface requests a forced redraw.
+    fn surface_parked(&self) -> bool {
+        !self.visibility.is_visible() && self.renderer.is_unconfigured()
+    }
+
     fn restore_surface(&mut self) {
         if !self.renderer.is_unconfigured() {
             return;
@@ -973,6 +980,13 @@ impl WaylandWindowStatePtr {
 
         let frame_loop = self.frame_loop.get();
         if frame_loop == FrameLoop::AwaitingCallback {
+            return;
+        }
+
+        // Retrying would fail the same way until the window is shown, and a
+        // suspended surface gets no frame callback to pace the retries.
+        if state.surface_parked() {
+            self.frame_loop.set(FrameLoop::Parked);
             return;
         }
 
@@ -2003,6 +2017,13 @@ impl PlatformWindow for WaylandWindow {
         // the first frame of a shown window reconfigures before drawing.
         if state.visibility.is_visible() {
             state.restore_surface();
+        } else if state.surface_parked() {
+            // Not a failed presentation, so the presentation state is kept.
+            // The redraw request is dropped rather than latched: a latched one
+            // would force a full render on every frame while hidden, and the
+            // configure that shows the window requests its own.
+            state.redraw_requested = false;
+            return;
         }
 
         // Surface state changed during this GPUI tick is included in this presentation.
