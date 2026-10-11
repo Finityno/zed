@@ -12,7 +12,7 @@ use cocoa::{
         NSApplication, NSBackingStoreBuffered, NSColor, NSControl as _, NSEvent,
         NSEventModifierFlags, NSEventType,
         NSFilenamesPboardType, NSMenu, NSMenuItem, NSPasteboard, NSRequestUserAttentionType,
-        NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
+        NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
         NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
         NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
@@ -2257,7 +2257,7 @@ impl PlatformWindow for MacWindow {
                 } else if opaque_window {
                     // Mica: a plain, natively-configured visual effect
                     // view with the real sidebar material. BlurredView's
-                    // Selection material + stripped backdrop layers are
+                    // Window material + stripped backdrop layers are
                     // tuned for the colorless non-opaque blur; what
                     // remains of them in an opaque window renders as a
                     // glowing wash instead of glass.
@@ -4605,9 +4605,9 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
-        // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        // Selection has no backdrop layer on macOS 27. Strip tint from a window material instead.
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
+        NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
         view
     }
