@@ -1421,6 +1421,15 @@ pub struct WindowProfiler {
     last_draw: Option<FrameTiming>,
 }
 
+/// Every per-window histogram keeps two significant digits. Three made each
+/// one 160-480 KiB once it held frame-scale nanosecond values, several per
+/// window, landing on the UI thread's large pages; two keep each under 40 KiB
+/// while bounding any reported quantile's error at under 1%.
+#[cfg(feature = "profiler")]
+fn new_window_histogram(name: &str) -> anyhow::Result<Histogram<u64>> {
+    Histogram::new(2).map_err(|error| anyhow::anyhow!("Failed to create {name} histogram: {error}"))
+}
+
 #[cfg(feature = "profiler")]
 impl WindowProfiler {
     /// Creates a profiler for a window.
@@ -1429,23 +1438,13 @@ impl WindowProfiler {
             window_id,
             active_activities: SmallVec::new(),
             active_actions: SmallVec::new(),
-            dirty_to_present_histogram: Histogram::new(3).map_err(|error| {
-                anyhow::anyhow!("Failed to create dirty-to-present histogram: {error}")
-            })?,
-            draw_duration_histogram: Histogram::new(3).map_err(|error| {
-                anyhow::anyhow!("Failed to create draw duration histogram: {error}")
-            })?,
-            present_interval_histogram: Histogram::new(3).map_err(|error| {
-                anyhow::anyhow!("Failed to create present interval histogram: {error}")
-            })?,
+            dirty_to_present_histogram: new_window_histogram("dirty-to-present")?,
+            draw_duration_histogram: new_window_histogram("draw duration")?,
+            present_interval_histogram: new_window_histogram("present interval")?,
             first_input_at: None,
             pending_input_count: 0,
-            input_latency_histogram: Histogram::new(3).map_err(|error| {
-                anyhow::anyhow!("Failed to create input latency histogram: {error}")
-            })?,
-            events_per_frame_histogram: Histogram::new(3).map_err(|error| {
-                anyhow::anyhow!("Failed to create events per frame histogram: {error}")
-            })?,
+            input_latency_histogram: new_window_histogram("input latency")?,
+            events_per_frame_histogram: new_window_histogram("events per frame")?,
             mid_draw_events_dropped: 0,
             last_present_at: None,
             animating_at_last_present: false,
