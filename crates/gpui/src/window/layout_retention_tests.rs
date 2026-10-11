@@ -2012,10 +2012,12 @@ fn lines_whose_glyphs_reach_into_the_clip_are_painted() {
             window.line_glyph_cache.lines_painted_last_draw()
         })
         .unwrap();
-    // A 40 px font's glyphs rise far above a 4 px line box, so lines whose
-    // boxes start 50 px below the clip still put ink inside it.
+    // The test font's box reaches 44.8 px above the baseline at 40 px, and
+    // a 4 px line puts the baseline 17 px below the top of its box, so ink
+    // rises 27.8 px above the box: the lines whose boxes start before 87.8 px,
+    // the first 22, put ink inside the 60 px clip.
     assert!(
-        painted >= (60 + 50) / 4,
+        painted >= 22,
         "only {painted} lines painted, though glyphs of lines below the clip reach into it"
     );
     assert!(painted < 200, "every line painted into a 60 px clip");
