@@ -4062,6 +4062,10 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        if self.layout_engine.as_mut().unwrap().shrink_after_low_use() {
+            // As after an idle reclaim: the records name nodes of the old tree.
+            self.rendered_frame.retained_views.forget_layouts();
+        }
         self.scene_animates
             .set(self.rendered_frame.scene.has_time_animations());
         self.scene_transitioning
