@@ -362,6 +362,12 @@ impl LineGlyphCache {
         self.current.clear();
     }
 
+    /// How many lines the last finished draw painted.
+    #[cfg(test)]
+    pub(crate) fn lines_painted_last_draw(&self) -> usize {
+        self.previous.len()
+    }
+
     /// Forgets the lines of the last frame, whose sprites may name tiles the
     /// atlas has retired.
     pub(crate) fn forget_previous(&mut self) {

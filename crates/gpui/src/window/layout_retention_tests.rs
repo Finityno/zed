@@ -1949,3 +1949,76 @@ fn text_in_a_box_snapped_narrower_keeps_its_lines() {
         "{lines} lines paint {painted:?} tall into {bounds:?}"
     );
 }
+
+/// A long block clipped to a few lines paints the glyphs of those lines
+/// and their neighbours, not every line it holds: sprites outside the clip
+/// were always dropped, but each line's glyphs were still worked out.
+#[test]
+fn lines_outside_the_clip_are_not_painted() {
+    struct Block;
+    impl Render for Block {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let text = (0..200)
+                .map(|line| format!("line {line:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            div()
+                .h(px(60.))
+                .overflow_hidden()
+                .child(div().child(SharedString::from(text)))
+        }
+    }
+
+    let mut cx = text_system_context(0);
+    let window = cx.add_window(|_, _| Block);
+    let painted = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.line_glyph_cache.lines_painted_last_draw()
+        })
+        .unwrap();
+    assert!(painted > 0, "the visible lines are painted");
+    assert!(
+        painted < 20,
+        "{painted} of 200 lines painted into a 60 px clip"
+    );
+}
+
+/// With a line height far tighter than the font, glyphs overhang their line
+/// box by several lines, and the lines they belong to are painted.
+#[test]
+fn lines_whose_glyphs_reach_into_the_clip_are_painted() {
+    struct TightBlock;
+    impl Render for TightBlock {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let text = (0..200)
+                .map(|line| format!("line {line:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            div().h(px(60.)).overflow_hidden().child(
+                div()
+                    .text_size(px(40.))
+                    .line_height(px(4.))
+                    .child(SharedString::from(text)),
+            )
+        }
+    }
+
+    let mut cx = text_system_context(0);
+    let window = cx.add_window(|_, _| TightBlock);
+    let painted = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.line_glyph_cache.lines_painted_last_draw()
+        })
+        .unwrap();
+    // The test font's box reaches 44.8 px above the baseline at 40 px, and
+    // a 4 px line puts the baseline 17 px below the top of its box, so ink
+    // rises 27.8 px above the box: the lines whose boxes start before 87.8 px,
+    // the first 22, put ink inside the 60 px clip.
+    assert!(
+        painted >= 22,
+        "only {painted} lines painted, though glyphs of lines below the clip reach into it"
+    );
+    assert!(painted < 200, "every line painted into a 60 px clip");
+}
