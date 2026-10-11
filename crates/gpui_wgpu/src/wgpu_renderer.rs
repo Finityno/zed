@@ -8,6 +8,7 @@ use gpui::{
     quad_depth,
 };
 use log::warn;
+use parking_lot::Mutex;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smallvec::SmallVec;
@@ -15,7 +16,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -163,6 +164,69 @@ struct WgpuPipelines {
     paths: OnceLock<wgpu::RenderPipeline>,
     poly_sprites: OnceLock<wgpu::RenderPipeline>,
     factory: PipelineFactory,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct PipelineKey {
+    surface_format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    path_sample_count: u32,
+    depth_format: wgpu::TextureFormat,
+    dual_source_blending: bool,
+    uses_webgl_instance_data: bool,
+}
+
+/// Compiled pipelines shared by every window rendering to the same device
+/// with the same surface configuration. Compiling is most of renderer
+/// creation, and software drivers keep megabytes of generated code per
+/// pipeline set, so a second window reuses the first one's set instead of
+/// compiling its own. Entries are weak: a set goes away with the last window
+/// using it. Device recovery builds a new context, and with it a new cache.
+#[derive(Default)]
+pub(crate) struct PipelineCache {
+    // One set of layouts for every window, so each window's bind groups match
+    // whichever pipeline set it is handed.
+    layouts: OnceLock<WgpuBindGroupLayouts>,
+    entries: Mutex<Vec<(PipelineKey, Weak<WgpuPipelines>)>>,
+}
+
+impl PipelineCache {
+    fn layouts(
+        &self,
+        device: &wgpu::Device,
+        uses_webgl_instance_data: bool,
+    ) -> WgpuBindGroupLayouts {
+        self.layouts
+            .get_or_init(|| {
+                WgpuRendererCore::create_bind_group_layouts(device, uses_webgl_instance_data)
+            })
+            .clone()
+    }
+
+    fn get_or_create(&self, device: &wgpu::Device, key: PipelineKey) -> Arc<WgpuPipelines> {
+        let layouts = self.layouts(device, key.uses_webgl_instance_data);
+        let mut entries = self.entries.lock();
+        entries.retain(|(_, pipelines)| pipelines.strong_count() > 0);
+        if let Some(pipelines) = entries
+            .iter()
+            .find(|(entry_key, _)| *entry_key == key)
+            .and_then(|(_, pipelines)| pipelines.upgrade())
+        {
+            return pipelines;
+        }
+        let pipelines = Arc::new(WgpuRendererCore::create_pipelines(
+            device,
+            &layouts,
+            key.surface_format,
+            key.alpha_mode,
+            key.path_sample_count,
+            key.depth_format,
+            key.dual_source_blending,
+            key.uses_webgl_instance_data,
+        ));
+        entries.push((key, Arc::downgrade(&pipelines)));
+        pipelines
+    }
 }
 
 struct PipelineFactory {
@@ -392,7 +456,8 @@ enum InstanceData {
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    pipelines: WgpuPipelines,
+    pipelines: Arc<WgpuPipelines>,
+    pipeline_cache: Arc<PipelineCache>,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
@@ -1409,15 +1474,16 @@ impl WgpuRenderer {
             return;
         };
         let resources = &mut core.resources;
-        resources.pipelines = WgpuRendererCore::create_pipelines(
+        resources.pipelines = resources.pipeline_cache.get_or_create(
             &resources.device,
-            &resources.bind_group_layouts,
-            format,
-            new_alpha_mode,
-            core.rendering_params.path_sample_count,
-            core.rendering_params.depth_format,
-            core.dual_source_blending,
-            core.uses_webgl_instance_data,
+            PipelineKey {
+                surface_format: format,
+                alpha_mode: new_alpha_mode,
+                path_sample_count: core.rendering_params.path_sample_count,
+                depth_format: core.rendering_params.depth_format,
+                dual_source_blending: core.dual_source_blending,
+                uses_webgl_instance_data: core.uses_webgl_instance_data,
+            },
         );
 
         if let RendererState::Ready { surface, core } = &self.state {
@@ -1569,17 +1635,18 @@ impl WgpuRendererCore {
         }
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
-        let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
-        let pipelines = Self::create_pipelines(
-            &device,
-            &bind_group_layouts,
-            target_format,
+        let key = PipelineKey {
+            surface_format: target_format,
             alpha_mode,
-            rendering_params.path_sample_count,
-            rendering_params.depth_format,
+            path_sample_count: rendering_params.path_sample_count,
+            depth_format: rendering_params.depth_format,
             dual_source_blending,
             uses_webgl_instance_data,
-        );
+        };
+        let pipelines = context.pipeline_cache.get_or_create(&device, key);
+        let bind_group_layouts = context
+            .pipeline_cache
+            .layouts(&device, uses_webgl_instance_data);
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -1689,6 +1756,7 @@ impl WgpuRendererCore {
                 device,
                 queue,
                 pipelines,
+                pipeline_cache: Arc::clone(&context.pipeline_cache),
                 bind_group_layouts,
                 atlas_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
@@ -3837,6 +3905,56 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_on_one_device_share_compiled_pipelines() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let format = renderer.core.target_format;
+        let second = WgpuRendererCore::new(
+            &renderer.context,
+            renderer.core.atlas.clone(),
+            format,
+            wgpu::CompositeAlphaMode::Opaque,
+        );
+        assert!(Arc::ptr_eq(
+            &renderer.core.resources.pipelines,
+            &second.resources.pipelines
+        ));
+
+        // A pipeline one window compiles on first use is there for the other.
+        let mut path_scene = Scene::default();
+        path_scene.insert_primitive(red_square_path(16.0));
+        path_scene.finish();
+        renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
+        assert!(second.resources.pipelines.paths.get().is_some());
+
+        let third = WgpuRendererCore::new(
+            &renderer.context,
+            renderer.core.atlas.clone(),
+            format,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+        );
+        assert!(!Arc::ptr_eq(
+            &renderer.core.resources.pipelines,
+            &third.resources.pipelines
+        ));
+
+        let live_sets = |renderer: &WgpuHeadlessRenderer| {
+            renderer
+                .context
+                .pipeline_cache
+                .entries
+                .lock()
+                .iter()
+                .filter(|(_, pipelines)| pipelines.strong_count() > 0)
+                .count()
+        };
+        assert_eq!(live_sets(&renderer), 2);
+        drop(third);
+        drop(second);
+        assert_eq!(live_sets(&renderer), 1);
+        Ok(())
+    }
+
     #[test]
     fn rare_pipelines_are_compiled_on_first_draw() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
