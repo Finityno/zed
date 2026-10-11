@@ -1983,3 +1983,40 @@ fn lines_outside_the_clip_are_not_painted() {
         "{painted} of 200 lines painted into a 60 px clip"
     );
 }
+
+/// With a line height far tighter than the font, glyphs overhang their line
+/// box by several lines, and the lines they belong to are painted.
+#[test]
+fn lines_whose_glyphs_reach_into_the_clip_are_painted() {
+    struct TightBlock;
+    impl Render for TightBlock {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let text = (0..200)
+                .map(|line| format!("line {line:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            div().h(px(60.)).overflow_hidden().child(
+                div()
+                    .text_size(px(40.))
+                    .line_height(px(4.))
+                    .child(SharedString::from(text)),
+            )
+        }
+    }
+
+    let mut cx = text_system_context(0);
+    let window = cx.add_window(|_, _| TightBlock);
+    let painted = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.line_glyph_cache.lines_painted_last_draw()
+        })
+        .unwrap();
+    // A 40 px font's glyphs rise far above a 4 px line box, so lines whose
+    // boxes start 50 px below the clip still put ink inside it.
+    assert!(
+        painted >= (60 + 50) / 4,
+        "only {painted} lines painted, though glyphs of lines below the clip reach into it"
+    );
+    assert!(painted < 200, "every line painted into a 60 px clip");
+}

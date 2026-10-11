@@ -949,6 +949,25 @@ struct TextLayoutInner {
     measured_by: measurement::MeasuredBy,
 }
 
+/// How far past its line box any glyph of `lines` can put ink: the height of
+/// the tallest font's bounding box with its offset from the baseline and its
+/// descent, which bounds the ink wherever the baseline sits in the box, plus
+/// the antialiasing skirt the glyph cull in `text_system::line` allows.
+fn ink_overhang(lines: &[WrappedLine], window: &mut Window) -> Pixels {
+    let mut overhang = px(0.);
+    for line in lines {
+        let layout = &line.unwrapped_layout;
+        for run in &layout.runs {
+            let extents = window.font_extents(run.font_id, layout.font_size);
+            let reach = extents.bounding_box.size.height
+                + extents.bounding_box.origin.y.abs()
+                + extents.descent.abs();
+            overhang = overhang.max(reach);
+        }
+    }
+    overhang + px(2.)
+}
+
 impl TextLayout {
     fn layout(
         &self,
@@ -1001,20 +1020,26 @@ impl TextLayout {
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
         // Lines outside the clip paint nothing visible, and a long block in a
-        // scrolled container would otherwise shape every glyph of every line
-        // each frame. A line height of slack keeps glyphs that overhang their
-        // line box (tall marks, emoji) painted at the clip's edges.
+        // scrolled container would otherwise paint every glyph of every line
+        // each frame. Glyphs can overhang their line box, by more than a line
+        // when the line height is tighter than the font, so a line is only
+        // skipped once it is further from the clip than any of the block's
+        // fonts can reach, which is asked for only when a line could be.
         let visible = window.content_mask().bounds;
-        let visible_top = visible.top() - line_height;
-        let visible_bottom = visible.bottom() + line_height;
+        let mut slack = None;
         for line in &element_state.lines {
             let height = line.size(line_height).height;
-            if line_origin.y > visible_bottom {
-                break;
-            }
-            if line_origin.y + height < visible_top {
-                line_origin.y += height;
-                continue;
+            if line_origin.y > visible.bottom() || line_origin.y + height < visible.top() {
+                let slack = *slack.get_or_insert_with(|| {
+                    ink_overhang(&element_state.lines, window).max(line_height)
+                });
+                if line_origin.y > visible.bottom() + slack {
+                    break;
+                }
+                if line_origin.y + height < visible.top() - slack {
+                    line_origin.y += height;
+                    continue;
+                }
             }
             line.paint_background(
                 line_origin,
