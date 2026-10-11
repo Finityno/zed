@@ -2,7 +2,7 @@ use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
     Style, Window, size,
     util::{
-        MIN_RETAINED_CAPACITY, ceil_to_device_pixel, round_half_toward_zero,
+        CapacityShrink, MIN_RETAINED_CAPACITY, ceil_to_device_pixel, round_half_toward_zero,
         round_stroke_to_device_pixel, round_to_device_pixel,
     },
 };
@@ -52,6 +52,7 @@ pub struct TaffyLayoutEngine {
     /// unless [`Self::reclaim_idle_capacity`] rebuilds the tree.
     last_frame_node_count: usize,
     node_high_water: usize,
+    low_use: CapacityShrink,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -70,6 +71,7 @@ impl TaffyLayoutEngine {
             layout_bounds_scratch_space: Vec::new(),
             last_frame_node_count: 0,
             node_high_water: 0,
+            low_use: CapacityShrink::default(),
         }
     }
 
@@ -103,9 +105,33 @@ impl TaffyLayoutEngine {
             .last_frame_node_count
             .saturating_mul(2)
             .max(MIN_RETAINED_CAPACITY);
+        self.rebuild(target)
+    }
+
+    /// Rebuilds the cleared tree like [`Self::reclaim_idle_capacity`] once
+    /// `SHRINK_AFTER_FRAMES` frames in a row have used at most half of it,
+    /// sized to twice the most any of them used.
+    ///
+    /// A window that never stops drawing, such as one with a blinking caret
+    /// or a spinner, is never quiet for long enough to reclaim, so the tree
+    /// would keep the largest frame it ever laid out. The next frame lays
+    /// out afresh, which is one full layout per shrink. Returns whether it
+    /// rebuilt.
+    pub fn shrink_after_low_use(&mut self) -> bool {
+        match self
+            .low_use
+            .record(self.last_frame_node_count, self.node_high_water)
+        {
+            Some(target) => self.rebuild(target),
+            None => false,
+        }
+    }
+
+    fn rebuild(&mut self, target: usize) -> bool {
         if self.node_high_water <= target {
             return false;
         }
+        self.low_use = CapacityShrink::default();
         let mut taffy = TaffyTree::with_capacity(target);
         taffy.disable_rounding();
         self.taffy = taffy;
@@ -929,6 +955,42 @@ mod tests {
         engine.clear();
         assert!(engine.reclaim_idle_capacity());
         assert_eq!(engine.node_high_water(), 200);
+    }
+
+    /// A window that keeps drawing small frames, as one with a blinking
+    /// caret does, never goes quiet for the idle rebuild; after
+    /// `SHRINK_AFTER_FRAMES` frames that used at most half of the tree, it is
+    /// rebuilt at twice the most any of them used.
+    #[test]
+    fn low_use_frames_rebuild_a_window_that_keeps_drawing() {
+        let mut engine = TaffyLayoutEngine::new();
+        request_leaves(&mut engine, 10_000);
+        engine.clear();
+        assert!(!engine.shrink_after_low_use());
+
+        for frame in 1..crate::util::SHRINK_AFTER_FRAMES {
+            request_leaves(&mut engine, if frame == 7 { 150 } else { 100 });
+            engine.clear();
+            assert!(!engine.shrink_after_low_use());
+        }
+        // A frame that fills more than half of the tree starts the run over.
+        request_leaves(&mut engine, 6_000);
+        engine.clear();
+        assert!(!engine.shrink_after_low_use());
+        assert_eq!(engine.node_high_water(), 10_000);
+
+        for frame in 1..=crate::util::SHRINK_AFTER_FRAMES {
+            request_leaves(&mut engine, if frame == 7 { 150 } else { 100 });
+            engine.clear();
+            let rebuilt = engine.shrink_after_low_use();
+            assert_eq!(rebuilt, frame == crate::util::SHRINK_AFTER_FRAMES);
+        }
+        assert_eq!(engine.node_high_water(), 300);
+
+        request_leaves(&mut engine, 100);
+        assert_eq!(engine.taffy.total_node_count(), 100);
+        engine.clear();
+        assert!(!engine.shrink_after_low_use());
     }
 
     #[test]
