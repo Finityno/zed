@@ -1000,7 +1000,22 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
+        // Lines outside the clip paint nothing visible, and a long block in a
+        // scrolled container would otherwise shape every glyph of every line
+        // each frame. A line height of slack keeps glyphs that overhang their
+        // line box (tall marks, emoji) painted at the clip's edges.
+        let visible = window.content_mask().bounds;
+        let visible_top = visible.top() - line_height;
+        let visible_bottom = visible.bottom() + line_height;
         for line in &element_state.lines {
+            let height = line.size(line_height).height;
+            if line_origin.y > visible_bottom {
+                break;
+            }
+            if line_origin.y + height < visible_top {
+                line_origin.y += height;
+                continue;
+            }
             line.paint_background(
                 line_origin,
                 line_height,
@@ -1019,7 +1034,7 @@ impl TextLayout {
                 cx,
             )
             .log_err();
-            line_origin.y += line.size(line_height).height;
+            line_origin.y += height;
         }
     }
 
