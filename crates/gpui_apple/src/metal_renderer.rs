@@ -37,7 +37,7 @@ use std::{
     ops::Range,
     ptr, slice,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU32, Ordering},
     },
     time::Instant,
@@ -246,20 +246,7 @@ pub struct MetalRenderer {
     opaque: bool,
     command_queue: CommandQueue,
     unfinished_submissions: Arc<AtomicU32>,
-    paths_rasterization_pipeline_state: metal::RenderPipelineState,
-    path_sprites_pipeline_state: metal::RenderPipelineState,
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    // Same as `quads_pipeline_state` but preserves the destination alpha, used
-    // for quads painted as glass content (see `Styled::glass`).
-    quads_glass_pipeline_state: metal::RenderPipelineState,
-    opaque_quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
-    surfaces_pipeline_state: metal::RenderPipelineState,
-    depth_write_state: metal::DepthStencilState,
-    depth_test_state: metal::DepthStencilState,
+    pipelines: Arc<MetalPipelines>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -349,6 +336,161 @@ impl PathBatchSlot {
         },
         empty: true,
     };
+}
+
+/// The shader library and pipeline states, which depend only on the device.
+/// Every renderer on a device shares one set: a window and its overlay
+/// renderer, and every other window, would otherwise each load the library
+/// and build all of these again.
+struct MetalPipelines {
+    paths_rasterization_pipeline_state: metal::RenderPipelineState,
+    path_sprites_pipeline_state: metal::RenderPipelineState,
+    shadows_pipeline_state: metal::RenderPipelineState,
+    quads_pipeline_state: metal::RenderPipelineState,
+    // Same as `quads_pipeline_state` but preserves the destination alpha, used
+    // for quads painted as glass content (see `Styled::glass`).
+    quads_glass_pipeline_state: metal::RenderPipelineState,
+    opaque_quads_pipeline_state: metal::RenderPipelineState,
+    underlines_pipeline_state: metal::RenderPipelineState,
+    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    surfaces_pipeline_state: metal::RenderPipelineState,
+    depth_write_state: metal::DepthStencilState,
+    depth_test_state: metal::DepthStencilState,
+}
+
+/// Weak, so a device's set goes away with the last renderer using it.
+static SHARED_PIPELINES: Mutex<Vec<(u64, Weak<MetalPipelines>)>> = Mutex::new(Vec::new());
+
+impl MetalPipelines {
+    fn shared(device: &metal::Device) -> Arc<Self> {
+        let registry_id = device.registry_id();
+        let mut shared = SHARED_PIPELINES.lock();
+        shared.retain(|(_, pipelines)| pipelines.strong_count() > 0);
+        if let Some(pipelines) = shared
+            .iter()
+            .find(|(id, _)| *id == registry_id)
+            .and_then(|(_, pipelines)| pipelines.upgrade())
+        {
+            return pipelines;
+        }
+        let pipelines = Arc::new(Self::new(device));
+        shared.push((registry_id, Arc::downgrade(&pipelines)));
+        pipelines
+    }
+
+    fn new(device: &metal::Device) -> Self {
+        #[cfg(feature = "runtime_shaders")]
+        let library = device
+            .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
+            .expect("error building metal library");
+        #[cfg(not(feature = "runtime_shaders"))]
+        let library = device
+            .new_library_with_data(SHADERS_METALLIB)
+            .expect("error building metal library");
+
+        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
+            device,
+            &library,
+            "paths_rasterization",
+            "path_rasterization_vertex",
+            "path_rasterization_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            PATH_SAMPLE_COUNT,
+        );
+        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
+            device,
+            &library,
+            "path_sprites",
+            "path_sprite_vertex",
+            "path_sprite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let shadows_pipeline_state = build_pipeline_state(
+            device,
+            &library,
+            "shadows",
+            "shadow_vertex",
+            "shadow_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let quads_pipeline_state = build_pipeline_state(
+            device,
+            &library,
+            "quads",
+            "quad_vertex",
+            "quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let quads_glass_pipeline_state = build_pipeline_state_with_blend(
+            device,
+            &library,
+            "quads_glass",
+            "quad_vertex",
+            "quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            metal::MTLBlendFactor::Zero,
+            metal::MTLBlendFactor::One,
+        );
+        let opaque_quads_pipeline_state = build_opaque_quads_pipeline_state(
+            device,
+            &library,
+            "opaque_quads",
+            "opaque_quad_vertex",
+            "opaque_quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let underlines_pipeline_state = build_pipeline_state(
+            device,
+            &library,
+            "underlines",
+            "underline_vertex",
+            "underline_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let monochrome_sprites_pipeline_state = build_pipeline_state(
+            device,
+            &library,
+            "monochrome_sprites",
+            "monochrome_sprite_vertex",
+            "monochrome_sprite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let polychrome_sprites_pipeline_state = build_pipeline_state(
+            device,
+            &library,
+            "polychrome_sprites",
+            "polychrome_sprite_vertex",
+            "polychrome_sprite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let surfaces_pipeline_state = build_pipeline_state(
+            device,
+            &library,
+            "surfaces",
+            "surface_vertex",
+            "surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+
+        let depth_write_state = build_depth_stencil_state(device, true);
+        let depth_test_state = build_depth_stencil_state(device, false);
+
+        Self {
+            paths_rasterization_pipeline_state,
+            path_sprites_pipeline_state,
+            shadows_pipeline_state,
+            quads_pipeline_state,
+            quads_glass_pipeline_state,
+            opaque_quads_pipeline_state,
+            underlines_pipeline_state,
+            monochrome_sprites_pipeline_state,
+            polychrome_sprites_pipeline_state,
+            surfaces_pipeline_state,
+            depth_write_state,
+            depth_test_state,
+        }
+    }
 }
 
 /// The drawable-sized textures a frame renders through, moved between a
@@ -545,15 +687,6 @@ impl MetalRenderer {
         shared_sprite_atlas: Option<Arc<MetalAtlas>>,
         shared_command_queue: Option<CommandQueue>,
     ) -> Self {
-        #[cfg(feature = "runtime_shaders")]
-        let library = device
-            .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
-            .expect("error building metal library");
-        #[cfg(not(feature = "runtime_shaders"))]
-        let library = device
-            .new_library_with_data(SHADERS_METALLIB)
-            .expect("error building metal library");
-
         fn to_float2_bits(point: PointF) -> u64 {
             let mut output = point.y.to_bits() as u64;
             output <<= 32;
@@ -589,92 +722,7 @@ impl MetalRenderer {
             },
         );
 
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &device,
-            &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        );
-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &library,
-            "path_sprites",
-            "path_sprite_vertex",
-            "path_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_glass_pipeline_state = build_pipeline_state_with_blend(
-            &device,
-            &library,
-            "quads_glass",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            metal::MTLBlendFactor::Zero,
-            metal::MTLBlendFactor::One,
-        );
-        let opaque_quads_pipeline_state = build_opaque_quads_pipeline_state(
-            &device,
-            &library,
-            "opaque_quads",
-            "opaque_quad_vertex",
-            "opaque_quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let surfaces_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "surfaces",
-            "surface_vertex",
-            "surface_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-
-        let depth_write_state = build_depth_stencil_state(&device, true);
-        let depth_test_state = build_depth_stencil_state(&device, false);
+        let pipelines = MetalPipelines::shared(&device);
 
         // A renderer that borrows another's intermediate textures must also
         // queue behind its command buffers: Metal orders command buffers
@@ -694,18 +742,7 @@ impl MetalRenderer {
             opaque,
             command_queue,
             unfinished_submissions: Arc::new(AtomicU32::new(0)),
-            paths_rasterization_pipeline_state,
-            path_sprites_pipeline_state,
-            shadows_pipeline_state,
-            quads_pipeline_state,
-            quads_glass_pipeline_state,
-            opaque_quads_pipeline_state,
-            underlines_pipeline_state,
-            monochrome_sprites_pipeline_state,
-            polychrome_sprites_pipeline_state,
-            surfaces_pipeline_state,
-            depth_write_state,
-            depth_test_state,
+            pipelines,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1096,7 +1133,8 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        command_encoder
+            .set_render_pipeline_state(&self.pipelines.paths_rasterization_pipeline_state);
         command_encoder
     }
 
@@ -1679,17 +1717,17 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
-        command_encoder.set_depth_stencil_state(&self.depth_write_state);
+        command_encoder.set_depth_stencil_state(&self.pipelines.depth_write_state);
         let opaque_quad_indices = scene.blended_quad_indices.len()
             ..scene.blended_quad_indices.len() + scene.opaque_quad_indices.len();
         self.draw_quads(
-            &self.opaque_quads_pipeline_state,
+            &self.pipelines.opaque_quads_pipeline_state,
             opaque_quad_indices,
             instances,
             viewport_size,
             command_encoder,
         );
-        command_encoder.set_depth_stencil_state(&self.depth_test_state);
+        command_encoder.set_depth_stencil_state(&self.pipelines.depth_test_state);
 
         let mut quad_cursor: u32 = 0;
         for batch in scene.batches() {
@@ -1727,9 +1765,9 @@ impl MetalRenderer {
                         }
 
                         let pipeline = if is_glass {
-                            &self.quads_glass_pipeline_state
+                            &self.pipelines.quads_glass_pipeline_state
                         } else {
-                            &self.quads_pipeline_state
+                            &self.pipelines.quads_pipeline_state
                         };
                         self.draw_quads(
                             pipeline,
@@ -1779,7 +1817,7 @@ impl MetalRenderer {
                         viewport_size,
                         None,
                     );
-                    command_encoder.set_depth_stencil_state(&self.depth_test_state);
+                    command_encoder.set_depth_stencil_state(&self.pipelines.depth_test_state);
                     set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
 
                     if did_draw {
@@ -1896,7 +1934,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.shadows_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines.shadows_pipeline_state);
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1993,7 +2031,7 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines.path_sprites_pipeline_state);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2065,7 +2103,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.underlines_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines.underlines_pipeline_state);
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2115,7 +2153,8 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
+        command_encoder
+            .set_render_pipeline_state(&self.pipelines.monochrome_sprites_pipeline_state);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2171,7 +2210,8 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder
+            .set_render_pipeline_state(&self.pipelines.polychrome_sprites_pipeline_state);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2220,7 +2260,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -3115,6 +3155,13 @@ mod render_memory_tests {
 
     fn headless() -> MetalRenderer {
         MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+    }
+
+    #[test]
+    fn renderers_on_one_device_share_pipelines() {
+        let first = headless();
+        let second = headless();
+        assert!(Arc::ptr_eq(&first.pipelines, &second.pipelines));
     }
 
     /// A renderer reports the depth attachments it holds, follows them as they
