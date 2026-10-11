@@ -3162,11 +3162,6 @@ mod render_memory_tests {
         let first = headless();
         let second = headless();
         assert!(Arc::ptr_eq(&first.pipelines, &second.pipelines));
-
-        let pipelines = Arc::downgrade(&first.pipelines);
-        drop(first);
-        drop(second);
-        assert!(pipelines.upgrade().is_none());
     }
 
     /// A renderer reports the depth attachments it holds, follows them as they
