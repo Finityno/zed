@@ -140,6 +140,7 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.shrink_to(target);
         self.absolute_outer_origins.shrink_to(target);
         self.computed_layouts.shrink_to(target);
+        self.detached_layouts.shrink_to(target);
         // Emptied by every recompute that fills it, so between draws it holds
         // only the capacity of the largest subtree ever walked.
         self.layout_bounds_scratch_space.shrink_to(target);
