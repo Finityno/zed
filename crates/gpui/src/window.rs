@@ -1426,7 +1426,7 @@ pub struct Window {
     display_id: Option<DisplayId>,
     is_resizable: bool,
     is_minimizable: bool,
-    sprite_atlas: Arc<dyn PlatformAtlas>,
+    pub(crate) sprite_atlas: Arc<dyn PlatformAtlas>,
     /// The sprite atlas's frame counter when this window last presented. The
     /// retained scene's tiles were all marked used at that frame, so while it is
     /// recent they cannot have been retired; see `rendered_scene_may_reference_retired_tiles`.
@@ -6122,15 +6122,7 @@ impl Window {
 
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
-        for frame_index in 0..data.frame_count() {
-            let params = RenderImageParams {
-                image_id: data.id,
-                frame_index,
-            };
-
-            self.sprite_atlas.remove(&params.clone().into());
-        }
-
+        remove_image_from_atlas(self.sprite_atlas.as_ref(), &data);
         Ok(())
     }
 
@@ -9174,6 +9166,18 @@ mod glyph_quantization_tests {
     }
 }
 
+pub(crate) fn remove_image_from_atlas(atlas: &dyn PlatformAtlas, image: &RenderImage) {
+    for frame_index in 0..image.frame_count() {
+        atlas.remove(
+            &RenderImageParams {
+                image_id: image.id,
+                frame_index,
+            }
+            .into(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -9320,6 +9324,87 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    fn insert_image(window: &mut Window, image: &crate::RenderImage) {
+        let params = crate::RenderImageParams {
+            image_id: image.id,
+            frame_index: 0,
+        };
+        window
+            .sprite_atlas
+            .get_or_insert_with(params.into(), &mut || {
+                Ok(Some((
+                    image.size(0),
+                    std::borrow::Cow::Borrowed(image.as_bytes(0).expect("one frame")),
+                )))
+            })
+            .expect("the headless atlas inserts");
+        assert!(window.has_image_atlas_entry(image));
+    }
+
+    fn image_in_atlas(window: &mut Window) -> std::sync::Arc<crate::RenderImage> {
+        let frame = image::Frame::new(image::ImageBuffer::from_pixel(
+            8,
+            8,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let image = std::sync::Arc::new(crate::RenderImage::new(smallvec::SmallVec::from_const([
+            frame,
+        ])));
+        insert_image(window, &image);
+        image
+    }
+
+    /// A drop issued while its window is leased out of `App`, as from that
+    /// window's render or a listener, reaches the window's atlas right away
+    /// instead of leaving the texture there for good, and a texture the
+    /// window paints again afterwards stays.
+    #[gpui::test]
+    fn an_image_dropped_while_its_window_is_leased_leaves_that_atlas(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let image = window
+            .update(cx, |_, window, cx| {
+                let image = image_in_atlas(window);
+                cx.drop_image(image.clone(), None);
+                assert!(!window.has_image_atlas_entry(&image));
+                image
+            })
+            .expect("window is open");
+        window
+            .update(cx, |_, window, _| {
+                assert!(!window.has_image_atlas_entry(&image));
+            })
+            .expect("window is open");
+
+        let image = window
+            .update(cx, |_, window, cx| {
+                let image = image_in_atlas(window);
+                cx.drop_image(image.clone(), None);
+                insert_image(window, &image);
+                image
+            })
+            .expect("window is open");
+        window
+            .update(cx, |_, window, _| {
+                assert!(window.has_image_atlas_entry(&image));
+            })
+            .expect("window is open");
+
+        let other_window = cx.add_window(|_, _| EmptyView);
+        let image = other_window
+            .update(cx, |_, window, _| image_in_atlas(window))
+            .expect("window is open");
+        window
+            .update(cx, |_, window, cx| {
+                cx.drop_image(image.clone(), Some(window));
+                other_window
+                    .update(cx, |_, other_window, _| {
+                        assert!(!other_window.has_image_atlas_entry(&image));
+                    })
+                    .expect("window is open");
+            })
+            .expect("window is open");
     }
 
     struct OpensWindowOnPaint {

@@ -47,8 +47,8 @@ use crate::{
     ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload,
     FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke,
     LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
-    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+    PlatformAtlas, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point,
+    Priority, PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
     RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
     Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
     TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
@@ -830,6 +830,9 @@ pub struct App {
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
 
     pub(crate) window_update_stack: Vec<WindowId>,
+    /// The atlases of the windows leased out of `windows` while they are
+    /// built or updated, for [`App::drop_image`] to reach.
+    leased_window_atlases: Vec<Arc<dyn PlatformAtlas>>,
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
     pub(crate) reduce_motion: bool,
@@ -904,6 +907,7 @@ impl App {
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
+                leased_window_atlases: Vec::new(),
                 window_handles: FxHashMap::default(),
                 focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
@@ -1377,6 +1381,7 @@ impl App {
             let handle = WindowHandle::new(id);
             match Window::new(handle.into(), options, cx) {
                 Ok(mut window) => {
+                    cx.leased_window_atlases.push(window.sprite_atlas.clone());
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
                     cx.window_update_stack.pop();
@@ -1389,6 +1394,7 @@ impl App {
                     // where DispatchTree::root_node_id asserts on empty nodes
                     let clear = window.draw(cx);
                     clear.clear(cx);
+                    cx.leased_window_atlases.pop();
 
                     cx.window_handles.insert(id, window.handle);
                     cx.windows.get_mut(id).unwrap().replace(Box::new(window));
@@ -2924,12 +2930,22 @@ impl App {
 
     /// Removes an image from the sprite atlas on all windows.
     ///
-    /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
+    /// A window that is being updated is removed from `App.windows`; the
+    /// texture is removed from its atlas all the same.
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
         // remove the texture from all other windows
         for window in self.windows.values_mut().flatten() {
             _ = window.drop_image(image.clone());
+        }
+
+        // A window being updated is leased out of `self.windows`, so the loop
+        // above skips it, and a drop issued from its render or a listener
+        // would leave the texture in its atlas for the window's lifetime.
+        // Its atlas is shared, so remove the texture there now, as passing
+        // the window as `current_window` does.
+        for atlas in &self.leased_window_atlases {
+            crate::window::remove_image_from_atlas(atlas.as_ref(), &image);
         }
 
         // remove the texture from the current window
@@ -2977,9 +2993,11 @@ impl App {
             let root_view = window.root.clone().unwrap();
 
             cx.window_update_stack.push(window.handle.id);
+            cx.leased_window_atlases.push(window.sprite_atlas.clone());
             update(Some((root_view, &mut window, cx)));
             fn trail(window_id: WindowId, window: Box<Window>, cx: &mut App) -> Option<()> {
                 cx.window_update_stack.pop();
+                cx.leased_window_atlases.pop();
 
                 if window.removed {
                     // The window's own idle reclaim is dropped with it, so a
