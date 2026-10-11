@@ -83,7 +83,13 @@ impl LinuxDispatcher {
                     })
                     .expect("Failed to start timer thread");
 
-                event_loop.run(None, &mut (), |_| {}).log_err();
+                // The callback runs after each dispatch, right before the loop
+                // blocks again: this thread's idle point. Without it the
+                // pages emptied by the timer sources it frees stay resident
+                // for the life of the process. See `gpui::set_thread_idle_hook`.
+                event_loop
+                    .run(None, &mut (), |_| gpui::thread_idle())
+                    .log_err();
             })
             .unwrap();
 
