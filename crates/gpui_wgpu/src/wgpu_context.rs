@@ -16,6 +16,7 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     errors: Arc<DeviceErrorState>,
+    pub(crate) pipeline_cache: Arc<crate::wgpu_renderer::PipelineCache>,
 }
 
 /// Errors reported by wgpu's device-wide callbacks.
@@ -284,6 +285,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             errors,
+            pipeline_cache: Default::default(),
         }
     }
 
@@ -382,6 +384,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             errors,
+            pipeline_cache: Default::default(),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
