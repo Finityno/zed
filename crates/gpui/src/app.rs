@@ -2924,7 +2924,9 @@ impl App {
 
     /// Removes an image from the sprite atlas on all windows.
     ///
-    /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
+    /// A window that is being updated is removed from `App.windows`. Pass it as
+    /// `current_window` to drop the texture there right away; otherwise it is
+    /// dropped there once that update ends.
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
         // remove the texture from all other windows
@@ -2933,8 +2935,29 @@ impl App {
         }
 
         // remove the texture from the current window
-        if let Some(window) = current_window {
-            _ = window.drop_image(image);
+        let current_window_id = current_window.map(|window| {
+            _ = window.drop_image(image.clone());
+            window.handle.window_id()
+        });
+
+        // A window being updated is leased out of `self.windows`, so the loop
+        // above skipped it, and a drop issued from its render or a listener
+        // would otherwise leave the texture in its atlas for the window's
+        // lifetime. Drop it there once the lease has ended.
+        let leased_windows: SmallVec<[WindowId; 2]> = self
+            .windows
+            .iter()
+            .filter(|(id, window)| window.is_none() && Some(*id) != current_window_id)
+            .map(|(id, _)| id)
+            .collect();
+        if !leased_windows.is_empty() {
+            self.defer(move |cx| {
+                for id in leased_windows {
+                    if let Some(Some(window)) = cx.windows.get_mut(id) {
+                        _ = window.drop_image(image.clone());
+                    }
+                }
+            });
         }
     }
 
