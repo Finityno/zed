@@ -428,15 +428,9 @@ fn format_duration(duration: Duration) -> String {
 /// foreground work recorded before the scope starts (e.g. per-iteration
 /// setup) is excluded from what [`Self::finish`] returns: a collector only
 /// observes entries recorded after its creation.
-///
-/// Both sources are fixed rings that overwrite their oldest entries, and a
-/// scope can outlive many of their laps (a whole Criterion sample, or a long
-/// renderer session), so the measurement loops call [`Self::drain`] as they
-/// go instead of reading everything at the end.
 struct TraceScope {
     collector: FrameTimingCollector,
     journal_collector: ForegroundJournalCollector,
-    events: TracedEvents,
     _trace_guard: profiler::TraceGuard,
 }
 
@@ -446,26 +440,31 @@ impl TraceScope {
         Self {
             collector: FrameTimingCollector::new(),
             journal_collector,
-            events: TracedEvents {
-                frame_events: Vec::new(),
-                journal_entries: Vec::new(),
-            },
             _trace_guard: trace_guard,
         }
     }
 
-    fn drain(&mut self) {
-        self.events
-            .frame_events
-            .extend(self.collector.collect_unseen());
-        self.events
-            .journal_entries
-            .extend(self.journal_collector.collect_unseen().entries);
+    /// Records the journal's unread entries into `report` once they fill half
+    /// its ring. A scope can span a whole Criterion sample or a long renderer
+    /// session, far more entries than the ring holds, so the measurement loops
+    /// call this as they go. It runs inside the timed interval, so the common
+    /// case is one atomic load; the copy happens once per half a ring.
+    fn drain_journal_if_half_full(&mut self, report: &BenchReport) {
+        if !self.journal_collector.is_half_full() {
+            return;
+        }
+        let entries = self.journal_collector.collect_unseen().entries;
+        report.record_foreground_events(entries.iter().filter_map(|entry| match entry {
+            ForegroundJournalEntry::Event(event) => Some(event),
+            _ => None,
+        }));
     }
 
     fn finish(mut self) -> TracedEvents {
-        self.drain();
-        self.events
+        TracedEvents {
+            frame_events: self.collector.collect_unseen(),
+            journal_entries: self.journal_collector.collect_unseen().entries,
+        }
     }
 }
 
@@ -726,12 +725,13 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         self.settle();
         self.dispatch_pending_frames(|| true);
         let mut collector = TraceScope::start(self.foreground_journal_collector());
+        let report = self.report.clone();
         let mut benchmark = || {
             with_autorelease_pool(|| {
                 benchmark(self);
                 self.dispatch_pending_frames(|| true);
             });
-            collector.drain();
+            collector.drain_journal_if_half_full(&report);
         };
         bencher.iter(&mut benchmark);
         let events = collector.finish();
@@ -864,6 +864,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         let dispatcher = self.background_executor.dispatcher().clone();
         self.dispatch_pending_frames(|| true);
         let mut collector = TraceScope::start(self.foreground_journal_collector());
+        let report = self.report.clone();
         let mut benchmark = || {
             with_autorelease_pool(|| {
                 // Work already queued at frame start delays the frame in
@@ -883,7 +884,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                 .expect("cannot benchmark renderer for entity without a current window");
                 self.dispatch_pending_frames(|| true);
             });
-            collector.drain();
+            collector.drain_journal_if_half_full(&report);
         };
         bencher.iter(&mut benchmark);
 
@@ -1006,7 +1007,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                             .expect("renderer session window must remain open");
                     }
                     dispatch_frames(&benchmark_context);
-                    trace_scope.drain();
+                    trace_scope.drain_journal_if_half_full(&report);
                     frame += 1;
                 }
                 MeasuredTaskOutput {

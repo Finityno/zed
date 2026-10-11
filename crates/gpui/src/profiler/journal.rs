@@ -1107,6 +1107,15 @@ pub struct ForegroundJournalCollector {
 }
 
 impl ForegroundJournalCollector {
+    /// Whether the entries this collector has not read yet fill at least half
+    /// the ring, so a caller that cannot drain on every step knows when it must
+    /// before the writer starts overwriting them.
+    #[cfg(feature = "bench-support")]
+    pub(crate) fn is_half_full(&self) -> bool {
+        let end = self.ring.finalized.load(Ordering::Acquire);
+        end.saturating_sub(self.cursor) >= (self.ring.capacity() / 2).max(1) as u64
+    }
+
     /// Returns entries recorded since the previous call (or since the
     /// collector was created), reporting how many were unavailable before this
     /// drain observed them.
@@ -2038,6 +2047,22 @@ mod tests {
         // our entries again.
         let drained = collector.collect_unseen();
         assert!(ours(&drained.entries).is_empty());
+    }
+
+    #[cfg(feature = "bench-support")]
+    #[test]
+    fn collector_reports_half_full_until_drained() {
+        let origin = Instant::now();
+        let (journal, mut publisher) = ForegroundJournal::new(8, 4);
+        let mut collector = journal.collector();
+        for sequence in 0..3 {
+            publisher.publish([ring_entry(origin, sequence)]);
+        }
+        assert!(!collector.is_half_full());
+        publisher.publish([ring_entry(origin, 3)]);
+        assert!(collector.is_half_full());
+        assert_eq!(collector.collect_unseen().entries.len(), 4);
+        assert!(!collector.is_half_full());
     }
 
     #[test]
