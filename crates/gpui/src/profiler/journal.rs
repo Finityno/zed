@@ -51,11 +51,15 @@ pub const FRAME_DEADLINE: Duration = Duration::from_secs(1);
 // so this bound is only reachable when something is already deeply wrong.
 const MAX_INTERVAL_EVENTS: usize = 16 * 1024;
 
-// Allow 4MiB for the fixed ring allocation, including each slot's atomic
-// metadata. The poll floor and frame cadence bound the event rate to roughly
-// 10k per second in the worst case, so this holds several seconds of
-// worst-case traffic between consumer drains.
-const MAX_JOURNAL_ENTRIES: usize = (4 * 1024 * 1024) / core::mem::size_of::<JournalSlot>();
+// Allow 1MiB for the fixed ring allocation, including each slot's atomic
+// metadata: about 4.4k entries. The ring wraps, so every byte of it becomes
+// resident once the app has run for a while. The slowest regular drain is the
+// hang detector's, once a second. Every retained poll took at least the 100us
+// floor and frames come at the display's cadence, so outrunning that drain
+// takes a foreground near saturated with polls just above the floor. Such a
+// storm costs discontinuity markers, which only suppress budget-only reports
+// for the intervals they touch, not threshold stalls recorded outside the gap.
+const MAX_JOURNAL_ENTRIES: usize = (1024 * 1024) / core::mem::size_of::<JournalSlot>();
 
 // Every byte an entry grows by costs the ring capacity, and the largest
 // entry (a presentation boundary, which carries its drawn frame) sets the
@@ -845,7 +849,7 @@ const SLOT_READER_MASK: usize = !SLOT_WRITER;
 
 // An all-zero slot is a valid empty slot, so the ring is allocated zeroed and
 // never written up front. The allocator hands back fresh zero pages for it,
-// and each page of the 4MiB ring becomes resident only when the writer first
+// and each page of the 1MiB ring becomes resident only when the writer first
 // reaches it instead of at launch.
 struct JournalSlot {
     users: AtomicUsize,
@@ -1103,6 +1107,15 @@ pub struct ForegroundJournalCollector {
 }
 
 impl ForegroundJournalCollector {
+    /// Whether the entries this collector has not read yet fill at least half
+    /// the ring, so a caller that cannot drain on every step knows when it must
+    /// before the writer starts overwriting them.
+    #[cfg(feature = "bench-support")]
+    pub(crate) fn is_half_full(&self) -> bool {
+        let end = self.ring.finalized.load(Ordering::Acquire);
+        end.saturating_sub(self.cursor) >= (self.ring.capacity() / 2).max(1) as u64
+    }
+
     /// Returns entries recorded since the previous call (or since the
     /// collector was created), reporting how many were unavailable before this
     /// drain observed them.
@@ -2034,6 +2047,22 @@ mod tests {
         // our entries again.
         let drained = collector.collect_unseen();
         assert!(ours(&drained.entries).is_empty());
+    }
+
+    #[cfg(feature = "bench-support")]
+    #[test]
+    fn collector_reports_half_full_until_drained() {
+        let origin = Instant::now();
+        let (journal, mut publisher) = ForegroundJournal::new(8, 4);
+        let mut collector = journal.collector();
+        for sequence in 0..3 {
+            publisher.publish([ring_entry(origin, sequence)]);
+        }
+        assert!(!collector.is_half_full());
+        publisher.publish([ring_entry(origin, 3)]);
+        assert!(collector.is_half_full());
+        assert_eq!(collector.collect_unseen().entries.len(), 4);
+        assert!(!collector.is_half_full());
     }
 
     #[test]

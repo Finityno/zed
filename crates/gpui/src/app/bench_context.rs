@@ -444,6 +444,22 @@ impl TraceScope {
         }
     }
 
+    /// Records the journal's unread entries into `report` once they fill half
+    /// its ring. A scope can span a whole Criterion sample or a long renderer
+    /// session, far more entries than the ring holds, so the measurement loops
+    /// call this as they go. It runs inside the timed interval, so the common
+    /// case is one atomic load; the copy happens once per half a ring.
+    fn drain_journal_if_half_full(&mut self, report: &BenchReport) {
+        if !self.journal_collector.is_half_full() {
+            return;
+        }
+        let entries = self.journal_collector.collect_unseen().entries;
+        report.record_foreground_events(entries.iter().filter_map(|entry| match entry {
+            ForegroundJournalEntry::Event(event) => Some(event),
+            _ => None,
+        }));
+    }
+
     fn finish(mut self) -> TracedEvents {
         TracedEvents {
             frame_events: self.collector.collect_unseen(),
@@ -708,12 +724,14 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         // the measured iterations.
         self.settle();
         self.dispatch_pending_frames(|| true);
-        let collector = TraceScope::start(self.foreground_journal_collector());
+        let mut collector = TraceScope::start(self.foreground_journal_collector());
+        let report = self.report.clone();
         let mut benchmark = || {
             with_autorelease_pool(|| {
                 benchmark(self);
                 self.dispatch_pending_frames(|| true);
-            })
+            });
+            collector.drain_journal_if_half_full(&report);
         };
         bencher.iter(&mut benchmark);
         let events = collector.finish();
@@ -845,7 +863,8 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         self.settle();
         let dispatcher = self.background_executor.dispatcher().clone();
         self.dispatch_pending_frames(|| true);
-        let collector = TraceScope::start(self.foreground_journal_collector());
+        let mut collector = TraceScope::start(self.foreground_journal_collector());
+        let report = self.report.clone();
         let mut benchmark = || {
             with_autorelease_pool(|| {
                 // Work already queued at frame start delays the frame in
@@ -865,6 +884,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                 .expect("cannot benchmark renderer for entity without a current window");
                 self.dispatch_pending_frames(|| true);
             });
+            collector.drain_journal_if_half_full(&report);
         };
         bencher.iter(&mut benchmark);
 
@@ -929,6 +949,10 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
             },
             |measured_input| {
                 let (state, window, stopped) = &mut measured_input.input;
+                let trace_scope = measured_input
+                    .trace_scope
+                    .as_mut()
+                    .expect("measured session input should hold its trace scope");
                 let started = Instant::now();
                 let check_deadline = || {
                     assert!(
@@ -983,6 +1007,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                             .expect("renderer session window must remain open");
                     }
                     dispatch_frames(&benchmark_context);
+                    trace_scope.drain_journal_if_half_full(&report);
                     frame += 1;
                 }
                 MeasuredTaskOutput {
