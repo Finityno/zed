@@ -386,6 +386,7 @@ struct ViewElementState {
 struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
+    rounded_clip: Option<std::sync::Arc<crate::window::RoundedClipRegion>>,
     text_style: TextStyle,
 }
 
@@ -629,6 +630,7 @@ fn prepaint_view(
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
+                    && element_state.cache_key.rounded_clip == window.rounded_clip
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
@@ -674,6 +676,7 @@ fn prepaint_view(
                         cache_key: ViewElementCacheKey {
                             bounds,
                             content_mask,
+                            rounded_clip: window.rounded_clip.clone(),
                             text_style,
                         },
                     },

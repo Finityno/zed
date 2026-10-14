@@ -55,6 +55,9 @@ pub(crate) struct FontInfo {
 }
 
 pub(crate) struct DirectXRenderer {
+    rounded_clip_buffer: Option<ID3D11Buffer>,
+    rounded_clip_view: Option<ID3D11ShaderResourceView>,
+    rounded_clip_capacity: usize,
     hwnd: HWND,
     atlas: Arc<DirectXAtlas>,
     devices: Option<DirectXRendererDevices>,
@@ -330,6 +333,9 @@ impl DirectXRenderer {
         };
 
         Ok(DirectXRenderer {
+            rounded_clip_buffer: None,
+            rounded_clip_view: None,
+            rounded_clip_capacity: 0,
             hwnd,
             atlas,
             devices: Some(devices),
@@ -382,6 +388,9 @@ impl DirectXRenderer {
             .context("Creating DirectX render pipelines")?;
 
         Ok(DirectXRenderer {
+            rounded_clip_buffer: None,
+            rounded_clip_view: None,
+            rounded_clip_capacity: 0,
             hwnd: HWND::default(),
             atlas,
             devices: Some(devices),
@@ -629,6 +638,9 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.rounded_clip_buffer.take();
+            self.rounded_clip_view.take();
+            self.rounded_clip_capacity = 0;
             self.overlay_resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
@@ -895,7 +907,28 @@ impl DirectXRenderer {
         ))
     }
 
+    fn upload_rounded_clips(&mut self, scene: &Scene) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let required = scene.rounded_clips.len().max(1);
+        if self.rounded_clip_capacity < required || self.rounded_clip_capacity > required.saturating_mul(4) {
+            anyhow::ensure!(required <= MAX_INSTANCE_BUFFER_SIZE / std::mem::size_of::<gpui::RoundedClipNode>(),
+                "rounded clip table exceeds buffer limit");
+            let capacity = required.next_power_of_two();
+            let buffer = create_buffer(&devices.device, std::mem::size_of::<gpui::RoundedClipNode>(), capacity)?;
+            self.rounded_clip_view = create_buffer_view(&devices.device, &buffer)?;
+            self.rounded_clip_buffer = Some(buffer);
+            self.rounded_clip_capacity = capacity;
+        }
+        let buffer = self.rounded_clip_buffer.as_ref().context("rounded clip buffer missing")?;
+        if !scene.rounded_clips.is_empty() {
+            update_buffer(&devices.device_context, buffer, &scene.rounded_clips)?;
+        }
+        unsafe { devices.device_context.PSSetShaderResources(3, Some(&[self.rounded_clip_view.clone()])); }
+        Ok(())
+    }
+
     fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
+        self.upload_rounded_clips(scene)?;
         self.upload_scene_buffers(scene)?;
         self.update_quad_indices(scene)?;
 
@@ -1402,6 +1435,8 @@ impl DirectXRenderer {
         vertices.clear();
         for path in paths {
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
+                rounded_clip: path.rounded_clip,
+                clip_padding: 0,
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
@@ -2463,6 +2498,8 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 #[derive(Clone, Copy)]

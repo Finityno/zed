@@ -368,6 +368,8 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl MetalRenderer {
@@ -1001,6 +1003,7 @@ impl MetalRenderer {
     fn rasterize_path_batches(
         &mut self,
         scene: &Scene,
+        rounded_clips: &BufferRegion,
         slots: &[PathBatchSlot],
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
@@ -1012,6 +1015,7 @@ impl MetalRenderer {
         let intermediate_texture = self.ensure_path_intermediate_textures(viewport_size)?;
         let command_encoder =
             self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
+        command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
@@ -1033,6 +1037,8 @@ impl MetalRenderer {
             vertices.clear();
             for path in &scene.paths[range] {
                 vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                    rounded_clip: path.rounded_clip,
+                    clip_padding: 0,
                     xy_position: v.xy_position,
                     st_position: v.st_position,
                     color: path.color,
@@ -1665,7 +1671,7 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         if let Some(slots) = &path_plan {
-            self.rasterize_path_batches(scene, slots, writer, viewport_size, command_buffer)?;
+            self.rasterize_path_batches(scene, &instances.rounded_clips, slots, writer, viewport_size, command_buffer)?;
         }
         let mut planned_slots = path_plan.as_deref().map(|slots| slots.iter());
         let alpha = if self.opaque { 1. } else { 0. };
@@ -1678,6 +1684,7 @@ impl MetalRenderer {
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
+        command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
 
         command_encoder.set_depth_stencil_state(&self.depth_write_state);
         let opaque_quad_indices = scene.blended_quad_indices.len()
@@ -1766,6 +1773,7 @@ impl MetalRenderer {
 
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        &instances.rounded_clips,
                         writer,
                         viewport_size,
                         command_buffer,
@@ -1779,6 +1787,7 @@ impl MetalRenderer {
                         viewport_size,
                         None,
                     );
+                    command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
                     command_encoder.set_depth_stencil_state(&self.depth_test_state);
                     set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
 
@@ -1833,6 +1842,7 @@ impl MetalRenderer {
     fn draw_paths_to_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
+        rounded_clips: &BufferRegion,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
@@ -1843,6 +1853,7 @@ impl MetalRenderer {
         let intermediate_texture = self.ensure_path_intermediate_textures(viewport_size)?;
         let command_encoder =
             self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
+        command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         let slot_offset = [0f32, 0f32];
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::SlotOffset as u64,
@@ -1853,6 +1864,8 @@ impl MetalRenderer {
         let mut vertices = Vec::new();
         for path in paths {
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                rounded_clip: path.rounded_clip,
+                clip_padding: 0,
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
@@ -2575,6 +2588,7 @@ struct BufferRegion {
 }
 
 struct FrameInstances {
+    rounded_clips: BufferRegion,
     quads: BufferRegion,
     quad_indices: BufferRegion,
     shadows: BufferRegion,
@@ -2600,6 +2614,9 @@ fn upload_frame_instances(
     writer: &mut InstanceBufferWriter,
 ) -> Result<FrameInstances> {
     Ok(FrameInstances {
+        rounded_clips: if scene.rounded_clips.is_empty() {
+            writer.write(&[gpui::RoundedClipNode::default()])?
+        } else { writer.write(&scene.rounded_clips)? },
         quads: writer.write(&scene.quads)?,
         quad_indices: writer.write_slices(&[
             &scene.blended_quad_indices,
@@ -2612,6 +2629,8 @@ fn upload_frame_instances(
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            rounded_clip: surface.rounded_clip,
+            clip_padding: 0,
         }))?,
     })
 }
@@ -2825,6 +2844,8 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -2888,6 +2909,8 @@ mod alpha_blend_tests {
             size: gpui::size(ScaledPixels(EXTENT), ScaledPixels(EXTENT)),
         };
         Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order,
             border_style: Default::default(),
             bounds,
@@ -3201,6 +3224,8 @@ mod stripe_pattern_tests {
         };
         let mut scene = Scene::default();
         scene.quads.push(Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             border_style: Default::default(),
             bounds,
@@ -3268,6 +3293,8 @@ mod stale_texture_healing_tests {
             size: gpui::size(ScaledPixels(extent), ScaledPixels(extent)),
         };
         scene.quads.push(Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             border_style: Default::default(),
             bounds,
@@ -3512,6 +3539,8 @@ mod stale_texture_healing_tests {
             size: gpui::size(ScaledPixels(4.), ScaledPixels(4.)),
         };
         scene.insert_primitive(Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             border_style: Default::default(),
             bounds,
@@ -3604,6 +3633,8 @@ mod stale_texture_healing_tests {
                 size: gpui::size(ScaledPixels(4.), ScaledPixels(4.)),
             };
             scene.insert_primitive(Quad {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 border_style: Default::default(),
                 bounds,

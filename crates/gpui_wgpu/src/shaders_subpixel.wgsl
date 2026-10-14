@@ -13,6 +13,8 @@ struct SubpixelSprite {
     effect: SpriteEffect,
     tile: AtlasTile,
     transformation: TransformationMatrix,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 @group(1) @binding(0) var<storage, read> b_subpixel_sprites: array<SubpixelSprite>;
 
@@ -24,6 +26,7 @@ struct SubpixelSpriteOutput {
     @location(3) @interpolate(flat) sprite_id: u32,
     @location(4) clip_distances: vec4<f32>,
     @location(5) @interpolate(flat) effect_kind: u32,
+    @location(6) @interpolate(flat) rounded_clip: u32,
 }
 
 struct SubpixelSpriteFragmentOutput {
@@ -44,6 +47,7 @@ fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     out.effect_kind = sprite.effect.kind;
+    out.rounded_clip = sprite.rounded_clip;
     return out;
 }
 
@@ -63,7 +67,7 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
+        return rounded_subpixel_clip(SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0)), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     // Unshimmered text is the overwhelmingly common case, and the shimmer path
@@ -74,7 +78,7 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
         var plain = SubpixelSpriteFragmentOutput();
         plain.foreground = vec4<f32>(base_color.rgb, 1.0);
         plain.alpha = vec4<f32>(base_color.a * base_alpha_corrected, 1.0);
-        return plain;
+        return rounded_subpixel_clip(plain, rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let sprite = b_subpixel_sprites[input.sprite_id];
@@ -100,5 +104,9 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
     var out = SubpixelSpriteFragmentOutput();
     out.foreground = vec4<f32>(combined_rgb, 1.0);
     out.alpha = vec4<f32>(combined_alpha, 1.0);
-    return out;
+    return rounded_subpixel_clip(out, rounded_clip_coverage(input.rounded_clip, input.position.xy));
+}
+
+fn rounded_subpixel_clip(value: SubpixelSpriteFragmentOutput, coverage: f32) -> SubpixelSpriteFragmentOutput {
+    return SubpixelSpriteFragmentOutput(vec4<f32>(value.foreground.rgb, value.foreground.a * coverage), value.alpha * coverage);
 }

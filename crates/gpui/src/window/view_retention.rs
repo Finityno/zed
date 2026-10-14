@@ -325,6 +325,7 @@ enum PaintStatus {
 struct ViewContext {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
+    rounded_clip: Option<std::sync::Arc<super::RoundedClipRegion>>,
     text_style: TextStyle,
     opacity: f32,
     rem_size: Pixels,
@@ -1081,6 +1082,7 @@ impl Window {
         ViewContext {
             bounds,
             content_mask: self.content_mask(),
+            rounded_clip: self.rounded_clip.clone(),
             text_style: self.text_style(),
             opacity: self.element_opacity,
             rem_size: self.rem_size(),
@@ -1101,6 +1103,7 @@ impl Window {
             && context.opacity == self.element_opacity
             && context.rem_size == self.rem_size()
             && context.content_mask == self.content_mask()
+            && context.rounded_clip == self.rounded_clip
             && context.text_style == self.text_style()
             && context.image_cache == self.inherited_image_cache()
             && context.glass_content == self.glass_content
@@ -1415,6 +1418,7 @@ impl Window {
         // Moved with what it painted from the mask around it then to the one
         // around it now, which can differ from the ones around its prepaint.
         let moved = record.moved.as_ref().map(|moved| ViewMove {
+            inherited_clip_depth: moved.inherited_clip_depth,
             delta: moved.delta,
             old_outer: record.paint_mask,
             new_outer: paint_mask,
@@ -1483,6 +1487,7 @@ impl Window {
                 context: Rc::new(ViewContext {
                     bounds: Bounds::default(),
                     content_mask: ContentMask::default(),
+                    rounded_clip: None,
                     text_style: TextStyle::default(),
                     opacity: 1.,
                     rem_size: Pixels::ZERO,

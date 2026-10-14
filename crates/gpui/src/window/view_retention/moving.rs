@@ -74,6 +74,7 @@ pub(crate) struct ViewMove {
     pub(crate) delta: Point<Pixels>,
     pub(crate) old_outer: ContentMask<Pixels>,
     pub(crate) new_outer: ContentMask<Pixels>,
+    pub(crate) inherited_clip_depth: usize,
 }
 
 impl ViewMove {
@@ -101,6 +102,7 @@ impl ViewMove {
                 size: hitbox.bounds.size,
             },
             content_mask: self.mask_of(&hitbox.content_mask),
+            rounded_clip: hitbox.rounded_clip.as_ref().map(|clip| clip.moved_inside(self.delta, self.inherited_clip_depth)),
             behavior: hitbox.behavior,
         }
     }
@@ -112,6 +114,8 @@ impl ViewMove {
             delta: self.delta.scale(window.scale_factor()),
             old_outer: scaled_edges(&window.cover_bounds(self.old_outer.bounds)),
             new_outer: scaled_edges(&window.cover_bounds(self.new_outer.bounds)),
+            inherited_clip_depth: self.inherited_clip_depth,
+            inherited_clip: window.next_frame.scene.current_rounded_clip,
         }
     }
 
@@ -122,6 +126,7 @@ impl ViewMove {
                 size: context.bounds.size,
             },
             content_mask: self.mask_of(&context.content_mask),
+            rounded_clip: context.rounded_clip.as_ref().map(|clip| clip.moved_inside(self.delta, self.inherited_clip_depth)),
             text_style: context.text_style.clone(),
             opacity: context.opacity,
             rem_size: context.rem_size,
@@ -211,6 +216,7 @@ pub(crate) enum MoveRefusal {
     StaysPut,
     /// It was painted inside a text shimmer from around it.
     InheritedShimmer,
+    InheritedRoundedClip,
     SizeChanged,
     OpacityChanged,
     RemSizeChanged,
@@ -338,6 +344,9 @@ impl Window {
         if !whole_device_pixels(scaled.x.0) || !whole_device_pixels(scaled.y.0) {
             return Err(MoveRefusal::NotWholeDevicePixels);
         }
+        if self.rounded_clip != context.rounded_clip {
+            return Err(MoveRefusal::InheritedRoundedClip);
+        }
         let mask = self.content_mask();
         let outer = edges(&context.content_mask.bounds);
         if !inside(edges(&context.bounds), outer) {
@@ -400,6 +409,7 @@ impl Window {
             delta,
             old_outer: context.content_mask,
             new_outer: mask,
+            inherited_clip_depth: self.rounded_clip.as_ref().map_or(0, |clip| clip.depth()),
         })
     }
 

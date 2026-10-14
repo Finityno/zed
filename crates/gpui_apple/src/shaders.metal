@@ -14,6 +14,7 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
                           TransformationMatrix transformation,
                           constant Size_DevicePixels *input_viewport_size);
 float quad_depth(uint quad_id);
+float rounded_clip_coverage(uint index, float2 position, constant RoundedClipNode *masks);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
@@ -46,6 +47,7 @@ struct GradientColor {
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla color0, Hsla color1);
 
 struct QuadVertexOutput {
+  uint rounded_clip [[flat]];
   uint quad_id [[flat]];
   float4 position [[position]];
   float4 border_color [[flat]];
@@ -56,6 +58,7 @@ struct QuadVertexOutput {
 };
 
 struct QuadFragmentInput {
+  uint rounded_clip [[flat]];
   uint quad_id [[flat]];
   float4 position [[position]];
   float4 border_color [[flat]];
@@ -93,6 +96,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   );
 
   return QuadVertexOutput{
+      quad.rounded_clip,
       quad_id,
       device_position,
       border_color,
@@ -104,7 +108,8 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+                              [[buffer(QuadInputIndex_Quads)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -120,7 +125,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
-    return background_color;
+    return (background_color) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
@@ -180,7 +185,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
-    return background_color;
+    return (background_color) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
 
   // Signed distance of the point to the outside edge of the quad's border
@@ -398,7 +403,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  return (color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf))) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -550,6 +555,7 @@ fragment float4 opaque_quad_fragment(OpaqueQuadFragmentInput input
 }
 
 struct ShadowVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float4 color [[flat]];
   uint shadow_id [[flat]];
@@ -557,6 +563,7 @@ struct ShadowVertexOutput {
 };
 
 struct ShadowFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float4 color [[flat]];
   uint shadow_id [[flat]];
@@ -591,6 +598,7 @@ vertex ShadowVertexOutput shadow_vertex(
   float4 color = hsla_to_rgba(shadow.color);
 
   return ShadowVertexOutput{
+      shadow.rounded_clip,
       device_position,
       color,
       shadow_id,
@@ -599,7 +607,8 @@ vertex ShadowVertexOutput shadow_vertex(
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
+                                [[buffer(ShadowInputIndex_Shadows)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   Shadow shadow = shadows[input.shadow_id];
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
@@ -654,10 +663,11 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
-  return input.color * float4(1., 1., 1., alpha);
+  return (input.color * float4(1., 1., 1., alpha)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 struct UnderlineVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float4 color [[flat]];
   uint underline_id [[flat]];
@@ -665,6 +675,7 @@ struct UnderlineVertexOutput {
 };
 
 struct UnderlineFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float4 color [[flat]];
   uint underline_id [[flat]];
@@ -684,6 +695,7 @@ vertex UnderlineVertexOutput underline_vertex(
                                                  underline.content_mask.bounds);
   float4 color = hsla_to_rgba(underline.color);
   return UnderlineVertexOutput{
+      underline.rounded_clip,
       device_position,
       color,
       underline_id,
@@ -692,7 +704,8 @@ vertex UnderlineVertexOutput underline_vertex(
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
                                    constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
+                                   [[buffer(UnderlineInputIndex_Underlines)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
@@ -715,13 +728,14 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return (input.color * float4(1., 1., 1., alpha)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   } else {
-    return input.color;
+    return (input.color) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
 }
 
 struct MonochromeSpriteVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 tile_position;
   float2 local_position;
@@ -732,6 +746,7 @@ struct MonochromeSpriteVertexOutput {
 };
 
 struct MonochromeSpriteFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 tile_position;
   float2 local_position;
@@ -787,6 +802,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       sprite.bounds.origin.y + unit_vertex.y * sprite.bounds.size.height);
   float4 color = hsla_to_rgba(sprite.color);
   return MonochromeSpriteVertexOutput{
+      sprite.rounded_clip,
       device_position,
       tile_position,
       local_position,
@@ -799,9 +815,10 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   if (any(input.clip_distance < float4(0.0))) {
-    return float4(0.0);
+    return (float4(0.0)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
 
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
@@ -816,7 +833,7 @@ fragment float4 monochrome_sprite_fragment(
   // overlay blend below ends in a divide; neither is worth paying on all text
   // for an effect a handful of labels use.
   if (input.effect_kind == 0u) {
-    return float4(base_color.rgb, base_color.a * sample.a);
+    return (float4(base_color.rgb, base_color.a * sample.a)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
 
   float intensity = sprite_effect_intensity(
@@ -834,10 +851,11 @@ fragment float4 monochrome_sprite_fragment(
          base_color.rgb * base_alpha * (1.0 - overlay_alpha)) /
         combined_alpha;
   }
-  return float4(combined_rgb, combined_alpha);
+  return (float4(combined_rgb, combined_alpha)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 struct PolychromeSpriteVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
@@ -845,6 +863,7 @@ struct PolychromeSpriteVertexOutput {
 };
 
 struct PolychromeSpriteFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
@@ -867,6 +886,7 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
                                                  sprite.content_mask.bounds);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   return PolychromeSpriteVertexOutput{
+      sprite.rounded_clip,
       device_position,
       tile_position,
       sprite_id,
@@ -876,7 +896,8 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
@@ -893,10 +914,11 @@ fragment float4 polychrome_sprite_fragment(
     color.b = grayscale;
   }
   color.a *= sprite.opacity * saturate(0.5 - distance);
-  return color;
+  return (color) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 struct PathRasterizationVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 st_position;
   // Screen-space position: `position` lands in the batch's slot of the
@@ -907,6 +929,7 @@ struct PathRasterizationVertexOutput {
 };
 
 struct PathRasterizationFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 st_position;
   float2 screen_position;
@@ -928,6 +951,7 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
     1.
   );
   return PathRasterizationVertexOutput{
+      v.rounded_clip,
       position,
       float2(v.st_position.x, v.st_position.y),
       screen_position,
@@ -944,7 +968,8 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
   constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
-) {
+,
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
 
@@ -980,7 +1005,7 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
-  return float4(color.rgb * color.a * alpha, alpha * color.a);
+  return (float4(color.rgb * color.a * alpha, alpha * color.a)) * rounded_clip_coverage(input.rounded_clip, input.screen_position, rounded_masks);
 }
 
 struct PathSpriteVertexOutput {
@@ -1021,12 +1046,14 @@ fragment float4 path_sprite_fragment(
 }
 
 struct SurfaceVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 texture_position;
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 texture_position;
 };
@@ -1049,6 +1076,7 @@ vertex SurfaceVertexOutput surface_vertex(
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
   return SurfaceVertexOutput{
+      surface.rounded_clip,
       device_position,
       texture_position,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -1058,7 +1086,8 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -1069,7 +1098,7 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  return (ycbcrToRGBTransform * ycbcr) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1466,4 +1495,14 @@ float4 fill_color(Background background,
   }
 
   return color;
+}
+
+float rounded_clip_coverage(uint index, float2 position, constant RoundedClipNode *masks) {
+  float coverage = 1.0;
+  while (index != 0) {
+    RoundedClipNode mask = masks[index - 1];
+    coverage = min(coverage, saturate(0.5 - quad_sdf(position, mask.bounds, mask.corner_radii)));
+    index = mask.parent;
+  }
+  return coverage;
 }

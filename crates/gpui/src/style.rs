@@ -658,6 +658,34 @@ impl Style {
         }
     }
 
+    pub(crate) fn with_overflow<R>(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        draw: impl FnOnce(&mut Window) -> R,
+    ) -> R {
+        let rem_size = window.rem_size();
+        let mask = self.overflow_mask(bounds, rem_size);
+        window.with_content_mask(mask, |window| {
+            if self.overflow.x == Overflow::Visible || self.overflow.y == Overflow::Visible {
+                return draw(window);
+            }
+            let Some(mask) = mask else { return draw(window); };
+            let corners = self.corner_radii.to_pixels(rem_size)
+                .clamp_radii_for_quad_size(bounds.size);
+            let widths = if self.border_color.is_some_and(|color| !color.is_transparent()) {
+                self.border_widths.to_pixels(rem_size)
+            } else { Edges::default() };
+            let corners = Corners {
+                top_left: (corners.top_left - widths.top.max(widths.left)).max(Pixels::ZERO),
+                top_right: (corners.top_right - widths.top.max(widths.right)).max(Pixels::ZERO),
+                bottom_right: (corners.bottom_right - widths.bottom.max(widths.right)).max(Pixels::ZERO),
+                bottom_left: (corners.bottom_left - widths.bottom.max(widths.left)).max(Pixels::ZERO),
+            };
+            window.with_rounded_clip(mask.bounds, corners, draw)
+        })
+    }
+
     /// Get the content mask for this element style, based on the given bounds.
     /// If the element does not hide its overflow, this will return `None`.
     pub fn overflow_mask(

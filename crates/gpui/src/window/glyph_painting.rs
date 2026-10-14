@@ -612,6 +612,8 @@ impl Window {
         let color = run.sprite_color;
         if subpixel_rendering {
             self.next_frame.scene.insert_subpixel_sprite(SubpixelSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 bounds,
@@ -623,6 +625,8 @@ impl Window {
             });
         } else {
             self.next_frame.scene.insert_monochrome_sprite(MonochromeSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 bounds,
