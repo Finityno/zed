@@ -134,6 +134,9 @@ pub struct Scene {
     painted_subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Rounded masks referenced by primitives, one-based so zero needs no mask.
+    pub rounded_clips: Vec<RoundedClipNode>,
+    pub(crate) current_rounded_clip: u32,
     pub blended_quad_indices: Vec<u32>,
     pub opaque_quad_indices: Vec<u32>,
     /// Sweeps referenced by `SpriteEffect::animation`.
@@ -185,6 +188,8 @@ impl Scene {
         ] = &mut self.shrink;
         paint_operations.clear_vec(&mut self.paint_operations);
         self.primitive_bounds.clear();
+        self.rounded_clips.clear();
+        self.current_rounded_clip = 0;
         layer_stack.clear_vec(&mut self.layer_stack);
         paths.clear_vec(&mut self.paths);
         shadows.clear_vec(&mut self.shadows);
@@ -325,6 +330,7 @@ impl Scene {
             return;
         };
         sprite.order = order;
+        sprite.rounded_clip = self.current_rounded_clip;
         let index = self.painted_monochrome_sprites.len() as u32;
         self.painted_monochrome_sprites.push(sprite);
         self.paint_operations
@@ -339,6 +345,7 @@ impl Scene {
             return;
         };
         sprite.order = order;
+        sprite.rounded_clip = self.current_rounded_clip;
         let index = self.painted_subpixel_sprites.len() as u32;
         self.painted_subpixel_sprites.push(sprite);
         self.paint_operations
@@ -418,6 +425,7 @@ impl Scene {
                     |sprite| {
                         sprite.order = order;
                         sprite.pad = pad;
+                        sprite.rounded_clip = self.current_rounded_clip;
                     },
                 );
                 self.paint_operations
@@ -429,6 +437,7 @@ impl Scene {
                     |sprite| {
                         sprite.order = order;
                         sprite.pad = pad;
+                        sprite.rounded_clip = self.current_rounded_clip;
                     },
                 );
                 self.paint_operations
@@ -465,6 +474,9 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        if primitive.rounded_clip() == 0 {
+            primitive.set_rounded_clip(self.current_rounded_clip);
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -634,6 +646,26 @@ impl Scene {
         std::mem::replace(&mut self.current_transition, transition)
     }
 
+    fn remap_rounded_clip(
+        &mut self,
+        previous: &Scene,
+        index: u32,
+        remapped: &mut Vec<(u32, u32)>,
+        moved: Option<&SceneMove>,
+    ) -> u32 {
+        if index == 0 { return 0; }
+        if let Some((_, current)) = remapped.iter().find(|(old, _)| *old == index) {
+            return *current;
+        }
+        let mut mask = previous.rounded_clips[index as usize - 1];
+        mask.parent = self.remap_rounded_clip(previous, mask.parent, remapped, moved);
+        if let Some(moved) = moved { mask.bounds.origin = mask.bounds.origin + moved.delta; }
+        self.rounded_clips.push(mask);
+        let current = self.rounded_clips.len() as u32;
+        remapped.push((index, current));
+        current
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         self.replay_inside(range, prev_scene, None, None);
     }
@@ -683,6 +715,7 @@ impl Scene {
     ) {
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
+        let mut remapped_clips = Vec::new();
         let mut remapped_animation = (0, 0);
         let mut remapped_transitions: Vec<(u32, u32)> = Vec::new();
         // Only content drawn again from a view's record is compacted; a
@@ -708,6 +741,10 @@ impl Scene {
                         PaintOperation::Primitive(primitive) => primitive.clone(),
                         PaintOperation::StartLayer(_) | PaintOperation::EndLayer => continue,
                     };
+                    let clip = self.remap_rounded_clip(
+                        prev_scene, primitive.rounded_clip(), &mut remapped_clips, moved,
+                    );
+                    primitive.set_rounded_clip(clip);
                     if let Some(moved) = moved {
                         moved.move_primitive(&mut primitive);
                     }
@@ -1576,6 +1613,8 @@ mod tests {
         let subpixel = |tile: u32, x: f32| {
             let sprite = monochrome(tile, x);
             SubpixelSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 bounds: sprite.bounds,
@@ -2066,7 +2105,11 @@ mod tests {
     #[test]
     fn glyph_sprite_inserts_match_insert_primitive() {
         fn subpixel(sprite: MonochromeSprite) -> SubpixelSprite {
+            rounded_clip: 0,
+            clip_padding: 0,
             SubpixelSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: sprite.order,
                 pad: sprite.pad,
                 bounds: sprite.bounds,
@@ -2323,6 +2366,32 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    fn rounded_clip(&self) -> u32 {
+        match self {
+            Self::Shadow(value) => value.rounded_clip,
+            Self::Quad(value) => value.rounded_clip,
+            Self::Path(value) => value.rounded_clip,
+            Self::Underline(value) => value.rounded_clip,
+            Self::MonochromeSprite(value) => value.rounded_clip,
+            Self::SubpixelSprite(value) => value.rounded_clip,
+            Self::PolychromeSprite(value) => value.rounded_clip,
+            Self::Surface(value) => value.rounded_clip,
+        }
+    }
+
+    fn set_rounded_clip(&mut self, index: u32) {
+        match self {
+            Self::Shadow(value) => value.rounded_clip = index,
+            Self::Quad(value) => value.rounded_clip = index,
+            Self::Path(value) => value.rounded_clip = index,
+            Self::Underline(value) => value.rounded_clip = index,
+            Self::MonochromeSprite(value) => value.rounded_clip = index,
+            Self::SubpixelSprite(value) => value.rounded_clip = index,
+            Self::PolychromeSprite(value) => value.rounded_clip = index,
+            Self::Surface(value) => value.rounded_clip = index,
+        }
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -2640,6 +2709,20 @@ impl PrimitiveBatch {
     }
 }
 
+/// One intersection in a rounded clip chain, in device coordinates.
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+pub struct RoundedClipNode {
+    /// The rectangle before rounding, independent of rectangular overflow masks.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Radii clamped to the rectangle, in clockwise order.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// One-based parent index, or zero for the outermost clip.
+    pub parent: u32,
+    /// Explicit GPU padding.
+    pub padding: [u32; 3],
+}
+
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -2652,6 +2735,8 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl Quad {
@@ -2661,7 +2746,8 @@ impl Quad {
         // translucent surface beneath it untouched. The opaque pass blends
         // nothing and so would write alpha 1 over that surface, so glass quads
         // never take it, however solid their color is.
-        !self.background.is_glass_content()
+        self.rounded_clip == 0
+            && !self.background.is_glass_content()
             && self
                 .background
                 .as_solid()
@@ -2698,6 +2784,8 @@ pub struct Underline {
     pub color: Hsla,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl From<Underline> for Primitive {
@@ -2721,6 +2809,8 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl From<Shadow> for Primitive {
@@ -3210,6 +3300,8 @@ pub struct MonochromeSprite {
     pub effect: SpriteEffect,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -3230,6 +3322,8 @@ pub struct SubpixelSprite {
     pub effect: SpriteEffect,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl From<SubpixelSprite> for Primitive {
@@ -3250,6 +3344,8 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -3266,6 +3362,8 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl From<PaintSurface> for Primitive {
@@ -3286,6 +3384,7 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub order: DrawOrder,
     pub bounds: Bounds<P>,
     pub content_mask: ContentMask<P>,
+    pub rounded_clip: u32,
     pub vertices: Vec<PathVertex<P>>,
     pub color: Background,
     start: Point<P>,
@@ -3307,6 +3406,7 @@ impl Path<Pixels> {
                 size: Default::default(),
             },
             content_mask: Default::default(),
+            rounded_clip: 0,
             color: Default::default(),
             contour_count: 0,
         }
@@ -3319,6 +3419,7 @@ impl Path<Pixels> {
             order: self.order,
             bounds: self.bounds.scale(factor),
             content_mask: self.content_mask.scale(factor),
+            rounded_clip: self.rounded_clip,
             vertices: self
                 .vertices
                 .iter()

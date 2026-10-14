@@ -642,6 +642,8 @@ mod tests {
         let mut scene = Scene::default();
         for tile in tiles {
             scene.monochrome_sprites.push(gpui::MonochromeSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 bounds: Default::default(),

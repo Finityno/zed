@@ -72,6 +72,8 @@ pub(crate) mod a11y;
 mod draw_profile;
 mod frame_work;
 mod glyph_painting;
+mod rounded_clip;
+pub(crate) use rounded_clip::RoundedClipRegion;
 mod layout_keys;
 #[cfg(test)]
 mod layout_retention_tests;
@@ -965,6 +967,7 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    pub(crate) rounded_clip: Option<Arc<RoundedClipRegion>>,
 }
 
 impl Hitbox {
@@ -1118,6 +1121,7 @@ pub(crate) struct DeferredDraw {
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
+    rounded_clip: Option<Arc<RoundedClipRegion>>,
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
@@ -1362,7 +1366,9 @@ impl Frame {
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if bounds.contains(&position)
+                && hitbox.rounded_clip.as_ref().is_none_or(|clip| clip.contains(position))
+            {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1457,6 +1463,7 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     pub(crate) glass_content: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    pub(crate) rounded_clip: Option<Arc<RoundedClipRegion>>,
     pub(crate) text_shimmer_stack: Vec<TextShimmerStyle>,
     glyph_raster_cache: glyph_painting::GlyphRasterCache,
     pub(crate) line_glyph_cache: glyph_painting::LineGlyphCache,
@@ -2444,6 +2451,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            rounded_clip: None,
             text_shimmer_stack: Vec::new(),
             glyph_raster_cache: glyph_painting::GlyphRasterCache::default(),
             line_glyph_cache: glyph_painting::LineGlyphCache::default(),
@@ -3778,7 +3786,11 @@ impl Window {
     }
 
     fn underline(&self, origin: Point<Pixels>, width: Pixels, style: &UnderlineStyle) -> Underline {
+        rounded_clip: 0,
+        clip_padding: 0,
         Underline {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             pad: 0,
             bounds: self.underline_bounds(origin, width, style),
@@ -4682,6 +4694,9 @@ impl Window {
                 .set_active_node(deferred_draw.parent_node);
 
             let paint_start = self.paint_index();
+            let previous_rounded_clip = self.rounded_clip.clone();
+            let previous_gpu_clip = self.next_frame.scene.current_rounded_clip;
+            self.install_rounded_clip(deferred_draw.rounded_clip.clone());
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
                 let recording = self.begin_deferred_view(&deferred_draw.enclosing_views, cx);
@@ -4702,6 +4717,8 @@ impl Window {
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
+            self.rounded_clip = previous_rounded_clip;
+            self.next_frame.scene.current_rounded_clip = previous_gpu_clip;
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
@@ -4807,6 +4824,7 @@ impl Window {
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
+                    rounded_clip: deferred_draw.rounded_clip.clone(),
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     beneath_native_surfaces: deferred_draw.beneath_native_surfaces,
@@ -5521,6 +5539,7 @@ impl Window {
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
+            rounded_clip: content_mask.and(self.rounded_clip.clone()),
             rem_size: self.rem_size(),
             priority,
             beneath_native_surfaces,
@@ -5587,6 +5606,8 @@ impl Window {
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
@@ -5632,6 +5653,8 @@ impl Window {
                 bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
             };
             self.next_frame.scene.insert_primitive(Shadow {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
@@ -5705,6 +5728,8 @@ impl Window {
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
@@ -5838,6 +5863,8 @@ impl Window {
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             pad: 0,
             bounds,
@@ -5916,6 +5943,8 @@ impl Window {
             let opacity = self.element_opacity();
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 grayscale: false.into(),
@@ -5982,6 +6011,8 @@ impl Window {
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             pad: 0,
             bounds: final_bounds,
@@ -6089,6 +6120,8 @@ impl Window {
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             pad: 0,
             grayscale: grayscale.into(),
@@ -6113,6 +6146,8 @@ impl Window {
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             bounds,
             content_mask,
@@ -6392,6 +6427,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            rounded_clip: self.rounded_clip.clone(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox

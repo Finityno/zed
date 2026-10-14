@@ -127,6 +127,8 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -464,6 +466,8 @@ struct WgpuResources {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
+    rounded_clip_texture: wgpu::Texture,
+    rounded_clip_view: wgpu::TextureView,
     instance_data: InstanceData,
     depth_texture: Option<wgpu::Texture>,
     depth_view: Option<wgpu::TextureView>,
@@ -972,6 +976,16 @@ impl WgpuRendererCore {
                             min_binding_size: NonZeroU64::new(
                                 std::mem::size_of::<GlobalParams>() as u64
                             ),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
                         count: None,
                     },
@@ -1703,10 +1717,13 @@ impl WgpuRendererCore {
                 device.limits().min_storage_buffer_offset_alignment as u64,
             )
         };
+        let rounded_clip_texture = Self::create_rounded_clip_texture(&device, 1);
+        let rounded_clip_view = rounded_clip_texture.create_view(&Default::default());
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals_bind_group"),
             layout: &bind_group_layouts.globals,
             entries: &[
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&rounded_clip_view) },
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -1729,6 +1746,7 @@ impl WgpuRendererCore {
             label: Some("path_globals_bind_group"),
             layout: &bind_group_layouts.globals,
             entries: &[
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&rounded_clip_view) },
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -1763,6 +1781,8 @@ impl WgpuRendererCore {
                 globals_buffer,
                 globals_bind_group,
                 path_globals_bind_group,
+                rounded_clip_texture,
+                rounded_clip_view,
                 instance_data,
                 depth_texture: None,
                 depth_view: None,
@@ -1868,6 +1888,59 @@ impl WgpuRendererCore {
         resources.path_msaa_view = path_msaa_view;
     }
 
+    fn create_rounded_clip_texture(device: &wgpu::Device, height: u32) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rounded clip masks"),
+            size: wgpu::Extent3d { width: 256, height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+    }
+
+    fn upload_rounded_clips(&mut self, scene: &Scene) -> Result<()> {
+        let height = ((scene.rounded_clips.len() * 3).div_ceil(256).max(1) as u32).next_power_of_two();
+        anyhow::ensure!(height <= self.max_texture_size, "rounded clip table exceeds texture limit");
+        let globals_size = std::mem::size_of::<GlobalParams>() as u64;
+        let gamma_size = std::mem::size_of::<GammaParams>() as u64;
+        let gamma_offset = self.gamma_offset;
+        let path_offset = self.path_globals_offset;
+        let resources = self.resources_mut();
+        if resources.rounded_clip_texture.height() != height {
+            resources.rounded_clip_texture = Self::create_rounded_clip_texture(&resources.device, height);
+            resources.rounded_clip_view = resources.rounded_clip_texture.create_view(&Default::default());
+            let make_group = |offset| resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("globals with rounded clips"), layout: &resources.bind_group_layouts.globals,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &resources.globals_buffer, offset, size: NonZeroU64::new(globals_size),
+                    }) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &resources.globals_buffer, offset: gamma_offset, size: NonZeroU64::new(gamma_size),
+                    }) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&resources.rounded_clip_view) },
+                ],
+            });
+            resources.globals_bind_group = make_group(0);
+            resources.path_globals_bind_group = make_group(path_offset);
+        }
+        if scene.rounded_clips.is_empty() { return Ok(()); }
+        let mut bytes = vec![0u8; height as usize * 256 * 16];
+        let source = unsafe { std::slice::from_raw_parts(scene.rounded_clips.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(scene.rounded_clips.as_slice())) };
+        bytes[..source.len()].copy_from_slice(source);
+        resources.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &resources.rounded_clip_texture, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256 * 16), rows_per_image: Some(height) },
+            wgpu::Extent3d { width: 256, height, depth_or_array_layers: 1 },
+        );
+        Ok(())
+    }
+
     fn render_frame(
         &mut self,
         scene: &Scene,
@@ -1887,6 +1960,7 @@ impl WgpuRendererCore {
             self.max_texture_size
         );
 
+        self.upload_rounded_clips(scene)?;
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size, !scene.paths.is_empty());
         self.resources.publish_target_memory();
@@ -2480,6 +2554,8 @@ impl WgpuRendererCore {
         for path in paths {
             let bounds = path.clipped_bounds();
             vertices.extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
+                rounded_clip: path.rounded_clip,
+                clip_padding: 0,
                 xy_position: vertex.xy_position,
                 st_position: vertex.st_position,
                 color: path.color,
@@ -3443,6 +3519,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn solid_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
+        rounded_clip: 0,
+        clip_padding: 0,
         let bounds = Bounds {
             origin: Point {
                 x: x.into(),
@@ -3454,6 +3532,8 @@ mod tests {
             },
         };
         Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             border_style: BorderStyle::Solid,
             bounds,
@@ -3994,6 +4074,8 @@ mod tests {
             }
             .scale(1.0);
             PolychromeSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 grayscale: false.into(),
@@ -4049,6 +4131,8 @@ mod tests {
         }
         .scale(1.0);
         shadow_and_sprite_scene.insert_primitive(Shadow {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             blur_radius: ScaledPixels(0.),
             bounds: shadow_bounds,
@@ -4304,6 +4388,8 @@ mod tests {
     #[test]
     fn webgl_quad_layout_matches_fixed_decoder() {
         let quad = Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 41,
             border_style: BorderStyle::Dashed,
             bounds: Bounds {

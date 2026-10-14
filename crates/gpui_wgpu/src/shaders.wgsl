@@ -542,6 +542,8 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 struct QuadVarying {
@@ -553,6 +555,7 @@ struct QuadVarying {
     @location(3) @interpolate(flat) background_solid: vec4<f32>,
     @location(4) @interpolate(flat) background_color0: vec4<f32>,
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
+    @location(6) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
@@ -577,6 +580,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = quad_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.rounded_clip = quad.rounded_clip;
     return out;
 }
 
@@ -584,7 +588,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let quad = load_quad(input.quad_id);
@@ -603,7 +607,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return rounded_clip_color(blend_color(background_color, 1.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let size = quad.bounds.size;
@@ -669,7 +673,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return rounded_clip_color(blend_color(background_color, 1.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -908,7 +912,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return rounded_clip_color(blend_color(color, saturate(antialias_threshold - outer_sdf)), rounded_clip_coverage(input.rounded_clip, input.position.xy));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1066,6 +1070,8 @@ struct Shadow {
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
     pad: u32, // align to 8 bytes
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 struct ShadowVarying {
@@ -1074,6 +1080,7 @@ struct ShadowVarying {
     @location(1) @interpolate(flat) shadow_id: u32,
     //TODO: use `clip_distance` once Naga supports it
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
@@ -1097,6 +1104,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
+    out.rounded_clip = shadow.rounded_clip;
     return out;
 }
 
@@ -1104,7 +1112,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let shadow = load_shadow(input.shadow_id);
@@ -1146,7 +1154,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return blend_color(input.color, alpha);
+    return rounded_clip_color(blend_color(input.color, alpha), rounded_clip_coverage(input.rounded_clip, input.position.xy));
 }
 
 // --- path rasterization --- //
@@ -1156,6 +1164,8 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 
@@ -1170,6 +1180,7 @@ struct PathRasterizationVarying {
     // origin, so the framebuffer position is tile-relative; this recovers
     // the whole-pixel origin to put it back in window space.
     @location(4) window_position: vec2<f32>,
+    @location(5) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
@@ -1182,6 +1193,7 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     out.vertex_id = vertex_id;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
     out.window_position = v.xy_position;
+    out.rounded_clip = v.rounded_clip;
     return out;
 }
 
@@ -1190,7 +1202,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     let dx = dpdx(input.st_position);
     let dy = dpdy(input.st_position);
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return (vec4<f32>(0.0)) * rounded_clip_coverage(input.rounded_clip, input.window_position);
     }
 
     let v = load_path_vertex(input.vertex_id);
@@ -1218,7 +1230,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     let tile_origin = round(input.window_position - input.position.xy);
     let color = gradient_color(background, input.position.xy + tile_origin, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
-    return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
+    return (vec4<f32>(color.rgb * color.a * alpha, color.a * alpha)) * rounded_clip_coverage(input.rounded_clip, input.window_position);
 }
 
 // --- paths --- //
@@ -1266,6 +1278,8 @@ struct Underline {
     color: Hsla,
     thickness: f32,
     wavy: u32,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 
@@ -1275,6 +1289,7 @@ struct UnderlineVarying {
     @location(1) @interpolate(flat) underline_id: u32,
     //TODO: use `clip_distance` once Naga supports it
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
@@ -1287,6 +1302,7 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     out.color = hsla_to_rgba(underline.color);
     out.underline_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
+    out.rounded_clip = underline.rounded_clip;
     return out;
 }
 
@@ -1297,13 +1313,13 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let underline = load_underline(input.underline_id);
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return rounded_clip_color(blend_color(input.color, input.color.a), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1319,7 +1335,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return rounded_clip_color(blend_color(input.color, alpha * input.color.a), rounded_clip_coverage(input.rounded_clip, input.position.xy));
 }
 
 // --- monochrome sprites --- //
@@ -1352,6 +1368,8 @@ struct MonochromeSprite {
     effect: SpriteEffect,
     tile: AtlasTile,
     transformation: TransformationMatrix,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 
@@ -1363,6 +1381,7 @@ struct MonoSpriteVarying {
     @location(3) @interpolate(flat) sprite_id: u32,
     @location(4) clip_distances: vec4<f32>,
     @location(5) @interpolate(flat) effect_kind: u32,
+    @location(6) @interpolate(flat) rounded_clip: u32,
 }
 
 // Highlight profile of the shimmer band. `u` is the position across the band
@@ -1407,6 +1426,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     out.effect_kind = sprite.effect.kind;
+    out.rounded_clip = sprite.rounded_clip;
     return out;
 }
 
@@ -1418,7 +1438,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     // Virtually every glyph in the window is unshimmered, so bail out before
@@ -1427,7 +1447,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     // blend below ends in a divide; neither is worth paying on all text for
     // an effect a handful of labels use.
     if (input.effect_kind == 0u) {
-        return blend_color(vec4<f32>(base_color.rgb, 1.0), base_color.a * alpha_corrected);
+        return rounded_clip_color(blend_color(vec4<f32>(base_color.rgb, 1.0), base_color.a * alpha_corrected), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let sprite = load_mono_sprite(input.sprite_id);
@@ -1444,7 +1464,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
             combined_alpha;
     }
 
-    return blend_color(vec4<f32>(combined_rgb, 1.0), combined_alpha);
+    return rounded_clip_color(blend_color(vec4<f32>(combined_rgb, 1.0), combined_alpha), rounded_clip_coverage(input.rounded_clip, input.position.xy));
 }
 
 // --- polychrome sprites --- //
@@ -1458,6 +1478,8 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     tile: AtlasTile,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 
@@ -1466,6 +1488,7 @@ struct PolySpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
@@ -1478,6 +1501,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.rounded_clip = sprite.rounded_clip;
     return out;
 }
 
@@ -1486,7 +1510,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
@@ -1497,14 +1521,17 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    return rounded_clip_color(blend_color(color, sprite.opacity * saturate(0.5 - distance)), rounded_clip_coverage(input.rounded_clip, input.position.xy));
 }
 
 // --- surfaces --- //
 
 struct SurfaceParams {
+    _clip_uniform_padding: vec2<u32>,
     bounds: Bounds,
     content_mask: Bounds,
+    rounded_clip: u32,
+    clip_padding: u32,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1523,6 +1550,7 @@ struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_position: vec2<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
@@ -1533,6 +1561,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
     out.position = to_device_position(unit_vertex, surface_locals.bounds);
     out.texture_position = unit_vertex;
     out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    out.rounded_clip = surface_locals.rounded_clip;
     return out;
 }
 
@@ -1540,7 +1569,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
     let y_cb_cr = vec4<f32>(
@@ -1548,5 +1577,33 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return ycbcr_to_RGB * y_cb_cr;
+    return rounded_clip_color(ycbcr_to_RGB * y_cb_cr, rounded_clip_coverage(input.rounded_clip, input.position.xy));
+}
+
+@group(0) @binding(2) var t_rounded_clips: texture_2d<u32>;
+
+fn rounded_clip_texel(index: u32) -> vec4<u32> {
+    let width = textureDimensions(t_rounded_clips).x;
+    return textureLoad(t_rounded_clips, vec2<i32>(i32(index % width), i32(index / width)), 0);
+}
+
+fn rounded_clip_coverage(first: u32, position: vec2<f32>) -> f32 {
+    var index = first;
+    var coverage = 1.0;
+    loop {
+        if index == 0u { break; }
+        let offset = (index - 1u) * 3u;
+        let rectangle = bitcast<vec4<f32>>(rounded_clip_texel(offset));
+        let radii = bitcast<vec4<f32>>(rounded_clip_texel(offset + 1u));
+        let distance = quad_sdf(position, Bounds(rectangle.xy, rectangle.zw),
+            Corners(radii.x, radii.y, radii.z, radii.w));
+        coverage = min(coverage, saturate(0.5 - distance));
+        index = rounded_clip_texel(offset + 2u).x;
+    }
+    return coverage;
+}
+
+fn rounded_clip_color(color: vec4<f32>, coverage: f32) -> vec4<f32> {
+    if globals.premultiplied_alpha != 0u { return color * coverage; }
+    return vec4<f32>(color.rgb, color.a * coverage);
 }

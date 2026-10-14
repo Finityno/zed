@@ -101,6 +101,7 @@ impl ViewMove {
                 size: hitbox.bounds.size,
             },
             content_mask: self.mask_of(&hitbox.content_mask),
+            rounded_clip: hitbox.rounded_clip.as_ref().map(|clip| clip.moved(self.delta)),
             behavior: hitbox.behavior,
         }
     }
@@ -122,6 +123,7 @@ impl ViewMove {
                 size: context.bounds.size,
             },
             content_mask: self.mask_of(&context.content_mask),
+            rounded_clip: context.rounded_clip.as_ref().map(|clip| clip.moved(self.delta)),
             text_style: context.text_style.clone(),
             opacity: context.opacity,
             rem_size: context.rem_size,
@@ -211,6 +213,7 @@ pub(crate) enum MoveRefusal {
     StaysPut,
     /// It was painted inside a text shimmer from around it.
     InheritedShimmer,
+    InheritedRoundedClip,
     SizeChanged,
     OpacityChanged,
     RemSizeChanged,
@@ -337,6 +340,9 @@ impl Window {
         let scaled = delta.scale(scale_factor);
         if !whole_device_pixels(scaled.x.0) || !whole_device_pixels(scaled.y.0) {
             return Err(MoveRefusal::NotWholeDevicePixels);
+        }
+        if self.rounded_clip.is_some() || context.rounded_clip.is_some() {
+            return Err(MoveRefusal::InheritedRoundedClip);
         }
         let mask = self.content_mask();
         let outer = edges(&context.content_mask.bounds);

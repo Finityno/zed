@@ -3878,6 +3878,8 @@ mod atlas_tests {
         let mut scene = Scene::default();
         for tile in tiles {
             scene.monochrome_sprites.push(crate::MonochromeSprite {
+                rounded_clip: 0,
+                clip_padding: 0,
                 order: 0,
                 pad: 0,
                 bounds: Default::default(),
@@ -3989,6 +3991,8 @@ mod atlas_tests {
         assert_ne!(shown_tile.texture_id, scrolled_away_tile.texture_id);
         let mut scene = Scene::default();
         scene.polychrome_sprites.push(crate::PolychromeSprite {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             pad: 0,
             grayscale: Default::default(),
