@@ -1,9 +1,8 @@
 use crate::{
-    BoolExt, MacActivity, MacDisplay, MacPlatform, NSRange, NSStringExt,
-    TISCopyCurrentKeyboardInputSource,
-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    AppleActivity, BoolExt, MacDisplay, MacPlatform, NSRange, NSStringExt,
+    TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty, WindowFrameSource,
+    events::platform_input_from_native, kTISPropertyInputSourceIsASCIICapable,
+    kTISPropertyInputSourceType, kTISTypeKeyboardInputMode, ns_string, renderer,
 };
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
@@ -1392,7 +1391,7 @@ impl MacWindow {
                 // `LatencyCritical` is the part that matters: user-initiated
                 // alone still lets the timers be coalesced.
                 _hidden_rendering_activity: render_while_hidden.then(|| {
-                    MacActivity::begin(
+                    AppleActivity::begin(
                         "Rendering a hidden window",
                         NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
                             | NSActivityOptions::LatencyCritical,

@@ -7,8 +7,7 @@ use anyhow::{Context as _, anyhow};
 use block2::RcBlock;
 use cocoa::{
     appkit::{
-        NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight, NSApplication,
-        NSApplicationActivationPolicy,
+        NSApplication, NSApplicationActivationPolicy,
         NSApplicationActivationPolicy::{
             NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
         },

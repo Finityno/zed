@@ -4583,6 +4583,7 @@ impl Window {
         self.mark_draw_phase(draw_profile::DrawClockPhase::Prepaint);
         frame_work::add_elapsed(&mut self.frame_work.stats.build_time, build_started_at);
         let prepaint_started_at = self.frame_work.clock();
+        #[cfg(feature = "profiler")]
         let prepaint_start = Instant::now();
         self.layout_engine
             .as_mut()
@@ -4625,6 +4626,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Paint);
         let paint_started_at = self.frame_work.clock();
+        #[cfg(feature = "profiler")]
         let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
