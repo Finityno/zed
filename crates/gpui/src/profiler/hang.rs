@@ -24,6 +24,10 @@ pub use monitor::{HangMonitorConfig, HangMonitorError, HangMonitorPoll, HangMoni
 
 /// Version of the power/visibility-aware measurement rules.
 ///
+/// 5: display-paced late frames are distinct from individually blocking
+/// work. Earlier budget incidents used a different accounting rule, so
+/// comparisons must keep their measurement versions separate.
+///
 /// 4: draws carry a phase breakdown and, where measured, thread CPU and
 /// memory-fault counters. Inside the draw span this adds a thread-CPU read
 /// at the start of every draw (about 0.5 µs on macOS), two timestamps per
@@ -36,7 +40,7 @@ pub use monitor::{HangMonitorConfig, HangMonitorError, HangMonitorPoll, HangMoni
 /// latency and dirty-to-present spans of the frame it failed to show, and its
 /// window stays pending, even when nothing was invalidated, until a present
 /// lands or the frame outlives its deadline.
-pub const MEASUREMENT_VERSION: u32 = 4;
+pub const MEASUREMENT_VERSION: u32 = 5;
 
 use super::SerializedLocation;
 use super::journal::{
