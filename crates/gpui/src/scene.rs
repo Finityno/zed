@@ -1691,6 +1691,8 @@ mod tests {
 
     fn shimmering_glyph(animation: u32) -> MonochromeSprite {
         MonochromeSprite {
+            rounded_clip: 0,
+            clip_padding: 0,
             order: 0,
             pad: 0,
             bounds: unit_bounds(),
@@ -1874,6 +1876,44 @@ mod tests {
             scale_factor: 2.0,
             parent,
         }
+    }
+
+    #[test]
+    fn rounded_clip_replay_remaps_parents_and_moves_only_transition_local_masks() {
+        let started_at = std::time::Instant::now();
+        let mut source = Scene::default();
+        let Some(transition) = source.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition fits");
+        };
+        let outer = RoundedClipNode {
+            bounds: Bounds::new(Point::default(), size(ScaledPixels(100.), ScaledPixels(80.))),
+            corner_radii: Corners::all(ScaledPixels(20.)),
+            ..Default::default()
+        };
+        source.rounded_clips.push(outer);
+        source.rounded_clips.push(RoundedClipNode { parent: 1, transition, ..outer });
+        source.current_rounded_clip = 2;
+        source.set_current_transition(transition);
+        source.insert_primitive(shimmering_glyph(0));
+        source.set_current_transition(0);
+        source.finish();
+        source.advance_transitions(started_at + std::time::Duration::from_millis(50));
+        assert_eq!(source.rounded_clips[0].bounds.origin.y, ScaledPixels(0.));
+        assert_eq!(source.rounded_clips[1].bounds.origin.y, ScaledPixels(10.));
+
+        let mut replayed = Scene::default();
+        replayed.rounded_clips.push(outer);
+        replayed.push_transition(sliding(started_at, 0));
+        replayed.replay(0..source.len(), &source);
+        replayed.finish();
+        assert_eq!(replayed.monochrome_sprites[0].rounded_clip, 3);
+        assert_eq!(replayed.rounded_clips[2].parent, 2);
+        assert_eq!(replayed.rounded_clips[2].transition, 2);
+        replayed.advance_transitions(started_at + std::time::Duration::from_millis(50));
+        assert_eq!(replayed.rounded_clips[1].bounds.origin.y, ScaledPixels(0.));
+        assert_eq!(replayed.rounded_clips[2].bounds.origin.y, ScaledPixels(10.));
+        replayed.advance_transitions(started_at + std::time::Duration::from_millis(100));
+        assert_eq!(replayed.rounded_clips[2].bounds.origin.y, ScaledPixels(0.));
     }
 
     #[test]

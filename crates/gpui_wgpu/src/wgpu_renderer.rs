@@ -3584,6 +3584,42 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn rounded_clip_intersects_quad_and_path_without_covering_the_backdrop() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 32.0, gpui::blue()));
+        let bounds = solid_quad(0.0, 0.0, 32.0, 32.0, gpui::red()).bounds;
+        scene.rounded_clips.push(gpui::RoundedClipNode {
+            bounds,
+            corner_radii: Corners::all(gpui::ScaledPixels(12.0)),
+            base_origin: bounds.origin,
+            ..Default::default()
+        });
+        let mut quad = solid_quad(0.0, 0.0, 32.0, 32.0, gpui::red());
+        quad.rounded_clip = 1;
+        scene.insert_primitive(quad);
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, device_size(32, 32))?;
+        assert_pixel(&image, 1, 1, BLUE);
+        assert_pixel(&image, 16, 16, RED);
+        assert_pixel(&image, 30, 30, BLUE);
+
+        let mut path_scene = Scene::default();
+        path_scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 32.0, gpui::blue()));
+        path_scene.rounded_clips = scene.rounded_clips.clone();
+        let mut path = red_square_path(32.0);
+        path.rounded_clip = 1;
+        path_scene.insert_primitive(path);
+        path_scene.finish();
+        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
+        assert_pixel(&image, 1, 1, BLUE);
+        assert_pixel(&image, 16, 16, RED);
+        assert_pixel(&image, 30, 30, BLUE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn headless_renderer_captures_each_requested_size() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
         let mut scene = Scene::default();
