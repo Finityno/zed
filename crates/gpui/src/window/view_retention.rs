@@ -1418,6 +1418,7 @@ impl Window {
         // Moved with what it painted from the mask around it then to the one
         // around it now, which can differ from the ones around its prepaint.
         let moved = record.moved.as_ref().map(|moved| ViewMove {
+            inherited_clip_depth: moved.inherited_clip_depth,
             delta: moved.delta,
             old_outer: record.paint_mask,
             new_outer: paint_mask,

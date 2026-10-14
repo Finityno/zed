@@ -32,13 +32,19 @@ impl RoundedClipRegion {
         inside_corner && self.parent.as_ref().is_none_or(|parent| parent.contains(position))
     }
 
-    pub(crate) fn moved(&self, delta: Point<Pixels>) -> Arc<Self> {
+    pub(crate) fn depth(&self) -> usize {
+        1 + self.parent.as_ref().map_or(0, |parent| parent.depth())
+    }
+
+    pub(crate) fn moved_inside(self: &Arc<Self>, delta: Point<Pixels>, inherited_depth: usize) -> Arc<Self> {
+        if self.depth() <= inherited_depth { return Arc::clone(self); }
         Arc::new(Self {
             bounds: Bounds { origin: self.bounds.origin + delta, ..self.bounds },
             corners: self.corners,
-            parent: self.parent.as_ref().map(|parent| parent.moved(delta)),
+            parent: self.parent.as_ref().map(|parent| parent.moved_inside(delta, inherited_depth)),
         })
     }
+
 }
 
 impl Window {
@@ -56,7 +62,9 @@ impl Window {
             });
             window.next_frame.scene.rounded_clips.len() as u32
         }
-        self.next_frame.scene.current_rounded_clip = clip.as_ref().map_or(0, |clip| insert(self, clip));
+        if self.invalidator.is_painting() {
+            self.next_frame.scene.current_rounded_clip = clip.as_ref().map_or(0, |clip| insert(self, clip));
+        }
         self.rounded_clip = clip;
     }
 
@@ -81,16 +89,18 @@ impl Window {
             bounds, corners, parent: previous.clone(),
         }));
         let parent = self.next_frame.scene.current_rounded_clip;
-        let scale_factor = self.scale_factor();
-        let device_bounds = bounds.scale(scale_factor);
-        self.next_frame.scene.rounded_clips.push(RoundedClipNode {
-            bounds: device_bounds,
-            corner_radii: corners.map(|radius| radius.scale(scale_factor)),
-            parent,
-            transition: self.next_frame.scene.current_transition(),
-            base_origin: device_bounds.origin,
-        });
-        self.next_frame.scene.current_rounded_clip = self.next_frame.scene.rounded_clips.len() as u32;
+        if self.invalidator.is_painting() {
+            let scale_factor = self.scale_factor();
+            let device_bounds = bounds.scale(scale_factor);
+            self.next_frame.scene.rounded_clips.push(RoundedClipNode {
+                bounds: device_bounds,
+                corner_radii: corners.map(|radius| radius.scale(scale_factor)),
+                parent,
+                transition: self.next_frame.scene.current_transition(),
+                base_origin: device_bounds.origin,
+            });
+            self.next_frame.scene.current_rounded_clip = self.next_frame.scene.rounded_clips.len() as u32;
+        }
         let result = self.with_content_mask(Some(crate::ContentMask { bounds }), draw);
         self.next_frame.scene.current_rounded_clip = parent;
         self.rounded_clip = previous;

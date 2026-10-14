@@ -659,6 +659,15 @@ impl Scene {
         if let Some((_, current)) = remapped.iter().find(|(old, _)| *old == index) {
             return *current;
         }
+        if let Some(moved) = moved {
+            let mut depth = 0;
+            let mut ancestor = index;
+            while ancestor != 0 {
+                depth += 1;
+                ancestor = previous.rounded_clips[ancestor as usize - 1].parent;
+            }
+            if depth <= moved.inherited_clip_depth { return moved.inherited_clip; }
+        }
         let mut mask = previous.rounded_clips[index as usize - 1];
         mask.parent = self.remap_rounded_clip(previous, mask.parent, remapped, moved, transitions, landed_before);
         if mask.transition != 0 {
@@ -1879,6 +1888,35 @@ mod tests {
     }
 
     #[test]
+    fn rounded_clip_move_keeps_ancestor_masks_stationary() {
+        let mut source = Scene::default();
+        let outer = RoundedClipNode {
+            bounds: unit_bounds(),
+            corner_radii: Corners::all(ScaledPixels(0.25)),
+            ..Default::default()
+        };
+        source.rounded_clips.push(outer);
+        source.rounded_clips.push(RoundedClipNode { parent: 1, ..outer });
+        source.current_rounded_clip = 2;
+        source.insert_primitive(shimmering_glyph(0));
+        let mut replayed = Scene::default();
+        replayed.rounded_clips.push(outer);
+        replayed.replay_inside(0..source.len(), &source, None, Some(&SceneMove {
+            delta: point(ScaledPixels(1.), ScaledPixels(0.)),
+            old_outer: [0., 0., 10., 10.],
+            new_outer: [0., 0., 10., 10.],
+            inherited_clip_depth: 1,
+            inherited_clip: 1,
+        }));
+        replayed.finish();
+        assert_eq!(replayed.rounded_clips.len(), 2);
+        assert_eq!(replayed.rounded_clips[0].bounds.origin.x, ScaledPixels(0.));
+        assert_eq!(replayed.rounded_clips[1].bounds.origin.x, ScaledPixels(1.));
+        assert_eq!(replayed.rounded_clips[1].parent, 1);
+        assert_eq!(replayed.monochrome_sprites[0].rounded_clip, 2);
+    }
+
+    #[test]
     fn rounded_clip_replay_remaps_parents_and_moves_only_transition_local_masks() {
         let started_at = std::time::Instant::now();
         let mut source = Scene::default();
@@ -1886,7 +1924,7 @@ mod tests {
             panic!("a first transition fits");
         };
         let outer = RoundedClipNode {
-            bounds: Bounds::new(Point::default(), size(ScaledPixels(100.), ScaledPixels(80.))),
+            bounds: Bounds::new(Point::default(), crate::size(ScaledPixels(100.), ScaledPixels(80.))),
             corner_radii: Corners::all(ScaledPixels(20.)),
             ..Default::default()
         };
@@ -2269,6 +2307,8 @@ pub(crate) struct SceneMove {
     /// The edges of the mask around what moved, then and now.
     pub(crate) old_outer: [f32; 4],
     pub(crate) new_outer: [f32; 4],
+    pub(crate) inherited_clip_depth: usize,
+    pub(crate) inherited_clip: u32,
 }
 
 impl SceneMove {
