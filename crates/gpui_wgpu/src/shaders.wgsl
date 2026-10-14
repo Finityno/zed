@@ -1527,11 +1527,11 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 // --- surfaces --- //
 
 struct SurfaceParams {
-    _clip_uniform_padding: vec2<u32>,
     bounds: Bounds,
     content_mask: Bounds,
     rounded_clip: u32,
     clip_padding: u32,
+    _clip_uniform_padding: vec2<u32>,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;

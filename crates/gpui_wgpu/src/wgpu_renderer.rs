@@ -1908,7 +1908,9 @@ impl WgpuRendererCore {
         let gamma_offset = self.gamma_offset;
         let path_offset = self.path_globals_offset;
         let resources = self.resources_mut();
-        if resources.rounded_clip_texture.height() != height {
+        if resources.rounded_clip_texture.height() < height
+            || resources.rounded_clip_texture.height() > height.saturating_mul(4)
+        {
             resources.rounded_clip_texture = Self::create_rounded_clip_texture(&resources.device, height);
             resources.rounded_clip_view = resources.rounded_clip_texture.create_view(&Default::default());
             let make_group = |offset| resources.device.create_bind_group(&wgpu::BindGroupDescriptor {

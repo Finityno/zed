@@ -162,7 +162,7 @@ pub struct Scene {
     /// prepared, reused across presents.
     transition_states: Vec<(Point<ScaledPixels>, f32)>,
     /// One tracker per vector above, in the order `clear` destructures them.
-    shrink: [CapacityShrink; 14],
+    shrink: [CapacityShrink; 15],
     /// Room `finish` sorts in, kept across frames.
     draw_order_scratch: DrawOrderScratch,
 }
@@ -185,10 +185,11 @@ impl Scene {
             opaque_quad_indices,
             painted_monochrome_sprites,
             painted_subpixel_sprites,
+            rounded_clips,
         ] = &mut self.shrink;
         paint_operations.clear_vec(&mut self.paint_operations);
         self.primitive_bounds.clear();
-        self.rounded_clips.clear();
+        rounded_clips.clear_vec(&mut self.rounded_clips);
         self.current_rounded_clip = 0;
         layer_stack.clear_vec(&mut self.layer_stack);
         paths.clear_vec(&mut self.paths);

@@ -368,8 +368,8 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
-    rounded_clip: u32,
-    clip_padding: u32,
+    pub rounded_clip: u32,
+    pub clip_padding: u32,
 }
 
 impl MetalRenderer {
@@ -1787,7 +1787,7 @@ impl MetalRenderer {
                         viewport_size,
                         None,
                     );
-        command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
+                    command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
                     command_encoder.set_depth_stencil_state(&self.depth_test_state);
                     set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
 
