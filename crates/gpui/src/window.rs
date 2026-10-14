@@ -1855,6 +1855,8 @@ impl Window {
             icon,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            render_while_hidden,
         } = options;
 
         let initial_window_title = titlebar
@@ -1880,6 +1882,8 @@ impl Window {
                 icon,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
+                #[cfg(target_os = "macos")]
+                render_while_hidden,
             },
         )?;
 
