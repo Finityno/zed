@@ -42,7 +42,6 @@ use collections::FxHashMap;
 use std::{
     any::Any,
     fmt::{self, Debug, Display},
-    hash::{BuildHasher, Hash, Hasher},
     mem, panic,
     sync::Arc,
 };
@@ -940,6 +939,7 @@ fn prepare_inspector_id(
 #[cfg(test)]
 mod global_element_id_tests {
     use super::*;
+    use std::hash::{BuildHasher, Hash, Hasher};
 
     fn cached_path(ids: &[&'static str]) -> Vec<ElementId> {
         ids.iter().map(|id| ElementId::from(*id)).collect()
@@ -1015,8 +1015,6 @@ mod global_element_id_tests {
         stack.clear();
         assert_eq!(stack.global_id(&mut cache), GlobalElementId::default());
     }
-
-    use std::hash::{Hash, Hasher};
 
     fn path(depth: usize, leaf: u64) -> Vec<ElementId> {
         let mut ids: Vec<ElementId> = (0..depth as u64)

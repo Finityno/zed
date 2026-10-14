@@ -156,12 +156,12 @@ unsafe extern "C" fn display_link_output_callback(
     if let Some(entry) = registry.displays.get(&display_id) {
         for subscriber in &entry.subscribers {
             if subscriber.frame_demand.swap(false, Ordering::AcqRel) {
-            if let Some(signal_at) = signal_at {
-                subscriber
-                    .signal
-                    .record(signal_at, FrameRequestSource::NativeCallback);
-            }
-            subscriber.frame_requests.merge_data(1);
+                if let Some(signal_at) = signal_at {
+                    subscriber
+                        .signal
+                        .record(signal_at, FrameRequestSource::NativeCallback);
+                }
+                subscriber.frame_requests.merge_data(1);
             }
         }
     }
