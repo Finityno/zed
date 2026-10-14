@@ -58,7 +58,7 @@ const MIN_DETECTED_SUSPEND: Duration = Duration::from_millis(50);
 const MAX_INTERVAL_EVENTS: usize = 16 * 1024;
 
 // Allow 1MiB for the fixed ring allocation, including each slot's atomic
-// metadata: about 4.4k entries. The ring wraps, so every byte of it becomes
+// metadata: about 3.2k entries. The ring wraps, so every byte of it becomes
 // resident once the app has run for a while. The slowest regular drain is the
 // hang detector's, once a second. Every retained poll took at least the 100us
 // floor and frames come at the display's cadence, so outrunning that drain
@@ -70,7 +70,9 @@ const MAX_JOURNAL_ENTRIES: usize = (1024 * 1024) / core::mem::size_of::<JournalS
 // Every byte an entry grows by costs the ring capacity, and the largest
 // entry (a presentation boundary, which carries its drawn frame) sets the
 // slot size for all of them. Grow this deliberately, not by accident.
-const _: () = assert!(core::mem::size_of::<ForegroundJournalEntry>() <= 224);
+// Display timestamps and the upstream phase measurements add 80 bytes to
+// the retained presentation boundary. The ring stays at its fixed 1 MiB.
+const _: () = assert!(core::mem::size_of::<ForegroundJournalEntry>() <= 304);
 
 // Absorbs brief collisions with a collector reading the exact slot being
 // wrapped. The foreground never waits for a reader; queued entries are retried

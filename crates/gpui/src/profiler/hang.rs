@@ -1328,6 +1328,9 @@ mod tests {
                 flags: crate::DrawBreakdown::DETAIL_RECORDED,
                 ..Default::default()
             },
+            refresh_interval: None,
+            signal_at: None,
+            phases: Default::default(),
         };
         let snapshot = FrameSnapshot {
             interval_start: at(1000),

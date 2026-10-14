@@ -1117,7 +1117,7 @@ pub fn draw_detail_threshold() -> Duration {
 /// name the slowest in a slow draw (see [`set_view_timing`]).
 #[cfg(feature = "profiler")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum ViewTiming {
+pub enum ViewTimingMode {
     /// Never.
     Off,
     /// A draw is timed from its start when the window's previous draw
@@ -1131,24 +1131,24 @@ pub enum ViewTiming {
 }
 
 #[cfg(feature = "profiler")]
-static VIEW_TIMING: AtomicU8 = AtomicU8::new(ViewTiming::OnSlowDraws as u8);
+static VIEW_TIMING: AtomicU8 = AtomicU8::new(ViewTimingMode::OnSlowDraws as u8);
 
 /// Sets when window draws time their views. A draw that is timed costs two
 /// `Instant::now()` calls per view per phase; a draw that is not costs a
 /// branch per view. Only draws that reach [`draw_detail_threshold`] record
 /// their slowest views, into a buffer [`slow_draw_detail`] reads.
 #[cfg(feature = "profiler")]
-pub fn set_view_timing(timing: ViewTiming) {
+pub fn set_view_timing(timing: ViewTimingMode) {
     VIEW_TIMING.store(timing as u8, Ordering::Relaxed);
 }
 
 /// The policy [`set_view_timing`] set; `OnSlowDraws` by default.
 #[cfg(feature = "profiler")]
-pub fn view_timing() -> ViewTiming {
+pub fn view_timing() -> ViewTimingMode {
     match VIEW_TIMING.load(Ordering::Relaxed) {
-        0 => ViewTiming::Off,
-        2 => ViewTiming::Always,
-        _ => ViewTiming::OnSlowDraws,
+        0 => ViewTimingMode::Off,
+        2 => ViewTimingMode::Always,
+        _ => ViewTimingMode::OnSlowDraws,
     }
 }
 

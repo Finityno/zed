@@ -1269,7 +1269,7 @@ impl MetalRenderer {
         let Some(drawable) = drawable else {
             let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
             let allows_timeout = objc2_layer.allowsNextDrawableTimeout();
-            let outcome = self.missing_drawable_outcome(allows_timeout == YES);
+            let outcome = self.missing_drawable_outcome(allows_timeout);
             match outcome {
                 PresentOutcome::Deferred if self.consecutive_deferred_presents == 1 => {
                     log::warn!(

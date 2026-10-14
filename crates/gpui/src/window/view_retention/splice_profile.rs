@@ -180,7 +180,7 @@ fn profile_layout_key_sets() {
     let (held_bytes, peak_bytes, requested_bytes, allocation_calls) = (-1, -1, 0, 0);
     let (state_count, state_box_bytes, frame_hash) = cx.update_window(window.into(), |_, window, _| {
         let states = window.rendered_frame.element_states.iter().filter(|((id, _), _)| {
-            matches!(id.0.last(), Some(crate::ElementId::NamedInteger(name, _)) if name.as_ref() == "profile-state")
+            matches!(id.last(), Some(crate::ElementId::NamedInteger(name, _)) if name.as_ref() == "profile-state")
         });
         let (count, bytes) = states.fold((0, 0), |(count, bytes), (_, state)| {
             (count + 1, bytes + std::mem::size_of_val(state.inner.as_ref()))

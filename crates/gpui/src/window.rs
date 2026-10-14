@@ -1160,6 +1160,16 @@ impl ElementIdStack {
     }
 }
 
+impl FromIterator<ElementId> for ElementIdStack {
+    fn from_iter<T: IntoIterator<Item = ElementId>>(ids: T) -> Self {
+        let mut stack = Self::default();
+        for id in ids {
+            stack.push(id);
+        }
+        stack
+    }
+}
+
 impl std::ops::Deref for ElementIdStack {
     type Target = [ElementId];
 
@@ -10549,6 +10559,7 @@ mod tests {
     const PRESENT_ONLY: RequestFrameOptions = RequestFrameOptions {
         require_presentation: true,
         force_render: false,
+        ..RequestFrameOptions::default()
     };
 
     /// A present the platform deferred (no surface to render into) keeps its
