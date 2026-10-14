@@ -111,7 +111,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Context, InteractiveElement, IntoElement, ParentElement, Render, Styled, TestAppContext, div, point, px, size};
+    use crate::{AppContext, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled, TestAppContext, div, point, px, size};
 
     struct ClippedCard { radius: Pixels }
 
