@@ -657,23 +657,27 @@ impl Scene {
         moved: Option<&SceneMove>,
         transitions: &mut Vec<(u32, u32)>,
         landed_before: Option<std::time::Instant>,
+        inherited_clip: Option<(usize, u32)>,
     ) -> u32 {
         if index == 0 { return 0; }
         if let Some((_, current)) = remapped.iter().find(|(old, _)| *old == index) {
             return *current;
         }
-        if let Some(moved) = moved {
+        let inherited_clip = inherited_clip.or_else(|| moved.map(|moved| (moved.inherited_clip_depth, moved.inherited_clip)));
+        if let Some((inherited_depth, inherited_index)) = inherited_clip {
             let mut depth = 0;
             let mut ancestor = index;
             while ancestor != 0 {
                 depth += 1;
                 ancestor = previous.rounded_clips[ancestor as usize - 1].parent;
             }
-            if depth <= moved.inherited_clip_depth { return moved.inherited_clip; }
+            if depth <= inherited_depth { return inherited_index; }
         }
         let mut mask = previous.rounded_clips[index as usize - 1];
-        mask.parent = self.remap_rounded_clip(previous, mask.parent, remapped, moved, transitions, landed_before);
-        if mask.transition != 0 {
+        mask.parent = self.remap_rounded_clip(previous, mask.parent, remapped, moved, transitions, landed_before, inherited_clip);
+        if let Some((_, current)) = transitions.iter().find(|(old, _)| *old == mask.transition) {
+            mask.transition = *current;
+        } else if mask.transition != 0 {
             mask.transition = self.remap_transition(previous, mask.transition, transitions, landed_before);
         }
         if let Some(moved) = moved { mask.base_origin = mask.base_origin + moved.delta; }
@@ -685,7 +689,7 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        self.replay_inside(range, prev_scene, None, None);
+        self.replay_inside(range, prev_scene, None, None, None);
     }
 
     /// Whether every primitive and layer in `range` that reached past its
@@ -730,6 +734,7 @@ impl Scene {
         prev_scene: &Scene,
         rebase: Option<(u32, u32)>,
         moved: Option<&SceneMove>,
+        inherited_clip: Option<(usize, u32)>,
     ) {
         // Every glyph of one shimmering label names the same sweep, so the
         // label's glyphs share one remapped entry rather than one each.
@@ -761,7 +766,7 @@ impl Scene {
                     };
                     let clip = self.remap_rounded_clip(
                         prev_scene, primitive.rounded_clip(), &mut remapped_clips, moved,
-                        &mut remapped_transitions, landed_before,
+                        &mut remapped_transitions, landed_before, inherited_clip,
                     );
                     primitive.set_rounded_clip(clip);
                     if let Some(moved) = moved {
@@ -1910,13 +1915,42 @@ mod tests {
             new_outer: [0., 0., 10., 10.],
             inherited_clip_depth: 1,
             inherited_clip: 1,
-        }));
+        }), None);
         replayed.finish();
         assert_eq!(replayed.rounded_clips.len(), 2);
         assert_eq!(replayed.rounded_clips[0].bounds.origin.x, ScaledPixels(0.));
         assert_eq!(replayed.rounded_clips[1].bounds.origin.x, ScaledPixels(1.));
         assert_eq!(replayed.rounded_clips[1].parent, 1);
         assert_eq!(replayed.monochrome_sprites[0].rounded_clip, 2);
+    }
+
+    #[test]
+    fn rounded_clip_cached_subtree_joins_a_new_transition_without_moving_its_ancestor() {
+        let started_at = std::time::Instant::now();
+        let mut source = Scene::default();
+        let outer = RoundedClipNode {
+            bounds: unit_bounds(),
+            corner_radii: Corners::all(ScaledPixels(0.25)),
+            ..Default::default()
+        };
+        source.rounded_clips.push(outer);
+        source.rounded_clips.push(RoundedClipNode { parent: 1, ..outer });
+        source.current_rounded_clip = 2;
+        source.insert_primitive(shimmering_glyph(0));
+        let mut replayed = Scene::default();
+        replayed.rounded_clips.push(outer);
+        let Some(transition) = replayed.push_transition(rolling_in(started_at)) else {
+            panic!("a first transition fits");
+        };
+        replayed.replay_inside(0..source.len(), &source, Some((0, transition)), None, Some((1, 1)));
+        replayed.finish();
+        assert_eq!(replayed.rounded_clips.len(), 2);
+        assert_eq!(replayed.rounded_clips[0].transition, 0);
+        assert_eq!(replayed.rounded_clips[1].transition, transition);
+        replayed.advance_transitions(started_at + std::time::Duration::from_millis(50));
+        assert_eq!(replayed.rounded_clips[0].bounds.origin.y, ScaledPixels(0.));
+        assert_eq!(replayed.rounded_clips[1].bounds.origin.y, ScaledPixels(10.));
+        assert_eq!(replayed.monochrome_sprites[0].bounds.origin.y, ScaledPixels(10.));
     }
 
     #[test]
