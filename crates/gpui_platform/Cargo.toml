@@ -13,7 +13,10 @@ path = "src/gpui_platform.rs"
 doctest = false
 
 [features]
-default = []
+default = ["multithreaded"]
+# Threads in the browser: needs a nightly toolchain and a cross-origin-isolated
+# page. Off, gpui_web builds on stable.
+multithreaded = ["gpui_web/multithreaded"]
 bench-support = ["gpui/bench-support", "gpui_macos/bench-support", "gpui_windows/bench-support", "gpui_wgpu/bench-support"]
 font-kit = ["gpui_macos/font-kit"]
 inspector = ["gpui/inspector"]
@@ -28,11 +31,17 @@ name = "inspector_render"
 harness = false
 required-features = ["bench-support"]
 
+[[bench]]
+name = "randomized_element_tree"
+harness = false
+required-features = ["bench-support"]
+
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
 
 [dev-dependencies]
+bench_metrics.workspace = true
 criterion.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

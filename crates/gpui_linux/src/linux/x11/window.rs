@@ -257,7 +257,6 @@ pub struct Callbacks {
 }
 
 pub struct X11WindowState {
-    pub destroyed: bool,
     parent: Option<X11WindowStatePtr>,
     children: FxHashSet<xproto::Window>,
     client: X11ClientStatePtr,
@@ -270,7 +269,9 @@ pub struct X11WindowState {
     pub(crate) last_sync_counter: Option<sync::Int64>,
     bounds: Bounds<Pixels>,
     scale_factor: f32,
-    renderer: WgpuRenderer,
+    /// Taken when the window is dropped. Its GPU objects use the X connection, so they mustn't
+    /// outlive the window, which a display mode switch relies on.
+    renderer: Option<WgpuRenderer>,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
@@ -310,6 +311,13 @@ impl X11WindowState {
 
     fn is_transparent(&self) -> bool {
         self.background_appearance != WindowBackgroundAppearance::Opaque
+    }
+
+    fn update_transparency(&mut self) {
+        let is_transparent = self.is_transparent();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.update_transparency(is_transparent);
+        }
     }
 }
 
@@ -842,7 +850,7 @@ impl X11WindowState {
                 visual_id: visual.id,
                 bounds: bounds.to_pixels(scale_factor),
                 scale_factor,
-                renderer,
+                renderer: Some(renderer),
                 atoms: *atoms,
                 input_handler: None,
                 active: false,
@@ -859,7 +867,6 @@ impl X11WindowState {
                 appearance,
                 handle,
                 background_appearance: WindowBackgroundAppearance::Opaque,
-                destroyed: false,
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
@@ -896,9 +903,11 @@ impl Drop for X11Window {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
         }
 
-        state.renderer.destroy();
+        // The renderer's GPU objects use the X connection, and a display mode switch closes the
+        // connection once no window is left in the client's window map, so both go now.
+        state.renderer.take();
 
-        let destroy_x_window = maybe!({
+        maybe!({
             check_reply(
                 || "X11 DestroyWindow failure.",
                 self.0.xcb.destroy_window(self.0.x_window),
@@ -908,22 +917,13 @@ impl Drop for X11Window {
             anyhow::Ok(())
         })
         .log_err();
-
-        if destroy_x_window.is_some() {
-            state.destroyed = true;
-
-            let this_ptr = self.0.clone();
-            let client_ptr = state.client.clone();
-            state
-                .executor
-                .spawn(async move {
-                    this_ptr.close();
-                    client_ptr.drop_window(this_ptr.x_window);
-                })
-                .detach();
-        }
-
+        let client = state.client.clone();
+        let executor = state.executor.clone();
         drop(state);
+
+        client.drop_window(self.0.x_window);
+        let this_ptr = self.0.clone();
+        executor.spawn(async move { this_ptr.close() }).detach();
     }
 }
 
@@ -1089,22 +1089,25 @@ impl X11WindowStatePtr {
             // The restored surface is empty; render the next frame rather
             // than rely on something in the window being dirty. A failed
             // restore needs that frame too: its draw retries the restore.
-            if state.renderer.is_unconfigured() {
+            if state.renderer.as_ref().is_some_and(WgpuRenderer::is_unconfigured) {
                 self.restore_surface(&mut state);
                 state.force_render_next_frame();
             }
         } else {
-            state.renderer.unconfigure_surface();
+            if let Some(renderer) = state.renderer.as_mut() {
+                renderer.unconfigure_surface();
+            }
         }
     }
 
     /// Returns whether a released surface was restored.
     fn restore_surface(&self, state: &mut X11WindowState) -> bool {
-        if !state.renderer.is_unconfigured() {
+        if !state.renderer.as_ref().is_some_and(WgpuRenderer::is_unconfigured) {
             return false;
         }
         let raw_window = self.raw_window(state);
-        match state.renderer.restore_surface(&raw_window) {
+        let Some(renderer) = state.renderer.as_mut() else { return false; };
+        match renderer.restore_surface(&raw_window) {
             Ok(()) => true,
             Err(error) => {
                 log::warn!(
@@ -1255,7 +1258,7 @@ impl X11WindowStatePtr {
             // A lost device still waiting out its recovery backoff has nothing
             // to draw, so the request stays latched until the attempt is due.
             let mut state = self.state.borrow_mut();
-            if state.renderer.recovery_delay().is_none() {
+            if state.renderer.as_ref().and_then(WgpuRenderer::recovery_delay).is_none() {
                 request_frame_options.force_render |=
                     std::mem::take(&mut state.force_render_after_recovery);
             } else if state.force_render_after_recovery
@@ -1385,7 +1388,9 @@ impl X11WindowStatePtr {
             }
 
             let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
-            state.renderer.update_drawable_size(gpu_size);
+            if let Some(renderer) = &mut state.renderer {
+                renderer.update_drawable_size(gpu_size);
+            }
             let result = (is_resize, state.content_size(), state.scale_factor);
             if let Some(value) = state.last_sync_counter.take() {
                 check_reply(
@@ -1441,8 +1446,7 @@ impl X11WindowStatePtr {
     pub fn set_appearance(&mut self, appearance: WindowAppearance) {
         let mut state = self.state.borrow_mut();
         state.appearance = appearance;
-        let is_transparent = state.is_transparent();
-        state.renderer.update_transparency(is_transparent);
+        state.update_transparency();
         state.appearance = appearance;
         drop(state);
         let callback = self.callbacks.borrow_mut().appearance_changed.take();
@@ -1702,8 +1706,7 @@ impl PlatformWindow for X11Window {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.0.state.borrow_mut();
         state.background_appearance = background_appearance;
-        let transparent = state.is_transparent();
-        state.renderer.update_transparency(transparent);
+        state.update_transparency();
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -1812,6 +1815,10 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().moved = Some(callback);
     }
 
+    // A GPUI display on X11 is an X screen, which spans every monitor, and a
+    // window never changes screen.
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {}
+
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.callbacks.borrow_mut().should_close = Some(callback);
     }
@@ -1833,13 +1840,22 @@ impl PlatformWindow for X11Window {
 
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
+        let inner = &mut *inner;
+        if inner.renderer.is_none() {
+            return;
+        }
 
-        if inner.renderer.device_lost() {
-            let raw_window = self.0.raw_window(&inner);
-            match inner.renderer.recover(&raw_window) {
-                // Recovery recreates the surface configured; an unmapped
-                // window releases it again rather than holding it until mapped.
-                Ok(()) if !inner.mapped => inner.renderer.unconfigure_surface(),
+        if let Some(renderer) = inner.renderer.as_mut() && renderer.device_lost() {
+            let raw_window = RawWindow {
+                connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
+                    &*self.0.xcb,
+                ) as *mut _,
+                screen_id: inner.x_screen_index,
+                window_id: self.0.x_window,
+                visual_id: inner.visual_id,
+            };
+            match renderer.recover(&raw_window) {
+                Ok(()) if !inner.mapped => renderer.unconfigure_surface(),
                 Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
@@ -1856,23 +1872,30 @@ impl PlatformWindow for X11Window {
         // forced render afterwards.
         if inner.mapped {
             self.0.restore_surface(&mut inner);
-            if inner.renderer.is_unconfigured() {
+            if inner.renderer.as_ref().is_some_and(WgpuRenderer::is_unconfigured) {
                 // Still released: force the next frame so it retries, since an
                 // idle window would otherwise never draw again.
                 inner.force_render_next_frame();
                 return;
             }
         }
-        inner.renderer.draw(scene);
+        let Some(renderer) = inner.renderer.as_mut() else { return; };
+        renderer.draw(scene);
 
-        if inner.renderer.needs_redraw() {
+        if renderer.needs_redraw() {
             inner.force_render_next_frame();
         }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        let inner = self.0.state.borrow();
-        inner.renderer.sprite_atlas().clone()
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .as_ref()
+            .expect("the renderer is only taken when the window is dropped")
+            .sprite_atlas()
+            .clone()
     }
 
     fn show_window_menu(&self, position: Point<Pixels>) {
@@ -2036,13 +2059,11 @@ impl PlatformWindow for X11Window {
         match decorations {
             WindowDecorations::Server => {
                 state.decorations = WindowDecorations::Server;
-                let is_transparent = state.is_transparent();
-                state.renderer.update_transparency(is_transparent);
+                state.update_transparency();
             }
             WindowDecorations::Client => {
                 state.decorations = WindowDecorations::Client;
-                let is_transparent = state.is_transparent();
-                state.renderer.update_transparency(is_transparent);
+                state.update_transparency();
             }
         }
 
@@ -2061,7 +2082,7 @@ impl PlatformWindow for X11Window {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.0.state.borrow().renderer.gpu_specs()
+        self.0.state.borrow().renderer.as_ref()?.gpu_specs()
     }
 
     fn play_system_bell(&self) {

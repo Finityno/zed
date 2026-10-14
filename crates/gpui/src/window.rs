@@ -10,14 +10,12 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeMenuItem, Path, Pixels,
-    PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    PresentOutcome, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
+    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeMenuItem, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, PresentOutcome, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubscriberSet, Subscription,
     TimeTransition,
@@ -33,14 +31,16 @@ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecogni
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_foundation::CFRetained;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_video::CVPixelBuffer;
 use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
@@ -162,6 +162,15 @@ struct WindowInvalidatorInner {
 struct FrameDirtyAccumulator {
     dirty_at: Option<Instant>,
     invalidations: u64,
+}
+
+/// Why GPUI capped a window's frame rate.
+#[derive(Clone, Copy)]
+enum FrameRateLimit {
+    /// The window isn't focused.
+    Inactive,
+    /// The system is under thermal pressure.
+    Thermal,
 }
 
 #[derive(Clone)]
@@ -1111,6 +1120,54 @@ pub(crate) struct TooltipRequest {
     tooltip: AnyTooltip,
 }
 
+/// The ids of the elements being drawn, root first, with the hash of every
+/// prefix alongside: a [`GlobalElementId`] for the current element is then
+/// the ids cloned out and the hash on top of the stack, without walking the
+/// path — the ids of every ancestor, string names byte by byte — for each
+/// element on every frame.
+#[derive(Clone, Default)]
+pub(crate) struct ElementIdStack {
+    ids: SmallVec<[ElementId; 32]>,
+    hashes: SmallVec<[u64; 32]>,
+}
+
+impl ElementIdStack {
+    pub(crate) fn push(&mut self, id: ElementId) {
+        self.hashes.push(crate::extend_path_hash(self.hash(), &id));
+        self.ids.push(id);
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<ElementId> {
+        self.hashes.pop();
+        self.ids.pop()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ids.clear();
+        self.hashes.clear();
+    }
+
+    /// The hash of the whole path on the stack.
+    fn hash(&self) -> u64 {
+        self.hashes
+            .last()
+            .copied()
+            .unwrap_or(crate::EMPTY_PATH_HASH)
+    }
+
+    pub(crate) fn global_id(&self, cache: &mut crate::element::GlobalElementIdCache) -> GlobalElementId {
+        cache.get(&self.ids, self.hash())
+    }
+}
+
+impl std::ops::Deref for ElementIdStack {
+    type Target = [ElementId];
+
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
+}
+
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
@@ -1118,7 +1175,7 @@ pub(crate) struct DeferredDraw {
     /// scene plane; see [`Window::defer_draw_beneath_native_surfaces`].
     beneath_native_surfaces: bool,
     parent_node: DispatchNodeId,
-    element_id_stack: SmallVec<[ElementId; 32]>,
+    element_id_stack: ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
     rounded_clip: Option<Arc<RoundedClipRegion>>,
@@ -1429,7 +1486,8 @@ pub struct Window {
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
-    display_id: Option<DisplayId>,
+    pub(crate) display_id: Option<DisplayId>,
+    pub(crate) display_observers: SubscriberSet<(), AnyObserver>,
     is_resizable: bool,
     is_minimizable: bool,
     pub(crate) sprite_atlas: Arc<dyn PlatformAtlas>,
@@ -1455,7 +1513,7 @@ pub struct Window {
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) layout_keys: layout_keys::LayoutKeys,
     pub(crate) root: Option<AnyView>,
-    pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    pub(crate) element_id_stack: ElementIdStack,
     pub(crate) global_element_ids: crate::element::GlobalElementIdCache,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
@@ -1522,7 +1580,7 @@ pub struct Window {
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
-    window_profiler: profiler::WindowProfiler,
+    pub(crate) window_profiler: profiler::WindowProfiler,
     #[cfg(feature = "profiler")]
     pub(crate) draw_clock: draw_profile::DrawClock,
     #[cfg(feature = "profiler")]
@@ -2033,8 +2091,18 @@ impl Window {
             let mut deferred_force_render = false;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
-                let _foreground_turn = profiler::journal::foreground_turn();
-                // This must be checked before anything else: if this request
+                let (_foreground_turn, window_id) = {
+                    let foreground_turn = profiler::journal::foreground_turn();
+                    let window_id = handle.window_id();
+                    profiler::journal::record_platform_signal(profiler::journal::PlatformSignal {
+                        window_id,
+                        signal_at: request_frame_options.signal_at,
+                        handled_at: Instant::now(),
+                        source: request_frame_options.signal_source,
+                    });
+                    (foreground_turn, window_id)
+                };
+                // This must be checked before accessing App: if this request
                 // arrived re-entrantly while a draw is on this thread's stack
                 // (e.g. via a nested message pump in the Windows window
                 // procedure), drawing would nest draws, and even touching the
@@ -2056,6 +2124,8 @@ impl Window {
                     // would otherwise never deliver the deferred frame. The
                     // waker only touches the invalidator, never the App.
                     invalidator.wake_platform();
+                    #[cfg(feature = "profiler")]
+                    profiler::journal::record_reentrant_frame_skipped(window_id, Instant::now());
                     return;
                 }
                 // Take the deferred flag first: `||` short-circuits, and leaving
@@ -2081,18 +2151,19 @@ impl Window {
                 {
                     None
                 } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
-                    inactive_frame_interval
+                    inactive_frame_interval.map(|interval| (interval, FrameRateLimit::Inactive))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err()
                 {
-                    Some(Duration::from_micros(16667))
+                    Some((Duration::from_micros(16667), FrameRateLimit::Thermal))
                 } else {
                     None
                 };
 
                 let now = Instant::now();
-                if let Some(min_interval) = min_frame_interval {
+                #[cfg_attr(not(feature = "profiler"), expect(unused_variables))]
+                if let Some((min_interval, limit)) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
                     {
@@ -2109,6 +2180,19 @@ impl Window {
                         // unserved; platforms that stop requesting frames for
                         // idle windows need a wakeup to deliver the retry.
                         invalidator.wake_platform();
+                        #[cfg(feature = "profiler")]
+                        profiler::journal::record_frame_skipped(
+                            window_id,
+                            Instant::now(),
+                            match limit {
+                                FrameRateLimit::Inactive => {
+                                    profiler::journal::FrameSkipReason::InactiveFrameRateLimit
+                                }
+                                FrameRateLimit::Thermal => {
+                                    profiler::journal::FrameSkipReason::ThermalFrameRateLimit
+                                }
+                            },
+                        );
                         return;
                     }
                 }
@@ -2161,10 +2245,15 @@ impl Window {
                                 >= interval
                         }));
 
-                if invalidator.is_dirty() || force_render {
+                let should_draw = invalidator.is_dirty() || force_render;
+                if should_draw {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
+                                #[cfg(feature = "profiler")]
+                                window
+                                    .window_profiler
+                                    .record_frame_signal(request_frame_options.signal_at);
                                 if force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
@@ -2246,6 +2335,14 @@ impl Window {
                 {
                     invalidator.wake_platform();
                 }
+                #[cfg(feature = "profiler")]
+                if !should_draw {
+                    profiler::journal::record_frame_skipped(
+                        window_id,
+                        Instant::now(),
+                        profiler::journal::FrameSkipReason::NoRenderNeeded,
+                    );
+                }
             }
         }));
         invalidator.set_platform_waker(platform_window.frame_waker());
@@ -2280,6 +2377,10 @@ impl Window {
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
                     .log_err();
             }
+        }));
+        platform_window.on_display_changed(Box::new({
+            let cx = cx.to_async();
+            move || cx.update(|cx| Window::display_changed(handle, cx))
         }));
         platform_window.on_appearance_changed(Box::new({
             let cx = cx.to_async();
@@ -2436,6 +2537,7 @@ impl Window {
             removed: false,
             platform_window,
             display_id,
+            display_observers: SubscriberSet::new(),
             is_resizable,
             is_minimizable,
             sprite_atlas,
@@ -2449,7 +2551,7 @@ impl Window {
             layout_engine: Some(TaffyLayoutEngine::new()),
             layout_keys: layout_keys::LayoutKeys::default(),
             root: None,
-            element_id_stack: SmallVec::default(),
+            element_id_stack: ElementIdStack::default(),
             global_element_ids: crate::element::GlobalElementIdCache::default(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
@@ -3026,6 +3128,7 @@ impl Window {
     pub(crate) fn dispatch_keystroke_observers(
         &mut self,
         keystroke: &Keystroke,
+        input_preference: InputPreference,
         action: Option<&dyn Action>,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
@@ -3034,6 +3137,7 @@ impl Window {
             (callback)(
                 &KeystrokeEvent {
                     keystroke: keystroke.clone(),
+                    input_preference,
                     action: action.map(|action| action.boxed_clone()),
                     context_stack: context_stack.clone(),
                 },
@@ -3046,6 +3150,7 @@ impl Window {
     pub(crate) fn dispatch_keystroke_interceptors(
         &mut self,
         keystroke: &Keystroke,
+        input_preference: InputPreference,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
     ) {
@@ -3055,6 +3160,7 @@ impl Window {
                 (callback)(
                     &KeystrokeEvent {
                         keystroke: keystroke.clone(),
+                        input_preference,
                         action: None,
                         context_stack: context_stack.clone(),
                     },
@@ -3258,7 +3364,6 @@ impl Window {
         }
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
-        self.display_id = self.platform_window.display().map(|display| display.id());
         self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
@@ -3266,6 +3371,65 @@ impl Window {
         self.bounds_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    fn display_changed(handle: AnyWindowHandle, cx: &mut App) {
+        let moved_to = handle
+            .update(cx, |_, window, _| {
+                let display_id = window.platform_window.display().map(|display| display.id());
+                let moved = display_id != window.display_id;
+                window.display_id = display_id;
+                moved.then_some(display_id)
+            })
+            .log_err()
+            .flatten();
+        let Some(display_id) = moved_to else {
+            return;
+        };
+        // The platform's notifications about the window and about displays
+        // arrive in no guaranteed order, so make sure App knows the display
+        // before the window's observers read its state.
+        if let Some(display_id) = display_id
+            && !cx.knows_display(display_id)
+        {
+            cx.displays_changed();
+        }
+        handle
+            .update(cx, |_, window, cx| window.notify_display_observers(cx))
+            .log_err();
+    }
+
+    pub(crate) fn notify_display_observers(&mut self, cx: &mut App) {
+        self.display_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+    }
+
+    /// The time between refreshes of the display the window is on, as of the
+    /// platform's last display change notification. Variable refresh rate
+    /// displays report their maximum rate. Returns `None` when the platform
+    /// doesn't report it.
+    pub fn refresh_interval(&self, cx: &App) -> Option<Duration> {
+        cx.display_refresh_interval(self.display_id?)
+    }
+
+    /// Registers a callback invoked when the window moves to another display
+    /// or its display's properties change, for example its refresh
+    /// interval. [`Self::refresh_interval`] already returns the new value
+    /// when the callback runs.
+    pub fn observe_window_display(
+        &self,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.display_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
     }
 
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
@@ -3641,7 +3805,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = this.global_element_ids.get(&this.element_id_stack);
+            let global_id = this.element_id_stack.global_id(&mut this.global_element_ids);
 
             f(&global_id, this)
         })
@@ -4146,6 +4310,8 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         {
+            self.window_profiler
+                .set_refresh_interval(self.refresh_interval(cx));
             let draw_duration =
                 self.end_draw_profile(frame_dirty.dirty_at, frame_dirty.invalidations, cx);
             self.debug_frame_overlay.record_frame(draw_duration);
@@ -4397,6 +4563,8 @@ impl Window {
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
         let build_started_at = self.frame_work.clock();
+        #[cfg(feature = "profiler")]
+        let request_layout_start = Instant::now();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::RequestLayout);
@@ -4405,6 +4573,7 @@ impl Window {
         self.mark_draw_phase(draw_profile::DrawClockPhase::Prepaint);
         frame_work::add_elapsed(&mut self.frame_work.stats.build_time, build_started_at);
         let prepaint_started_at = self.frame_work.clock();
+        let prepaint_start = Instant::now();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -4446,6 +4615,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Paint);
         let paint_started_at = self.frame_work.clock();
+        let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -4474,6 +4644,14 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         self.mark_draw_phase(draw_profile::DrawClockPhase::Finish);
+
+        #[cfg(feature = "profiler")]
+        self.window_profiler
+            .record_draw_phases(profiler::DrawPhases {
+                request_layout: prepaint_start.duration_since(request_layout_start),
+                prepaint: paint_start.duration_since(prepaint_start),
+                paint: Instant::now().duration_since(paint_start),
+            });
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -6151,8 +6329,12 @@ impl Window {
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CFRetained<CVPixelBuffer>,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -7174,6 +7356,27 @@ impl Window {
         }
     }
 
+    // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
+    // we prefer the text input over bindings.
+    fn input_preference(&mut self, event: &dyn Any, cx: &mut App) -> InputPreference {
+        let prefer_character_input = event
+            .downcast_ref::<KeyDownEvent>()
+            .is_some_and(|key_down_event| key_down_event.prefer_character_input);
+        if !prefer_character_input {
+            return InputPreference::KeyBindings;
+        }
+        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
+            return InputPreference::KeyBindings;
+        };
+        let accepts_text_input = input_handler.accepts_text_input(self, cx);
+        self.platform_window.set_input_handler(input_handler);
+        if accepts_text_input {
+            InputPreference::CharacterInput
+        } else {
+            InputPreference::KeyBindings
+        }
+    }
+
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
@@ -7230,16 +7433,31 @@ impl Window {
         }
 
         let Some(keystroke) = keystroke else {
-            self.finish_dispatch_key_event(event, None, dispatch_path, self.context_stack(), cx);
+            self.finish_dispatch_key_event(
+                event,
+                None,
+                InputPreference::KeyBindings,
+                dispatch_path,
+                self.context_stack(),
+                cx,
+            );
             return;
         };
 
+        let input_preference = self.input_preference(event, cx);
+
         cx.propagate_event = true;
-        self.dispatch_keystroke_interceptors(&keystroke, self.context_stack(), cx);
+        self.dispatch_keystroke_interceptors(
+            &keystroke,
+            input_preference,
+            self.context_stack(),
+            cx,
+        );
         if !cx.propagate_event {
             self.finish_dispatch_key_event(
                 event,
                 Some(&keystroke),
+                input_preference,
                 dispatch_path,
                 self.context_stack(),
                 cx,
@@ -7301,28 +7519,15 @@ impl Window {
             return;
         }
 
-        let skip_bindings = event
-            .downcast_ref::<KeyDownEvent>()
-            .filter(|key_down_event| key_down_event.prefer_character_input)
-            .map(|_| {
-                self.platform_window
-                    .take_input_handler()
-                    .map_or(false, |mut input_handler| {
-                        let accepts = input_handler.accepts_text_input(self, cx);
-                        self.platform_window.set_input_handler(input_handler);
-                        // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
-                        // we prefer the text input over bindings.
-                        accepts
-                    })
-            })
-            .unwrap_or(false);
-
-        if !skip_bindings {
+        // Interceptors or replayed actions may have changed whether the input handler accepts text.
+        let input_preference = self.input_preference(event, cx);
+        if input_preference == InputPreference::KeyBindings {
             for binding in match_result.bindings {
                 self.dispatch_action_on_node(node_id, binding.action.as_ref(), cx);
                 if !cx.propagate_event {
                     self.dispatch_keystroke_observers(
                         &keystroke,
+                        input_preference,
                         Some(binding.action.as_ref()),
                         match_result.context_stack,
                         cx,
@@ -7336,6 +7541,7 @@ impl Window {
         self.finish_dispatch_key_event(
             event,
             Some(&keystroke),
+            input_preference,
             dispatch_path,
             match_result.context_stack,
             cx,
@@ -7385,6 +7591,7 @@ impl Window {
         &mut self,
         event: &dyn Any,
         recognized_keystroke: Option<&Keystroke>,
+        input_preference: InputPreference,
         dispatch_path: SmallVec<[DispatchNodeId; 32]>,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
@@ -7400,7 +7607,7 @@ impl Window {
         }
 
         if let Some(keystroke) = recognized_keystroke {
-            self.dispatch_keystroke_observers(keystroke, None, context_stack, cx);
+            self.dispatch_keystroke_observers(keystroke, input_preference, None, context_stack, cx);
         }
     }
 
@@ -7604,6 +7811,7 @@ impl Window {
                 if !cx.propagate_event {
                     self.dispatch_keystroke_observers(
                         &replay.keystroke,
+                        InputPreference::KeyBindings,
                         Some(binding.action.as_ref()),
                         Vec::default(),
                         cx,
@@ -9250,6 +9458,163 @@ mod tests {
     };
     use crate::arena::SHRINK_AFTER_DURATION;
 
+    #[cfg(feature = "profiler")]
+    #[gpui::test]
+    fn test_frame_requests_and_skips_are_journaled(cx: &mut TestAppContext) {
+        use crate::FrameRequestSource;
+        use crate::profiler::journal::{
+            self, ForegroundJournalEntry, FrameSkipReason, IntervalBoundary,
+        };
+        use scheduler::Instant;
+
+        cx.app.borrow_mut().mode = crate::app::GpuiMode::Production;
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform_window = cx.test_window(window.into());
+        platform_window.simulate_frame_request(RequestFrameOptions::default());
+        let (journal, _guard) = journal::install_test_foreground_journal(64, 4);
+        let mut collector = journal.collector();
+
+        for (signal_at, source) in [
+            (Some(Instant::now()), FrameRequestSource::NativeCallback),
+            (Some(Instant::now()), FrameRequestSource::LocalSchedule),
+            (None, FrameRequestSource::NativeCallback),
+        ] {
+            platform_window.simulate_frame_request(RequestFrameOptions {
+                signal_at,
+                signal_source: source,
+                require_presentation: true,
+                ..Default::default()
+            });
+            let entries = collector.collect_unseen().entries;
+            let signal_index = entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        ForegroundJournalEntry::PlatformSignal(signal)
+                            if signal.window_id == window.window_id()
+                                && signal.signal_at == signal_at
+                                && signal.source == source
+                                && signal_at.is_none_or(|at| signal.handled_at >= at)
+                    )
+                })
+                .expect("frame request metadata");
+            let skip_index = entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        ForegroundJournalEntry::Boundary(IntervalBoundary::FrameSkipped(skipped))
+                            if skipped.window_id == window.window_id()
+                                && skipped.reason == FrameSkipReason::NoRenderNeeded
+                    )
+                })
+                .expect("completed no-render boundary");
+            assert!(signal_index < skip_index);
+        }
+    }
+
+    #[cfg(feature = "profiler")]
+    #[gpui::test]
+    fn test_frame_demand_survives_throttling(cx: &mut TestAppContext) {
+        use crate::profiler::journal::{
+            self, ForegroundJournalEntry, FrameSkipReason, IntervalBoundary,
+        };
+        use scheduler::Instant;
+
+        // Test mode draws during effect flushing, bypassing platform frame throttling.
+        cx.app.borrow_mut().mode = crate::app::GpuiMode::Production;
+        let (journal, _guard) = journal::install_test_foreground_journal(256, 4);
+        let mut collector = journal.collector();
+        for initially_dirty in [true, false] {
+            // Keep the throttle closed without depending on short wall-clock deadlines.
+            let window = cx
+                .app
+                .borrow_mut()
+                .open_window(
+                    WindowOptions {
+                        inactive_frame_interval: Some(Duration::from_secs(3600)),
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(|_| EmptyView),
+                )
+                .expect("open inactive test window");
+            let platform_window = cx.test_window(window.into());
+            platform_window.simulate_active_status_change(false);
+            platform_window.simulate_frame_request(RequestFrameOptions::default());
+            let callback_ran = Rc::new(Cell::new(false));
+            let draws_before = window
+                .update(cx, |_, window, _| {
+                    let draws_before = window
+                        .frame_duration_snapshot()
+                        .draw_duration_histogram
+                        .len();
+                    if initially_dirty {
+                        window.refresh();
+                    }
+                    window.on_next_frame({
+                        let callback_ran = callback_ran.clone();
+                        move |window, _| {
+                            callback_ran.set(true);
+                            window.refresh();
+                        }
+                    });
+                    draws_before
+                })
+                .expect("schedule throttled frame");
+            // Skips only seal retained work, so give the throttled skip some.
+            let input_at = Instant::now();
+            journal::record_input(journal::InputTiming {
+                kind: "test",
+                start: input_at,
+                end: input_at,
+                caused_invalidation: false,
+            });
+            collector.collect_unseen();
+            platform_window.simulate_frame_request(RequestFrameOptions {
+                signal_at: Some(Instant::now()),
+                ..Default::default()
+            });
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(
+                        window
+                            .frame_duration_snapshot()
+                            .draw_duration_histogram
+                            .len(),
+                        draws_before,
+                    );
+                })
+                .expect("inspect deferred frame");
+            assert!(!callback_ran.get());
+            assert!(collector.collect_unseen().entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    ForegroundJournalEntry::Boundary(IntervalBoundary::FrameSkipped(skipped))
+                        if skipped.window_id == window.window_id()
+                            && skipped.reason == FrameSkipReason::InactiveFrameRateLimit
+                )
+            }));
+            platform_window.simulate_frame_request(RequestFrameOptions {
+                signal_at: Some(Instant::now()),
+                require_presentation: true,
+                ..Default::default()
+            });
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(
+                        window
+                            .frame_duration_snapshot()
+                            .draw_duration_histogram
+                            .len(),
+                        draws_before + 1,
+                    );
+                })
+                .expect("inspect presented frame");
+            assert!(callback_ran.get());
+        }
+    }
+
     /// Visibility transitions reach observers exactly once each, with the new
     /// state already stored on the window, and never wake the platform for a
     /// frame: the platform requests one itself when it resumes presenting.
@@ -9294,6 +9659,118 @@ mod tests {
             .update(cx, |_, window, _| assert!(window.is_visible()))
             .unwrap();
         assert_eq!(test_window.frame_wake_count(), frame_wake_count);
+    }
+
+    /// App learns display state from the platform's display notifications,
+    /// and a window from the platform's report of which display it is on.
+    #[gpui::test]
+    fn test_display_tracking(cx: &mut TestAppContext) {
+        use crate::{DisplayChanges, DisplayEvent, DisplayId, Subscription};
+
+        let sixty_hertz = Duration::from_secs(1) / 60;
+        let one_hundred_twenty_hertz = Duration::from_secs(1) / 120;
+        let one_hundred_forty_four_hertz = Duration::from_secs(1) / 144;
+
+        let display_events = Rc::new(RefCell::new(Vec::new()));
+        let _display_subscription = cx.update({
+            let display_events = display_events.clone();
+            move |cx| cx.observe_displays(move |event, _| display_events.borrow_mut().push(event))
+        });
+
+        let window = cx.add_window(|window, cx| DisplayTracker {
+            refresh_intervals: Vec::new(),
+            _subscription: cx.observe_window_display(
+                window,
+                |tracker: &mut DisplayTracker, window, cx| {
+                    tracker.refresh_intervals.push(window.refresh_interval(cx));
+                },
+            ),
+        });
+        let window_notifications = Rc::new(RefCell::new(Vec::new()));
+        let _window_subscription = window
+            .update(cx, {
+                let window_notifications = window_notifications.clone();
+                move |_, window, cx| {
+                    assert_eq!(window.refresh_interval(cx), Some(sixty_hertz));
+                    window.observe_window_display(move |window, cx| {
+                        window_notifications
+                            .borrow_mut()
+                            .push((window.display_id, window.refresh_interval(cx)));
+                    })
+                }
+            })
+            .unwrap();
+        let test_window = cx.test_window(window.into());
+
+        // The window may hear that it moved before App hears the display was
+        // connected. App learns about the display before the window's
+        // observers run, and the platform's later notification changes
+        // nothing.
+        cx.test_platform()
+            .connect_display(DisplayId(2), Some(one_hundred_twenty_hertz));
+        test_window.simulate_move_to_display(DisplayId(2));
+        assert_eq!(
+            window_notifications.take(),
+            [(Some(DisplayId(2)), Some(one_hundred_twenty_hertz))]
+        );
+        assert_eq!(display_events.take(), [DisplayEvent::Added(DisplayId(2))]);
+        cx.simulate_display_refresh_interval_change(DisplayId(2), Some(one_hundred_twenty_hertz));
+        assert!(window_notifications.borrow().is_empty());
+
+        // Platforms may report a move that isn't one.
+        test_window.simulate_move_to_display(DisplayId(2));
+        assert!(window_notifications.borrow().is_empty());
+
+        cx.simulate_display_refresh_interval_change(
+            DisplayId(2),
+            Some(one_hundred_forty_four_hertz),
+        );
+        assert_eq!(
+            window_notifications.take(),
+            [(Some(DisplayId(2)), Some(one_hundred_forty_four_hertz))]
+        );
+
+        // Changes to a display the window isn't on don't notify it.
+        cx.simulate_display_refresh_interval_change(DisplayId(1), Some(one_hundred_twenty_hertz));
+        cx.simulate_display_removed(DisplayId(1));
+        assert!(window_notifications.borrow().is_empty());
+
+        assert_eq!(
+            display_events.take(),
+            [
+                DisplayEvent::Changed {
+                    id: DisplayId(2),
+                    changes: DisplayChanges::REFRESH_INTERVAL,
+                },
+                DisplayEvent::Changed {
+                    id: DisplayId(1),
+                    changes: DisplayChanges::REFRESH_INTERVAL,
+                },
+                DisplayEvent::Removed(DisplayId(1)),
+            ]
+        );
+        window
+            .update(cx, |tracker, _, _| {
+                assert_eq!(
+                    tracker.refresh_intervals,
+                    [
+                        Some(one_hundred_twenty_hertz),
+                        Some(one_hundred_forty_four_hertz)
+                    ]
+                );
+            })
+            .unwrap();
+
+        struct DisplayTracker {
+            refresh_intervals: Vec<Option<Duration>>,
+            _subscription: Subscription,
+        }
+
+        impl Render for DisplayTracker {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                Empty
+            }
+        }
     }
 
     #[gpui::test]

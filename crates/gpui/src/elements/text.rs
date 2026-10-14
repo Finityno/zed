@@ -934,6 +934,13 @@ impl crate::window::view_retention::PositionedState for RefCell<Option<TextLayou
     }
 }
 
+#[derive(Clone, Copy)]
+enum TextPaintPass {
+    All,
+    Background,
+    Foreground,
+}
+
 struct TextLayoutInner {
     text_align: TextAlign,
     len: usize,
@@ -1006,15 +1013,36 @@ impl TextLayout {
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
+        self.paint_lines(TextPaintPass::All, window, cx)
+            .with_context(|| format!("failed to paint {text}"))
+            .unwrap();
+    }
+
+    /// Paints the backgrounds of the text runs without the glyphs, so that callers can paint
+    /// content, such as highlights, between the backgrounds and the text. Follow it with
+    /// [`Self::paint_foreground`] to paint the glyphs.
+    pub fn paint_background(&self, window: &mut Window, cx: &mut App) -> anyhow::Result<()> {
+        self.paint_lines(TextPaintPass::Background, window, cx)
+    }
+
+    /// Paints the glyphs and decorations of the text without the run backgrounds.
+    pub fn paint_foreground(&self, window: &mut Window, cx: &mut App) -> anyhow::Result<()> {
+        self.paint_lines(TextPaintPass::Foreground, window, cx)
+    }
+
+    fn paint_lines(
+        &self,
+        pass: TextPaintPass,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> anyhow::Result<()> {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
-            .with_context(|| format!("measurement has not been performed on {text}"))
-            .unwrap();
+            .context("measurement has not been performed")?;
         let bounds = element_state
             .bounds
-            .with_context(|| format!("prepaint has not been performed on {text}"))
-            .unwrap();
+            .context("prepaint has not been performed")?;
 
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
@@ -1041,26 +1069,31 @@ impl TextLayout {
                     continue;
                 }
             }
-            line.paint_background(
-                line_origin,
-                line_height,
-                text_style.text_align,
-                Some(bounds),
-                window,
-                cx,
-            )
-            .log_err();
-            line.paint(
-                line_origin,
-                line_height,
-                text_style.text_align,
-                Some(bounds),
-                window,
-                cx,
-            )
-            .log_err();
+            if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
+                line.paint_background(
+                    line_origin,
+                    line_height,
+                    text_style.text_align,
+                    Some(bounds),
+                    window,
+                    cx,
+                )
+                .log_err();
+            }
+            if matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
+                line.paint(
+                    line_origin,
+                    line_height,
+                    text_style.text_align,
+                    Some(bounds),
+                    window,
+                    cx,
+                )
+                .log_err();
+            }
             line_origin.y += height;
         }
+        Ok(())
     }
 
     fn paint_shimmer(
