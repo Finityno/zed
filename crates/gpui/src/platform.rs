@@ -2679,6 +2679,17 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// Whether the window keeps drawing and presenting frames while it is
+    /// hidden: covered by other windows, minimized, on another Space, or
+    /// never shown. A hidden window otherwise stops its frame loop and gives
+    /// up its drawable-sized textures, which saves power and memory but
+    /// leaves nothing to measure, so this is for harnesses that profile
+    /// rendering unattended. While such a window is open the process also
+    /// stays out of App Nap, so its frames are paced as a visible window's
+    /// are. Only macOS stops drawing hidden windows, and only macOS reads
+    /// this.
+    pub render_while_hidden: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2744,6 +2755,9 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    #[cfg(target_os = "macos")]
+    pub render_while_hidden: bool,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2805,6 +2819,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            render_while_hidden: false,
         }
     }
 }
