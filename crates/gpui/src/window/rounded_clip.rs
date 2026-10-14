@@ -45,11 +45,14 @@ impl Window {
     pub(crate) fn install_rounded_clip(&mut self, clip: Option<Arc<RoundedClipRegion>>) {
         fn insert(window: &mut Window, clip: &RoundedClipRegion) -> u32 {
             let parent = clip.parent.as_ref().map_or(0, |parent| insert(window, parent));
+            let scale_factor = window.scale_factor();
+            let bounds = clip.bounds.scale(scale_factor);
             window.next_frame.scene.rounded_clips.push(RoundedClipNode {
-                bounds: clip.bounds.scale(window.scale_factor()),
-                corner_radii: clip.corners.map(|radius| radius.scale(window.scale_factor())),
+                bounds,
+                corner_radii: clip.corners.map(|radius| radius.scale(scale_factor)),
                 parent,
-                padding: [0; 3],
+                transition: 0,
+                base_origin: bounds.origin,
             });
             window.next_frame.scene.rounded_clips.len() as u32
         }
@@ -68,7 +71,7 @@ impl Window {
         draw: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
-        let corners = corners.into().map(|radius| radius.max(Pixels::ZERO))
+        let corners = corners.into().map(|radius| (*radius).max(Pixels::ZERO))
             .clamp_radii_for_quad_size(bounds.size);
         if corners == Corners::default() {
             return self.with_content_mask(Some(crate::ContentMask { bounds }), draw);
@@ -78,11 +81,14 @@ impl Window {
             bounds, corners, parent: previous.clone(),
         }));
         let parent = self.next_frame.scene.current_rounded_clip;
+        let scale_factor = self.scale_factor();
+        let device_bounds = bounds.scale(scale_factor);
         self.next_frame.scene.rounded_clips.push(RoundedClipNode {
-            bounds: bounds.scale(self.scale_factor()),
-            corner_radii: corners.map(|radius| radius.scale(self.scale_factor())),
+            bounds: device_bounds,
+            corner_radii: corners.map(|radius| radius.scale(scale_factor)),
             parent,
-            padding: [0; 3],
+            transition: self.next_frame.scene.current_transition(),
+            base_origin: device_bounds.origin,
         });
         self.next_frame.scene.current_rounded_clip = self.next_frame.scene.rounded_clips.len() as u32;
         let result = self.with_content_mask(Some(crate::ContentMask { bounds }), draw);

@@ -638,6 +638,9 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.rounded_clip_buffer.take();
+            self.rounded_clip_view.take();
+            self.rounded_clip_capacity = 0;
             self.overlay_resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);

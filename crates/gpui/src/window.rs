@@ -3786,8 +3786,6 @@ impl Window {
     }
 
     fn underline(&self, origin: Point<Pixels>, width: Pixels, style: &UnderlineStyle) -> Underline {
-        rounded_clip: 0,
-        clip_padding: 0,
         Underline {
             rounded_clip: 0,
             clip_padding: 0,
@@ -4612,6 +4610,8 @@ impl Window {
                     prepaint_range,
                     beneath_native_surfaces,
                     enclosing_views,
+                    rounded_clip,
+                    content_mask,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4627,10 +4627,15 @@ impl Window {
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.beneath_native_surfaces,
                         deferred_draw.enclosing_views.clone(),
+                        deferred_draw.rounded_clip.clone(),
+                        deferred_draw.content_mask,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
+                let previous_rounded_clip = self.rounded_clip.clone();
+                let previous_gpu_clip = self.next_frame.scene.current_rounded_clip;
+                self.install_rounded_clip(rounded_clip);
                 let prepaint_start = self.prepaint_index();
                 let records_start = self.retained_records_len();
                 let retained_records = if let Some(mut element) = element {
@@ -4640,7 +4645,9 @@ impl Window {
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
-                                element.prepaint(window, cx);
+                                window.with_content_mask(content_mask, |window| {
+                                    element.prepaint(window, cx);
+                                });
                             });
                         });
                     });
@@ -4655,6 +4662,8 @@ impl Window {
                         .clone();
                     self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
                 };
+                self.rounded_clip = previous_rounded_clip;
+                self.next_frame.scene.current_rounded_clip = previous_gpu_clip;
                 let prepaint_end = self.prepaint_index();
                 let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                 deferred_draw.prepaint_range = prepaint_start..prepaint_end;

@@ -3519,8 +3519,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn solid_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
-        rounded_clip: 0,
-        clip_padding: 0,
         let bounds = Bounds {
             origin: Point {
                 x: x.into(),
@@ -4375,20 +4373,20 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 42 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 30 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 44 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 44 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 18 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 26 * 4);
     }
 
     #[test]
     fn webgl_quad_layout_matches_fixed_decoder() {
         let quad = Quad {
-            rounded_clip: 0,
+            rounded_clip: 37,
             clip_padding: 0,
             order: 41,
             border_style: BorderStyle::Dashed,
@@ -4501,6 +4499,8 @@ mod tests {
                 31.0_f32.to_bits(),
                 32.0_f32.to_bits(),
                 33.0_f32.to_bits(),
+                37,
+                0,
             ]
         );
     }

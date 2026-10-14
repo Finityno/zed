@@ -652,14 +652,20 @@ impl Scene {
         index: u32,
         remapped: &mut Vec<(u32, u32)>,
         moved: Option<&SceneMove>,
+        transitions: &mut Vec<(u32, u32)>,
+        landed_before: Option<std::time::Instant>,
     ) -> u32 {
         if index == 0 { return 0; }
         if let Some((_, current)) = remapped.iter().find(|(old, _)| *old == index) {
             return *current;
         }
         let mut mask = previous.rounded_clips[index as usize - 1];
-        mask.parent = self.remap_rounded_clip(previous, mask.parent, remapped, moved);
-        if let Some(moved) = moved { mask.bounds.origin = mask.bounds.origin + moved.delta; }
+        mask.parent = self.remap_rounded_clip(previous, mask.parent, remapped, moved, transitions, landed_before);
+        if mask.transition != 0 {
+            mask.transition = self.remap_transition(previous, mask.transition, transitions, landed_before);
+        }
+        if let Some(moved) = moved { mask.base_origin = mask.base_origin + moved.delta; }
+        mask.bounds.origin = mask.base_origin;
         self.rounded_clips.push(mask);
         let current = self.rounded_clips.len() as u32;
         remapped.push((index, current));
@@ -743,6 +749,7 @@ impl Scene {
                     };
                     let clip = self.remap_rounded_clip(
                         prev_scene, primitive.rounded_clip(), &mut remapped_clips, moved,
+                        &mut remapped_transitions, landed_before,
                     );
                     primitive.set_rounded_clip(clip);
                     if let Some(moved) = moved {
@@ -987,7 +994,7 @@ impl Scene {
     }
 
     fn advance_transitions(&mut self, now: std::time::Instant) {
-        if self.transitioned.is_empty() {
+        if self.transitioned.is_empty() && self.rounded_clips.iter().all(|clip| clip.transition == 0) {
             return;
         }
         // Parents are always pushed before the transitions inside them, so
@@ -1003,6 +1010,11 @@ impl Scene {
                 }
             };
             self.transition_states.push(composed);
+        }
+        for clip in &mut self.rounded_clips {
+            if clip.transition != 0 {
+                clip.bounds.origin = clip.base_origin + self.transition_states[clip.transition as usize - 1].0;
+            }
         }
         for primitive in &self.transitioned {
             let (offset, opacity) = self.transition_states[primitive.transition as usize - 1];
@@ -2105,8 +2117,6 @@ mod tests {
     #[test]
     fn glyph_sprite_inserts_match_insert_primitive() {
         fn subpixel(sprite: MonochromeSprite) -> SubpixelSprite {
-            rounded_clip: 0,
-            clip_padding: 0,
             SubpixelSprite {
                 rounded_clip: 0,
                 clip_padding: 0,
@@ -2719,8 +2729,10 @@ pub struct RoundedClipNode {
     pub corner_radii: Corners<ScaledPixels>,
     /// One-based parent index, or zero for the outermost clip.
     pub parent: u32,
-    /// Explicit GPU padding.
-    pub padding: [u32; 3],
+    /// The transition containing this clip, independent of its children.
+    pub transition: u32,
+    /// The unanimated origin, so advancing a transition never compounds offsets.
+    pub base_origin: Point<ScaledPixels>,
 }
 
 #[derive(Default, Debug, Copy, Clone)]

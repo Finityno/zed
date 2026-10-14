@@ -216,8 +216,6 @@ fn solid_quad(
     content_mask: &ContentMask<ScaledPixels>,
     color: Hsla,
 ) -> Quad {
-    rounded_clip: 0,
-    clip_padding: 0,
     Quad {
         rounded_clip: 0,
         clip_padding: 0,

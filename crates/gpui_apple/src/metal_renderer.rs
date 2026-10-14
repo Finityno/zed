@@ -2901,8 +2901,6 @@ mod alpha_blend_tests {
     const EXTENT: f32 = 64.;
 
     fn translucent_quad(order: u32, color: Hsla) -> Quad {
-        rounded_clip: 0,
-        clip_padding: 0,
         let bounds = Bounds {
             origin: Point {
                 x: ScaledPixels(0.),

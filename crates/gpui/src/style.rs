@@ -658,8 +658,6 @@ impl Style {
         }
     }
 
-    /// Get the content mask for this element style, based on the given bounds.
-    /// If the element does not hide its overflow, this will return `None`.
     pub(crate) fn with_overflow<R>(
         &self,
         bounds: Bounds<Pixels>,
@@ -688,6 +686,8 @@ impl Style {
         })
     }
 
+    /// Get the content mask for this element style, based on the given bounds.
+    /// If the element does not hide its overflow, this will return `None`.
     pub fn overflow_mask(
         &self,
         bounds: Bounds<Pixels>,

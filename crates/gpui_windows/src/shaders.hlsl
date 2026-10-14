@@ -1532,7 +1532,8 @@ struct RoundedClipNode {
     Bounds bounds;
     Corners corner_radii;
     uint parent;
-    uint3 padding;
+    uint transition;
+    float2 base_origin;
 };
 StructuredBuffer<RoundedClipNode> b_rounded_clips : register(t3);
 float rounded_clip_coverage(uint index, float2 position) {
