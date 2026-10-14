@@ -1082,7 +1082,7 @@ impl X11WindowStatePtr {
     /// mapped and keeps its surface.
     pub fn set_mapped(&self, mapped: bool) {
         let mut state = self.state.borrow_mut();
-        if std::mem::replace(&mut state.mapped, mapped) == mapped || state.destroyed {
+        if std::mem::replace(&mut state.mapped, mapped) == mapped || state.renderer.is_none() {
             return;
         }
         if mapped {
@@ -1871,7 +1871,7 @@ impl PlatformWindow for X11Window {
         // The scene drawn next is complete, so a restore here needs no
         // forced render afterwards.
         if inner.mapped {
-            self.0.restore_surface(&mut inner);
+            self.0.restore_surface(inner);
             if inner.renderer.as_ref().is_some_and(WgpuRenderer::is_unconfigured) {
                 // Still released: force the next frame so it retries, since an
                 // idle window would otherwise never draw again.

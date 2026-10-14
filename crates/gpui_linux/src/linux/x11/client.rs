@@ -401,7 +401,7 @@ impl Drop for X11Connection {
             .filter_map(|window| match window.refresh_state.take() {
                 Some(RefreshState::PeriodicRefresh {
                     event_loop_token, ..
-                }) => Some(event_loop_token),
+                }) => event_loop_token,
                 _ => None,
             })
             .collect::<Vec<_>>();
