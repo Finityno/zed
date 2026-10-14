@@ -15,7 +15,7 @@ use collections::FxHashMap;
 use crate::{
     App, DRAW_QUIET_GAP, DrawBreakdown, DrawResourceSampling, DrawResources, EntityId,
     PlatformDispatcher, ResourceSample, SLOW_DRAW_VIEW_COUNT, SLOW_DRAW_VIEW_MIN, SlowDrawDetail,
-    ViewRenderTime, ViewTiming, ViewTimingStart, Window, profiler, view::ViewName,
+    ViewRenderTime, ViewTimingMode, ViewTimingStart, Window, profiler, view::ViewName,
 };
 
 impl Window {
@@ -28,9 +28,9 @@ impl Window {
                 draw_start.saturating_duration_since(last_draw_end) >= DRAW_QUIET_GAP
             });
         let time_views = match profiler::view_timing() {
-            ViewTiming::Off => false,
-            ViewTiming::OnSlowDraws => self.draw_clock.previous_draw_slow,
-            ViewTiming::Always => true,
+            ViewTimingMode::Off => false,
+            ViewTimingMode::OnSlowDraws => self.draw_clock.previous_draw_slow,
+            ViewTimingMode::Always => true,
         };
         self.draw_clock.begin(draw_start);
         self.draw_resources
@@ -68,7 +68,7 @@ impl Window {
         }
     }
 
-    /// Under [`ViewTiming::OnSlowDraws`], starts timing views once the draw
+    /// Under [`ViewTimingMode::OnSlowDraws`], starts timing views once the draw
     /// has run for half the detail threshold. The views being drawn at that
     /// moment are timed from `now` on, so the view whose prepaint turned
     /// the draw slow is still charged for the rest of it.
@@ -77,7 +77,7 @@ impl Window {
         if !self.view_timer.is_armed()
             && self.draw_clock.active
             && self.draw_clock.elapsed(now) >= profiler::draw_detail_threshold() / 2
-            && profiler::view_timing() == ViewTiming::OnSlowDraws
+            && profiler::view_timing() == ViewTimingMode::OnSlowDraws
         {
             self.view_timer
                 .arm_partway(timed_from, now, self.rendered_entity_stack.len());
@@ -318,7 +318,7 @@ impl DrawClock {
 }
 
 /// Times each view's `render`, prepaint and paint, net of the views nested
-/// inside it, for the draws [`crate::ViewTiming`] selects.
+/// inside it, for the draws [`crate::ViewTimingMode`] selects.
 pub(crate) struct ViewTimer {
     armed: Option<ViewTimingStart>,
     stack: Vec<TimedView>,
@@ -520,7 +520,7 @@ mod tests {
         FaultScope, FocusHandle, FrameTiming, InteractiveElement as _, IntoElement, ListAlignment,
         ListState, ParentElement as _, Render, RequestFrameOptions, ResourceSample,
         SLOW_DRAW_VIEW_MIN, SlowDrawDetail, Style, Styled as _, TestAppContext, TestWindow,
-        ViewTiming, ViewTimingStart, Window, WindowHandle, WindowId, WindowOptions, div, list,
+        ViewTimingMode, ViewTimingStart, Window, WindowHandle, WindowId, WindowOptions, div, list,
         profiler, px, size, view::ViewName,
     };
 
@@ -548,7 +548,7 @@ mod tests {
         /// test's settings would otherwise change.
         fn defaults() -> Self {
             let knobs = Self::set(Duration::from_millis(8), DrawResourceSampling::AfterQuiet);
-            profiler::set_view_timing(ViewTiming::OnSlowDraws);
+            profiler::set_view_timing(ViewTimingMode::OnSlowDraws);
             knobs
         }
     }
@@ -557,7 +557,7 @@ mod tests {
         fn drop(&mut self) {
             profiler::set_draw_detail_threshold(Duration::from_millis(8));
             profiler::set_draw_resource_sampling(DrawResourceSampling::AfterQuiet);
-            profiler::set_view_timing(ViewTiming::OnSlowDraws);
+            profiler::set_view_timing(ViewTimingMode::OnSlowDraws);
         }
     }
 
@@ -1048,7 +1048,7 @@ mod tests {
     #[gpui::test]
     fn a_slow_draw_names_its_slowest_view(cx: &mut TestAppContext) {
         let _knobs = Knobs::set(Duration::from_millis(1), DrawResourceSampling::Off);
-        profiler::set_view_timing(ViewTiming::Always);
+        profiler::set_view_timing(ViewTimingMode::Always);
         let fixture = open_window(cx);
 
         fixture.spin_in.set(SpinIn::Render);
@@ -1076,7 +1076,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::Off);
-        profiler::set_view_timing(ViewTiming::OnSlowDraws);
+        profiler::set_view_timing(ViewTimingMode::OnSlowDraws);
         let fixture = open_window(cx);
 
         let fast = fixture.redraw(&fixture.worker, cx);
@@ -1120,7 +1120,7 @@ mod tests {
     #[gpui::test]
     fn a_view_that_rendered_before_timing_started_is_named_by_its_paint(cx: &mut TestAppContext) {
         let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::Off);
-        profiler::set_view_timing(ViewTiming::OnSlowDraws);
+        profiler::set_view_timing(ViewTimingMode::OnSlowDraws);
         let fixture = open_window(cx);
         fixture.redraw(&fixture.worker, cx);
 
@@ -1197,7 +1197,7 @@ mod tests {
     #[gpui::test]
     fn a_draw_slowed_by_a_list_row_times_the_rest_of_prepaint(cx: &mut TestAppContext) {
         let _knobs = Knobs::set(NO_DRAW_IS_SLOW, DrawResourceSampling::Off);
-        profiler::set_view_timing(ViewTiming::OnSlowDraws);
+        profiler::set_view_timing(ViewTimingMode::OnSlowDraws);
         let spin_rows = Rc::new(Cell::new(false));
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), {
@@ -1289,7 +1289,7 @@ mod tests {
     #[gpui::test]
     fn a_hand_written_view_is_counted_and_named(cx: &mut TestAppContext) {
         let _knobs = Knobs::set(Duration::from_millis(1), DrawResourceSampling::Off);
-        profiler::set_view_timing(ViewTiming::Always);
+        profiler::set_view_timing(ViewTimingMode::Always);
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), |_, cx| {
                 let identity = cx.new(|_| Cached);

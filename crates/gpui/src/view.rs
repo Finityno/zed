@@ -27,8 +27,7 @@ use std::{
 pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
-    #[cfg(feature = "profiler")]
-    type_name: fn() -> &'static str,
+    view_type_name: &'static str,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -36,8 +35,7 @@ impl<V: Render> From<Entity<V>> for AnyView {
         AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
-            #[cfg(feature = "profiler")]
-            type_name: type_name::<V>,
+            view_type_name: type_name::<V>(),
         }
     }
 }
@@ -49,7 +47,7 @@ impl AnyView {
     /// [Context::notify] was called on the backing entity since it was rendered
     /// (or [Window::refresh] is called, which ignores caching).
     pub fn cached(self, style: StyleRefinement) -> ViewElement<AnyView> {
-        ViewElement::new(self).cached(style)
+        self.into_element().cached(style)
     }
 
     /// Convert this to a weak handle.
@@ -57,8 +55,7 @@ impl AnyView {
         AnyWeakView {
             entity: self.entity.downgrade(),
             render: self.render,
-            #[cfg(feature = "profiler")]
-            type_name: self.type_name,
+            view_type_name: self.view_type_name,
         }
     }
 
@@ -70,8 +67,7 @@ impl AnyView {
             Err(entity) => Err(Self {
                 entity,
                 render: self.render,
-                #[cfg(feature = "profiler")]
-                type_name: self.type_name,
+                view_type_name: self.view_type_name,
             }),
         }
     }
@@ -109,7 +105,7 @@ impl View for AnyView {
 
     #[cfg(feature = "profiler")]
     fn view_type_name(&self) -> &'static str {
-        (self.type_name)()
+        self.view_type_name
     }
 
     fn any_view(&self) -> Option<AnyView> {
@@ -128,7 +124,7 @@ impl<V: 'static + Render> IntoElement for Entity<V> {
     type Element = ViewElement<Entity<V>>;
 
     fn into_element(self) -> Self::Element {
-        ViewElement::new(self)
+        ViewElement::with_type_name(self, type_name::<V>())
     }
 
     #[inline(never)]
@@ -141,7 +137,8 @@ impl IntoElement for AnyView {
     type Element = ViewElement<AnyView>;
 
     fn into_element(self) -> Self::Element {
-        ViewElement::new(self)
+        let view_type_name = self.view_type_name;
+        ViewElement::with_type_name(self, view_type_name)
     }
 }
 
@@ -149,8 +146,7 @@ impl IntoElement for AnyView {
 pub struct AnyWeakView {
     entity: AnyWeakEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
-    #[cfg(feature = "profiler")]
-    type_name: fn() -> &'static str,
+    view_type_name: &'static str,
 }
 
 impl AnyWeakView {
@@ -160,8 +156,7 @@ impl AnyWeakView {
         Some(AnyView {
             entity,
             render: self.render,
-            #[cfg(feature = "profiler")]
-            type_name: self.type_name,
+            view_type_name: self.view_type_name,
         })
     }
 }
@@ -171,8 +166,7 @@ impl<V: 'static + Render> From<WeakEntity<V>> for AnyWeakView {
         AnyWeakView {
             entity: view.into(),
             render: any_view::render::<V>,
-            #[cfg(feature = "profiler")]
-            type_name: type_name::<V>,
+            view_type_name: type_name::<V>(),
         }
     }
 }
@@ -299,7 +293,7 @@ impl<T: Render> Entity<T> {
     /// uncached case.
     #[track_caller]
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
-        ViewElement::new(self).cached(style)
+        ViewElement::with_type_name(self, type_name::<T>()).cached(style)
     }
 }
 
@@ -314,6 +308,8 @@ pub struct ViewElement<V: View> {
     /// The view, kept as it is rendered with view retention on, for its
     /// record to build it on its own later.
     any_view: Option<AnyView>,
+    #[cfg(feature = "profiler")]
+    view_type_name: &'static str,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -337,12 +333,22 @@ impl<V: View> ViewElement<V> {
     /// Wrap a [`View`] as an element.
     #[track_caller]
     pub fn new(view: V) -> Self {
+        Self::with_type_name(view, type_name::<V>())
+    }
+
+    /// Wraps a view whose draw time profiling attributes to `view_type_name`,
+    /// such as an entity's type rather than [`Entity`]'s.
+    #[track_caller]
+    #[cfg_attr(not(feature = "profiler"), expect(unused_variables))]
+    pub(crate) fn with_type_name(view: V, view_type_name: &'static str) -> Self {
         let entity_id = view.entity_id();
         ViewElement {
             entity_id,
             cached_style: None,
             view_name: ViewName::of(&view),
             any_view: None,
+            #[cfg(feature = "profiler")]
+            view_type_name,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -415,6 +421,9 @@ impl<V: View> Element for ViewElement<V> {
     ) -> (LayoutId, Self::RequestLayoutState) {
         if let Some(entity_id) = self.entity_id {
             // Stateful path: create a reactive boundary.
+            #[cfg(feature = "profiler")]
+            let start = window.window_profiler.begin_view();
+            let layout = (|| {
             if cx.view_retention() {
                 self.any_view = self.view.as_ref().and_then(View::any_view);
             }
@@ -444,6 +453,10 @@ impl<V: View> Element for ViewElement<V> {
                 &mut render,
             );
             (layout_id, ViewLayoutState(ViewLayout::Unretained(element)))
+            })();
+            #[cfg(feature = "profiler")]
+            window.window_profiler.end_view(start, self.view_type_name, crate::profiler::ViewPhase::RequestLayout);
+            layout
         } else {
             // Stateless path: isolate subtree via type name (no entity identity).
             let (layout_id, element) =
@@ -480,11 +493,13 @@ impl<V: View> Element for ViewElement<V> {
                 cx,
             )));
         };
+        #[cfg(feature = "profiler")]
+        let start = window.window_profiler.begin_view();
         let view = &mut self.view;
         let mut render = |window: &mut Window, cx: &mut App| {
             view.take().unwrap().render(window, cx).into_any_element()
         };
-        match (layout, global_id) {
+        let prepainted = match (layout, global_id) {
             (ViewLayout::Unretained(mut element), _) => ViewPrepaintState(
                 ViewPrepaint::Unretained(prepaint_view(
                     entity_id,
@@ -512,7 +527,10 @@ impl<V: View> Element for ViewElement<V> {
             )),
             // A retained layout is only made for a view with an id.
             (_, None) => ViewPrepaintState(ViewPrepaint::Unretained(None)),
-        }
+        };
+        #[cfg(feature = "profiler")]
+        window.window_profiler.end_view(start, self.view_type_name, crate::profiler::ViewPhase::Prepaint);
+        prepainted
     }
 
     fn paint(
@@ -532,6 +550,8 @@ impl<V: View> Element for ViewElement<V> {
             }
             return;
         };
+        #[cfg(feature = "profiler")]
+        let start = window.window_profiler.begin_view();
         match (&mut prepaint.0, global_id) {
             (ViewPrepaint::Unretained(element), _) => paint_view(
                 entity_id,
@@ -547,6 +567,8 @@ impl<V: View> Element for ViewElement<V> {
             }
             (_, None) => {}
         }
+        #[cfg(feature = "profiler")]
+        window.window_profiler.end_view(start, self.view_type_name, crate::profiler::ViewPhase::Paint);
     }
 }
 

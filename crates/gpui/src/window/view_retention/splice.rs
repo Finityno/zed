@@ -94,7 +94,7 @@ impl OpenDispatchCopy {
 
 /// What the window inherits where a gap is built, set aside meanwhile.
 struct Inherited {
-    element_id_stack: SmallVec<[ElementId; 32]>,
+    element_id_stack: crate::window::ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask_stack: Vec<ContentMask<Pixels>>,
     element_offset_stack: Vec<Point<Pixels>>,
@@ -129,7 +129,7 @@ fn text_style_refinement(style: &TextStyle) -> TextStyleRefinement {
 
 /// The entity of the view whose element has the id `id`.
 pub(super) fn view_entity(id: &GlobalElementId) -> Option<EntityId> {
-    match id.0.last()? {
+    match id.last()? {
         ElementId::View(entity) => Some(*entity),
         _ => None,
     }
@@ -353,7 +353,7 @@ impl Window {
         let inherited = Inherited {
             element_id_stack: mem::replace(
                 &mut self.element_id_stack,
-                record.id.0.iter().cloned().collect(),
+                record.id.iter().cloned().collect(),
             ),
             text_style_stack: mem::replace(
                 &mut self.text_style_stack,
