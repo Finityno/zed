@@ -1744,6 +1744,7 @@ mod tests {
                         // the frame late.
                         present_end: at(submitted_ms + 50),
                         animation_interval: None,
+                        report: Default::default(),
                     },
                 }),
                 events: vec![
@@ -1928,12 +1929,14 @@ mod tests {
                         refresh_interval: None,
                         signal_at: None,
                         phases: Default::default(),
+                        breakdown: Default::default(),
                     },
                     presentation: PresentTiming {
                         window_id,
                         present_start: interval_end,
                         present_end: interval_end,
                         animation_interval: None,
+                        report: Default::default(),
                     },
                 }),
                 events,

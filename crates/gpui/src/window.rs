@@ -10559,7 +10559,8 @@ mod tests {
     const PRESENT_ONLY: RequestFrameOptions = RequestFrameOptions {
         require_presentation: true,
         force_render: false,
-        ..RequestFrameOptions::default()
+        signal_at: None,
+        signal_source: crate::FrameRequestSource::NativeCallback,
     };
 
     /// A present the platform deferred (no surface to render into) keeps its
