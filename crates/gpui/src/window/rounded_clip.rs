@@ -111,7 +111,39 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{point, px, size};
+    use crate::{Context, InteractiveElement, IntoElement, ParentElement, Render, Styled, TestAppContext, div, point, px, size};
+
+    struct ClippedCard { radius: Pixels }
+
+    impl Render for ClippedCard {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(100.0)).rounded(self.radius).overflow_hidden().occlude()
+                .child(div().size_full().bg(crate::red()).occlude())
+        }
+    }
+
+    #[test]
+    fn rounded_clip_style_applies_to_paint_and_hitboxes_and_updates_with_radius() -> anyhow::Result<()> {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| ClippedCard { radius: px(20.0) });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let frame = &window.rendered_frame;
+            assert!(frame.scene.quads.iter().any(|quad| quad.rounded_clip != 0));
+            assert!(frame.hit_test(point(px(1.0), px(1.0))).ids.is_empty());
+            assert!(!frame.hit_test(point(px(50.0), px(50.0))).ids.is_empty());
+        })?;
+        window.update(&mut cx, |card, _, cx| {
+            card.radius = px(0.0);
+            cx.notify();
+        })?;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.rendered_frame.scene.rounded_clips.is_empty());
+            assert!(!window.rendered_frame.hit_test(point(px(1.0), px(1.0))).ids.is_empty());
+        })?;
+        Ok(())
+    }
 
     #[test]
     fn rounded_clip_hit_testing_intersects_nested_corners() {

@@ -3606,11 +3606,22 @@ mod tests {
         assert_pixel(&image, 16, 16, RED);
         assert_pixel(&image, 30, 30, BLUE);
 
+        for parent in 1..100 {
+            scene.rounded_clips.push(gpui::RoundedClipNode { parent, ..scene.rounded_clips[0] });
+        }
+        for quad in &mut scene.quads {
+            if quad.rounded_clip != 0 { quad.rounded_clip = 100; }
+        }
+        let nested = renderer.render_scene_to_image(&scene, device_size(32, 32))?;
+        assert_eq!(nested.get_pixel(3, 3), image.get_pixel(3, 3));
+        assert_pixel(&nested, 1, 1, BLUE);
+        assert_pixel(&nested, 16, 16, RED);
+
         let mut path_scene = Scene::default();
         path_scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 32.0, gpui::blue()));
         path_scene.rounded_clips = scene.rounded_clips.clone();
         let mut path = red_square_path(32.0);
-        path.rounded_clip = 1;
+        path.rounded_clip = 100;
         path_scene.insert_primitive(path);
         path_scene.finish();
         let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
