@@ -4970,6 +4970,7 @@ impl Window {
             &self.rendered_frame.scene,
             rebase,
             moved.as_ref(),
+            Some((self.rounded_clip.as_ref().map_or(0, |clip| clip.depth()), self.next_frame.scene.current_rounded_clip)),
         );
     }
 
