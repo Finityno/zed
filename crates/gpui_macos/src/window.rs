@@ -1,5 +1,6 @@
 use crate::{
-    BoolExt, MacDisplay, MacPlatform, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
+    BoolExt, MacActivity, MacDisplay, MacPlatform, NSRange, NSStringExt,
+    TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
@@ -63,7 +64,7 @@ use objc2_app_kit::{
     NSTrackingAreaOptions, NSView as Objc2NSView, NSWindow as Objc2NSWindow,
     NSWindowButton as Objc2NSWindowButton, NSWorkspace,
 };
-use objc2_foundation::{NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSURL};
+use objc2_foundation::{NSActivityOptions, NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSURL};
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
@@ -828,6 +829,14 @@ struct MacWindowState {
     /// display link only wakes this window while it is set, so an idle
     /// window costs nothing per vsync. Starts set so the first frame draws.
     frame_demand: Arc<AtomicBool>,
+    /// Keeps the display link and the drawable-sized textures while AppKit
+    /// reports the window occluded; see `WindowOptions::render_while_hidden`.
+    render_while_hidden: bool,
+    /// Held for a window that renders while hidden. A process whose windows
+    /// are all hidden is a candidate for App Nap, which after about 30 s
+    /// stretches its 16 ms timers past 100 ms; that would pace the frames
+    /// this window keeps drawing unlike a visible window's.
+    _hidden_rendering_activity: Option<gpui::ActivityGuard>,
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
     /// The layered present's two halves; see `draw_layered`.
@@ -1093,7 +1102,7 @@ impl MacWindowState {
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
         };
-        if visible {
+        if visible || self.render_while_hidden {
             return;
         }
         self.renderer.release_intermediate_textures();
@@ -1105,10 +1114,11 @@ impl MacWindowState {
     fn start_display_link(&mut self) {
         self.stop_display_link();
         unsafe {
-            if !self
-                .native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            if !self.render_while_hidden
+                && !self
+                    .native_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
                 return;
             }
@@ -1243,6 +1253,7 @@ impl MacWindow {
             display_id,
             window_min_size,
             tabbing_identifier,
+            render_while_hidden,
             ..
         }: WindowParams,
         cursor_visible: Arc<AtomicBool>,
@@ -1375,6 +1386,16 @@ impl MacWindow {
                 cursor_visible,
                 frame_source: None,
                 frame_demand: Arc::new(AtomicBool::new(true)),
+                render_while_hidden,
+                // `LatencyCritical` is the part that matters: user-initiated
+                // alone still lets the timers be coalesced.
+                _hidden_rendering_activity: render_while_hidden.then(|| {
+                    MacActivity::begin(
+                        "Rendering a hidden window",
+                        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+                            | NSActivityOptions::LatencyCritical,
+                    )
+                }),
                 renderer: renderer::new_renderer(
                     renderer_context.clone(),
                     native_window as *mut _,
@@ -1598,6 +1619,11 @@ impl MacWindow {
                 let mut window_state = window.0.lock();
                 window_state.move_traffic_light();
                 window_state.sheet_parent = sheet_parent;
+                // A window that is never shown gets no occlusion change to
+                // start its link from.
+                if render_while_hidden {
+                    window_state.start_display_link();
+                }
             }
 
             pool.drain();
@@ -3754,7 +3780,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
         {
             lock.move_traffic_light();
             lock.start_display_link();
-        } else {
+        } else if !lock.render_while_hidden {
             lock.stop_display_link();
             // Nothing paints an occluded window, so its drawable-sized
             // intermediate textures can go; the first draw after it becomes
