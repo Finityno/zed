@@ -234,9 +234,11 @@ impl Scene {
             opaque_quad_indices,
             painted_monochrome_sprites,
             painted_subpixel_sprites,
+            rounded_clips,
         ] = &mut self.shrink;
         paint_operations.shrink_vec_idle(&mut self.paint_operations, rendered.paint_operations.len());
         self.primitive_bounds.shrink_idle(&rendered.primitive_bounds);
+        rounded_clips.shrink_vec_idle(&mut self.rounded_clips, rendered.rounded_clips.len());
         layer_stack.shrink_vec_idle(&mut self.layer_stack, rendered.layer_stack.len());
         paths.shrink_vec_idle(&mut self.paths, rendered.paths.len());
         shadows.shrink_vec_idle(&mut self.shadows, rendered.shadows.len());
