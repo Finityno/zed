@@ -1589,6 +1589,9 @@ pub struct Window {
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    /// Until when this window's frames answer the user, as last told to the
+    /// platform: see [`Window::mark_frames_interactive`].
+    interactive_until: Option<Instant>,
     #[cfg(feature = "profiler")]
     pub(crate) window_profiler: profiler::WindowProfiler,
     #[cfg(feature = "profiler")]
@@ -2610,6 +2613,7 @@ impl Window {
             scene_transitioning,
             last_present_at,
             input_rate_tracker,
+            interactive_until: None,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             #[cfg(feature = "profiler")]
@@ -7131,6 +7135,7 @@ impl Window {
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
             self.input_rate_tracker.borrow_mut().record_input();
+            self.extend_interactive_frames();
         }
         #[cfg(feature = "profiler")]
         self.window_profiler.end_input(caused_invalidation);
@@ -7139,6 +7144,39 @@ impl Window {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
         }
+    }
+
+    /// Marks this window's frames, for a short while, as answering the user,
+    /// as input dispatched through [`Window::dispatch_event`] that redraws
+    /// something already does. Call it on every frame of an animation the
+    /// user started (a disclosure opening, a scroll gliding to rest), and when
+    /// acting for the user without going through `dispatch_event`. Frames
+    /// drawn for anything else (streamed text, background work landing,
+    /// timers) stay on the platform's default scheduling.
+    pub fn mark_frames_interactive(&mut self) {
+        self.extend_interactive_frames();
+    }
+
+    fn extend_interactive_frames(&mut self) {
+        /// How long frames stay interactive after the last input or animation
+        /// step: long enough to cover the frames an input's consequences take
+        /// to draw (a click that loads rows, a key whose result arrives a
+        /// little later), short enough that redraws after the user stops are
+        /// back on the default scheduling within half a second.
+        const INTERACTIVE_FRAME_TAIL: Duration = Duration::from_millis(400);
+        /// Input arrives up to a few hundred times a second; the platform
+        /// hears about it only when the window moves on by this much.
+        const REPORT_GRANULARITY: Duration = Duration::from_millis(50);
+
+        let until = Instant::now() + INTERACTIVE_FRAME_TAIL;
+        if self
+            .interactive_until
+            .is_some_and(|reported| until < reported + REPORT_GRANULARITY)
+        {
+            return;
+        }
+        self.interactive_until = Some(until);
+        self.platform_window.set_interactive_until(until);
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
@@ -9671,6 +9709,59 @@ mod tests {
             .update(cx, |_, window, _| assert!(window.is_visible()))
             .unwrap();
         assert_eq!(test_window.frame_wake_count(), frame_wake_count);
+    }
+
+    /// A window tells the platform its frames answer the user only after input
+    /// that redrew something, or an animation the app marks as the user's;
+    /// until then, as for streamed redraws, it says nothing.
+    #[gpui::test]
+    fn test_interactive_frames_follow_redrawing_input_and_marked_animations(
+        cx: &mut TestAppContext,
+    ) {
+        use scheduler::Instant;
+
+        struct Clickable;
+        impl Render for Clickable {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.notify()))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Clickable);
+        cx.run_until_parked();
+        let mut test_window = cx.test_window(window.into());
+        window
+            .update(cx, |_, _, cx| cx.notify())
+            .expect("a redraw no input asked for");
+        cx.run_until_parked();
+        assert_eq!(test_window.interactive_until(), None);
+
+        let clicked_at = Instant::now();
+        test_window.simulate_input(PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(10.), px(10.)),
+            click_count: 1,
+            ..Default::default()
+        }));
+        let after_click = test_window
+            .interactive_until()
+            .expect("a click that redraws makes the window's frames interactive");
+        assert!(after_click > clicked_at);
+
+        let other = cx.add_window(|_, _| EmptyView);
+        let other_window = cx.test_window(other.into());
+        assert_eq!(other_window.interactive_until(), None);
+        let animated_at = Instant::now();
+        other
+            .update(cx, |_, window, _| window.mark_frames_interactive())
+            .expect("an animation step");
+        let after_animation = other_window
+            .interactive_until()
+            .expect("a marked animation makes its own window's frames interactive");
+        assert!(after_animation > animated_at);
+        assert_eq!(test_window.interactive_until(), Some(after_click));
     }
 
     /// App learns display state from the platform's display notifications,

@@ -70,6 +70,7 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
+    interactive_until: Option<scheduler::Instant>,
     is_fullscreen: bool,
     scale_factor: f32,
     appearance: WindowAppearance,
@@ -155,6 +156,7 @@ impl TestWindow {
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
+            interactive_until: None,
             is_fullscreen: false,
             // Preserve the test platform's historical 2x default.
             scale_factor: 2.0,
@@ -269,6 +271,11 @@ impl TestWindow {
     /// Every text input state change the window reported, in order.
     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
         self.0.lock().text_input_state_changes.clone()
+    }
+
+    /// Until when the window last said its frames answer the user.
+    pub fn interactive_until(&self) -> Option<scheduler::Instant> {
+        self.0.lock().interactive_until
     }
 
     pub(crate) fn set_mouse_position(&self, position: Point<Pixels>) {
@@ -556,6 +563,10 @@ impl PlatformWindow for TestWindow {
         if !state.frame_callback_pending {
             state.frame_scheduled = true;
         }
+    }
+
+    fn set_interactive_until(&self, until: scheduler::Instant) {
+        self.0.lock().interactive_until = Some(until);
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {

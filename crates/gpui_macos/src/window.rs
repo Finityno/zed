@@ -829,6 +829,9 @@ struct MacWindowState {
     /// display link only wakes this window while it is set, so an idle
     /// window costs nothing per vsync. Starts set so the first frame draws.
     frame_demand: Arc<AtomicBool>,
+    /// Until when frames answer the user; only those are reported to the
+    /// performance controller (see `frame_work_interval`).
+    interactive_until: Option<Instant>,
     /// Keeps the display link and the drawable-sized textures while AppKit
     /// reports the window occluded; see `WindowOptions::render_while_hidden`.
     render_while_hidden: bool,
@@ -1387,6 +1390,7 @@ impl MacWindow {
                 cursor_visible,
                 frame_source: None,
                 frame_demand: Arc::new(AtomicBool::new(true)),
+                interactive_until: None,
                 render_while_hidden,
                 // `LatencyCritical` is the part that matters: user-initiated
                 // alone still lets the timers be coalesced.
@@ -2590,6 +2594,10 @@ impl PlatformWindow for MacWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
+    }
+
+    fn set_interactive_until(&self, until: Instant) {
+        self.0.as_ref().lock().interactive_until = Some(until);
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
@@ -4227,7 +4235,11 @@ extern "C" fn step(view: *mut c_void) {
         let frame_deadline = lock
             .frame_source
             .as_ref()
-            .and_then(WindowFrameSource::take_frame_deadline);
+            .and_then(WindowFrameSource::take_frame_deadline)
+            .filter(|_| {
+                lock.interactive_until
+                    .is_some_and(|until| Instant::now() < until)
+            });
         drop(lock);
         let frame_work = frame_deadline.and_then(crate::frame_work_interval::frame_starts);
         callback(RequestFrameOptions {
