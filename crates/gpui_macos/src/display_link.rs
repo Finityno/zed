@@ -63,7 +63,7 @@ use std::{
     ffi::c_void,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -95,6 +95,7 @@ struct DisplayLinkSubscriber {
     frame_requests: DispatchRetained<DispatchSource>,
     signal: Arc<PlatformFrameSignal>,
     frame_demand: Arc<AtomicBool>,
+    frame_deadline: Arc<AtomicU64>,
 }
 
 // SAFETY: Both fields wrapping raw pointers are refcounted handles to
@@ -132,7 +133,7 @@ fn debug_assert_main_thread() {
 unsafe extern "C" fn display_link_output_callback(
     _display_link_out: *mut sys::CVDisplayLink,
     current_time: *const sys::CVTimeStamp,
-    _output_time: *const sys::CVTimeStamp,
+    output_time: *const sys::CVTimeStamp,
     _flags_in: i64,
     _flags_out: *mut i64,
     display_id: *mut c_void,
@@ -151,6 +152,11 @@ unsafe extern "C" fn display_link_output_callback(
             received_at,
         )
     });
+    // SAFETY: CoreVideo owns this timestamp for the lifetime of the callback.
+    let output_time = unsafe { output_time.as_ref() };
+    let frame_deadline =
+        frame_deadline_host_time(output_time, objc2_core_video::CVGetHostClockFrequency())
+            .unwrap_or(0);
     let display_id = display_id as usize as CGDirectDisplayID;
     let registry = lock_registry();
     if let Some(entry) = registry.displays.get(&display_id) {
@@ -161,6 +167,7 @@ unsafe extern "C" fn display_link_output_callback(
                         .signal
                         .record(signal_at, FrameRequestSource::NativeCallback);
                 }
+                subscriber.frame_deadline.store(frame_deadline, Ordering::Release);
                 subscriber.frame_requests.merge_data(1);
             }
         }
@@ -194,10 +201,44 @@ fn frame_request_instant(
         .unwrap_or(received_at)
 }
 
+/// The host time by which a frame requested on this callback has to be
+/// drawn. CoreVideo's output time is the refresh that shows a frame drawn
+/// now; the compositor puts it on screen during the refresh before, so the
+/// frame is due when that one starts, as Core Animation expects of an app's
+/// frames. `None` when CoreVideo gave no usable timing.
+fn frame_deadline_host_time(
+    output_time: Option<&sys::CVTimeStamp>,
+    host_clock_frequency: f64,
+) -> Option<u64> {
+    const PERIOD_VALID: u64 =
+        sys::kCVTimeStampHostTimeValid | sys::kCVTimeStampVideoRefreshPeriodValid;
+    let timestamp = output_time.filter(|timestamp| {
+        timestamp.version == 0
+            && timestamp.flags & PERIOD_VALID == PERIOD_VALID
+            && timestamp.video_time_scale > 0
+            && timestamp.video_refresh_period > 0
+    })?;
+    if !host_clock_frequency.is_finite() || host_clock_frequency <= 0.0 {
+        return None;
+    }
+    let period_seconds =
+        timestamp.video_refresh_period as f64 / timestamp.video_time_scale as f64;
+    // No display refreshes faster than 1000 Hz or slower than once a second;
+    // a period outside that is a timestamp to ignore, not a deadline.
+    if !(0.001..=1.0).contains(&period_seconds) {
+        return None;
+    }
+    timestamp
+        .host_time
+        .checked_sub((period_seconds * host_clock_frequency).round() as u64)
+        .filter(|deadline| *deadline != 0)
+}
+
 fn subscribe(
     display_id: CGDirectDisplayID,
     frame_requests: DispatchRetained<DispatchSource>,
     frame_demand: Arc<AtomicBool>,
+    frame_deadline: Arc<AtomicU64>,
     signal: Arc<PlatformFrameSignal>,
 ) -> Result<SubscriberId> {
     debug_assert_main_thread();
@@ -242,6 +283,7 @@ fn subscribe(
             frame_requests,
             signal,
             frame_demand,
+            frame_deadline,
         });
         let link_to_start = if entry.running {
             None
@@ -312,6 +354,7 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 pub struct WindowFrameSource {
     frame_requests: DispatchRetained<DispatchSource>,
     frame_demand: Arc<AtomicBool>,
+    frame_deadline: Arc<AtomicU64>,
     registration: Option<(CGDirectDisplayID, SubscriberId)>,
     signal: Arc<PlatformFrameSignal>,
 }
@@ -341,6 +384,7 @@ impl WindowFrameSource {
         Self {
             frame_requests,
             frame_demand,
+            frame_deadline: Arc::new(AtomicU64::new(0)),
             registration: None,
             signal: Arc::new(PlatformFrameSignal::new()),
         }
@@ -356,6 +400,7 @@ impl WindowFrameSource {
             display_id,
             self.frame_requests.clone(),
             self.frame_demand.clone(),
+            self.frame_deadline.clone(),
             self.signal.clone(),
         )?;
         self.registration = Some((display_id, subscriber_id));
@@ -366,11 +411,19 @@ impl WindowFrameSource {
         self.signal.take()
     }
 
+    /// The host time by which the frame this source last requested has to
+    /// be drawn, once: `None` when the display gave no timing, or the
+    /// request was already taken.
+    pub fn take_frame_deadline(&self) -> Option<u64> {
+        Some(self.frame_deadline.swap(0, Ordering::AcqRel)).filter(|deadline| *deadline != 0)
+    }
+
     pub fn stop(&mut self) {
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
         }
         self.signal.take();
+        self.frame_deadline.store(0, Ordering::Release);
     }
 
     /// Whether this source is subscribed to a display's link, and so
@@ -613,6 +666,61 @@ mod tests {
                 frame_request_instant(Some(&valid), 2_000, frequency, received_at),
                 received_at,
             );
+        }
+    }
+
+    #[test]
+    fn frame_deadline_is_the_refresh_before_the_output_time() {
+        // CoreVideo's own numbers on a 120 Hz panel: a 24 MHz host clock and
+        // a refresh period of 200000 in a 24000000 time scale.
+        let output = refresh_timestamp(1_000_000, 200_000, 24_000_000);
+        assert_eq!(frame_deadline_host_time(Some(&output), 24e6), Some(800_000));
+        let at_60_hz = refresh_timestamp(1_000_000, 1, 60);
+        assert_eq!(frame_deadline_host_time(Some(&at_60_hz), 24e6), Some(600_000));
+    }
+
+    #[test]
+    fn frame_deadline_needs_a_valid_refresh_period() {
+        let valid = refresh_timestamp(1_000_000, 200_000, 24_000_000);
+        let mut no_period = valid;
+        no_period.flags = sys::kCVTimeStampHostTimeValid;
+        let mut no_host_time = valid;
+        no_host_time.flags = sys::kCVTimeStampVideoRefreshPeriodValid;
+        let mut unknown_version = valid;
+        unknown_version.version = 1;
+        let mut zero_scale = valid;
+        zero_scale.video_time_scale = 0;
+        let mut too_long = valid;
+        too_long.video_refresh_period = 48_000_000;
+        let mut too_short = valid;
+        too_short.video_refresh_period = 1;
+        for timestamp in [
+            None,
+            Some(&no_period),
+            Some(&no_host_time),
+            Some(&unknown_version),
+            Some(&zero_scale),
+            Some(&too_long),
+            Some(&too_short),
+        ] {
+            assert_eq!(frame_deadline_host_time(timestamp, 24e6), None);
+        }
+        for frequency in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(frame_deadline_host_time(Some(&valid), frequency), None);
+        }
+        for host_time in [0, 200_000] {
+            let before_any_refresh = refresh_timestamp(host_time, 200_000, 24_000_000);
+            assert_eq!(frame_deadline_host_time(Some(&before_any_refresh), 24e6), None);
+        }
+    }
+
+    fn refresh_timestamp(host_time: u64, period: i64, scale: i32) -> sys::CVTimeStamp {
+        sys::CVTimeStamp {
+            host_time,
+            video_refresh_period: period,
+            video_time_scale: scale,
+            flags: sys::kCVTimeStampHostTimeValid | sys::kCVTimeStampVideoRefreshPeriodValid,
+            ..Default::default()
         }
     }
 
