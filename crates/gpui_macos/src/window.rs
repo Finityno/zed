@@ -4224,12 +4224,18 @@ extern "C" fn step(view: *mut c_void) {
                 (None, FrameRequestSource::NativeCallback),
                 |(at, source)| (Some(at), source),
             );
+        let frame_deadline = lock
+            .frame_source
+            .as_ref()
+            .and_then(WindowFrameSource::take_frame_deadline);
         drop(lock);
+        let frame_work = frame_deadline.and_then(crate::frame_work_interval::frame_starts);
         callback(RequestFrameOptions {
             signal_at,
             signal_source,
             ..Default::default()
         });
+        drop(frame_work);
         window_state.lock().request_frame_callback = Some(callback);
     }
 }

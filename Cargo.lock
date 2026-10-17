@@ -7565,6 +7565,7 @@ dependencies = [
  "gpui_util",
  "image",
  "itertools 0.14.0",
+ "libc",
  "log",
  "objc",
  "objc2 0.6.3",
