@@ -1426,6 +1426,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Tells the platform that this window's frames answer the user (their
+    /// input, or an animation they started) until `until`, so it may ask the
+    /// system to draw them sooner. Frames after it are left on the system's
+    /// default scheduling. The default does nothing.
+    fn set_interactive_until(&self, _until: Instant) {}
     /// Draws a scene with primitives at and after `overlay_start` on a platform
     /// overlay surface when one has been enabled.
     ///

@@ -9,8 +9,13 @@
 //! frames to the controller. Started with the frame's deadline before its work
 //! and finished after, it has the controller run the frame fast enough to meet
 //! the deadline: a frame due at the next refresh that needs more than a sliver
-//! of it runs on the fastest cores at full clock. No frame, no report: an idle
-//! window costs nothing.
+//! of it runs on the fastest cores at full clock.
+//!
+//! That costs energy, so only frames that answer the user are reported: those
+//! drawn while the window's input, or an animation the app marks as the
+//! user's, is recent (`Window::mark_frames_interactive`). Redraws for
+//! anything else, such as streamed text or background work landing, keep the
+//! controller's default scheduling, and an idle window reports nothing.
 //!
 //! Neither of the obvious levers does this. The main thread is already
 //! user-interactive, which only makes it eligible for the fastest cores. An
