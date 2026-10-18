@@ -452,24 +452,29 @@ where
         self.replaying = false;
     }
 
-    /// Shrinks this cleared tree's storage to twice the fill of `rendered`,
-    /// the tree still on screen, once the window has stopped drawing; see
-    /// [`CapacityShrink::idle_target`].
-    pub fn shrink_idle(&mut self, rendered: &Self) {
+    /// Shrinks this tree's storage to twice the fill of `rendered`, the tree
+    /// still on screen, once the window has stopped drawing; see
+    /// [`CapacityShrink::idle_target`]. With `None` this is the tree on
+    /// screen, and keeps twice its own fill with what it recorded as it is.
+    pub fn shrink_idle(&mut self, rendered: Option<&Self>) {
+        let rendered = rendered.unwrap_or(&*self);
         // A fill replayed to its end filed nothing in its grid, so what it
         // recorded stands for what a built grid would have held.
         let rendered_entries = rendered.grid.entries.len().max(rendered.recorded.len());
+        let rendered_recorded = rendered.recorded.len();
         self.grid
             .entries_shrink
             .shrink_vec_idle(&mut self.grid.entries, rendered_entries);
-        // The fill before this tree was cleared sits in `previous`, kept for
-        // replay; a heavy fill there outlives a quiet frame on screen, so it
-        // counts toward the storage to release, and is dropped when it holds
-        // more than the target (the next fill then orders from scratch).
+        // The fill before this tree was last cleared sits in `previous`,
+        // kept for replay; a heavy fill there outlives a quiet frame on
+        // screen, so it counts toward the storage to release, and is dropped
+        // when it holds more than the target (the next fill then orders from
+        // scratch). The tree on screen replays nothing until it is cleared,
+        // when its own recording takes that place.
         let capacity = self.recorded.capacity().max(self.previous.capacity());
         if let Some(capacity) = self
             .recorded_shrink
-            .idle_target(rendered.recorded.len(), capacity)
+            .idle_target(rendered_recorded, capacity)
         {
             self.recorded.shrink_to(capacity);
             if self.previous.len() > capacity {
@@ -975,7 +980,7 @@ mod tests {
 
         let mut rendered = BoundsTree::<f32>::default();
         rendered.insert(unit_bounds(0));
-        retired.shrink_idle(&rendered);
+        retired.shrink_idle(Some(&rendered));
         assert!(retired.grid.entries.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
         assert!(retired.recorded.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
 
@@ -996,7 +1001,7 @@ mod tests {
 
         let mut rendered = BoundsTree::<f32>::default();
         rendered.insert(unit_bounds(0));
-        retired.shrink_idle(&rendered);
+        retired.shrink_idle(Some(&rendered));
         assert!(retired.previous.capacity() <= crate::util::MIN_RETAINED_CAPACITY);
 
         assert_eq!(retired.insert(unit_bounds(0)), 1);

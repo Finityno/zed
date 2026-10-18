@@ -1373,44 +1373,68 @@ impl Frame {
         }
     }
 
-    /// Shrinks this cleared frame's collections to twice the fill of
-    /// `rendered`, the frame still on screen, once the window has stopped
-    /// drawing; see [`CapacityShrink::idle_target`]. Only the retired frame
-    /// is touched: `rendered` is what event dispatch and presentation still
-    /// read.
-    pub(crate) fn shrink_idle(&mut self, rendered: &Frame) {
+    /// Shrinks this frame's collections to twice the fill of `rendered`, the
+    /// frame still on screen, once the window has stopped drawing; see
+    /// [`CapacityShrink::idle_target`]. With `None` this is the frame on
+    /// screen, and keeps twice its own fill: its contents stay as they are,
+    /// for event dispatch, presentation and the next draw's reuse to read,
+    /// and only the room past them goes. It is drawn into again two draws
+    /// from now, so without this it kept the capacity of the heaviest frame
+    /// it ever held for as long as the window stayed quiet.
+    pub(crate) fn shrink_idle(&mut self, rendered: Option<&Frame>) {
+        let fill = |frame: &Frame| {
+            [
+                frame.element_states.len(),
+                frame.accessed_element_states.len(),
+                frame.mouse_listeners.len(),
+                frame.input_handlers.len(),
+                frame.tooltip_requests.len(),
+                frame.cursor_styles.len(),
+                frame.hitboxes.len(),
+                frame.window_control_hitboxes.len(),
+                frame.deferred_draws.len(),
+            ]
+        };
+        let [
+            element_states,
+            accessed_element_states,
+            mouse_listeners,
+            input_handlers,
+            tooltip_requests,
+            cursor_styles,
+            hitboxes,
+            window_control_hitboxes,
+            deferred_draws,
+        ] = fill(rendered.unwrap_or(&*self));
         let shrink = &mut self.shrink;
         shrink
             .element_states
-            .shrink_map_idle(&mut self.element_states, rendered.element_states.len());
-        shrink.accessed_element_states.shrink_vec_idle(
-            &mut self.accessed_element_states,
-            rendered.accessed_element_states.len(),
-        );
+            .shrink_map_idle(&mut self.element_states, element_states);
+        shrink
+            .accessed_element_states
+            .shrink_vec_idle(&mut self.accessed_element_states, accessed_element_states);
         shrink
             .mouse_listeners
-            .shrink_vec_idle(&mut self.mouse_listeners, rendered.mouse_listeners.len());
+            .shrink_vec_idle(&mut self.mouse_listeners, mouse_listeners);
         shrink
             .input_handlers
-            .shrink_vec_idle(&mut self.input_handlers, rendered.input_handlers.len());
+            .shrink_vec_idle(&mut self.input_handlers, input_handlers);
         shrink
             .tooltip_requests
-            .shrink_vec_idle(&mut self.tooltip_requests, rendered.tooltip_requests.len());
+            .shrink_vec_idle(&mut self.tooltip_requests, tooltip_requests);
         shrink
             .cursor_styles
-            .shrink_vec_idle(&mut self.cursor_styles, rendered.cursor_styles.len());
+            .shrink_vec_idle(&mut self.cursor_styles, cursor_styles);
+        shrink.hitboxes.shrink_vec_idle(&mut self.hitboxes, hitboxes);
         shrink
-            .hitboxes
-            .shrink_vec_idle(&mut self.hitboxes, rendered.hitboxes.len());
-        shrink.window_control_hitboxes.shrink_vec_idle(
-            &mut self.window_control_hitboxes,
-            rendered.window_control_hitboxes.len(),
-        );
+            .window_control_hitboxes
+            .shrink_vec_idle(&mut self.window_control_hitboxes, window_control_hitboxes);
         shrink
             .deferred_draws
-            .shrink_vec_idle(&mut self.deferred_draws, rendered.deferred_draws.len());
-        self.dispatch_tree.shrink_idle(&rendered.dispatch_tree);
-        self.scene.shrink_idle(&rendered.scene);
+            .shrink_vec_idle(&mut self.deferred_draws, deferred_draws);
+        self.dispatch_tree
+            .shrink_idle(rendered.map(|rendered| &rendered.dispatch_tree));
+        self.scene.shrink_idle(rendered.map(|rendered| &rendered.scene));
     }
 
     pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
@@ -1610,6 +1634,8 @@ pub struct Window {
     /// ago; see [`Self::reclaim_idle_capacity`].
     last_draw_at: Instant,
     pub(crate) idle_capacity_reclaim: Option<Task<()>>,
+    /// Whether that reclaim ran since the last draw.
+    idle_capacity_reclaimed: bool,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -2633,6 +2659,7 @@ impl Window {
             long_press_capture: None,
             last_draw_at: cx.background_executor().now(),
             idle_capacity_reclaim: None,
+            idle_capacity_reclaimed: false,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -4318,6 +4345,7 @@ impl Window {
         self.needs_present.set(true);
 
         self.last_draw_at = cx.background_executor().now();
+        self.idle_capacity_reclaimed = false;
         if self.idle_capacity_reclaim.is_none() {
             self.schedule_idle_capacity_reclaim(SHRINK_AFTER_DURATION, cx);
         }
@@ -4357,10 +4385,13 @@ impl Window {
     /// `SHRINK_AFTER_DURATION`, keeping twice the on-screen frame's use so the
     /// next draw of that scene does not regrow everything.
     ///
-    /// It runs as a foreground task, so no draw is in flight, and it touches
-    /// only the retired frame's storage, the cleared layout tree and arena
-    /// chunks nothing points into; the rendered frame that dispatch and
-    /// presentation still read is left alone. Rather than re-arming on every
+    /// It runs as a foreground task, so no draw is in flight. It touches the
+    /// retired frame's storage, the cleared layout tree and arena chunks
+    /// nothing points into, and of the rendered frame, which dispatch and
+    /// presentation still read, only the room past what it holds: the
+    /// retired frame becomes the one drawn into next, and the rendered one
+    /// the draw after, so both would otherwise keep the heaviest frame's
+    /// capacity through the quiet period. Rather than re-arming on every
     /// draw, the timer checks how long ago the last draw finished and, if a
     /// draw landed since it was armed, waits out the remainder; an animating
     /// window costs one timer per quiet period instead of one per frame. It
@@ -4373,7 +4404,12 @@ impl Window {
             self.schedule_idle_capacity_reclaim(SHRINK_AFTER_DURATION - quiet_for, cx);
             return;
         }
-        self.next_frame.shrink_idle(&self.rendered_frame);
+        if !self.invalidator.not_drawing() {
+            self.schedule_idle_capacity_reclaim(SHRINK_AFTER_DURATION, cx);
+            return;
+        }
+        self.next_frame.shrink_idle(Some(&self.rendered_frame));
+        self.rendered_frame.shrink_idle(None);
         if let Some(layout_engine) = self.layout_engine.as_mut()
             && layout_engine.reclaim_idle_capacity()
         {
@@ -4383,6 +4419,16 @@ impl Window {
             self.rendered_frame.retained_views.forget_layouts();
         }
         cx.element_arena.borrow_mut().release_idle_chunks(now);
+        self.idle_capacity_reclaimed = true;
+    }
+
+    /// Whether the window has freed the per-frame capacity of its current
+    /// quiet period: false from each draw until no draw has finished for
+    /// `SHRINK_AFTER_DURATION` and the idle reclaim ran. A
+    /// reading of what an idle window holds is taken once this is true, as
+    /// before it the window still holds the capacity of its busiest frames.
+    pub fn has_reclaimed_idle_capacity(&self) -> bool {
+        self.idle_capacity_reclaimed
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -7157,6 +7203,15 @@ impl Window {
         self.extend_interactive_frames();
     }
 
+    /// Whether this window's frames are answering the user now: input that
+    /// redrew something, or an animation step marked by
+    /// [`Self::mark_frames_interactive`], within the last moments. Work that
+    /// would change what the user is looking at can wait until this is false.
+    pub fn frames_are_interactive(&self) -> bool {
+        self.interactive_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
     fn extend_interactive_frames(&mut self) {
         /// How long frames stay interactive after the last input or animation
         /// step: long enough to cover the frames an input's consequences take
@@ -9737,6 +9792,12 @@ mod tests {
             .expect("a redraw no input asked for");
         cx.run_until_parked();
         assert_eq!(test_window.interactive_until(), None);
+        let interactive = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, _| window.frames_are_interactive())
+                .expect("the window is open")
+        };
+        assert!(!interactive(cx), "a redraw no input asked for is not interactive");
 
         let clicked_at = Instant::now();
         test_window.simulate_input(PlatformInput::MouseDown(MouseDownEvent {
@@ -9749,6 +9810,7 @@ mod tests {
             .interactive_until()
             .expect("a click that redraws makes the window's frames interactive");
         assert!(after_click > clicked_at);
+        assert!(interactive(cx), "the window says so until the interaction window passes");
 
         let other = cx.add_window(|_, _| EmptyView);
         let other_window = cx.test_window(other.into());
@@ -10214,6 +10276,102 @@ mod tests {
             })
             .unwrap();
         assert!(rendered_quads >= HEAVY);
+    }
+
+    /// What the frame on screen holds: its quads' bounds, its quad vector's
+    /// capacity, and its hitboxes and their vector's capacity.
+    fn rendered_frame_state(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+    ) -> (Vec<Bounds<ScaledPixels>>, usize, usize, usize) {
+        cx.update_window(window, |_, window, _| {
+            let frame = &window.rendered_frame;
+            (
+                frame.scene.quads.iter().map(|quad| quad.bounds).collect(),
+                frame.scene.quads.capacity(),
+                frame.hitboxes.len(),
+                frame.hitboxes.capacity(),
+            )
+        })
+        .unwrap()
+    }
+
+    fn has_reclaimed(cx: &mut TestAppContext, window: AnyWindowHandle) -> bool {
+        cx.update_window(window, |_, window, _| window.has_reclaimed_idle_capacity())
+            .unwrap()
+    }
+
+    /// The frame on screen is drawn into again two draws later, and a window
+    /// that went quiet right after a heavy frame kept that frame's capacity
+    /// on screen for as long as it stayed quiet: only the retired frame was
+    /// shrunk. The idle reclaim shrinks the frame on screen to twice its own
+    /// fill too, leaving what it holds as it was.
+    #[gpui::test]
+    fn test_quiet_window_shrinks_the_frame_on_screen_to_its_own_fill(cx: &mut TestAppContext) {
+        const HEAVY: usize = 20_000;
+        let quads = Rc::new(Cell::new(HEAVY));
+        let window = cx.add_window({
+            let quads = quads.clone();
+            move |_, _| QuadGrid { quads }
+        });
+        draw_window(cx, window.into());
+        quads.set(3);
+        draw_window(cx, window.into());
+        draw_window(cx, window.into());
+        let (bounds, heavy_quads, hitboxes, _) = rendered_frame_state(cx, window.into());
+        assert!(bounds.len() >= 3 && bounds.len() < 16);
+        assert!(
+            heavy_quads >= HEAVY,
+            "both frames carry the heavy frame's capacity"
+        );
+        assert!(!has_reclaimed(cx, window.into()));
+
+        cx.executor().advance_clock(SHRINK_AFTER_DURATION * 3 / 2);
+        cx.run_until_parked();
+        assert!(has_reclaimed(cx, window.into()));
+        let (idle_bounds, idle_quads, idle_hitboxes, idle_hitbox_capacity) =
+            rendered_frame_state(cx, window.into());
+        assert_eq!(idle_bounds, bounds, "the frame on screen keeps what it drew");
+        assert_eq!(idle_hitboxes, hitboxes);
+        assert!(
+            idle_quads <= MIN_RETAINED_CAPACITY,
+            "the frame on screen kept quad capacity {idle_quads} for {} quads",
+            bounds.len()
+        );
+        assert!(idle_hitbox_capacity <= MIN_RETAINED_CAPACITY.max(hitboxes * 2));
+
+        // The next two draws go into both shrunk frames, and the window
+        // draws the heavy scene again.
+        quads.set(HEAVY);
+        draw_window(cx, window.into());
+        assert!(
+            !has_reclaimed(cx, window.into()),
+            "a draw starts a new quiet period"
+        );
+        draw_window(cx, window.into());
+        let (redrawn, _, _, _) = rendered_frame_state(cx, window.into());
+        assert!(redrawn.len() >= HEAVY);
+    }
+
+    /// A window that goes quiet on a heavy frame keeps that frame whole on
+    /// screen: twice its fill is never less than it holds.
+    #[gpui::test]
+    fn test_quiet_window_keeps_a_heavy_frame_on_screen(cx: &mut TestAppContext) {
+        const HEAVY: usize = 20_000;
+        let window = cx.add_window(|_, _| QuadGrid {
+            quads: Rc::new(Cell::new(HEAVY)),
+        });
+        draw_window(cx, window.into());
+        let (bounds, _, hitboxes, _) = rendered_frame_state(cx, window.into());
+        assert!(bounds.len() >= HEAVY);
+
+        cx.executor().advance_clock(SHRINK_AFTER_DURATION * 3 / 2);
+        cx.run_until_parked();
+        assert!(has_reclaimed(cx, window.into()));
+        let (idle_bounds, idle_quads, idle_hitboxes, _) = rendered_frame_state(cx, window.into());
+        assert_eq!(idle_bounds, bounds);
+        assert_eq!(idle_hitboxes, hitboxes);
+        assert!(idle_quads >= HEAVY);
     }
 
     /// A window that keeps drawing is never reclaimed: a timer that fires
