@@ -7203,6 +7203,15 @@ impl Window {
         self.extend_interactive_frames();
     }
 
+    /// Whether this window's frames are answering the user now: input that
+    /// redrew something, or an animation step marked by
+    /// [`Self::mark_frames_interactive`], within the last moments. Work that
+    /// would change what the user is looking at can wait until this is false.
+    pub fn frames_are_interactive(&self) -> bool {
+        self.interactive_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
     fn extend_interactive_frames(&mut self) {
         /// How long frames stay interactive after the last input or animation
         /// step: long enough to cover the frames an input's consequences take
@@ -9783,6 +9792,12 @@ mod tests {
             .expect("a redraw no input asked for");
         cx.run_until_parked();
         assert_eq!(test_window.interactive_until(), None);
+        let interactive = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, _| window.frames_are_interactive())
+                .expect("the window is open")
+        };
+        assert!(!interactive(cx), "a redraw no input asked for is not interactive");
 
         let clicked_at = Instant::now();
         test_window.simulate_input(PlatformInput::MouseDown(MouseDownEvent {
@@ -9795,6 +9810,7 @@ mod tests {
             .interactive_until()
             .expect("a click that redraws makes the window's frames interactive");
         assert!(after_click > clicked_at);
+        assert!(interactive(cx), "the window says so until the interaction window passes");
 
         let other = cx.add_window(|_, _| EmptyView);
         let other_window = cx.test_window(other.into());
