@@ -215,10 +215,49 @@ impl Scene {
         self.transitions_end_at = None;
     }
 
-    /// Shrinks this cleared scene's vectors to twice the fill of `rendered`,
-    /// the scene still on screen, once the window has stopped drawing; see
-    /// [`CapacityShrink::idle_target`].
-    pub(crate) fn shrink_idle(&mut self, rendered: &Scene) {
+    /// Shrinks this scene's vectors to twice the fill of `rendered`, the
+    /// scene still on screen, once the window has stopped drawing; see
+    /// [`CapacityShrink::idle_target`]. With `None` this is the scene on
+    /// screen, and keeps twice its own fill with its contents as they are.
+    pub(crate) fn shrink_idle(&mut self, rendered: Option<&Scene>) {
+        let fill = |scene: &Scene| {
+            [
+                scene.paint_operations.len(),
+                scene.layer_stack.len(),
+                scene.paths.len(),
+                scene.shadows.len(),
+                scene.quads.len(),
+                scene.underlines.len(),
+                scene.monochrome_sprites.len(),
+                scene.subpixel_sprites.len(),
+                scene.polychrome_sprites.len(),
+                scene.surfaces.len(),
+                scene.blended_quad_indices.len(),
+                scene.opaque_quad_indices.len(),
+                scene.painted_monochrome_sprites.len(),
+                scene.painted_subpixel_sprites.len(),
+                scene.rounded_clips.len(),
+                scene.largest_primitive_count(),
+            ]
+        };
+        let [
+            paint_operations_len,
+            layer_stack_len,
+            paths_len,
+            shadows_len,
+            quads_len,
+            underlines_len,
+            monochrome_sprites_len,
+            subpixel_sprites_len,
+            polychrome_sprites_len,
+            surfaces_len,
+            blended_quad_indices_len,
+            opaque_quad_indices_len,
+            painted_monochrome_sprites_len,
+            painted_subpixel_sprites_len,
+            rounded_clips_len,
+            largest_primitive_count,
+        ] = fill(rendered.unwrap_or(&*self));
         let [
             paint_operations,
             layer_stack,
@@ -236,33 +275,29 @@ impl Scene {
             painted_subpixel_sprites,
             rounded_clips,
         ] = &mut self.shrink;
-        paint_operations.shrink_vec_idle(&mut self.paint_operations, rendered.paint_operations.len());
-        self.primitive_bounds.shrink_idle(&rendered.primitive_bounds);
-        rounded_clips.shrink_vec_idle(&mut self.rounded_clips, rendered.rounded_clips.len());
-        layer_stack.shrink_vec_idle(&mut self.layer_stack, rendered.layer_stack.len());
-        paths.shrink_vec_idle(&mut self.paths, rendered.paths.len());
-        shadows.shrink_vec_idle(&mut self.shadows, rendered.shadows.len());
-        quads.shrink_vec_idle(&mut self.quads, rendered.quads.len());
-        underlines.shrink_vec_idle(&mut self.underlines, rendered.underlines.len());
-        monochrome_sprites
-            .shrink_vec_idle(&mut self.monochrome_sprites, rendered.monochrome_sprites.len());
-        subpixel_sprites.shrink_vec_idle(&mut self.subpixel_sprites, rendered.subpixel_sprites.len());
-        polychrome_sprites
-            .shrink_vec_idle(&mut self.polychrome_sprites, rendered.polychrome_sprites.len());
-        surfaces.shrink_vec_idle(&mut self.surfaces, rendered.surfaces.len());
+        paint_operations.shrink_vec_idle(&mut self.paint_operations, paint_operations_len);
+        self.primitive_bounds
+            .shrink_idle(rendered.map(|rendered| &rendered.primitive_bounds));
+        rounded_clips.shrink_vec_idle(&mut self.rounded_clips, rounded_clips_len);
+        layer_stack.shrink_vec_idle(&mut self.layer_stack, layer_stack_len);
+        paths.shrink_vec_idle(&mut self.paths, paths_len);
+        shadows.shrink_vec_idle(&mut self.shadows, shadows_len);
+        quads.shrink_vec_idle(&mut self.quads, quads_len);
+        underlines.shrink_vec_idle(&mut self.underlines, underlines_len);
+        monochrome_sprites.shrink_vec_idle(&mut self.monochrome_sprites, monochrome_sprites_len);
+        subpixel_sprites.shrink_vec_idle(&mut self.subpixel_sprites, subpixel_sprites_len);
+        polychrome_sprites.shrink_vec_idle(&mut self.polychrome_sprites, polychrome_sprites_len);
+        surfaces.shrink_vec_idle(&mut self.surfaces, surfaces_len);
         blended_quad_indices
-            .shrink_vec_idle(&mut self.blended_quad_indices, rendered.blended_quad_indices.len());
-        opaque_quad_indices
-            .shrink_vec_idle(&mut self.opaque_quad_indices, rendered.opaque_quad_indices.len());
+            .shrink_vec_idle(&mut self.blended_quad_indices, blended_quad_indices_len);
+        opaque_quad_indices.shrink_vec_idle(&mut self.opaque_quad_indices, opaque_quad_indices_len);
         painted_monochrome_sprites.shrink_vec_idle(
             &mut self.painted_monochrome_sprites,
-            rendered.painted_monochrome_sprites.len(),
+            painted_monochrome_sprites_len,
         );
-        painted_subpixel_sprites.shrink_vec_idle(
-            &mut self.painted_subpixel_sprites,
-            rendered.painted_subpixel_sprites.len(),
-        );
-        self.draw_order_scratch.shrink_idle(rendered.largest_primitive_count());
+        painted_subpixel_sprites
+            .shrink_vec_idle(&mut self.painted_subpixel_sprites, painted_subpixel_sprites_len);
+        self.draw_order_scratch.shrink_idle(largest_primitive_count);
     }
 
     fn largest_primitive_count(&self) -> usize {
