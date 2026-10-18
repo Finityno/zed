@@ -229,15 +229,25 @@ impl DispatchTree {
         view_node_ids.clear_map(&mut self.view_node_ids);
     }
 
-    /// Shrinks this cleared tree's storage to twice the fill of `rendered`,
-    /// the tree still dispatching events, once the window has stopped
-    /// drawing; see [`CapacityShrink::idle_target`].
-    pub fn shrink_idle(&mut self, rendered: &DispatchTree) {
+    /// Shrinks this tree's storage to twice the fill of `rendered`, the tree
+    /// still dispatching events, once the window has stopped drawing; see
+    /// [`CapacityShrink::idle_target`]. With `None` this is the tree
+    /// dispatching events, and keeps twice its own fill with its nodes as
+    /// they are.
+    pub fn shrink_idle(&mut self, rendered: Option<&DispatchTree>) {
+        let fill = |tree: &DispatchTree| {
+            [
+                tree.nodes.len(),
+                tree.focusable_node_ids.len(),
+                tree.view_node_ids.len(),
+            ]
+        };
+        let [nodes_len, focusable_node_ids_len, view_node_ids_len] =
+            fill(rendered.unwrap_or(&*self));
         let [nodes, focusable_node_ids, view_node_ids] = &mut self.shrink;
-        nodes.shrink_vec_idle(&mut self.nodes, rendered.nodes.len());
-        focusable_node_ids
-            .shrink_map_idle(&mut self.focusable_node_ids, rendered.focusable_node_ids.len());
-        view_node_ids.shrink_map_idle(&mut self.view_node_ids, rendered.view_node_ids.len());
+        nodes.shrink_vec_idle(&mut self.nodes, nodes_len);
+        focusable_node_ids.shrink_map_idle(&mut self.focusable_node_ids, focusable_node_ids_len);
+        view_node_ids.shrink_map_idle(&mut self.view_node_ids, view_node_ids_len);
     }
 
     pub fn len(&self) -> usize {
