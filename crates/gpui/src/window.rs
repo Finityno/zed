@@ -10358,10 +10358,8 @@ mod tests {
     #[gpui::test]
     fn test_quiet_window_keeps_a_heavy_frame_on_screen(cx: &mut TestAppContext) {
         const HEAVY: usize = 20_000;
-        let quads = Rc::new(Cell::new(HEAVY));
-        let window = cx.add_window({
-            let quads = quads.clone();
-            move |_, _| QuadGrid { quads }
+        let window = cx.add_window(|_, _| QuadGrid {
+            quads: Rc::new(Cell::new(HEAVY)),
         });
         draw_window(cx, window.into());
         let (bounds, _, hitboxes, _) = rendered_frame_state(cx, window.into());
