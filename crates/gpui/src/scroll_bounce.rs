@@ -163,7 +163,7 @@ impl ScrollBounce {
             return px(0.);
         }
         let state = self.0.borrow();
-        let now = Instant::now();
+        let now = cx.background_executor().now();
         let displacement = state.displacement(now);
         let velocity = state.sample(now).1;
         let direction = if displacement == 0. { velocity } else { displacement };
@@ -229,7 +229,7 @@ impl Window {
     pub(crate) fn apply_scroll_bounce(&mut self, cx: &mut App) {
         if let Some(request) = self.pending_scroll_bounce.take() {
             request.bounce.0.borrow_mut().input(
-                request.excess.into(), request.extent.into(), request.phase, request.input, Instant::now(),
+                request.excess.into(), request.extent.into(), request.phase, request.input, cx.background_executor().now(),
             );
             cx.notify(request.view);
         }
