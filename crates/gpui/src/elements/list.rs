@@ -3730,6 +3730,7 @@ mod test {
             window.activate_window();
             cx.set_global(crate::ScrollEdgeBounce(true));
         });
+        cx.run_until_parked();
         let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
         struct TestView(ListState);
         impl Render for TestView {

@@ -6647,6 +6647,7 @@ mod tests {
     fn scroll_bounce_is_opt_in_and_keeps_handle_clamped(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
         let handle = ScrollHandle::new();
         let view_handle = handle.clone();
         cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
@@ -6699,6 +6700,7 @@ mod tests {
             window.activate_window();
             cx.set_global(crate::ScrollEdgeBounce(true));
         });
+        cx.run_until_parked();
         let outer = ScrollHandle::new();
         let inner = ScrollHandle::new();
         let (view_outer, view_inner) = (outer.clone(), inner.clone());
