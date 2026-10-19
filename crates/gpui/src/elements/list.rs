@@ -2412,7 +2412,6 @@ impl Element for List {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 let mut state = list_state.0.borrow_mut();
-                let before = state.scroll_top(&state.logical_scroll_top()).min(state.max_scroll_offset());
                 state.scroll(
                     &scroll_top,
                     height,
@@ -2425,7 +2424,11 @@ impl Element for List {
                 let after = state.scroll_top(&state.logical_scroll_top()).min(maximum);
                 let delta = event.delta.pixel_delta(px(20.)).y;
                 if maximum > px(0.) && (delta != px(0.) || matches!(event.touch_phase, crate::TouchPhase::Ended | crate::TouchPhase::Cancelled)) {
-                    window.queue_scroll_bounce(&state.scroll_bounce, delta + after - before, height, event, current_view, cx);
+                    // Use the arriving step even when it lands exactly on the
+                    // boundary: a second outward wheel event is not required.
+                    let impact = if (delta > px(0.) && after == px(0.))
+                        || (delta < px(0.) && after == maximum) { delta } else { px(0.) };
+                    window.queue_scroll_bounce(&state.scroll_bounce, impact, height, event, current_view, cx);
                 }
             }
         });
