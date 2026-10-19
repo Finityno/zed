@@ -86,12 +86,12 @@ impl Bounce {
             }
             self.last_wheel = Some(now);
         }
-        if excess == 0. {
-            self.clear_motion();
-            return;
-        }
         if (input == ScrollInput::Momentum && self.momentum_consumed)
             || (input == ScrollInput::Wheel && self.wheel_consumed) {
+            return;
+        }
+        if excess == 0. {
+            self.clear_motion();
             return;
         }
         let (position, velocity) = self.sample(now);
@@ -273,7 +273,8 @@ mod tests {
             }
             for frame in 1..=120 {
                 let time = now + Duration::from_secs_f32(frame as f32 / 60.);
-                bounce.input(direction * 100., 540., TouchPhase::Moved, ScrollInput::Momentum, time);
+                let excess = if frame % 2 == 0 { 0. } else { direction * 100. };
+                bounce.input(excess, 540., TouchPhase::Moved, ScrollInput::Momentum, time);
                 assert_eq!(bounce.displacement(time), unforced.displacement(time));
                 if bounce.displacement(time) == 0. { bounce.clear_motion(); }
             }

@@ -260,7 +260,7 @@ pub(crate) unsafe fn platform_input_from_native(
                 let is_momentum = momentum_phase != NSEventPhase::NSEventPhaseNone;
                 let phase = match if is_momentum { momentum_phase } else { native_event.phase() } {
                     NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
-                        TouchPhase::Started
+                        if is_momentum { TouchPhase::Moved } else { TouchPhase::Started }
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
                     NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
