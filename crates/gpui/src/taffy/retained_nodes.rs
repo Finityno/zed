@@ -17,7 +17,7 @@ use crate::{
     AbsoluteLength, AlignItems, App, AvailableSpace, DefiniteLength, Edges, GridTemplate, Length,
     Pixels, Size, Style, Window, util::round_to_device_pixel,
 };
-use collections::{FxHashMap, FxHasher};
+use collections::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 use std::{
     any::Any,
@@ -27,7 +27,7 @@ use std::{
     mem,
     rc::Rc,
 };
-use taffy::TaffyTree;
+use taffy::{TaffyTree, TraversePartialTree as _};
 
 /// The nodes a [`TaffyLayoutEngine`] keeps across frames.
 #[derive(Default)]
@@ -47,6 +47,13 @@ pub(crate) struct LayoutRetention {
     /// layout it kept to lay its tree out again in. See
     /// [`TaffyLayoutEngine::root_space`].
     root_spaces: FxHashMap<LayoutId, Size<AvailableSpace>>,
+    /// Nodes that lost a child to another node since they were last asked
+    /// for their children. Taffy takes a child out of its old parent when
+    /// another is given it, so such a node no longer holds the tree it was
+    /// laid out with. Asked for again, it is given its children back (see
+    /// [`TaffyLayoutEngine::apply_children`]); kept without being asked, it
+    /// would stay without them, so a layout holding one is not kept.
+    missing_children: FxHashSet<LayoutId>,
     frame: u64,
     /// Retained nodes claimed this frame. When every retained node was, the
     /// end of the frame has nothing to sweep.
@@ -85,9 +92,6 @@ pub(crate) struct RetentionCounts {
 struct RetainedNode {
     id: LayoutId,
     claimed_in_frame: u64,
-    /// The children last written, kept because reading them back out of
-    /// Taffy allocates.
-    children: SmallVec<[LayoutId; 8]>,
     measured: bool,
     /// [`layout_fingerprint`] of the style last asked for.
     style_fingerprint: u64,
@@ -271,6 +275,7 @@ impl LayoutRetention {
         self.transient = Vec::new();
         self.unstretched_styles = FxHashMap::default();
         self.root_spaces = FxHashMap::default();
+        self.missing_children = FxHashSet::default();
         self.transaction_claims = Vec::new();
         self.claimed_keys = Vec::new();
         self.claimed_this_frame = 0;
@@ -346,7 +351,10 @@ impl TaffyLayoutEngine {
     /// `root` is the node the first set's layout was rooted at: it has to be
     /// one of that set's nodes still, as it is unless its key was released
     /// and made again since (the tree was rebuilt while the window was idle,
-    /// or a rolled-back transaction made it and handed it back).
+    /// or a rolled-back transaction made it and handed it back). None of
+    /// the nodes may have lost a child to another node since it was last
+    /// asked for its children: kept as it is, it would be laid out without
+    /// the child.
     pub(crate) fn try_keep_retained_sets<'a>(
         &mut self,
         key_sets: impl Iterator<Item = &'a [u64]> + Clone,
@@ -358,13 +366,14 @@ impl TaffyLayoutEngine {
             keys.iter()
                 .any(|key| retention.retained.get(key).is_some_and(|node| node.id == root))
         });
+        let missing_children = &retention.missing_children;
         let all_kept = root_kept
             && key_sets.clone().all(|keys| {
                 keys.iter().all(|key| {
-                    retention
-                        .retained
-                        .get(key)
-                        .is_some_and(|node| node.claimed_in_frame != frame)
+                    retention.retained.get(key).is_some_and(|node| {
+                        node.claimed_in_frame != frame
+                            && (missing_children.is_empty() || !missing_children.contains(&node.id))
+                    })
                 })
             });
         if all_kept {
@@ -500,14 +509,7 @@ impl TaffyLayoutEngine {
         }
     }
 
-    fn retain(
-        &mut self,
-        key: Option<u64>,
-        id: LayoutId,
-        children: &[LayoutId],
-        measured: bool,
-        style_fingerprint: u64,
-    ) {
+    fn retain(&mut self, key: Option<u64>, id: LayoutId, measured: bool, style_fingerprint: u64) {
         let retention = &mut self.retention;
         retention.counts.nodes_created += 1;
         let Some(key) = key else {
@@ -520,7 +522,6 @@ impl TaffyLayoutEngine {
             RetainedNode {
                 id,
                 claimed_in_frame: retention.frame,
-                children: SmallVec::from_slice(children),
                 measured,
                 style_fingerprint,
                 measurement: None,
@@ -583,18 +584,39 @@ impl TaffyLayoutEngine {
         dirty_ancestors(&mut self.taffy, id);
     }
 
-    fn apply_children(&mut self, key: u64, id: LayoutId, children: &[LayoutId]) {
-        let node = self.retained_node(key);
-        if node.children.as_slice() == children {
+    /// Writes `children` to a retained node if Taffy holds others under it.
+    /// What the node was last asked for is not enough to go by: another
+    /// node given one of its children since took the child out of it.
+    fn apply_children(&mut self, id: LayoutId, children: &[LayoutId]) {
+        let missing_children = &mut self.retention.missing_children;
+        if !missing_children.is_empty() {
+            missing_children.remove(&id);
+        }
+        if self
+            .taffy
+            .child_ids(id.into())
+            .eq(LayoutId::to_taffy_slice(children).iter().copied())
+        {
             return;
         }
-        node.children.clear();
-        node.children.extend_from_slice(children);
         self.retention.counts.children_writes += 1;
+        self.set_children(id, children);
+        dirty_ancestors(&mut self.taffy, id);
+    }
+
+    /// Gives `id` its `children`, noting each node one of them is taken out
+    /// of in [`LayoutRetention::missing_children`].
+    fn set_children(&mut self, id: LayoutId, children: &[LayoutId]) {
+        for child in children {
+            if let Some(parent) = self.taffy.parent((*child).into())
+                && parent != id.into()
+            {
+                self.retention.missing_children.insert(parent.into());
+            }
+        }
         self.taffy
             .set_children(id.into(), LayoutId::to_taffy_slice(children))
             .expect(EXPECT_MESSAGE);
-        dirty_ancestors(&mut self.taffy, id);
     }
 
     fn style_fingerprint(&mut self, style: Option<&Style>, rem_size: Pixels, scale_factor: f32) -> u64 {
@@ -629,7 +651,7 @@ impl TaffyLayoutEngine {
             Claim::Reused(key, id) => {
                 let fingerprint = layout_fingerprint(style, rem_size, scale_factor);
                 self.apply_requested_style(key, id, style, fingerprint, rem_size, scale_factor);
-                self.apply_children(key, id, children);
+                self.apply_children(id, children);
                 if aligns_by_baseline(style) {
                     self.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
                     dirty_ancestors(&mut self.taffy, id);
@@ -666,11 +688,9 @@ impl TaffyLayoutEngine {
             // and that parent rewriting its children later would cut the
             // child's parent link, which its position is added up along.
             // `set_children` detaches each child from wherever it was.
-            self.taffy
-                .set_children(id.into(), LayoutId::to_taffy_slice(children))
-                .expect(EXPECT_MESSAGE);
+            self.set_children(id, children);
         }
-        self.retain(key, id, children, false, fingerprint);
+        self.retain(key, id, false, fingerprint);
         id
     }
 
@@ -699,7 +719,7 @@ impl TaffyLayoutEngine {
                     }
                 };
                 self.apply_requested_style(key, id, style, fingerprint, rem_size, scale_factor);
-                self.apply_children(key, id, &[]);
+                self.apply_children(id, &[]);
                 self.retention.counts.measured_nodes_dirtied += 1;
                 if let Some(context) = self.taffy.get_node_context_mut(id.into()) {
                     context.measure = measure;
@@ -735,7 +755,7 @@ impl TaffyLayoutEngine {
                     .new_leaf_with_context(taffy_style, NodeContext { measure })
                     .expect(EXPECT_MESSAGE)
                     .into();
-                self.retain(key, id, &[], true, fingerprint);
+                self.retain(key, id, true, fingerprint);
                 id
             }
         }
@@ -882,13 +902,18 @@ impl TaffyLayoutEngine {
             retention.transient.clear();
             retention.unstretched_styles.clear();
             retention.root_spaces.clear();
+            retention.missing_children.clear();
             self.taffy.clear();
         } else {
             let forget_spaces = !retention.root_spaces.is_empty();
+            let forget_missing = !retention.missing_children.is_empty();
             for id in retention.transient.drain(..) {
                 retention.unstretched_styles.remove(&id);
                 if forget_spaces {
                     retention.root_spaces.remove(&id);
+                }
+                if forget_missing {
+                    retention.missing_children.remove(&id);
                 }
                 remove_node(&mut self.taffy, id);
                 retention.counts.nodes_released += 1;
@@ -898,6 +923,7 @@ impl TaffyLayoutEngine {
                 let taffy = &mut self.taffy;
                 let unstretched_styles = &mut retention.unstretched_styles;
                 let root_spaces = &mut retention.root_spaces;
+                let missing_children = &mut retention.missing_children;
                 let released = &mut retention.counts.nodes_released;
                 retention.retained.retain(|_, node| {
                     if node.claimed_in_frame == frame {
@@ -906,6 +932,9 @@ impl TaffyLayoutEngine {
                     unstretched_styles.remove(&node.id);
                     if forget_spaces {
                         root_spaces.remove(&node.id);
+                    }
+                    if forget_missing {
+                        missing_children.remove(&node.id);
                     }
                     remove_node(taffy, node.id);
                     *released += 1;
@@ -954,12 +983,17 @@ impl TaffyLayoutEngine {
         let scale_factor = window.scale_factor();
         let requested = self.taffy.style(id.into()).expect(EXPECT_MESSAGE).clone();
         let mut fixed = requested.clone();
-        let width = taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
-        let height =
-            taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
-        fixed.size = taffy::geometry::Size { width, height };
-        fixed.min_size = fixed.size;
-        fixed.max_size = fixed.size;
+        let width = round_to_device_pixel(size.width.0, scale_factor);
+        let height = round_to_device_pixel(size.height.0, scale_factor);
+        fixed.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(width),
+            height: taffy::style::Dimension::length(height),
+        };
+        fixed.min_size = taffy::geometry::Size {
+            width: taffy::style::LengthPercentageAuto::length(width),
+            height: taffy::style::LengthPercentageAuto::length(height),
+        };
+        fixed.max_size = fixed.min_size;
         self.taffy
             .set_style(id.into(), fixed)
             .expect(EXPECT_MESSAGE);
@@ -1283,6 +1317,72 @@ mod tests {
         assert_eq!(engine.retention.claimed_this_frame, 2);
         assert!(!engine.try_keep_retained_sets(valid.into_iter(), root));
         assert_eq!(engine.retention.claimed_this_frame, 2);
+    }
+
+    /// Lays a child out under one parent, then gives it to another while the
+    /// first is kept without being asked for anything, as the nodes of a
+    /// view drawn again are. Returns the child, the parent it was taken out
+    /// of, and the parent given it.
+    fn child_moved_out_of_a_kept_parent(engine: &mut TaffyLayoutEngine) -> [LayoutId; 3] {
+        let child = engine.request_keyed_layout(Some(1), &sized(5.), px(16.), 1., &[]);
+        let first = engine.request_keyed_layout(Some(2), &Style::default(), px(16.), 1., &[child]);
+        engine.clear();
+
+        assert_eq!(engine.request_keyed_layout(Some(1), &sized(5.), px(16.), 1., &[]), child);
+        let second = engine.request_keyed_layout(Some(3), &Style::default(), px(16.), 1., &[child]);
+        engine.keep_retained(&[2]);
+        engine.clear();
+        assert_eq!(engine.taffy.child_count(first.into()), 0);
+        assert_eq!(engine.taffy.parent(child.into()), Some(second.into()));
+        [child, first, second]
+    }
+
+    /// A parent asked again for the children it asked for before gets back
+    /// the one another parent took out of it since, and is left alone once
+    /// it holds it.
+    #[test]
+    fn a_parent_asked_again_for_a_child_it_lost_gets_it_back() {
+        let mut engine = TaffyLayoutEngine::new();
+        let [child, first, _] = child_moved_out_of_a_kept_parent(&mut engine);
+        let frame = |engine: &mut TaffyLayoutEngine| {
+            assert_eq!(engine.request_keyed_layout(Some(1), &sized(5.), px(16.), 1., &[]), child);
+            assert_eq!(
+                engine.request_keyed_layout(Some(2), &Style::default(), px(16.), 1., &[child]),
+                first
+            );
+            engine.clear();
+        };
+
+        let writes = engine.retention.counts.children_writes;
+        frame(&mut engine);
+        assert_eq!(engine.taffy.parent(child.into()), Some(first.into()));
+        assert_eq!(engine.taffy.child_count(first.into()), 1);
+        assert_eq!(engine.retention.counts.children_writes, writes + 1);
+
+        frame(&mut engine);
+        assert_eq!(engine.taffy.parent(child.into()), Some(first.into()));
+        assert_eq!(engine.retention.counts.children_writes, writes + 1);
+    }
+
+    /// The nodes of a layout one of which lost a child to another node are
+    /// not kept as they are, which would lay the layout out without the
+    /// child; asked for again, the layout gets the child back and can be
+    /// kept from then on.
+    #[test]
+    fn a_layout_holding_a_parent_that_lost_a_child_is_not_kept() {
+        let mut engine = TaffyLayoutEngine::new();
+        let [child, first, _] = child_moved_out_of_a_kept_parent(&mut engine);
+        let keys: [&[u64]; 1] = [&[1, 2]];
+
+        assert!(!engine.try_keep_retained_sets(keys.into_iter(), first));
+        assert_eq!(engine.retention.claimed_this_frame, 0);
+        assert_eq!(engine.request_keyed_layout(Some(1), &sized(5.), px(16.), 1., &[]), child);
+        engine.request_keyed_layout(Some(2), &Style::default(), px(16.), 1., &[child]);
+        engine.clear();
+
+        assert!(engine.try_keep_retained_sets(keys.into_iter(), first));
+        engine.clear();
+        assert_eq!(engine.taffy.parent(child.into()), Some(first.into()));
     }
 
     /// A retained node hidden with `display: none` and shown again is laid
