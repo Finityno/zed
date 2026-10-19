@@ -5936,6 +5936,7 @@ pub(crate) mod tests {
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-10_000.))),
             modifiers: gpui::Modifiers::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            is_momentum: false,
         });
         cx.run_until_parked();
 

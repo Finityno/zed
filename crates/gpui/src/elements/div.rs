@@ -3627,7 +3627,7 @@ impl Interactivity {
                         && (delta_y != px(0.) || matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled))
                     {
                         let excess = delta_y - (scroll_offset.y - old_scroll_offset.y);
-                        window.queue_scroll_bounce(bounce, excess, extent, event.touch_phase, current_view, cx);
+                        window.queue_scroll_bounce(bounce, excess, extent, event, current_view, cx);
                     }
 
                     let moved = *scroll_offset != old_scroll_offset;

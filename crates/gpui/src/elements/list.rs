@@ -2425,7 +2425,7 @@ impl Element for List {
                 let after = state.scroll_top(&state.logical_scroll_top()).min(maximum);
                 let delta = event.delta.pixel_delta(px(20.)).y;
                 if maximum > px(0.) && (delta != px(0.) || matches!(event.touch_phase, crate::TouchPhase::Ended | crate::TouchPhase::Cancelled)) {
-                    window.queue_scroll_bounce(&state.scroll_bounce, delta + after - before, height, event.touch_phase, current_view, cx);
+                    window.queue_scroll_bounce(&state.scroll_bounce, delta + after - before, height, event, current_view, cx);
                 }
             }
         });

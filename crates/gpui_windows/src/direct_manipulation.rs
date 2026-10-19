@@ -192,6 +192,7 @@ struct DirectManipulationEventHandler {
     last_x_offset: Cell<f32>,
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
+    is_momentum: Cell<bool>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
     frame_demand: Arc<AtomicBool>,
 }
@@ -211,6 +212,7 @@ impl DirectManipulationEventHandler {
             last_x_offset: Cell::new(0.0),
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
+            is_momentum: Cell::new(false),
             pending_events,
             frame_demand,
         }
@@ -228,6 +230,7 @@ impl DirectManipulationEventHandler {
                         delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
                         modifiers,
                         touch_phase: TouchPhase::Ended,
+                        is_momentum: self.is_momentum.get(),
                     }));
             }
             GestureKind::Pinch => {
@@ -266,6 +269,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         if current == previous {
             return Ok(());
         }
+        self.is_momentum.set(current == DIRECTMANIPULATION_INERTIA);
 
         // A gesture can start long after the contact's grace period, for
         // example when fingers rest before panning. Ask for frames here so
@@ -390,6 +394,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                         delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
                         modifiers,
                         touch_phase,
+                        is_momentum: self.is_momentum.get(),
                     }));
             }
             GestureKind::Pinch => {

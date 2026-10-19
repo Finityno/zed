@@ -668,6 +668,7 @@ impl WebWindowInner {
                 delta,
                 modifiers,
                 touch_phase: TouchPhase::Moved,
+                is_momentum: false,
             }));
         })
     }

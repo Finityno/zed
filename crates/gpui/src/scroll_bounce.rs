@@ -1,6 +1,6 @@
-use crate::{App, EntityId, Global, Pixels, TouchPhase, Window, px};
+use crate::{App, EntityId, Global, Pixels, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, px};
 use scheduler::Instant;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 /// App-wide opt-in for elastic feedback at vertical scroll boundaries.
 #[derive(Default)]
@@ -20,16 +20,28 @@ impl ScrollEdgeBounce {
 #[derive(Clone, Debug, Default)]
 pub struct ScrollBounce(Rc<RefCell<Bounce>>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollInput {
+    Direct,
+    Momentum,
+    Wheel,
+}
+
 #[derive(Debug, Default)]
 struct Bounce {
     position: f32,
     velocity: f32,
     limit: f32,
     last_update: Option<Instant>,
+    momentum_consumed: bool,
+    wheel_consumed: bool,
+    last_wheel: Option<Instant>,
 }
 
 impl Bounce {
-    const SPRING_FREQUENCY: f32 = 32.;
+    // The reference's six edge impacts fit x = A * e * w * t * exp(-w * t).
+    // This peaks after 80 ms, then returns halfway in another 134 ms.
+    const SPRING_FREQUENCY: f32 = 12.5;
 
     fn sample(&self, now: Instant) -> (f32, f32) {
         let Some(last_update) = self.last_update else { return (0., 0.); };
@@ -44,38 +56,72 @@ impl Bounce {
     }
 
     fn displacement(&self, now: Instant) -> f32 {
-        let displacement = self.sample(now).0;
-        if displacement.abs() < 0.1 { 0. } else { displacement }
+        let (position, velocity) = self.sample(now);
+        if position.abs() < 0.5 && velocity.abs() < 5. { 0. } else { position }
     }
 
-    fn input(&mut self, excess: f32, extent: f32, phase: TouchPhase, now: Instant) {
+    fn clear_motion(&mut self) {
+        // Keep consumed-input latches after settling: a long native momentum
+        // tail must not start another bounce on the next packet.
+        self.position = 0.;
+        self.velocity = 0.;
+        self.last_update = None;
+    }
+
+    fn input(&mut self, excess: f32, extent: f32, phase: TouchPhase, input: ScrollInput, now: Instant) {
         if phase == TouchPhase::Cancelled {
-            *self = Self::default();
-        } else if phase == TouchPhase::Ended {
-            // The spring is already returning; restarting it here would lose its velocity.
+            self.clear_motion();
+            self.momentum_consumed = true;
+            self.wheel_consumed = true;
             return;
-        } else if excess != 0. {
-            let (position, velocity) = self.sample(now);
-            if phase == TouchPhase::Started || position.abs() < 0.1
-                || position.signum() != excess.signum() {
+        }
+        if phase == TouchPhase::Ended { return; }
+        if input == ScrollInput::Direct {
+            self.momentum_consumed = false;
+            self.wheel_consumed = false;
+        }
+        if input == ScrollInput::Wheel {
+            if self.last_wheel.is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_millis(150)) {
+                self.wheel_consumed = false;
+            }
+            self.last_wheel = Some(now);
+        }
+        if excess == 0. {
+            self.clear_motion();
+            return;
+        }
+        if (input == ScrollInput::Momentum && self.momentum_consumed)
+            || (input == ScrollInput::Wheel && self.wheel_consumed) {
+            return;
+        }
+        let (position, velocity) = self.sample(now);
+        self.limit = (extent * 0.06).clamp(6., 80.);
+        if input != ScrollInput::Direct {
+            if input == ScrollInput::Momentum { self.momentum_consumed = true; }
+            else { self.wheel_consumed = true; }
+            if position.abs() >= 0.5 && position.signum() == excess.signum() {
+                return;
+            }
+            let pull = excess * 0.55;
+            let peak = self.limit * pull / (self.limit + pull.abs());
+            self.position = 0.;
+            self.velocity = peak * std::f32::consts::E * Self::SPRING_FREQUENCY;
+        } else {
+            if phase == TouchPhase::Started || position.signum() != excess.signum() {
                 self.position = 0.;
                 self.velocity = 0.;
             } else {
-                // Momentum packets must not reset the return to a stationary pull.
                 self.position = position;
                 self.velocity = velocity;
             }
-            self.limit = (extent * 0.15).clamp(12., 80.);
             let pull = self.position * self.limit
                 / (self.limit - self.position.abs()).max(self.limit / 9.);
             let pull = (pull + excess * 0.55).clamp(-self.limit * 8., self.limit * 8.);
             self.position = self.limit * pull / (self.limit + pull.abs());
             let maximum_velocity = Self::SPRING_FREQUENCY * self.position.abs();
             self.velocity = self.velocity.clamp(-maximum_velocity, maximum_velocity);
-            self.last_update = Some(now);
-        } else {
-            *self = Self::default();
         }
+        self.last_update = Some(now);
     }
 }
 
@@ -87,19 +133,19 @@ impl ScrollBounce {
         &self,
         excess: Pixels,
         viewport_height: Pixels,
-        phase: TouchPhase,
+        event: &ScrollWheelEvent,
         view: EntityId,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.queue_scroll_bounce(self, excess, viewport_height, phase, view, cx);
+        window.queue_scroll_bounce(self, excess, viewport_height, event, view, cx);
     }
 
     /// Clear feedback after a programmatic scroll, scrollbar drag, or content reset.
     pub fn clear(&self) -> bool {
         let mut state = self.0.borrow_mut();
-        let changed = state.position != 0.;
-        *state = Bounce::default();
+        let changed = state.position != 0. || state.velocity != 0.;
+        state.clear_motion();
         changed
     }
 
@@ -116,10 +162,16 @@ impl ScrollBounce {
             self.clear();
             return px(0.);
         }
-        let displacement = self.0.borrow().displacement(Instant::now());
-        if (displacement > 0. && offset < px(-0.5))
-            || (displacement < 0. && offset > -maximum + px(0.5))
-            || displacement == 0.
+        let state = self.0.borrow();
+        let now = Instant::now();
+        let displacement = state.displacement(now);
+        let velocity = state.sample(now).1;
+        let direction = if displacement == 0. { velocity } else { displacement };
+        let active = state.last_update.is_some() && (displacement != 0. || velocity.abs() >= 5.);
+        drop(state);
+        if (direction > 0. && offset < px(-0.5))
+            || (direction < 0. && offset > -maximum + px(0.5))
+            || !active
         {
             self.clear();
             return px(0.);
@@ -134,6 +186,7 @@ pub(crate) struct ScrollBounceRequest {
     excess: Pixels,
     extent: Pixels,
     phase: TouchPhase,
+    input: ScrollInput,
     view: EntityId,
 }
 
@@ -143,7 +196,7 @@ impl Window {
         bounce: &ScrollBounce,
         excess: Pixels,
         extent: Pixels,
-        phase: TouchPhase,
+        event: &ScrollWheelEvent,
         view: EntityId,
         cx: &mut App,
     ) {
@@ -160,14 +213,18 @@ impl Window {
             cx.notify(previous.view);
         }
         self.pending_scroll_bounce = Some(ScrollBounceRequest {
-            bounce: bounce.clone(), excess, extent, phase, view,
+            bounce: bounce.clone(), excess, extent, phase: event.touch_phase,
+            input: if event.is_momentum { ScrollInput::Momentum }
+                else if matches!(event.delta, ScrollDelta::Lines(_)) { ScrollInput::Wheel }
+                else { ScrollInput::Direct },
+            view,
         });
     }
 
     pub(crate) fn apply_scroll_bounce(&mut self, cx: &mut App) {
         if let Some(request) = self.pending_scroll_bounce.take() {
             request.bounce.0.borrow_mut().input(
-                request.excess.into(), request.extent.into(), request.phase, Instant::now(),
+                request.excess.into(), request.extent.into(), request.phase, request.input, Instant::now(),
             );
             cx.notify(request.view);
         }
@@ -177,71 +234,87 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
-    fn scroll_bounce_resists_both_edges_and_settles() {
+    fn scroll_bounce_matches_measured_momentum_curve() {
         let now = Instant::now();
+        // Bottom impact at video frame 408, tracked through the helper text.
+        let reference = [(1, 14. / 31.), (2, 23. / 31.), (4, 29. / 31.),
+            (5, 1.), (9, 26. / 31.), (12, 18. / 31.), (17, 9. / 31.),
+            (22, 4. / 31.), (29, 1. / 31.)];
         for direction in [-1., 1.] {
             let mut bounce = Bounce::default();
-            bounce.input(direction * 10000., 600., TouchPhase::Moved, now);
-            let pulled = bounce.displacement(now);
-            assert_eq!(pulled.signum(), direction);
-            assert!(pulled.abs() < 80.);
-            assert!(bounce.displacement(now + Duration::from_millis(16)).abs() < pulled.abs() * 0.95);
-            bounce.input(0., 600., TouchPhase::Ended, now);
-            assert!((bounce.displacement(now) - pulled).abs() < 0.01);
-            assert!(bounce.displacement(now + Duration::from_millis(100)).abs() < pulled.abs() * 0.2);
-            assert_eq!(bounce.displacement(now + Duration::from_secs(1)), 0.);
-        }
-    }
-
-    #[test]
-    fn scroll_bounce_keeps_returning_through_a_momentum_tail() {
-        let now = Instant::now();
-        for direction in [-1., 1.] {
-            let mut bounce = Bounce::default();
-            bounce.input(direction * 200., 600., TouchPhase::Started, now);
-            let initial = bounce.displacement(now).abs();
-            for frame in 1..=20 {
-                let time = now + Duration::from_millis(frame * 16);
-                let excess = direction * 4. * (-0.25 * frame as f32).exp();
-                let before = bounce.displacement(time).abs();
-                bounce.input(excess, 600., TouchPhase::Moved, time);
-                let after = bounce.displacement(time).abs();
-                assert!(after - before < excess.abs() * 0.55 + 0.1);
+            bounce.input(direction * 200., 540., TouchPhase::Moved, ScrollInput::Momentum, now);
+            let peak = bounce.displacement(now + Duration::from_millis(80)).abs();
+            assert!(peak <= 540. * 0.06);
+            assert_eq!(bounce.displacement(now), 0.);
+            for (frame, fraction) in reference {
+                let actual = bounce.displacement(now + Duration::from_secs_f32(frame as f32 / 60.));
+                assert_eq!(actual.signum(), direction);
+                assert!((actual.abs() / peak - fraction).abs() < 0.065,
+                    "frame {frame}: {} vs {fraction}", actual.abs() / peak);
             }
-            assert!(bounce.displacement(now + Duration::from_millis(320)).abs() < initial * 0.02);
-            assert_eq!(bounce.displacement(now + Duration::from_millis(600)), 0.);
         }
     }
 
     #[test]
-    fn scroll_bounce_end_does_not_restart_the_return() {
+    fn scroll_bounce_absorbs_momentum_even_after_settling() {
         let now = Instant::now();
-        let mut bounce = Bounce::default();
-        bounce.input(200., 600., TouchPhase::Moved, now);
-        let ended = now + Duration::from_millis(48);
-        let later = now + Duration::from_millis(80);
-        let position_at_end = bounce.displacement(ended);
-        let position_later = bounce.displacement(later);
-        bounce.input(0., 600., TouchPhase::Ended, ended);
-        assert_eq!(bounce.displacement(ended), position_at_end);
-        assert_eq!(bounce.displacement(later), position_later);
+        for direction in [-1., 1.] {
+            let mut bounce = Bounce::default();
+            let mut unforced = Bounce::default();
+            for state in [&mut bounce, &mut unforced] {
+                state.input(direction * 200., 540., TouchPhase::Moved, ScrollInput::Momentum, now);
+            }
+            for frame in 1..=120 {
+                let time = now + Duration::from_secs_f32(frame as f32 / 60.);
+                bounce.input(direction * 100., 540., TouchPhase::Moved, ScrollInput::Momentum, time);
+                assert_eq!(bounce.displacement(time), unforced.displacement(time));
+                if bounce.displacement(time) == 0. { bounce.clear_motion(); }
+            }
+            let next_gesture = now + Duration::from_secs(3);
+            bounce.input(direction * 80., 540., TouchPhase::Started, ScrollInput::Direct, next_gesture);
+            assert_eq!(bounce.displacement(next_gesture).signum(), direction);
+        }
     }
 
     #[test]
-    fn scroll_bounce_returns_without_an_end_event_and_cancels() {
+    fn scroll_bounce_wheel_burst_returns_and_rearms_after_a_pause() {
         let now = Instant::now();
         let mut bounce = Bounce::default();
-        bounce.input(100., 400., TouchPhase::Moved, now);
-        assert!(bounce.displacement(now + Duration::from_millis(50)) > 0.);
+        bounce.input(200., 540., TouchPhase::Moved, ScrollInput::Wheel, now);
+        let peak = bounce.displacement(now + Duration::from_millis(80));
+        for frame in 1..=40 {
+            bounce.input(100., 540., TouchPhase::Moved, ScrollInput::Wheel, now + Duration::from_millis(frame * 16));
+        }
         assert_eq!(bounce.displacement(now + Duration::from_secs(1)), 0.);
-        bounce.input(100., 400., TouchPhase::Moved, now);
-        bounce.input(0., 400., TouchPhase::Cancelled, now);
-        assert_eq!(bounce.displacement(now), 0.);
-        bounce.input(-100., 400., TouchPhase::Moved, now);
-        bounce.input(0., 400., TouchPhase::Moved, now);
-        assert_eq!(bounce.displacement(now), 0.);
+        let next = now + Duration::from_secs(2);
+        bounce.input(200., 540., TouchPhase::Moved, ScrollInput::Wheel, next);
+        assert!((bounce.displacement(next + Duration::from_millis(80)) - peak).abs() < 0.01);
+    }
+
+    #[test]
+    fn scroll_bounce_waits_for_momentum_to_reach_the_edge() {
+        let now = Instant::now();
+        let mut bounce = Bounce::default();
+        bounce.input(0., 540., TouchPhase::Moved, ScrollInput::Momentum, now);
+        bounce.input(-200., 540., TouchPhase::Moved, ScrollInput::Momentum, now + Duration::from_millis(100));
+        assert!(bounce.displacement(now + Duration::from_millis(180)) < 0.);
+    }
+
+    #[test]
+    fn scroll_bounce_release_keeps_the_existing_return() {
+        let now = Instant::now();
+        let mut bounce = Bounce::default();
+        bounce.input(200., 540., TouchPhase::Moved, ScrollInput::Direct, now);
+        let later = now + Duration::from_millis(200);
+        let expected = bounce.displacement(later);
+        bounce.input(0., 540., TouchPhase::Ended, ScrollInput::Direct, now + Duration::from_millis(48));
+        bounce.input(100., 540., TouchPhase::Moved, ScrollInput::Momentum, now + Duration::from_millis(64));
+        assert_eq!(bounce.displacement(later), expected);
+        bounce.input(0., 540., TouchPhase::Cancelled, ScrollInput::Direct, later);
+        assert_eq!(bounce.displacement(later), 0.);
+        bounce.input(100., 540., TouchPhase::Moved, ScrollInput::Momentum, later);
+        assert_eq!(bounce.displacement(later), 0.);
     }
 }
