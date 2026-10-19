@@ -2024,23 +2024,6 @@ impl StateInner {
                 return Err(PrepaintRetry::HeldItem(scroll_top));
             }
 
-            // Pulling up at the bottom exposes rows above the logical viewport.
-            // Keep them in the painted range without changing the scroll anchor.
-            let mut leading_height = px(0.);
-            let mut leading_index = layout_response.scroll_top.item_ix;
-            while leading_height + layout_response.scroll_top.offset_in_item < -bounce_offset
-                && leading_index > 0
-            {
-                leading_index -= 1;
-                let mut element = render_item(leading_index, window, cx);
-                let size = window.layout_as_list_item(
-                    &mut element, leading_index,
-                    size(bounds.size.width.into(), AvailableSpace::MinContent), cx,
-                );
-                leading_height += size.height;
-                layout_response.item_layouts.push_front(ItemLayout { index: leading_index, element, size });
-            }
-
             // Avoid honoring autoscroll requests from elements other than our children.
             window.take_autoscroll();
 
@@ -2048,7 +2031,7 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
-                item_origin.y += bounce_offset - leading_height;
+                item_origin.y += bounce_offset;
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         item.element.prepaint_at(item_origin, window, cx);
