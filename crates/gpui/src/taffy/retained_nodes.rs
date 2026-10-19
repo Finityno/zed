@@ -954,12 +954,17 @@ impl TaffyLayoutEngine {
         let scale_factor = window.scale_factor();
         let requested = self.taffy.style(id.into()).expect(EXPECT_MESSAGE).clone();
         let mut fixed = requested.clone();
-        let width = taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
-        let height =
-            taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
-        fixed.size = taffy::geometry::Size { width, height };
-        fixed.min_size = fixed.size;
-        fixed.max_size = fixed.size;
+        let width = round_to_device_pixel(size.width.0, scale_factor);
+        let height = round_to_device_pixel(size.height.0, scale_factor);
+        fixed.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(width),
+            height: taffy::style::Dimension::length(height),
+        };
+        fixed.min_size = taffy::geometry::Size {
+            width: taffy::style::LengthPercentageAuto::length(width),
+            height: taffy::style::LengthPercentageAuto::length(height),
+        };
+        fixed.max_size = fixed.min_size;
         self.taffy
             .set_style(id.into(), fixed)
             .expect(EXPECT_MESSAGE);

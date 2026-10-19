@@ -315,44 +315,79 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        // Taffy lays an absolutely positioned root out as a box positioned
+        // against the available space: sized to fit its content and moved by
+        // its insets. A root here is placed by the element offset it is
+        // prepainted at, as an anchored overlay drawn on its own is, so it is
+        // laid out in flow, filling the space it is given, and keeps the
+        // position it asked for afterwards.
+        let absolute_root = self.taffy.style(id.into()).expect(EXPECT_MESSAGE).position
+            == taffy::style::Position::Absolute;
+        if absolute_root {
+            self.set_root_position(id, taffy::style::Position::Relative);
+        }
+
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
-                    let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
-                    };
+                |inputs, _id, node_context, style| {
+                    taffy::compute_leaf_layout(
+                        inputs,
+                        style,
+                        |_, _| 0.0,
+                        |known_dimensions, available_space| {
+                            let Some(node_context) = node_context else {
+                                return taffy::geometry::Size::default();
+                            };
 
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
+                            let known_dimensions = Size {
+                                width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
+                                height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+                            };
 
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
-                        }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
+                            let available_space: Size<AvailableSpace> = available_space.into();
+                            let untransform = |ev: AvailableSpace| match ev {
+                                AvailableSpace::Definite(pixels) => {
+                                    AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
+                                }
+                                AvailableSpace::MinContent => AvailableSpace::MinContent,
+                                AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+                            };
+                            let available_space = size(
+                                untransform(available_space.width),
+                                untransform(available_space.height),
+                            );
 
-                    let started_at = window.frame_work.clock();
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    window.frame_work.stats.measure_calls += 1;
-                    crate::window::add_elapsed(
-                        &mut window.frame_work.stats.measure_time,
-                        started_at,
-                    );
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                            let started_at = window.frame_work.clock();
+                            let measured_size: Size<Pixels> = (node_context.measure)(
+                                known_dimensions,
+                                available_space,
+                                window,
+                                cx,
+                            );
+                            window.frame_work.stats.measure_calls += 1;
+                            crate::window::add_elapsed(
+                                &mut window.frame_work.stats.measure_time,
+                                started_at,
+                            );
+                            snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                        },
+                    )
                 },
             )
+            .expect(EXPECT_MESSAGE);
+
+        if absolute_root {
+            self.set_root_position(id, taffy::style::Position::Absolute);
+        }
+    }
+
+    fn set_root_position(&mut self, id: LayoutId, position: taffy::style::Position) {
+        let mut style = self.taffy.style(id.into()).expect(EXPECT_MESSAGE).clone();
+        style.position = position;
+        self.taffy
+            .set_style(id.into(), style)
             .expect(EXPECT_MESSAGE);
     }
 
@@ -486,7 +521,10 @@ impl TaffyLayoutEngine {
                     .expect("parent absolute outer origin should be cached");
                 parent_origin + Point::from(layout_location)
             }
-            None => Point::from(layout_location),
+            // Taffy places a root's margin box at the origin and moves it by
+            // its insets; a root here is placed by the element offset it is
+            // prepainted at, its margins only narrowing the space it fills.
+            None => Point::default(),
         };
         self.absolute_outer_origins
             .insert(id, absolute_outer_origin);
@@ -617,10 +655,16 @@ impl ToTaffy<taffy::style::Style> for Style {
             margin: self.margin.to_taffy(rem_size, scale_factor),
             padding: self.padding.to_taffy(rem_size, scale_factor),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
-            align_items: self.align_items.map(|x| x.into()),
+            align_items: self
+                .align_items
+                .map_or(taffy::style::AlignItems::NORMAL, |x| x.into()),
             align_self: self.align_self.map(|x| x.into()),
-            align_content: self.align_content.map(|x| x.into()),
-            justify_content: self.justify_content.map(|x| x.into()),
+            align_content: self
+                .align_content
+                .map_or(taffy::style::AlignContent::NORMAL, |x| x.into()),
+            justify_content: self
+                .justify_content
+                .map_or(taffy::style::JustifyContent::NORMAL, |x| x.into()),
             gap: self.gap.to_taffy(rem_size, scale_factor),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),
@@ -1002,5 +1046,152 @@ mod tests {
         request_leaves(&mut engine, 1);
         assert!(!engine.reclaim_idle_capacity());
         assert_eq!(engine.taffy.total_node_count(), 1);
+    }
+
+    /// Elements laid out on their own and prepainted at an offset, as list
+    /// rows and popovers are: an anchored overlay, absolutely and relatively
+    /// positioned boxes with insets, and a box with margins.
+    struct LaidOutRootsView;
+
+    impl crate::Render for LaidOutRootsView {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _, px};
+
+            let grow_row = |selector: &'static str| {
+                crate::div()
+                    .flex()
+                    .child(crate::div().w(px(60.)).h(px(10.)))
+                    .child(
+                        crate::div()
+                            .flex_1()
+                            .h(px(10.))
+                            .debug_selector(move || selector.into()),
+                    )
+            };
+            crate::div().size_full().child(
+                crate::canvas(
+                    move |bounds, window, cx| {
+                        let roots = [
+                            crate::anchored()
+                                .position(crate::point(px(10.), px(20.)))
+                                .child(grow_row("ANCHORED_GROW"))
+                                .into_any_element(),
+                            crate::div()
+                                .absolute()
+                                .top(px(40.))
+                                .left(px(30.))
+                                .w(px(50.))
+                                .h(px(20.))
+                                .debug_selector(|| "ABSOLUTE_ROOT".into())
+                                .into_any_element(),
+                            grow_row("ABSOLUTE_ROOT_GROW")
+                                .absolute()
+                                .top(px(40.))
+                                .left(px(30.))
+                                .into_any_element(),
+                            crate::div()
+                                .relative()
+                                .top(px(5.))
+                                .left(px(7.))
+                                .w(px(40.))
+                                .h(px(20.))
+                                .debug_selector(|| "RELATIVE_ROOT".into())
+                                .into_any_element(),
+                            crate::div()
+                                .m(px(12.))
+                                .w(px(40.))
+                                .h(px(20.))
+                                .debug_selector(|| "MARGIN_ROOT".into())
+                                .into_any_element(),
+                            grow_row("MARGIN_ROOT_GROW")
+                                .m(px(12.))
+                                .into_any_element(),
+                            crate::div()
+                                .absolute()
+                                .top(px(40.))
+                                .child(
+                                    crate::div()
+                                        .w_full()
+                                        .h(px(10.))
+                                        .debug_selector(|| "ABSOLUTE_ROOT_FILL".into()),
+                                )
+                                .into_any_element(),
+                            crate::div()
+                                .m(px(12.))
+                                .child(
+                                    crate::div()
+                                        .w_full()
+                                        .h(px(10.))
+                                        .debug_selector(|| "MARGIN_ROOT_FILL".into()),
+                                )
+                                .into_any_element(),
+                        ];
+                        roots.map(|mut root| {
+                            root.prepaint_as_root(
+                                bounds.origin + crate::point(px(100.), px(50.)),
+                                size(
+                                    AvailableSpace::Definite(px(300.)),
+                                    AvailableSpace::Definite(px(200.)),
+                                ),
+                                window,
+                                cx,
+                            );
+                            root
+                        })
+                    },
+                    |_, roots, window, cx| {
+                        for mut root in roots {
+                            root.paint(window, cx);
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    #[crate::test]
+    fn roots_laid_out_on_their_own_are_placed_at_their_offset(cx: &mut crate::TestAppContext) {
+        use crate::px;
+
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| LaidOutRootsView);
+        cx.run_until_parked();
+
+        // Each root sits at its offset whatever its insets and margins, its
+        // margins only narrowing the space it fills, and an absolutely
+        // positioned root fills that space like any other.
+        let expected = [
+            ("ANCHORED_GROW", (70., 20.), (0., 10.)),
+            ("ABSOLUTE_ROOT", (100., 50.), (50., 20.)),
+            ("ABSOLUTE_ROOT_GROW", (160., 50.), (0., 10.)),
+            ("RELATIVE_ROOT", (100., 50.), (40., 20.)),
+            ("MARGIN_ROOT", (100., 50.), (40., 20.)),
+            ("MARGIN_ROOT_GROW", (160., 50.), (0., 10.)),
+            ("ABSOLUTE_ROOT_FILL", (100., 50.), (300., 10.)),
+            ("MARGIN_ROOT_FILL", (100., 50.), (276., 10.)),
+        ];
+        for frame in 0..2 {
+            window
+                .update(cx, |_, window, _| {
+                    for (selector, (x, y), (width, height)) in expected {
+                        let bounds = window.rendered_frame.debug_bounds.get(selector).copied();
+                        assert_eq!(
+                            bounds,
+                            Some(Bounds::new(
+                                crate::point(px(x), px(y)),
+                                size(px(width), px(height))
+                            )),
+                            "{selector} in frame {frame}"
+                        );
+                    }
+                })
+                .unwrap();
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+        }
     }
 }
