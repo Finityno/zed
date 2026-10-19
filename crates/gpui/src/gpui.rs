@@ -121,7 +121,7 @@ pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
 };
 pub use spring::*;
-pub use scroll_bounce::ScrollEdgeBounce;
+pub use scroll_bounce::{ScrollBounce, ScrollEdgeBounce};
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
 ///

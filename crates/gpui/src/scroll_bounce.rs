@@ -16,8 +16,9 @@ impl ScrollEdgeBounce {
     }
 }
 
+/// Persistent elastic feedback for a custom vertical scroll surface.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ScrollBounce(Rc<RefCell<Bounce>>);
+pub struct ScrollBounce(Rc<RefCell<Bounce>>);
 
 #[derive(Debug, Default)]
 struct Bounce {
@@ -67,14 +68,32 @@ impl Bounce {
 }
 
 impl ScrollBounce {
-    pub(crate) fn clear(&self) -> bool {
+    /// Feed the part of a wheel event a scrollable surface could not consume.
+    /// Call after normal scrolling, including zero-delta end/cancel events.
+    /// `view` must be the entity rendering the surface, captured before dispatch.
+    pub fn scroll(
+        &self,
+        excess: Pixels,
+        viewport_height: Pixels,
+        phase: TouchPhase,
+        view: EntityId,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.queue_scroll_bounce(self, excess, viewport_height, phase, view, cx);
+    }
+
+    /// Clear feedback after a programmatic scroll, scrollbar drag, or content reset.
+    pub fn clear(&self) -> bool {
         let mut state = self.0.borrow_mut();
         let changed = state.pull != 0.;
         *state = Bounce::default();
         changed
     }
 
-    pub(crate) fn offset(
+    /// Return the visual displacement and schedule its next animation frame.
+    /// `offset` is the clamped, negative content offset; `maximum` is its positive extent.
+    pub fn offset(
         &self,
         offset: Pixels,
         maximum: Pixels,
