@@ -1154,6 +1154,76 @@ mod tests {
         }
     }
 
+    /// A self-measuring root is offered the space it is laid out in less its
+    /// margins, as before: Taffy now takes the root's margins off before
+    /// laying it out, where a leaf used to take its own off.
+    #[crate::test]
+    fn a_measured_root_is_offered_the_space_inside_its_margins(cx: &mut crate::TestAppContext) {
+        use crate::{IntoElement as _, ParentElement as _, Styled as _, px};
+        use std::{cell::RefCell, rc::Rc};
+
+        struct MeasuredRootView(Rc<RefCell<Option<(AvailableSpace, Bounds<Pixels>)>>>);
+
+        impl crate::Render for MeasuredRootView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut crate::Context<Self>,
+            ) -> impl crate::IntoElement {
+                let measured = self.0.clone();
+                crate::div().size_full().child(
+                    crate::canvas(
+                        move |_, window, cx| {
+                            let mut style = Style::default();
+                            style.margin = Edges::all(px(12.).into());
+                            let offered = Rc::new(RefCell::new(None));
+                            let id = window.request_measured_layout(style, {
+                                let offered = offered.clone();
+                                move |_, available_space, _, _| {
+                                    *offered.borrow_mut() = Some(available_space.width);
+                                    let width = match available_space.width {
+                                        AvailableSpace::Definite(width) => width,
+                                        _ => px(1000.),
+                                    };
+                                    size(width, px(10.))
+                                }
+                            });
+                            window.compute_layout(
+                                id,
+                                size(
+                                    AvailableSpace::Definite(px(300.)),
+                                    AvailableSpace::Definite(px(200.)),
+                                ),
+                                cx,
+                            );
+                            let bounds = window.layout_bounds(id);
+                            let offered = offered.borrow_mut().take();
+                            *measured.borrow_mut() = offered.map(|offered| (offered, bounds));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .size_full()
+                    .into_any_element(),
+                )
+            }
+        }
+
+        let measured = Rc::new(RefCell::new(None));
+        cx.open_window(size(px(800.), px(600.)), {
+            let measured = measured.clone();
+            move |_, _| MeasuredRootView(measured)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            *measured.borrow(),
+            Some((
+                AvailableSpace::Definite(px(276.)),
+                Bounds::new(crate::point(px(0.), px(0.)), size(px(276.), px(10.)))
+            ))
+        );
+    }
+
     #[crate::test]
     fn roots_laid_out_on_their_own_are_placed_at_their_offset(cx: &mut crate::TestAppContext) {
         use crate::px;
