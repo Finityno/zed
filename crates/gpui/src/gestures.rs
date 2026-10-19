@@ -1136,8 +1136,8 @@ fn scroll_event(
         delta: ScrollDelta::Pixels(delta),
         modifiers: Modifiers::default(),
         touch_phase,
-    }
         is_momentum: false,
+    }
 }
 
 /// Estimates the velocity a touch had at its newest sample.
