@@ -405,6 +405,8 @@ impl Element for UniformList {
             handle.deferred_scroll_to_item.take()
         });
 
+        let scroll_bounce = self.interactivity.scroll_bounce.clone();
+        let scroll_max = self.interactivity.scroll_max.clone();
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -497,11 +499,16 @@ impl Element for UniformList {
                         scroll_offset = *updated_scroll_offset
                     }
 
+                    let bounce_offset = scroll_bounce.as_ref().map_or(px(0.), |bounce| {
+                        let maximum = scroll_max.as_ref().map_or(px(0.), |maximum| maximum.get().y);
+                        bounce.offset(scroll_offset.y, maximum, window, cx)
+                    });
                     let scroll_top = -scroll_offset.y.to_f64();
                     let item_height_f64 = item_height.to_f64();
+                    let visual_scroll_top = scroll_top - bounce_offset.to_f64();
                     let first_visible_element_ix =
-                        ((scroll_top - padding.top.to_f64()) / item_height_f64).floor() as usize;
-                    let last_visible_element_ix = ((scroll_top
+                        ((visual_scroll_top - padding.top.to_f64()) / item_height_f64).floor() as usize;
+                    let last_visible_element_ix = ((visual_scroll_top
                         + padded_bounds.size.height.to_f64())
                         / item_height_f64)
                         .ceil() as usize;
@@ -524,7 +531,7 @@ impl Element for UniformList {
                         for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
                             let item_top = item_height_f64 * ix as f64 - scroll_top;
                             let item_origin = padded_bounds.origin
-                                + point(scroll_offset.x, Pixels::from(item_top));
+                                + point(scroll_offset.x, Pixels::from(item_top) + bounce_offset);
 
                             let available_width = if can_scroll_horizontally {
                                 padded_bounds.size.width + scroll_offset.x.abs()
@@ -541,7 +548,7 @@ impl Element for UniformList {
                         }
 
                         let bounds =
-                            Bounds::new(padded_bounds.origin + scroll_offset, padded_bounds.size);
+                            Bounds::new(padded_bounds.origin + scroll_offset + point(px(0.), bounce_offset), padded_bounds.size);
                         for decoration in &self.decorations {
                             let mut decoration = decoration.as_ref().compute(
                                 visible_range.clone(),
