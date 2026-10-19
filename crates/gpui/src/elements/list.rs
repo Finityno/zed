@@ -1087,6 +1087,27 @@ impl ListState {
         })
     }
 
+    /// Change follow mode at the current anchor, preserving scroll-edge feedback.
+    /// Tail following remains suspended until the list reaches the bottom.
+    pub fn set_follow_mode_preserving_scroll(&self, mode: FollowMode) {
+        self.changing(|| {
+            let state = &mut *self.0.borrow_mut();
+            let mut scroll_top = state.logical_scroll_top();
+            let item_count = state.items.summary().count;
+            if scroll_top.item_ix >= item_count {
+                scroll_top.item_ix = item_count;
+                scroll_top.offset_in_item = px(0.);
+            }
+            state.follow_state = match mode {
+                FollowMode::Normal => FollowState::Normal,
+                FollowMode::Tail => FollowState::Tail { is_following: scroll_top.item_ix == item_count },
+            };
+            state.held_item = None;
+            state.rebase_pending_scroll(scroll_top);
+            state.logical_scroll_top = Some(scroll_top);
+        })
+    }
+
     /// Pause tail-following, freezing the list at its current scroll
     /// position. Unlike [`Self::set_follow_mode`] with [`FollowMode::Normal`],
     /// this keeps the list in `Tail` mode, so it will resume following
