@@ -212,6 +212,11 @@ impl Window {
         {
             cx.notify(previous.view);
         }
+        // An impact can consume nearly the whole last scroll step before it
+        // reaches the edge. Its velocity comes from that step, not the remainder.
+        let excess = if event.is_momentum && excess != px(0.) {
+            px(f32::from(excess).signum() * f32::from(event.delta.pixel_delta(px(1.)).y).abs().max(f32::from(excess).abs()))
+        } else { excess };
         self.pending_scroll_bounce = Some(ScrollBounceRequest {
             bounce: bounce.clone(), excess, extent, phase: event.touch_phase,
             input: if event.is_momentum { ScrollInput::Momentum }
