@@ -93,6 +93,7 @@ impl std::fmt::Debug for ListState {
 
 struct StateInner {
     scroll_bounce: crate::scroll_bounce::ScrollBounce,
+    scroll_bounce_bottom_inset: Pixels,
     last_layout_bounds: Option<Bounds<Pixels>>,
     /// Width items were last measured at. Equal to the list's own width unless
     /// the caller overrode it with [`List::measured_item_width`].
@@ -566,6 +567,7 @@ impl ListState {
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let this = Self(Rc::new(RefCell::new(StateInner {
             scroll_bounce: Default::default(),
+            scroll_bounce_bottom_inset: px(0.),
             last_layout_bounds: None,
             last_measured_item_width: None,
             last_padding: None,
@@ -1002,6 +1004,12 @@ impl ListState {
     pub fn logical_scroll_top(&self) -> ListOffset {
         self.note_read();
         self.0.borrow().logical_scroll_top()
+    }
+
+    /// Set non-content clearance below the visible bottom edge for elastic feedback.
+    /// This does not change logical scrolling or tail-following thresholds.
+    pub fn set_scroll_bounce_bottom_inset(&self, inset: Pixels) {
+        self.0.borrow_mut().scroll_bounce_bottom_inset = inset.max(px(0.));
     }
 
     /// Scroll the list by the given offset
@@ -2020,10 +2028,6 @@ impl StateInner {
                 _ => {}
             }
 
-            let bounce_offset = self.scroll_bounce.offset(
-                -self.scroll_top(&self.logical_scroll_top()).min(self.max_scroll_offset()),
-                self.max_scroll_offset(), window, cx,
-            );
             let mut layout_response = self.layout_items(
                 Some(bounds.size.width),
                 bounds.size.height,
@@ -2044,6 +2048,14 @@ impl StateInner {
             {
                 return Err(PrepaintRetry::HeldItem(scroll_top));
             }
+
+            // Resolve feedback after layout has applied tail following and remeasured
+            // streaming rows; stale geometry can otherwise cancel a valid impact.
+            let bounce_maximum = (self.max_scroll_offset() - self.scroll_bounce_bottom_inset).max(px(0.));
+            let bounce_offset = self.scroll_bounce.offset(
+                -self.scroll_top(&layout_response.scroll_top).min(bounce_maximum),
+                bounce_maximum, window, cx,
+            );
 
             // Avoid honoring autoscroll requests from elements other than our children.
             window.take_autoscroll();
@@ -2447,8 +2459,9 @@ impl Element for List {
                 if maximum > px(0.) && (delta != px(0.) || matches!(event.touch_phase, crate::TouchPhase::Ended | crate::TouchPhase::Cancelled)) {
                     // Use the arriving step even when it lands exactly on the
                     // boundary: a second outward wheel event is not required.
+                    let bottom = (maximum - state.scroll_bounce_bottom_inset).max(px(0.));
                     let impact = if (delta > px(0.) && after == px(0.))
-                        || (delta < px(0.) && after == maximum) { delta } else { px(0.) };
+                        || (delta < px(0.) && after >= bottom) { delta } else { px(0.) };
                     window.queue_scroll_bounce(&state.scroll_bounce, impact, height, event, current_view, cx);
                 }
             }
