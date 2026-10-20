@@ -94,6 +94,7 @@ static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
+static mut OVERLAY_BACKDROP_VIEW_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_UNARCHIVER_CLASS: *const Class = ptr::null();
 static mut CONTEXT_MENU_TARGET_CLASS: *const Class = ptr::null();
@@ -394,6 +395,18 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(updateLayer),
                 blurred_view_update_layer as extern "C" fn(&Object, Sel),
+            );
+            decl.register()
+        };
+        OVERLAY_BACKDROP_VIEW_CLASS = {
+            let mut decl = ClassDecl::new("GPUIOverlayBackdropView", class!(NSView)).unwrap();
+            decl.add_method(
+                sel!(makeBackingLayer),
+                overlay_backdrop_backing_layer as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(hitTest:),
+                overlay_backdrop_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
             );
             decl.register()
         };
@@ -814,6 +827,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     overlay_view: Option<NonNull<Object>>,
+    overlay_backdrops: Vec<OverlayBackdrop>,
     overlay_input_active: Arc<AtomicBool>,
     blurred_view: Option<id>,
     // Requested glass backdrop tint; applied to `blurred_view` when it is an
@@ -1381,6 +1395,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 overlay_view: None,
+                overlay_backdrops: Vec::new(),
                 overlay_input_active: Arc::new(AtomicBool::new(false)),
                 blurred_view: None,
                 glass_tint: None,
@@ -1715,6 +1730,7 @@ impl Drop for MacWindow {
         // renderer's command queue are actually released with the window.
         drop(this.accesskit_adapter.take());
         this.renderer.destroy();
+        this.remove_overlay_backdrops();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
@@ -2774,6 +2790,7 @@ impl PlatformWindow for MacWindow {
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
         this.release_intermediates_if_occluded();
+        this.sync_overlay_backdrops();
 
         report.breakdown.accumulate(overlay_report.breakdown);
         // The base layer holds the window's content, so the present's
@@ -2863,6 +2880,7 @@ impl PlatformWindow for MacWindow {
         // test racing the removal would otherwise route a click into a view
         // that is being torn down.
         this.overlay_input_active.store(false, Ordering::Release);
+        this.remove_overlay_backdrops();
         // The superview held the only strong reference (the view was added
         // autoreleased), so removing it deallocates the view, which drops the
         // window-state and input-flag references its ivars carried.
@@ -3312,6 +3330,148 @@ extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
         let raw: *mut c_void = *this.get_ivar(OVERLAY_INPUT_IVAR);
         drop(Arc::from_raw(raw as *const AtomicBool));
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
+    }
+}
+
+// A backdrop layer samples the window's composited layer tree live, so it
+// sees a WKWebView child the Metal planes cannot. A within-window
+// NSVisualEffectView would not do: its materials may blur a cached image of
+// the window, which never includes a layer-hosted WebKit view.
+extern "C" fn overlay_backdrop_backing_layer(_: &Object, _: Sel) -> id {
+    unsafe {
+        let layer: id = msg_send![class!(CABackdropLayer), layer];
+        let _: () = msg_send![layer, setAllowsInPlaceFiltering: NO];
+        // Sampling at half resolution halves the blur's cost and is
+        // indistinguishable under a gaussian this wide.
+        let _: () = msg_send![layer, setScale: 0.5f64];
+        layer
+    }
+}
+
+extern "C" fn overlay_backdrop_hit_test(_: &Object, _: Sel, _: NSPoint) -> id {
+    nil
+}
+
+/// The native blur under one frosted surface on the overlay plane, and the
+/// filter settings last applied to it.
+struct OverlayBackdrop {
+    view: NonNull<Object>,
+    blur_radius: f64,
+    saturation: f64,
+}
+
+impl MacWindowState {
+    /// Places a native backdrop view under every backdrop blur on the overlay
+    /// plane. The overlay's Metal target holds only overlay content, so its
+    /// own blur pass has nothing of the page or the base plane beneath a
+    /// popover to sample; these views sit between the native children and the
+    /// overlay view and blur both from the compositor's layer tree instead.
+    fn sync_overlay_backdrops(&mut self) {
+        let Some(overlay_view) = self.overlay_view else {
+            self.remove_overlay_backdrops();
+            return;
+        };
+        let blur_count = self.overlay_scene.backdrop_blurs.len();
+        if blur_count == 0 && self.overlay_backdrops.is_empty() {
+            return;
+        }
+        let scale = self.scale_factor() as f64;
+        let view_height = f64::from(f32::from(self.content_size().height));
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), begin];
+            // Frames and filters change with the popover; the default
+            // implicit animations would trail them behind the Metal planes.
+            let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+            while self.overlay_backdrops.len() > blur_count {
+                if let Some(backdrop) = self.overlay_backdrops.pop() {
+                    backdrop.remove();
+                }
+            }
+            let native_view = self.native_view.as_ptr() as id;
+            for index in 0..blur_count {
+                let blur = self.overlay_scene.backdrop_blurs[index];
+                if index == self.overlay_backdrops.len() {
+                    let view: id = msg_send![OVERLAY_BACKDROP_VIEW_CLASS, alloc];
+                    let view = NSView::initWithFrame_(view, NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)));
+                    let Some(view) = NonNull::new(view) else {
+                        break;
+                    };
+                    let _: () = msg_send![view.as_ptr() as id, setWantsLayer: YES];
+                    self.overlay_backdrops.push(OverlayBackdrop {
+                        view,
+                        blur_radius: -1.,
+                        saturation: -1.,
+                    });
+                }
+                let backdrop = &mut self.overlay_backdrops[index];
+                let view = backdrop.view.as_ptr() as id;
+                // A native child created since the last frame lands above
+                // everything; keeping each view just under the overlay keeps
+                // it above the page it blurs.
+                let _: () = msg_send![
+                    native_view,
+                    addSubview: view
+                    positioned: NSWindowOrderingMode::NSWindowBelow
+                    relativeTo: overlay_view.as_ptr() as id
+                ];
+                let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+                let x = f64::from(bounds.origin.x.0) / scale;
+                let width = (f64::from(bounds.size.width.0) / scale).max(0.);
+                let height = (f64::from(bounds.size.height.0) / scale).max(0.);
+                let y = view_height - f64::from(bounds.origin.y.0) / scale - height;
+                let _: () = msg_send![view, setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))];
+                let _: () = msg_send![view, setAlphaValue: f64::from(blur.opacity.clamp(0., 1.))];
+
+                let layer: id = msg_send![view, layer];
+                if layer.is_null() {
+                    continue;
+                }
+                let _: () = msg_send![layer, setCornerRadius: f64::from(blur.corner_radii.top_left.0) / scale];
+                let _: () = msg_send![layer, setMasksToBounds: YES];
+                let blur_radius = f64::from(blur.blur_radius.0) / scale;
+                let saturation = f64::from(blur.saturation);
+                if backdrop.blur_radius != blur_radius || backdrop.saturation != saturation {
+                    backdrop.blur_radius = blur_radius;
+                    backdrop.saturation = saturation;
+                    // The render server copies the filters it is given, so
+                    // changing a value means handing it a new array.
+                    let gaussian: id =
+                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
+                    let radius_value: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
+                    let _: () = msg_send![gaussian, setValue: radius_value forKey: ns_string("inputRadius")];
+                    // Clamp at the view's edges rather than fading to
+                    // transparent, as the Metal pass clamps at its copy's.
+                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
+                    let _: () = msg_send![gaussian, setValue: yes forKey: ns_string("inputNormalizeEdges")];
+                    let saturate: id =
+                        msg_send![class!(CAFilter), filterWithType: ns_string("colorSaturate")];
+                    let amount: id = msg_send![class!(NSNumber), numberWithDouble: saturation];
+                    let _: () = msg_send![saturate, setValue: amount forKey: ns_string("inputAmount")];
+                    let filters: id =
+                        msg_send![class!(NSArray), arrayWithObjects: [gaussian, saturate].as_ptr() count: 2usize];
+                    let _: () = msg_send![layer, setFilters: filters];
+                }
+            }
+            let _: () = msg_send![class!(CATransaction), commit];
+        }
+    }
+
+    fn remove_overlay_backdrops(&mut self) {
+        for backdrop in self.overlay_backdrops.drain(..) {
+            backdrop.remove();
+        }
+    }
+}
+
+impl OverlayBackdrop {
+    /// Takes the view out of the window and gives up the reference its
+    /// `alloc` returned, which this struct held alongside the superview's.
+    fn remove(self) {
+        unsafe {
+            let view = self.view.as_ptr() as id;
+            NSView::removeFromSuperview(view);
+            let _: () = msg_send![view, release];
+        }
     }
 }
 
