@@ -24,7 +24,10 @@ use windows::{
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
+use backdrop_blur::BackdropBlurs;
 use gpui::*;
+
+mod backdrop_blur;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -106,6 +109,10 @@ pub(crate) struct DirectXRenderer {
     frames_drawn: u64,
     frames_with_paths: u64,
     frames_since_paths: u32,
+
+    /// The backdrop blur pipeline and scratch textures, created by the first
+    /// frame that carries a blur.
+    backdrop_blurs: BackdropBlurs,
 }
 
 /// Direct3D objects
@@ -356,6 +363,7 @@ impl DirectXRenderer {
             frames_drawn: 0,
             frames_with_paths: 0,
             frames_since_paths: 0,
+            backdrop_blurs: BackdropBlurs::default(),
         })
     }
 
@@ -414,6 +422,7 @@ impl DirectXRenderer {
             frames_drawn: 0,
             frames_with_paths: 0,
             frames_since_paths: 0,
+            backdrop_blurs: BackdropBlurs::default(),
         })
     }
 
@@ -638,6 +647,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.backdrop_blurs = BackdropBlurs::default();
             self.rounded_clip_buffer.take();
             self.rounded_clip_view.take();
             self.rounded_clip_capacity = 0;
@@ -771,6 +781,7 @@ impl DirectXRenderer {
     fn draw_inner(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
         self.render(scene, clear_color)?;
         self.note_frame_paths(!scene.paths.is_empty());
+        self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
         self.atlas.on_frame_drawn(scene);
         self.present()
     }
@@ -837,6 +848,7 @@ impl DirectXRenderer {
         self.pre_draw(ScenePlane::Overlay, &[0.0; 4])?;
         self.draw_scene(overlay_scene)?;
         self.note_frame_paths(!scene.paths.is_empty());
+        self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
         // Both planes are replays of `scene`, so marking it covers every tile
         // this present draws, before anything idle is retired.
         self.atlas.on_frame_drawn(scene);
@@ -963,7 +975,16 @@ impl DirectXRenderer {
         );
 
         let mut quad_cursor: u32 = 0;
+        let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
         for batch in scene.batches() {
+            let batch_order = scene.batch_order(&batch);
+            while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+                let _annotation = annotation
+                    .as_ref()
+                    .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
+                self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
+            }
+
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -1017,6 +1038,13 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             })?;
+        }
+        // A blur above everything else still frosts what is beneath it.
+        for blur in pending_blurs {
+            let _annotation = annotation
+                .as_ref()
+                .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
+            self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
         }
 
         self.pipelines.opaque_quad_pipeline.disable_depth(
@@ -1195,6 +1223,7 @@ impl DirectXRenderer {
                 .context("Failed to resize swap chain")?;
         }
 
+        self.backdrop_blurs.release_textures();
         resources.recreate_resources(devices, width, height)?;
         self.resize_count += 1;
         log::debug!(
@@ -3150,6 +3179,8 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        BackdropBlurPass,
+        BackdropBlur,
         EmojiRasterization,
     }
 
@@ -3227,6 +3258,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlurPass => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_PASS_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_PASS_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlur => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -3319,6 +3358,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::BackdropBlurPass => "backdrop_blur_pass",
+                ShaderModule::BackdropBlur => "backdrop_blur",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
