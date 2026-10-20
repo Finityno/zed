@@ -377,13 +377,14 @@ impl DirectXRenderer {
         } else {
             blur.blur_radius.0.clamp(0.5, MAX_BACKDROP_BLUR_SIGMA)
         };
-        // The gaussian reaches about three standard deviations, so that much
-        // of what surrounds the visible region is copied along with it.
-        let padding = (sigma * 3.).ceil() + 1.;
-        let left = (visible.origin.x.0 - padding).floor().max(0.) as u32;
-        let top = (visible.origin.y.0 - padding).floor().max(0.) as u32;
-        let right = (visible.right().0 + padding).ceil().min(self.width as f32) as u32;
-        let bottom = (visible.bottom().0 + padding).ceil().min(self.height as f32) as u32;
+        // Only what lies under the surface is copied, and the blur clamps at
+        // the copy's edges. Sampling the surroundings too would carry
+        // whatever borders the surface (a line of text, a lighter panel) in
+        // across its edge as a pale band just inside the outline.
+        let left = visible.origin.x.0.floor().max(0.) as u32;
+        let top = visible.origin.y.0.floor().max(0.) as u32;
+        let right = visible.right().0.ceil().min(self.width as f32) as u32;
+        let bottom = visible.bottom().0.ceil().min(self.height as f32) as u32;
         if right <= left || bottom <= top {
             return Ok(());
         }

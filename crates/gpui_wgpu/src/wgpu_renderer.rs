@@ -3096,21 +3096,22 @@ impl WgpuRendererCore {
         frame_view: &wgpu::TextureView,
     ) {
         let sigma = blur.blur_radius.0.clamp(0.5, MAX_BACKDROP_BLUR_SIGMA);
-        // The gaussian reaches about three standard deviations, so that much
-        // of what surrounds the visible region is copied along with it.
-        let padding = (sigma * 3.).ceil() + 1.;
+        // Only what lies under the surface is copied, and the blur clamps at
+        // the copy's edges. Sampling the surroundings too would carry
+        // whatever borders the surface (a line of text, a lighter panel) in
+        // across its edge as a pale band just inside the outline.
         let visible = blur.bounds.intersect(&blur.content_mask.bounds);
         if visible.size.width.0 <= 0. || visible.size.height.0 <= 0. {
             return;
         }
         let frame_width = i64::from(frame_texture.width());
         let frame_height = i64::from(frame_texture.height());
-        let left = ((visible.origin.x.0 - padding).floor() as i64).max(0);
-        let top = ((visible.origin.y.0 - padding).floor() as i64).max(0);
-        let right = ((visible.origin.x.0 + visible.size.width.0 + padding).ceil() as i64)
-            .min(frame_width);
-        let bottom = ((visible.origin.y.0 + visible.size.height.0 + padding).ceil() as i64)
-            .min(frame_height);
+        let left = (visible.origin.x.0.floor() as i64).max(0);
+        let top = (visible.origin.y.0.floor() as i64).max(0);
+        let right =
+            ((visible.origin.x.0 + visible.size.width.0).ceil() as i64).min(frame_width);
+        let bottom =
+            ((visible.origin.y.0 + visible.size.height.0).ceil() as i64).min(frame_height);
         if right <= left || bottom <= top {
             return;
         }

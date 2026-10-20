@@ -1135,18 +1135,18 @@ impl MetalRenderer {
         depth: f64,
     ) -> Result<&'a metal::RenderCommandEncoderRef> {
         let sigma = blur.blur_radius.0.max(0.5);
-        // The gaussian reaches about three standard deviations, so that much
-        // of what surrounds the visible region is copied along with it.
-        let padding = (sigma * 3.).ceil() + 1.;
+        // Only what lies under the surface is copied, and the gaussian clamps
+        // at the copy's edges. Sampling the surroundings too would carry
+        // whatever borders the surface (a line of text, a lighter panel) in
+        // across its edge as a pale band just inside the outline.
         let visible = blur.bounds.intersect(&blur.content_mask.bounds);
         let texture_width = texture.width() as i64;
         let texture_height = texture.height() as i64;
-        let left = ((visible.origin.x.0 - padding).floor() as i64).max(0);
-        let top = ((visible.origin.y.0 - padding).floor() as i64).max(0);
-        let right = ((visible.origin.x.0 + visible.size.width.0 + padding).ceil() as i64)
-            .min(texture_width);
-        let bottom = ((visible.origin.y.0 + visible.size.height.0 + padding).ceil() as i64)
-            .min(texture_height);
+        let left = (visible.origin.x.0.floor() as i64).max(0);
+        let top = (visible.origin.y.0.floor() as i64).max(0);
+        let right = ((visible.origin.x.0 + visible.size.width.0).ceil() as i64).min(texture_width);
+        let bottom =
+            ((visible.origin.y.0 + visible.size.height.0).ceil() as i64).min(texture_height);
         if right <= left || bottom <= top {
             return Ok(command_encoder);
         }
