@@ -2820,6 +2820,16 @@ impl PlatformWindow for MacWindow {
                     NSView::removeFromSuperview(overlay_view);
                     native_view.addSubview_(overlay_view);
                     let _: () = msg_send![overlay_view, release];
+                    // The backdrop views belong between the native children
+                    // and the overlay, so they follow it above the new child.
+                    for backdrop in &this.overlay_backdrops {
+                        let _: () = msg_send![
+                            native_view,
+                            addSubview: backdrop.view.as_ptr() as id
+                            positioned: NSWindowOrderingMode::NSWindowBelow
+                            relativeTo: overlay_view
+                        ];
+                    }
                 }
             }
             return Ok(());
@@ -3377,11 +3387,13 @@ impl MacWindowState {
         }
         let scale = self.scale_factor() as f64;
         let view_height = f64::from(f32::from(self.content_size().height));
+        // No explicit CATransaction here: this runs with the window state
+        // locked, and committing an outermost transaction flushes AppKit's
+        // display cycle synchronously, whose tracking-area update calls
+        // `resetCursorRects` and blocks on that same lock. The views'
+        // backing layers are AppKit's, which already suppresses implicit
+        // animations on them.
         unsafe {
-            let _: () = msg_send![class!(CATransaction), begin];
-            // Frames and filters change with the popover; the default
-            // implicit animations would trail them behind the Metal planes.
-            let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
             while self.overlay_backdrops.len() > blur_count {
                 if let Some(backdrop) = self.overlay_backdrops.pop() {
                     backdrop.remove();
@@ -3397,6 +3409,12 @@ impl MacWindowState {
                         break;
                     };
                     let _: () = msg_send![view.as_ptr() as id, setWantsLayer: YES];
+                    let _: () = msg_send![
+                        native_view,
+                        addSubview: view.as_ptr() as id
+                        positioned: NSWindowOrderingMode::NSWindowBelow
+                        relativeTo: overlay_view.as_ptr() as id
+                    ];
                     self.overlay_backdrops.push(OverlayBackdrop {
                         view,
                         blur_radius: -1.,
@@ -3405,15 +3423,6 @@ impl MacWindowState {
                 }
                 let backdrop = &mut self.overlay_backdrops[index];
                 let view = backdrop.view.as_ptr() as id;
-                // A native child created since the last frame lands above
-                // everything; keeping each view just under the overlay keeps
-                // it above the page it blurs.
-                let _: () = msg_send![
-                    native_view,
-                    addSubview: view
-                    positioned: NSWindowOrderingMode::NSWindowBelow
-                    relativeTo: overlay_view.as_ptr() as id
-                ];
                 let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
                 let x = f64::from(bounds.origin.x.0) / scale;
                 let width = (f64::from(bounds.size.width.0) / scale).max(0.);
@@ -3452,7 +3461,6 @@ impl MacWindowState {
                     let _: () = msg_send![layer, setFilters: filters];
                 }
             }
-            let _: () = msg_send![class!(CATransaction), commit];
         }
     }
 
