@@ -3114,8 +3114,11 @@ pub struct BackdropBlur {
     /// How much of the effect replaces the unblurred backdrop, so that an
     /// element fading in or out fades its frost with it.
     pub opacity: f32,
+    /// The rect the frosted backdrop fills.
     pub bounds: Bounds<ScaledPixels>,
+    /// The mask the rect is clipped to.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// The rect's rounding, matching the surface painted over it.
     pub corner_radii: Corners<ScaledPixels>,
 }
 

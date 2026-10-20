@@ -1121,7 +1121,6 @@ impl MetalRenderer {
     /// a resumed encoder that has painted the result back inside the blur's
     /// rounded rect. A blur that is entirely clipped, or that the device
     /// cannot run, keeps the encoder it was given.
-    #[allow(clippy::too_many_arguments)]
     fn draw_backdrop_blur<'a>(
         &mut self,
         blur: &BackdropBlur,
