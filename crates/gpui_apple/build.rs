@@ -51,6 +51,8 @@ mod apple_build {
             "PathRasterizationVertex".into(),
             "ShadowInputIndex".into(),
             "Shadow".into(),
+            "BackdropBlurInputIndex".into(),
+            "BackdropBlur".into(),
             "QuadInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),

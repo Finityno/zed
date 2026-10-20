@@ -134,6 +134,10 @@ pub struct Scene {
     painted_subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Backdrop blurs, in draw order once `finish` has run. They are kept out
+    /// of the primitive batches: a renderer ends its pass at each one's order
+    /// to blur what is already in the framebuffer beneath it.
+    pub backdrop_blurs: Vec<BackdropBlur>,
     /// Rounded masks referenced by primitives, one-based so zero needs no mask.
     pub rounded_clips: Vec<RoundedClipNode>,
     pub(crate) current_rounded_clip: u32,
@@ -204,6 +208,7 @@ impl Scene {
         opaque_quad_indices.clear_vec(&mut self.opaque_quad_indices);
         painted_monochrome_sprites.clear_vec(&mut self.painted_monochrome_sprites);
         painted_subpixel_sprites.clear_vec(&mut self.painted_subpixel_sprites);
+        self.backdrop_blurs.clear();
         self.shimmer_animations.clear();
         self.animated_monochrome_sprites.clear();
         self.animated_subpixel_sprites.clear();
@@ -330,6 +335,7 @@ impl Scene {
             && self.painted_subpixel_sprites.is_empty()
             && self.polychrome_sprites.is_empty()
             && self.surfaces.is_empty()
+            && self.backdrop_blurs.is_empty()
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -435,6 +441,7 @@ impl Scene {
                 PaintOperation::MonochromeSprite(index) => (false, index),
                 PaintOperation::SubpixelSprite(index) => (true, index),
                 PaintOperation::Primitive(_)
+                | PaintOperation::BackdropBlur(_)
                 | PaintOperation::StartLayer(_)
                 | PaintOperation::EndLayer => {
                     debug_assert!(false, "only glyph sprites are replayed");
@@ -508,6 +515,43 @@ impl Scene {
                 .copied()
                 .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds)),
         )
+    }
+
+    /// Records a backdrop blur at the current layer's draw order, so that
+    /// everything the layer draws composites over the blurred backdrop.
+    pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
+        let clipped_bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+        if clipped_bounds.is_empty() || blur.opacity <= 0. {
+            return;
+        }
+        blur.order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        self.backdrop_blurs.push(blur);
+        self.paint_operations
+            .push(PaintOperation::BackdropBlur(blur));
+    }
+
+    /// The draw order of the first primitive in `batch`.
+    pub fn batch_order(&self, batch: &PrimitiveBatch) -> DrawOrder {
+        match batch {
+            PrimitiveBatch::Shadows(range) => self.shadows[range.start].order,
+            PrimitiveBatch::Quads { range, .. } => self.quads[range.start].order,
+            PrimitiveBatch::Paths(range) => self.paths[range.start].order,
+            PrimitiveBatch::Underlines(range) => self.underlines[range.start].order,
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                self.monochrome_sprites[range.start].order
+            }
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                self.subpixel_sprites[range.start].order
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                self.polychrome_sprites[range.start].order
+            }
+            PrimitiveBatch::Surfaces(range) => self.surfaces[range.start].order,
+        }
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -747,6 +791,7 @@ impl Scene {
                 let sprite = &self.painted_subpixel_sprites[*index as usize];
                 clipped(&sprite.bounds, &sprite.content_mask)
             }
+            PaintOperation::BackdropBlur(blur) => clipped(&blur.bounds, &blur.content_mask),
             // A layer is clipped again where it is drawn moved (see
             // `replay_inside`).
             PaintOperation::StartLayer(_) | PaintOperation::EndLayer => true,
@@ -797,7 +842,9 @@ impl Scene {
                             prev_scene.painted_subpixel_sprites[*index as usize],
                         ),
                         PaintOperation::Primitive(primitive) => primitive.clone(),
-                        PaintOperation::StartLayer(_) | PaintOperation::EndLayer => continue,
+                        PaintOperation::BackdropBlur(_)
+                        | PaintOperation::StartLayer(_)
+                        | PaintOperation::EndLayer => continue,
                     };
                     let clip = self.remap_rounded_clip(
                         prev_scene, primitive.rounded_clip(), &mut remapped_clips, moved,
@@ -843,6 +890,14 @@ impl Scene {
                         effect.animation = remapped_animation.1;
                     }
                     self.insert_primitive(primitive)
+                }
+                PaintOperation::BackdropBlur(blur) => {
+                    let mut blur = *blur;
+                    if let Some(moved) = moved {
+                        blur.bounds = moved.bounds(blur.bounds);
+                        blur.content_mask = moved.mask(&blur.content_mask);
+                    }
+                    self.insert_backdrop_blur(blur);
                 }
                 PaintOperation::StartLayer(layer) => match moved {
                     Some(moved) => {
@@ -907,6 +962,7 @@ impl Scene {
         scratch.sort_sprites(&mut self.polychrome_sprites, |sprite| {
             (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
         });
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
         self.partition_quads();
         self.animated_monochrome_sprites.clear();
         self.animated_monochrome_sprites.extend(
@@ -1120,8 +1176,13 @@ impl Scene {
     fn partition_quads(&mut self) {
         self.blended_quad_indices.clear();
         self.opaque_quad_indices.clear();
-        let partitioning_enabled =
-            opaque_quad_partitioning_enabled() && self.quads.len() <= MAX_DEPTH_PARTITIONED_QUADS;
+        // The depth prepass draws every opaque quad before anything else,
+        // including those above a backdrop blur, which the blur would then
+        // sample and paint over; a frame with a blur paints in plain
+        // back-to-front order instead.
+        let partitioning_enabled = opaque_quad_partitioning_enabled()
+            && self.quads.len() <= MAX_DEPTH_PARTITIONED_QUADS
+            && self.backdrop_blurs.is_empty();
         for (quad_id, quad) in self.quads.iter().enumerate() {
             // A quad whose opacity animates may be solid in this frame and
             // translucent in the next without the scene being rebuilt, so it
@@ -1170,6 +1231,7 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -1634,6 +1696,69 @@ mod tests {
             background: Background::from(Hsla::black()),
             ..Default::default()
         }
+    }
+
+    fn unit_backdrop_blur() -> BackdropBlur {
+        BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(8.),
+            saturation: 1.,
+            opacity: 1.,
+            bounds: unit_bounds(),
+            content_mask: ContentMask {
+                bounds: unit_bounds(),
+            },
+            corner_radii: Corners::default(),
+        }
+    }
+
+    /// A frosted card: the quad under it, then a layer holding the blur and
+    /// the card's own fill.
+    fn frosted_card_scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(opaque_quad());
+        scene.push_layer(unit_bounds());
+        scene.insert_backdrop_blur(unit_backdrop_blur());
+        scene.insert_primitive(opaque_quad());
+        scene.pop_layer();
+        scene
+    }
+
+    #[test]
+    fn a_backdrop_blur_ends_the_batch_beneath_it() {
+        let mut scene = frosted_card_scene();
+        scene.finish();
+
+        let blur_order = scene.backdrop_blurs[0].order;
+        let orders: Vec<_> = scene
+            .batches()
+            .map(|batch| scene.batch_order(&batch))
+            .collect();
+        assert_eq!(orders.len(), 2, "one quad batch either side of the blur");
+        assert!(orders[0] < blur_order);
+        assert_eq!(orders[1], blur_order);
+    }
+
+    #[test]
+    fn a_frame_with_a_backdrop_blur_skips_the_opaque_prepass() {
+        let mut scene = frosted_card_scene();
+        scene.finish();
+        assert!(scene.opaque_quad_indices.is_empty());
+        assert_eq!(scene.blended_quad_indices.len(), 2);
+    }
+
+    #[test]
+    fn replay_keeps_a_backdrop_blur_under_its_card() {
+        let mut painted = frosted_card_scene();
+        painted.finish();
+        let mut replayed = Scene::default();
+        replayed.replay(0..painted.len(), &painted);
+        replayed.finish();
+
+        assert_eq!(replayed.backdrop_blurs.len(), 1);
+        let blur_order = replayed.backdrop_blurs[0].order;
+        assert_eq!(replayed.quads[1].order, blur_order);
+        assert!(!replayed.is_empty());
     }
 
     /// What replaying a glyph sprite keeps (its kind, tile and place) and
@@ -2509,6 +2634,7 @@ pub(crate) enum PaintOperation {
     /// of inserting it.
     MonochromeSprite(u32),
     SubpixelSprite(u32),
+    BackdropBlur(BackdropBlur),
     StartLayer(Layer),
     EndLayer,
 }
@@ -2607,6 +2733,7 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -2645,11 +2772,22 @@ impl<'a> Iterator for BatchIterator<'a> {
 
         let first = orders_and_kinds[0];
         let second = orders_and_kinds[1];
-        let (batch_kind, max_order_and_kind) = if first.0.is_some() {
+        let (batch_kind, mut max_order_and_kind) = if let Some(first_order) = first.0 {
+            // A blur at or below this batch's order runs before it; the next
+            // one ends the batch, so nothing at or above its order is drawn
+            // before the blur samples the framebuffer.
+            while self
+                .backdrop_blurs_iter
+                .next_if(|blur| blur.order <= first_order)
+                .is_some()
+            {}
             (first.1, (second.0.unwrap_or(u32::MAX), second.1))
         } else {
             return None;
         };
+        if let Some(blur) = self.backdrop_blurs_iter.peek() {
+            max_order_and_kind = max_order_and_kind.min((blur.order, PrimitiveKind::Shadow));
+        }
 
         match batch_kind {
             PrimitiveKind::Shadow => {
@@ -2956,6 +3094,29 @@ impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
     }
+}
+
+/// A frosted backdrop: what is drawn beneath `bounds` at the time the
+/// renderer reaches `order`, blurred, its saturation scaled, and painted back
+/// inside the rounded rect, the way a within-window `NSVisualEffectView`
+/// treats the content behind it. Painted with
+/// [`crate::Window::paint_backdrop_blur`].
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct BackdropBlur {
+    /// The draw order the blur runs at, before every primitive of this order.
+    pub order: DrawOrder,
+    /// The gaussian's standard deviation.
+    pub blur_radius: ScaledPixels,
+    /// `1.0` keeps the backdrop's colour; above it the blurred backdrop is
+    /// more vivid, as system materials make it.
+    pub saturation: f32,
+    /// How much of the effect replaces the unblurred backdrop, so that an
+    /// element fading in or out fades its frost with it.
+    pub opacity: f32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
 }
 
 #[derive(Debug, Copy, Clone)]
