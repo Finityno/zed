@@ -666,6 +666,59 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
   return (input.color * float4(1., 1., 1., alpha)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  uint blur_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+  uint blur_id [[flat]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float4 device_position =
+      to_device_position(unit_vertex, blur.bounds, viewport_size);
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask.bounds);
+  return BackdropBlurVertexOutput{
+      device_position,
+      blur_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Blending is off for this pipeline: the fragment replaces the framebuffer
+// pixel, so wherever the effect is partial (the anti-aliased rounded edge, a
+// fade) it mixes with the unblurred copy of that same pixel itself. Both
+// textures are premultiplied copies of the region at `source_origin`.
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant float2 *source_origin [[buffer(BackdropBlurInputIndex_SourceOrigin)]],
+    texture2d<float> backdrop [[texture(BackdropBlurInputIndex_Backdrop)]],
+    texture2d<float> blurred [[texture(BackdropBlurInputIndex_Blurred)]]) {
+  BackdropBlur blur = blurs[input.blur_id];
+  uint2 texel = uint2(max(input.position.xy - *source_origin, float2(0.)));
+  texel = min(texel, uint2(backdrop.get_width() - 1, backdrop.get_height() - 1));
+  float4 original = backdrop.read(texel);
+  float4 frosted = blurred.read(texel);
+
+  float luma = dot(frosted.rgb, float3(0.2126, 0.7152, 0.0722));
+  frosted.rgb = clamp(mix(float3(luma), frosted.rgb, blur.saturation), 0., frosted.a);
+
+  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  float coverage = saturate(0.5 - distance) * saturate(blur.opacity);
+  return mix(original, frosted, coverage);
+}
+
 struct UnderlineVertexOutput {
   uint rounded_clip [[flat]];
   float4 position [[position]];

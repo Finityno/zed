@@ -1555,3 +1555,106 @@ SubpixelSpriteFragmentOutput rounded_subpixel_clip(SubpixelSpriteFragmentOutput 
 }
 
 float4 rounded_path_clip(float4 color, float coverage) { return color * coverage; }
+
+/*
+**
+**              Backdrop blurs
+**
+*/
+
+// Mirrors `BackdropBlurParams` in directx_renderer/backdrop_blur.rs.
+cbuffer BackdropBlurParams: register(b2) {
+    Bounds backdrop_bounds;
+    Corners backdrop_corner_radii;
+    Bounds backdrop_content_mask;
+    float2 backdrop_region_origin;
+    float2 backdrop_region_size;
+    float2 backdrop_source_size;
+    float2 backdrop_source_extent;
+    float2 backdrop_direction;
+    float2 backdrop_scale;
+    float backdrop_saturation;
+    float backdrop_opacity;
+    float backdrop_center_weight;
+    uint backdrop_tap_pair_count;
+    // xy and zw are each one (offset, weight) pair of folded taps.
+    float4 backdrop_taps[48];
+};
+
+static const uint BACKDROP_MAX_TAP_PAIRS = 96u;
+
+SamplerState s_backdrop: register(s1);
+Texture2D<float4> t_backdrop_blurred: register(t4);
+
+// Scratch textures are bucketed larger than the region copied into them, so a
+// tap past the region's edge repeats its last texel instead of reading stale
+// texels from an earlier blur.
+float4 sample_backdrop(Texture2D<float4> source, float2 texel) {
+    texel = clamp(texel, 0.5, backdrop_source_extent - 0.5);
+    return source.SampleLevel(s_backdrop, texel / backdrop_source_size, 0.);
+}
+
+struct BackdropBlurPassVertexOutput {
+    float4 position: SV_Position;
+};
+
+BackdropBlurPassVertexOutput backdrop_blur_pass_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlurPassVertexOutput output;
+    output.position = float4(unit_vertex * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+    return output;
+}
+
+// One axis of the separable gaussian. Every output texel is centred on a
+// source texel (a scale above one keeps every Nth along the axis), which is
+// what lets each pair of neighbouring taps fold exactly into one bilinear
+// sample.
+float4 backdrop_blur_pass_fragment(BackdropBlurPassVertexOutput input): SV_Target {
+    float2 center = floor(input.position.xy) * backdrop_scale + 0.5;
+    float4 sum = sample_backdrop(t_sprite, center) * backdrop_center_weight;
+    uint pair_count = min(backdrop_tap_pair_count, BACKDROP_MAX_TAP_PAIRS);
+    [loop]
+    for (uint pair = 0u; pair < pair_count; pair++) {
+        float4 packed = backdrop_taps[pair >> 1u];
+        float2 tap = (pair & 1u) != 0u ? packed.zw : packed.xy;
+        float2 offset = tap.x * backdrop_direction;
+        sum += (sample_backdrop(t_sprite, center + offset)
+            + sample_backdrop(t_sprite, center - offset)) * tap.y;
+    }
+    return sum;
+}
+
+struct BackdropBlurVertexOutput {
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BackdropBlurFragmentInput {
+    float4 position: SV_Position;
+};
+
+BackdropBlurVertexOutput backdrop_blur_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlurVertexOutput output;
+    output.position = to_device_position(unit_vertex, backdrop_bounds);
+    output.clip_distance = distance_from_clip_rect(unit_vertex, backdrop_bounds, backdrop_content_mask);
+    return output;
+}
+
+// Blending is off for this draw: the fragment replaces the target pixel, so
+// wherever the effect is partial (the anti-aliased rounded edge, a fade) it
+// mixes with the unblurred copy of that same pixel. Both copies are
+// premultiplied, like the target.
+float4 backdrop_blur_fragment(BackdropBlurFragmentInput input): SV_Target {
+    float2 local = input.position.xy - backdrop_region_origin;
+    int2 texel = int2(clamp(local, 0., backdrop_region_size - 1.));
+    float4 original = t_sprite.Load(int3(texel, 0));
+    float4 frosted = sample_backdrop(t_backdrop_blurred, (local - 0.5) / backdrop_scale + 0.5);
+
+    float luma = dot(frosted.rgb, GRAYSCALE_FACTORS);
+    frosted.rgb = clamp(lerp(float3(luma, luma, luma), frosted.rgb, backdrop_saturation), 0., frosted.a);
+
+    float distance = quad_sdf(input.position.xy, backdrop_bounds, backdrop_corner_radii);
+    float coverage = saturate(0.5 - distance) * saturate(backdrop_opacity);
+    return lerp(original, frosted, coverage);
+}

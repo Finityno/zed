@@ -4,13 +4,17 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PresentBreakdown, PresentOutcome, PresentReport, PrimitiveBatch, RenderMemoryGauge,
     RenderMemoryLedger, ScaledPixels, Scene, Size, point, quad_depth, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
-use objc2::runtime::AnyObject;
+use objc2::{
+    msg_send,
+    rc::{Allocated, Retained},
+    runtime::{AnyClass, AnyObject},
+};
 
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -65,6 +69,14 @@ const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 /// blink in and out (hover reveals, transient popups) keeps the texture;
 /// one that stopped drawing paths gives back its 4 bytes per pixel.
 const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 120;
+/// Region-sized scratch texture pairs kept for backdrop blurs. A frame with
+/// more blurs of distinct sizes than this recreates the oldest pair.
+const MAX_BACKDROP_TEXTURES: usize = 4;
+/// Gaussian kernels kept for backdrop blurs, one per distinct radius.
+const MAX_GAUSSIAN_KERNELS: usize = 4;
+
+#[link(name = "MetalPerformanceShaders", kind = "framework")]
+unsafe extern "C" {}
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 // A drawable may be reused while Metal's completion callbacks are delayed.
 // When targets are replaced, each unfinished submission can retain another full-size
@@ -254,6 +266,16 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    backdrop_blurs_pipeline_state: metal::RenderPipelineState,
+    /// Copies of the regions backdrop blurs sample, and their blurred
+    /// results, most recently used last. Popovers are small, so these are
+    /// sized to the region rather than the drawable.
+    backdrop_textures: Vec<BackdropTextures>,
+    /// Most recently used last.
+    gaussian_kernels: Vec<GaussianKernel>,
+    /// Frames drawn since the last backdrop blur; once it reaches
+    /// [`PATH_INTERMEDIATE_IDLE_FRAMES`] the blur textures and kernels go.
+    backdrop_idle_frames: u32,
     depth_write_state: metal::DepthStencilState,
     depth_test_state: metal::DepthStencilState,
     unit_vertices: metal::Buffer,
@@ -321,6 +343,52 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// The scratch pair one backdrop blur region goes through: `backdrop` holds
+/// the framebuffer region as it was, `blurred` the gaussian of it.
+struct BackdropTextures {
+    backdrop: metal::Texture,
+    blurred: metal::Texture,
+}
+
+impl BackdropTextures {
+    fn matches(&self, width: u64, height: u64, pixel_format: MTLPixelFormat) -> bool {
+        self.backdrop.width() == width
+            && self.backdrop.height() == height
+            && self.backdrop.pixel_format() == pixel_format
+    }
+}
+
+/// An `MPSImageGaussianBlur` for one standard deviation.
+struct GaussianKernel {
+    sigma: f32,
+    kernel: Retained<AnyObject>,
+}
+
+// SAFETY: a kernel is only ever encoded by the renderer that owns it, one
+// frame at a time; MPS kernels may be moved between threads, they are only
+// unsafe to encode from two threads at once.
+unsafe impl Send for GaussianKernel {}
+
+impl GaussianKernel {
+    fn new(device: &metal::DeviceRef, sigma: f32) -> Option<Self> {
+        let class = AnyClass::get(c"MPSImageGaussianBlur")?;
+        let device = device.as_ptr().cast::<AnyObject>();
+        // SAFETY: `initWithDevice:sigma:` takes an `id<MTLDevice>` and a
+        // float, and `setEdgeMode:` an `MPSImageEdgeMode` (NSUInteger).
+        unsafe {
+            let allocated: Allocated<AnyObject> = msg_send![class, alloc];
+            let kernel: Option<Retained<AnyObject>> =
+                msg_send![allocated, initWithDevice: device, sigma: sigma];
+            let kernel = kernel?;
+            // `MPSImageEdgeModeClamp`: the default zero mode reads
+            // transparent black past the region, darkening a blur that
+            // reaches the drawable's edge.
+            let _: () = msg_send![&*kernel, setEdgeMode: 1 as NSUInteger];
+            Some(Self { sigma, kernel })
+        }
+    }
 }
 
 /// One path batch's region of the path intermediate for the current frame.
@@ -706,6 +774,17 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        // Unblended: the blurred region replaces what was there, alpha
+        // included, so a frosted region over a translucent window keeps the
+        // window's translucency instead of adding to it.
+        let backdrop_blurs_pipeline_state = build_opaque_quads_pipeline_state(
+            &device,
+            &library,
+            "backdrop_blurs",
+            "backdrop_blur_vertex",
+            "backdrop_blur_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let depth_write_state = build_depth_stencil_state(&device, true);
         let depth_test_state = build_depth_stencil_state(&device, false);
@@ -755,6 +834,10 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            backdrop_blurs_pipeline_state,
+            backdrop_textures: Vec::new(),
+            gaussian_kernels: Vec::new(),
+            backdrop_idle_frames: 0,
             depth_write_state,
             depth_test_state,
             unit_vertices,
@@ -831,6 +914,8 @@ impl MetalRenderer {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
         self.fallback_depth_texture = None;
+        self.backdrop_textures.clear();
+        self.gaussian_kernels.clear();
         self.publish_depth_memory();
     }
 
@@ -949,6 +1034,218 @@ impl MetalRenderer {
                 self.fallback_depth_texture = None;
             }
         }
+    }
+
+    /// Counts a drawn frame against the backdrop blur scratch textures and
+    /// kernels, dropping them once enough frames have gone by without a
+    /// blur. In-flight command buffers hold their own references.
+    fn retire_idle_backdrop_resources(&mut self, scene: &Scene) {
+        if !scene.backdrop_blurs.is_empty() {
+            self.backdrop_idle_frames = 0;
+            return;
+        }
+        if self.backdrop_textures.is_empty() && self.gaussian_kernels.is_empty() {
+            return;
+        }
+        self.backdrop_idle_frames = self.backdrop_idle_frames.saturating_add(1);
+        if self.backdrop_idle_frames > PATH_INTERMEDIATE_IDLE_FRAMES {
+            self.backdrop_textures.clear();
+            self.gaussian_kernels.clear();
+        }
+    }
+
+    /// The scratch pair for a `width` × `height` region, created on demand.
+    fn backdrop_textures(
+        &mut self,
+        width: u64,
+        height: u64,
+        pixel_format: MTLPixelFormat,
+    ) -> (metal::Texture, metal::Texture) {
+        let index = match self
+            .backdrop_textures
+            .iter()
+            .position(|textures| textures.matches(width, height, pixel_format))
+        {
+            Some(index) => index,
+            None => {
+                if self.backdrop_textures.len() >= MAX_BACKDROP_TEXTURES {
+                    self.backdrop_textures.remove(0);
+                }
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(width);
+                descriptor.set_height(height);
+                descriptor.set_pixel_format(pixel_format);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                descriptor.set_usage(
+                    metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::ShaderWrite,
+                );
+                self.backdrop_textures.push(BackdropTextures {
+                    backdrop: self.device.new_texture(&descriptor),
+                    blurred: self.device.new_texture(&descriptor),
+                });
+                self.backdrop_textures.len() - 1
+            }
+        };
+        let textures = self.backdrop_textures.remove(index);
+        let pair = (textures.backdrop.clone(), textures.blurred.clone());
+        self.backdrop_textures.push(textures);
+        pair
+    }
+
+    /// The kernel for `sigma`, created on demand; `None` where Metal
+    /// Performance Shaders cannot make one.
+    fn gaussian_kernel(&mut self, sigma: f32) -> Option<Retained<AnyObject>> {
+        let index = match self
+            .gaussian_kernels
+            .iter()
+            .position(|kernel| (kernel.sigma - sigma).abs() < 0.01)
+        {
+            Some(index) => index,
+            None => {
+                let kernel = GaussianKernel::new(&self.device, sigma)?;
+                if self.gaussian_kernels.len() >= MAX_GAUSSIAN_KERNELS {
+                    self.gaussian_kernels.remove(0);
+                }
+                self.gaussian_kernels.push(kernel);
+                self.gaussian_kernels.len() - 1
+            }
+        };
+        let kernel = self.gaussian_kernels.remove(index);
+        let retained = kernel.kernel.clone();
+        self.gaussian_kernels.push(kernel);
+        Some(retained)
+    }
+
+    /// Runs `blur` between two batches: ends `command_encoder`, copies the
+    /// region the blur samples out of `texture`, blurs the copy, and returns
+    /// a resumed encoder that has painted the result back inside the blur's
+    /// rounded rect. A blur that is entirely clipped, or that the device
+    /// cannot run, keeps the encoder it was given.
+    fn draw_backdrop_blur<'a>(
+        &mut self,
+        blur: &BackdropBlur,
+        command_buffer: &'a metal::CommandBufferRef,
+        command_encoder: &'a metal::RenderCommandEncoderRef,
+        texture: &'a metal::TextureRef,
+        depth_texture: &metal::TextureRef,
+        store_depth: bool,
+        rounded_clips: &BufferRegion,
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        depth: f64,
+    ) -> Result<&'a metal::RenderCommandEncoderRef> {
+        let sigma = blur.blur_radius.0.max(0.5);
+        // Only what lies under the surface is copied, and the gaussian clamps
+        // at the copy's edges. Sampling the surroundings too would carry
+        // whatever borders the surface (a line of text, a lighter panel) in
+        // across its edge as a pale band just inside the outline.
+        let visible = blur.bounds.intersect(&blur.content_mask.bounds);
+        let texture_width = texture.width() as i64;
+        let texture_height = texture.height() as i64;
+        let left = (visible.origin.x.0.floor() as i64).max(0);
+        let top = (visible.origin.y.0.floor() as i64).max(0);
+        let right = ((visible.origin.x.0 + visible.size.width.0).ceil() as i64).min(texture_width);
+        let bottom =
+            ((visible.origin.y.0 + visible.size.height.0).ceil() as i64).min(texture_height);
+        if right <= left || bottom <= top {
+            return Ok(command_encoder);
+        }
+        let Some(kernel) = self.gaussian_kernel(sigma) else {
+            return Ok(command_encoder);
+        };
+        let width = (right - left) as u64;
+        let height = (bottom - top) as u64;
+        let (backdrop, blurred) = self.backdrop_textures(width, height, texture.pixel_format());
+
+        command_encoder.end_encoding();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin {
+                x: left as u64,
+                y: top as u64,
+                z: 0,
+            },
+            metal::MTLSize {
+                width,
+                height,
+                depth: 1,
+            },
+            &backdrop,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        // SAFETY: `encodeToCommandBuffer:sourceTexture:destinationTexture:`
+        // takes an `id<MTLCommandBuffer>` and two `id<MTLTexture>`s; the
+        // destination was created with shader write usage.
+        unsafe {
+            let _: () = msg_send![
+                &*kernel,
+                encodeToCommandBuffer: command_buffer.as_ptr().cast::<AnyObject>(),
+                sourceTexture: backdrop.as_ptr().cast::<AnyObject>(),
+                destinationTexture: blurred.as_ptr().cast::<AnyObject>()
+            ];
+        }
+
+        let command_encoder = new_command_encoder_for_texture(
+            command_buffer,
+            texture,
+            depth_texture,
+            store_depth,
+            viewport_size,
+            None,
+        );
+        command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_depth_stencil_state(&self.depth_test_state);
+        set_viewport(command_encoder, viewport_size, depth, depth);
+
+        let blurs = match writer.write(slice::from_ref(blur)) {
+            Ok(blurs) => blurs,
+            Err(error) => {
+                command_encoder.end_encoding();
+                return Err(error);
+            }
+        };
+        let source_origin = PointF {
+            x: left as f32,
+            y: top as f32,
+        };
+        command_encoder.set_render_pipeline_state(&self.backdrop_blurs_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Blurs as u64,
+            Some(&blurs.buffer),
+            blurs.offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            BackdropBlurInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_buffer(
+            BackdropBlurInputIndex::Blurs as u64,
+            Some(&blurs.buffer),
+            blurs.offset as u64,
+        );
+        command_encoder.set_fragment_bytes(
+            BackdropBlurInputIndex::SourceOrigin as u64,
+            mem::size_of_val(&source_origin) as u64,
+            &source_origin as *const PointF as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(BackdropBlurInputIndex::Backdrop as u64, Some(&backdrop));
+        command_encoder
+            .set_fragment_texture(BackdropBlurInputIndex::Blurred as u64, Some(&blurred));
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        Ok(command_encoder)
     }
 
     /// A private, drawable-sized depth texture for a frame whose main render
@@ -1536,6 +1833,7 @@ impl MetalRenderer {
             viewport_size,
         )?;
         self.retire_idle_path_intermediate();
+        self.retire_idle_backdrop_resources(scene);
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -1746,7 +2044,23 @@ impl MetalRenderer {
         command_encoder.set_depth_stencil_state(&self.depth_test_state);
 
         let mut quad_cursor: u32 = 0;
+        let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
         for batch in scene.batches() {
+            let batch_order = scene.batch_order(&batch);
+            while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+                command_encoder = self.draw_backdrop_blur(
+                    blur,
+                    command_buffer,
+                    command_encoder,
+                    texture,
+                    &depth_texture,
+                    store_depth,
+                    &instances.rounded_clips,
+                    writer,
+                    viewport_size,
+                    quad_depth(quad_cursor) as f64,
+                )?;
+            }
             // Quads carry their own depth. Every other batch is flattened onto
             // the depth of the quad cursor by collapsing the viewport's depth
             // range onto a single value.
@@ -1879,6 +2193,21 @@ impl MetalRenderer {
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
+        }
+        // A blur above everything else still frosts what is beneath it.
+        for blur in pending_blurs {
+            command_encoder = self.draw_backdrop_blur(
+                blur,
+                command_buffer,
+                command_encoder,
+                texture,
+                &depth_texture,
+                store_depth,
+                &instances.rounded_clips,
+                writer,
+                viewport_size,
+                quad_depth(quad_cursor) as f64,
+            )?;
         }
 
         command_encoder.end_encoding();
@@ -2397,7 +2726,15 @@ fn new_command_encoder_for_texture<'a>(
         depth_attachment.set_clear_depth(0.0);
     } else {
         color_attachment.set_load_action(metal::MTLLoadAction::Load);
-        depth_attachment.set_load_action(metal::MTLLoadAction::Load);
+        if store_depth {
+            depth_attachment.set_load_action(metal::MTLLoadAction::Load);
+        } else {
+            // A memoryless depth attachment has nothing to load. Only a
+            // frame with a backdrop blur resumes its pass on one, and such a
+            // frame has no opaque prepass, so its depth is still all zero.
+            depth_attachment.set_load_action(metal::MTLLoadAction::Clear);
+            depth_attachment.set_clear_depth(0.0);
+        }
     }
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
@@ -2839,6 +3176,16 @@ enum ShadowInputIndex {
     Vertices = 0,
     Shadows = 1,
     ViewportSize = 2,
+}
+
+#[repr(C)]
+enum BackdropBlurInputIndex {
+    Vertices = 0,
+    Blurs = 1,
+    ViewportSize = 2,
+    SourceOrigin = 3,
+    Backdrop = 4,
+    Blurred = 5,
 }
 
 #[repr(C)]

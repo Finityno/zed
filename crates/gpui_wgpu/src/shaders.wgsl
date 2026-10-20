@@ -1524,6 +1524,112 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     return rounded_clip_color(blend_color(color, sprite.opacity * saturate(0.5 - distance)), rounded_clip_coverage(input.rounded_clip, input.position.xy));
 }
 
+// --- backdrop blurs --- //
+
+// Must match `BackdropBlurPassParams` in `wgpu_renderer.rs`.
+struct BackdropBlurPassParams {
+    direction: vec2<f32>,
+    sigma: f32,
+    radius: u32,
+    // Source texels per destination texel along each axis.
+    box_size: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+// Must match `BackdropCompositeParams` in `wgpu_renderer.rs`.
+struct BackdropCompositeParams {
+    bounds: Bounds,
+    clip_bounds: Bounds,
+    corner_radii: Corners,
+    source_origin: vec2<f32>,
+    blurred_scale: vec2<f32>,
+    saturation: f32,
+    opacity: f32,
+    pad: vec2<f32>,
+}
+
+@group(1) @binding(0) var<uniform> backdrop_pass: BackdropBlurPassParams;
+@group(1) @binding(0) var<uniform> backdrop_composite: BackdropCompositeParams;
+@group(1) @binding(1) var t_backdrop: texture_2d<f32>;
+@group(1) @binding(2) var t_backdrop_blurred: texture_2d<f32>;
+@group(1) @binding(3) var s_backdrop: sampler;
+
+@vertex
+fn vs_backdrop_blur(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    return vec4<f32>(unit_vertex * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+}
+
+// One separable gaussian pass. A destination texel stands for a
+// `box_size`-square of source texels, so each tap averages that square, read
+// as bilinear samples between texel pairs, which downsamples the source in
+// the same pass as it blurs it.
+@fragment
+fn fs_backdrop_blur(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let params = backdrop_pass;
+    let source_size = vec2<f32>(textureDimensions(t_backdrop, 0));
+    let box_size = f32(params.box_size);
+    let box_taps = max(params.box_size / 2u, 1u);
+    let box_step = box_size / f32(box_taps);
+    let box_start = vec2<f32>((box_step - box_size) * 0.5);
+    let center = position.xy * box_size;
+    let radius = i32(params.radius);
+    var color = vec4<f32>(0.0);
+    var total_weight = 0.0;
+    for (var tap = -radius; tap <= radius; tap++) {
+        let offset = f32(tap);
+        let weight = exp(-(offset * offset) / (2.0 * params.sigma * params.sigma));
+        let tap_center = center + params.direction * offset * box_size + box_start;
+        var box_color = vec4<f32>(0.0);
+        for (var row = 0u; row < box_taps; row++) {
+            for (var column = 0u; column < box_taps; column++) {
+                let sample_position = tap_center + vec2<f32>(f32(column), f32(row)) * box_step;
+                box_color += textureSampleLevel(t_backdrop, s_backdrop, sample_position / source_size, 0.0);
+            }
+        }
+        color += box_color * (weight / f32(box_taps * box_taps));
+        total_weight += weight;
+    }
+    return color / total_weight;
+}
+
+@vertex
+fn vs_backdrop_composite(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let params = backdrop_composite;
+    // Drawing only the visible rect clips to the content mask without
+    // clip distances, which a pipeline without blending cannot fade out.
+    let origin = max(params.bounds.origin, params.clip_bounds.origin);
+    let end = min(params.bounds.origin + params.bounds.size,
+        params.clip_bounds.origin + params.clip_bounds.size);
+    return to_device_position(unit_vertex, Bounds(origin, max(end - origin, vec2<f32>(0.0))));
+}
+
+// Blending is off for this pipeline: the fragment replaces the frame's
+// pixel, so wherever the effect is partial (the anti-aliased rounded edge, a
+// fade) it mixes with the unblurred copy of that same pixel. Both textures
+// hold the frame's premultiplied colors.
+@fragment
+fn fs_backdrop_composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let params = backdrop_composite;
+    let source_position = position.xy - params.source_origin;
+    let last_texel = vec2<i32>(textureDimensions(t_backdrop, 0)) - vec2<i32>(1);
+    let texel = clamp(vec2<i32>(floor(source_position)), vec2<i32>(0), last_texel);
+    let original = textureLoad(t_backdrop, texel, 0);
+    var frosted = textureSampleLevel(t_backdrop_blurred, s_backdrop,
+        source_position * params.blurred_scale, 0.0);
+
+    let luma = dot(frosted.rgb, GRAYSCALE_FACTORS);
+    let saturated = mix(vec3<f32>(luma), frosted.rgb, params.saturation);
+    frosted = vec4<f32>(clamp(saturated, vec3<f32>(0.0), vec3<f32>(frosted.a)), frosted.a);
+
+    let distance = quad_sdf(position.xy, params.bounds, params.corner_radii);
+    let coverage = saturate(0.5 - distance) * saturate(params.opacity);
+    return mix(original, frosted, coverage);
+}
+
 // --- surfaces --- //
 
 struct SurfaceParams {

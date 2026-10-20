@@ -6,7 +6,8 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
+    BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -5836,6 +5837,41 @@ impl Window {
         }
 
         result
+    }
+
+    /// Paints a frosted backdrop: what was drawn beneath `bounds` before this
+    /// call is blurred by `blur_radius`, its saturation scaled by
+    /// `saturation`, and painted back inside the rounded rect; whatever is
+    /// painted after it composites on top. The current element opacity fades
+    /// the effect in and out. Renderers without support draw nothing, so keep
+    /// a translucent fill over it.
+    ///
+    /// Call it first inside a [`Self::paint_layer`] that also paints the
+    /// frosted surface's content. A layer gives everything in it one draw
+    /// order, which is what keeps the content above the blur; outside one,
+    /// content that overlaps nothing beneath it can be ordered before the
+    /// blur and be blurred away.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        saturation: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        self.next_frame.scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: blur_radius.scale(scale_factor),
+            saturation,
+            opacity: self.element_opacity(),
+            bounds: self.cover_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+        });
     }
 
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
