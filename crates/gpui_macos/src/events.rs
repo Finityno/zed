@@ -256,11 +256,14 @@ pub(crate) unsafe fn platform_input_from_native(
                 })
             }),
             NSEventType::NSScrollWheel => window_height.map(|window_height| {
-                let phase = match native_event.phase() {
+                let momentum_phase = native_event.momentumPhase();
+                let is_momentum = momentum_phase != NSEventPhase::NSEventPhaseNone;
+                let phase = match if is_momentum { momentum_phase } else { native_event.phase() } {
                     NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
-                        TouchPhase::Started
+                        if is_momentum { TouchPhase::Moved } else { TouchPhase::Started }
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                    NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 
@@ -282,6 +285,7 @@ pub(crate) unsafe fn platform_input_from_native(
                     ),
                     delta,
                     touch_phase: phase,
+                    is_momentum,
                     modifiers: read_modifiers(native_event),
                 })
             }),

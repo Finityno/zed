@@ -92,6 +92,7 @@ impl std::fmt::Debug for ListState {
 }
 
 struct StateInner {
+    scroll_bounce: crate::scroll_bounce::ScrollBounce,
     last_layout_bounds: Option<Bounds<Pixels>>,
     /// Width items were last measured at. Equal to the list's own width unless
     /// the caller overrode it with [`List::measured_item_width`].
@@ -564,6 +565,7 @@ impl ListState {
     /// that the list doesn't flicker or pop in when scrolling.
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let this = Self(Rc::new(RefCell::new(StateInner {
+            scroll_bounce: Default::default(),
             last_layout_bounds: None,
             last_measured_item_width: None,
             last_padding: None,
@@ -615,6 +617,7 @@ impl ListState {
         self.changed();
         let old_count = {
             let state = &mut *self.0.borrow_mut();
+            state.scroll_bounce.clear();
             state.reset = true;
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
@@ -1049,6 +1052,7 @@ impl ListState {
             let item_count = state.items.summary().count;
             state.pending_scroll = None;
             state.held_item = None;
+            state.scroll_bounce.clear();
             state.logical_scroll_top = Some(ListOffset {
                 item_ix: item_count,
                 offset_in_item: px(0.),
@@ -1080,6 +1084,27 @@ impl ListState {
                     }
                 }
             }
+        })
+    }
+
+    /// Change follow mode at the current anchor, preserving scroll-edge feedback.
+    /// Tail following remains suspended until the list reaches the bottom.
+    pub fn set_follow_mode_preserving_scroll(&self, mode: FollowMode) {
+        self.changing(|| {
+            let state = &mut *self.0.borrow_mut();
+            let mut scroll_top = state.logical_scroll_top();
+            let item_count = state.items.summary().count;
+            if scroll_top.item_ix >= item_count {
+                scroll_top.item_ix = item_count;
+                scroll_top.offset_in_item = px(0.);
+            }
+            state.follow_state = match mode {
+                FollowMode::Normal => FollowState::Normal,
+                FollowMode::Tail => FollowState::Tail { is_following: scroll_top.item_ix == item_count },
+            };
+            state.held_item = None;
+            state.rebase_pending_scroll(scroll_top);
+            state.logical_scroll_top = Some(scroll_top);
         })
     }
 
@@ -1172,6 +1197,7 @@ impl ListState {
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         self.changing(|| {
             let state = &mut *self.0.borrow_mut();
+            state.scroll_bounce.clear();
             state.held_item = None;
             let item_count = state.items.summary().count;
             if scroll_top.item_ix >= item_count {
@@ -1994,6 +2020,10 @@ impl StateInner {
                 _ => {}
             }
 
+            let bounce_offset = self.scroll_bounce.offset(
+                -self.scroll_top(&self.logical_scroll_top()).min(self.max_scroll_offset()),
+                self.max_scroll_offset(), window, cx,
+            );
             let mut layout_response = self.layout_items(
                 Some(bounds.size.width),
                 bounds.size.height,
@@ -2022,6 +2052,7 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
+                item_origin.y += bounce_offset;
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         item.element.prepaint_at(item_origin, window, cx);
@@ -2110,6 +2141,7 @@ impl StateInner {
     // Scrollbar support
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
+        self.scroll_bounce.clear();
         self.held_item = None;
         let Some(bounds) = self.last_layout_bounds else {
             return;
@@ -2400,14 +2432,25 @@ impl Element for List {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
+                let mut state = list_state.0.borrow_mut();
+                state.scroll(
                     &scroll_top,
                     height,
                     pixel_delta,
                     current_view,
                     window,
                     cx,
-                )
+                );
+                let maximum = state.max_scroll_offset();
+                let after = state.scroll_top(&state.logical_scroll_top()).min(maximum);
+                let delta = event.delta.pixel_delta(px(20.)).y;
+                if maximum > px(0.) && (delta != px(0.) || matches!(event.touch_phase, crate::TouchPhase::Ended | crate::TouchPhase::Cancelled)) {
+                    // Use the arriving step even when it lands exactly on the
+                    // boundary: a second outward wheel event is not required.
+                    let impact = if (delta > px(0.) && after == px(0.))
+                        || (delta < px(0.) && after == maximum) { delta } else { px(0.) };
+                    window.queue_scroll_bounce(&state.scroll_bounce, impact, height, event, current_view, cx);
+                }
             }
         });
 
@@ -3702,6 +3745,41 @@ mod test {
             state.is_following_tail(),
             "returning to the bottom must restore follow-tail"
         );
+    }
+
+    #[gpui::test]
+    fn scroll_bounce_preserves_list_tail_follow_and_position(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            window.activate_window();
+            cx.set_global(crate::ScrollEdgeBounce(true));
+        });
+        cx.run_until_parked();
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(50.)).w_full().into_any())
+                    .w_full().h_full()
+            }
+        }
+        state.set_follow_mode(FollowMode::Tail);
+        let view = cx.new(|_| TestView(state.clone()));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| view.clone().into_any_element());
+        let offset = state.scroll_px_offset_for_scrollbar();
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(100.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-100.))),
+            ..Default::default()
+        });
+        assert_eq!(state.scroll_px_offset_for_scrollbar(), offset);
+        assert!(state.is_following_tail());
+        cx.update(|window, cx| {
+            assert!(state.0.borrow().scroll_bounce.offset(offset.y, px(300.), window, cx) < px(0.));
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| view.into_any_element());
+        assert_eq!(state.scroll_px_offset_for_scrollbar(), offset);
+        assert!(state.is_following_tail());
     }
 
     #[gpui::test]

@@ -2060,6 +2060,8 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
+        let scroll_bounce = self.interactivity.scroll_bounce.clone();
+        let scroll_max = self.interactivity.scroll_max.clone();
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2067,7 +2069,11 @@ impl Element for Div {
             content_size,
             window,
             cx,
-            |style, scroll_offset, hitbox, window, cx| {
+            |style, mut scroll_offset, hitbox, window, cx| {
+                if let Some(bounce) = scroll_bounce.as_ref() {
+                    let maximum = scroll_max.as_ref().map_or(px(0.), |maximum| maximum.get().y);
+                    scroll_offset.y += bounce.offset(scroll_offset.y, maximum, window, cx);
+                }
                 // skip children
                 if style.display == Display::None {
                     return hitbox;
@@ -2296,6 +2302,7 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<Box<ScrollAnchor>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) scroll_bounce: Option<crate::scroll_bounce::ScrollBounce>,
     pub(crate) ongoing_scroll: Option<Rc<Cell<OngoingScroll>>>,
     pub(crate) scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
     /// Kept out of `Style`: a tuning is per scroll container, and `Style` is rebuilt and
@@ -2431,6 +2438,7 @@ impl Interactivity {
                     crate::window::view_retention::dependencies::note_state_read(
                         &scroll_handle_state.requests,
                     );
+                    self.scroll_bounce = Some(scroll_handle_state.scroll_bounce.clone());
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
                     self.scroll_max = Some(scroll_handle_state.max_offset.clone());
@@ -2438,6 +2446,7 @@ impl Interactivity {
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
                 {
+                    self.scroll_bounce = Some(element_state.scroll_bounce.get_or_insert_with(Default::default).clone());
                     self.scroll_offset = Some(
                         element_state
                             .scroll_offset
@@ -3519,6 +3528,8 @@ impl Interactivity {
         _cx: &mut App,
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
+            let scroll_bounce = self.scroll_bounce.clone();
+            let extent = hitbox.bounds.size.height;
             let ongoing_scroll = self.ongoing_scroll.clone();
             let scroll_max = self.scroll_max.clone();
             let overflow = style.overflow;
@@ -3608,6 +3619,15 @@ impl Interactivity {
                     } else {
                         scroll_offset.x += delta_x;
                         scroll_offset.y += delta_y;
+                    }
+
+                    if let Some(bounce) = scroll_bounce.as_ref()
+                        && let Some(maximum) = scroll_max.as_ref().map(|maximum| maximum.get())
+                        && maximum.y > px(0.)
+                        && (delta_y != px(0.) || matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled))
+                    {
+                        let excess = delta_y - (scroll_offset.y - old_scroll_offset.y);
+                        window.queue_scroll_bounce(bounce, excess, extent, event, current_view, cx);
                     }
 
                     let moved = *scroll_offset != old_scroll_offset;
@@ -3882,6 +3902,7 @@ pub struct InteractiveElementState {
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) scroll_bounce: Option<crate::scroll_bounce::ScrollBounce>,
     ongoing_scroll: Option<Rc<Cell<OngoingScroll>>>,
     scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
@@ -4518,6 +4539,7 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
+    scroll_bounce: crate::scroll_bounce::ScrollBounce,
     ongoing_scroll: Rc<Cell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     /// Shared so the paint-time scroll listener can clamp against the live bounds. Written
@@ -4720,6 +4742,7 @@ impl ScrollHandle {
             active.index != item.index
                 || mem::discriminant(&active.strategy) != mem::discriminant(&item.strategy)
         });
+        state.scroll_bounce.clear();
         state.active_item = Some(item);
         state.version.bump_if(changed);
         state.requests.bump_if(changed);
@@ -4792,6 +4815,7 @@ impl ScrollHandle {
     pub fn scroll_to_bottom(&self) {
         let mut state = self.0.borrow_mut();
         let changed = !state.scroll_to_bottom;
+        state.scroll_bounce.clear();
         state.scroll_to_bottom = true;
         state.version.bump_if(changed);
         state.requests.bump_if(changed);
@@ -4802,6 +4826,7 @@ impl ScrollHandle {
     /// As you scroll further down the offset becomes more negative.
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
+        state.scroll_bounce.clear();
         let changed = *state.offset.borrow() != position;
         *state.offset.borrow_mut() = position;
         state.version.bump_if(changed);
@@ -6616,6 +6641,87 @@ mod tests {
         let (inner, _) = scroll_nested(cx, false, 5);
 
         assert_eq!(inner, px(-50.));
+    }
+
+    #[gpui::test]
+    fn scroll_bounce_is_opt_in_and_keeps_handle_clamped(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let handle = ScrollHandle::new();
+        let view_handle = handle.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| OwnHandlerFreeScroller { handle: view_handle }).into_any_element()
+        });
+        let wheel = || ScrollWheelEvent {
+            position: point(px(10.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(60.))),
+            ..Default::default()
+        };
+        cx.simulate_event(wheel());
+        cx.update(|window, cx| {
+            let state = handle.0.borrow();
+            assert_eq!(state.scroll_bounce.offset(px(0.), px(300.), window, cx), px(0.));
+            cx.set_global(crate::ScrollEdgeBounce(true));
+        });
+        cx.simulate_event(wheel());
+        assert_eq!(handle.offset().y, px(0.));
+        cx.update(|window, cx| {
+            let state = handle.0.borrow();
+            assert!(state.scroll_bounce.offset(px(0.), px(300.), window, cx) > px(0.));
+        });
+        handle.set_offset(point(px(0.), px(-300.)));
+        let mut bottom_wheel = wheel();
+        bottom_wheel.delta = ScrollDelta::Pixels(point(px(0.), px(-60.)));
+        cx.simulate_event(bottom_wheel);
+        assert_eq!(handle.offset().y, px(-300.));
+        cx.update(|window, cx| {
+            let state = handle.0.borrow();
+            assert!(state.scroll_bounce.offset(px(-300.), px(300.), window, cx) < px(0.));
+            cx.set_reduce_motion(true);
+            assert_eq!(state.scroll_bounce.offset(px(-300.), px(300.), window, cx), px(0.));
+        });
+    }
+
+    struct OwnHandlerFreeScroller { handle: ScrollHandle }
+
+    impl Render for OwnHandlerFreeScroller {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().id("bounce-scroller").size(px(100.)).overflow_y_scroll()
+                .track_scroll(&self.handle)
+                .child(div().w(px(100.)).h(px(400.)))
+        }
+    }
+
+    #[gpui::test]
+    fn scroll_bounce_hands_feedback_to_the_ancestor(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            window.activate_window();
+            cx.set_global(crate::ScrollEdgeBounce(true));
+        });
+        cx.run_until_parked();
+        let outer = ScrollHandle::new();
+        let inner = ScrollHandle::new();
+        let (view_outer, view_inner) = (outer.clone(), inner.clone());
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| NestedScrollers {
+                outer: view_outer, inner: view_inner, chain_at_bounds_only: true,
+            }).into_any_element()
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(10.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(40.))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| {
+            assert_eq!(inner.0.borrow().scroll_bounce.offset(px(0.), px(50.), window, cx), px(0.));
+            assert!(outer.0.borrow().scroll_bounce.offset(px(0.), px(350.), window, cx) > px(0.));
+        });
+        cx.deactivate_window();
+        cx.update(|window, cx| {
+            assert_eq!(outer.0.borrow().scroll_bounce.offset(px(0.), px(350.), window, cx), px(0.));
+        });
     }
 
     struct AxisLockedRegion {

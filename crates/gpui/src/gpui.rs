@@ -52,6 +52,7 @@ mod thread_park;
 #[cfg(any(test, feature = "bench-support"))]
 pub mod randomized_element_tree;
 mod scene;
+mod scroll_bounce;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod seeds;
 mod shared_uri;
@@ -120,6 +121,7 @@ pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
 };
 pub use spring::*;
+pub use scroll_bounce::{ScrollBounce, ScrollEdgeBounce};
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
 ///

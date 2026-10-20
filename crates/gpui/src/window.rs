@@ -1516,6 +1516,7 @@ enum InputModality {
 
 /// Holds the state for a specific window.
 pub struct Window {
+    pub(crate) pending_scroll_bounce: Option<crate::scroll_bounce::ScrollBounceRequest>,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
@@ -2574,6 +2575,7 @@ impl Window {
             handle,
             invalidator,
             removed: false,
+            pending_scroll_bounce: None,
             platform_window,
             display_id,
             display_observers: SubscriberSet::new(),
@@ -7441,6 +7443,7 @@ impl Window {
         }
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
+        self.apply_scroll_bounce(cx);
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {

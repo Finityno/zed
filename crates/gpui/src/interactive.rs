@@ -531,6 +531,9 @@ pub struct ScrollWheelEvent {
 
     /// The phase of the touch event.
     pub touch_phase: TouchPhase,
+
+    /// Whether this packet comes from platform scroll inertia after contact ends.
+    pub is_momentum: bool,
 }
 
 impl Sealed for ScrollWheelEvent {}

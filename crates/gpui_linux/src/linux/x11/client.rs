@@ -2729,6 +2729,7 @@ fn make_scroll_wheel_event(
         delta: ScrollDelta::Lines(delta),
         modifiers,
         touch_phase: TouchPhase::default(),
+        is_momentum: false,
     }
 }
 

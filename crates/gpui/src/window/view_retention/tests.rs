@@ -692,6 +692,7 @@ impl Oracle {
                                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(delta))),
                                     modifiers: Modifiers::default(),
                                     touch_phase: crate::TouchPhase::Moved,
+                                    is_momentum: false,
                                 }),
                                 cx,
                             );
@@ -1905,6 +1906,7 @@ fn a_wheel_scroll_builds_the_views_reading_the_list() {
                 delta: crate::ScrollDelta::Pixels(point(px(0.), px(-100.))),
                 modifiers: Modifiers::default(),
                 touch_phase: crate::TouchPhase::Moved,
+                is_momentum: false,
             }),
             cx,
         );
@@ -1971,6 +1973,7 @@ fn a_wheel_scroll_does_not_notify_the_view_drawing_the_list() {
                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(-30.))),
                     modifiers: Modifiers::default(),
                     touch_phase: crate::TouchPhase::Moved,
+                    is_momentum: false,
                 }),
                 cx,
             );
@@ -4160,6 +4163,7 @@ fn rows_with_scrollers_scrolled_by_the_wheel_are_not_built_after() {
                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(-10.))),
                     modifiers: Modifiers::default(),
                     touch_phase: crate::TouchPhase::Moved,
+                    is_momentum: false,
                 }),
                 cx,
             );
@@ -4288,6 +4292,7 @@ fn a_wheel_scroll_under_the_pointer_draws_one_frame_a_wheel_event() {
                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(-15.))),
                     modifiers: Modifiers::default(),
                     touch_phase: crate::TouchPhase::Moved,
+                    is_momentum: false,
                 }),
                 cx,
             );

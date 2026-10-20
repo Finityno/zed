@@ -1114,20 +1114,15 @@ impl TouchGestureRecognizer {
             px(momentum.direction.y * step),
         );
         let position = momentum.position;
-        if elapsed >= momentum.duration {
+        let phase = if elapsed >= momentum.duration {
             self.momentum = None;
-            Some(RecognizedTouchGesture::Scroll(scroll_event(
-                position,
-                delta,
-                TouchPhase::Ended,
-            )))
+            TouchPhase::Ended
         } else {
-            Some(RecognizedTouchGesture::Scroll(scroll_event(
-                position,
-                delta,
-                TouchPhase::Moved,
-            )))
-        }
+            TouchPhase::Moved
+        };
+        let mut event = scroll_event(position, delta, phase);
+        event.is_momentum = true;
+        Some(RecognizedTouchGesture::Scroll(event))
     }
 }
 
@@ -1141,6 +1136,7 @@ fn scroll_event(
         delta: ScrollDelta::Pixels(delta),
         modifiers: Modifiers::default(),
         touch_phase,
+        is_momentum: false,
     }
 }
 
