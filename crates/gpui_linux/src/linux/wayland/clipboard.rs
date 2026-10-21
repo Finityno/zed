@@ -17,6 +17,8 @@ use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
+pub(crate) const HTML_MIME_TYPES: [&str; 3] =
+    ["text/html", "text/html;charset=utf-8", "text/html;charset=UTF-8"];
 
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
@@ -117,6 +119,30 @@ impl<T: ReceiveData> DataOffer<T> {
         Some(ClipboardItem::new_string(result))
     }
 
+    fn read_html(&self, connection: &Connection) -> Option<String> {
+        let mime_type = HTML_MIME_TYPES.iter().find(|mime_type| self.has_mime_type(mime_type))?;
+        let bytes = self.read_bytes(connection, mime_type)?;
+        if bytes.len() > gpui::MAX_CLIPBOARD_HTML_BYTES {
+            log::warn!("Ignoring oversized HTML clipboard content");
+            return None;
+        }
+        match String::from_utf8(bytes) {
+            Ok(html) => Some(html),
+            Err(error) => {
+                log::warn!("Ignoring invalid UTF-8 HTML clipboard content: {error}");
+                None
+            }
+        }
+    }
+
+    fn read_item(&self, connection: &Connection) -> Option<ClipboardItem> {
+        let item = self.read_text(connection).or_else(|| self.read_image(connection));
+        match self.read_html(connection) {
+            Some(html) => Some(item.unwrap_or_else(|| ClipboardItem::new_string(String::new())).with_html(html)),
+            None => item,
+        }
+    }
+
     fn read_image(&self, connection: &Connection) -> Option<ClipboardItem> {
         for format in ImageFormat::iter() {
             let mime_type = format.mime_type();
@@ -174,19 +200,15 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self.contents.as_ref().and_then(|contents| clipboard_payload(contents, &mime_type)) {
+            self.send_bytes(fd, bytes);
         }
     }
 
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
-            .primary_contents
-            .as_ref()
-            .and_then(|contents| contents.text())
-        {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self.primary_contents.as_ref().and_then(|contents| clipboard_payload(contents, &mime_type)) {
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -200,9 +222,7 @@ impl Clipboard {
             return self.contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let item = offer.read_item(&self.connection)?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -218,9 +238,7 @@ impl Clipboard {
             return self.primary_contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let item = offer.read_item(&self.connection)?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)
@@ -253,5 +271,30 @@ impl Clipboard {
                 },
             )
             .unwrap();
+    }
+}
+
+fn clipboard_payload(item: &ClipboardItem, mime_type: &str) -> Option<Vec<u8>> {
+    if HTML_MIME_TYPES.contains(&mime_type) {
+        item.html().map(|html| html.as_bytes().to_vec())
+    } else {
+        item.text().map(String::into_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_clipboard_mime_requests_keep_plain_text_distinct() {
+        let item = ClipboardItem::new_string("plain 東京".into()).with_html("<b>plain 東京</b>");
+        for mime_type in HTML_MIME_TYPES {
+            assert_eq!(clipboard_payload(&item, mime_type), Some("<b>plain 東京</b>".as_bytes().to_vec()));
+        }
+        for mime_type in TEXT_MIME_TYPES {
+            assert_eq!(clipboard_payload(&item, mime_type), Some("plain 東京".as_bytes().to_vec()));
+        }
+        assert!(clipboard_payload(&ClipboardItem::new_string("plain".into()), "text/html").is_none());
     }
 }
