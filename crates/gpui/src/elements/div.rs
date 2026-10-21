@@ -6781,6 +6781,7 @@ mod tests {
                     ..Default::default()
                 },
                 touch_phase: crate::TouchPhase::Moved,
+                is_momentum: false,
             });
         }
 
