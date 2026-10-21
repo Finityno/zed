@@ -5,7 +5,7 @@ use crate::{App, Bounds, LineLayout, Pixels, Point, Result, TextAlign, Window, W
 /// A wrapped line with shared glyph, decoration, caret and hit-test justification geometry.
 #[derive(Clone, Debug)]
 pub struct JustifiedLine {
-    line: WrappedLine,
+    line: Arc<WrappedLine>,
     rows: Arc<Vec<JustifiedRow>>,
 }
 
@@ -22,7 +22,13 @@ impl WrappedLine {
     /// Final rows, hard-break rows and nonbreaking spaces remain ragged. Glyph clusters,
     /// source byte indices, font choices, wrapping and decorations are retained.
     pub fn justify(&self, width: Pixels) -> JustifiedLine {
-        let original = || JustifiedLine { line: self.clone(), rows: Arc::default() };
+        let original = || JustifiedLine {
+            line: Arc::new(WrappedLine {
+                layout: Arc::clone(&self.layout), text: self.text.clone(),
+                decoration_runs: self.decoration_runs.clone(), cache_key: self.cache_key.clone(),
+            }),
+            rows: Arc::default(),
+        };
         if !width.0.is_finite() || width <= Pixels::ZERO || self.wrap_boundaries.is_empty() {
             return original();
         }
@@ -112,7 +118,7 @@ impl WrappedLine {
             carets.sort_by(|left, right| left.1.0.total_cmp(&right.1.0).then(left.0.cmp(&right.0)));
             rows.push(JustifiedRow { end_index, width: end - start, carets });
         }
-        JustifiedLine { line, rows: Arc::new(rows) }
+        JustifiedLine { line: Arc::new(line), rows: Arc::new(rows) }
     }
 }
 
@@ -195,6 +201,20 @@ mod tests {
 
     fn ascii(text: &str, wraps: &[usize]) -> WrappedLine {
         line(text, &text.char_indices().enumerate().map(|(glyph, (index, _))| (index, glyph as f32 * 10.0)).collect::<Vec<_>>(), wraps, text.chars().count() as f32 * 10.0)
+    }
+
+    #[test]
+    fn justified_line_clone_shares_immutable_geometry() {
+        for wraps in [&[][..], &[4][..]] {
+            let original = ascii("a b c d", wraps);
+            let justified = original.justify(px(60.0));
+            let cloned = justified.clone();
+            assert!(Arc::ptr_eq(&cloned.line, &justified.line));
+            assert!(Arc::ptr_eq(&cloned.rows, &justified.rows));
+            assert_eq!(cloned.position_for_index(2, px(20.0)), justified.position_for_index(2, px(20.0)));
+            assert_eq!(Arc::ptr_eq(&justified.layout, &original.layout), wraps.is_empty());
+            assert!(justified.cache_key.is_none());
+        }
     }
 
     #[test]
