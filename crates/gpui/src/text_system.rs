@@ -1,12 +1,14 @@
 mod font_fallbacks;
 mod font_features;
 mod line;
+mod justified_line;
 mod line_layout;
 mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
+pub use justified_line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
 use schemars::JsonSchema;
