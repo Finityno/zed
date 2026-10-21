@@ -1905,6 +1905,7 @@ impl X11Client {
             .clipboard
             .set_text(
                 std::borrow::Cow::Owned(item.text().unwrap_or_default()),
+                item.html(),
                 clipboard::ClipboardKind::Primary,
                 clipboard::WaitConfig::None,
             )
@@ -1918,6 +1919,7 @@ impl X11Client {
             .clipboard
             .set_text(
                 std::borrow::Cow::Owned(item.text().unwrap_or_default()),
+                item.html(),
                 clipboard::ClipboardKind::Clipboard,
                 clipboard::WaitConfig::None,
             )

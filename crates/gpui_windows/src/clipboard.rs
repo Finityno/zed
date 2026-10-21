@@ -24,6 +24,9 @@ use gpui::{
 
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
 
+static CLIPBOARD_HTML_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("HTML Format")));
+
 static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
 static CLIPBOARD_METADATA_FORMAT: LazyLock<u32> =
@@ -120,6 +123,12 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
         }
     }
 
+    let html = get_clipboard_data(*CLIPBOARD_HTML_FORMAT).and_then(|data| {
+        gpui::decode_windows_html_clipboard(data.as_bytes()).map(str::to_owned)
+    });
+    if let Some(html) = html {
+        return Some(ClipboardItem { entries }.with_html(html));
+    }
     if entries.is_empty() {
         log_unsupported_clipboard_formats();
         return None;
@@ -194,6 +203,9 @@ fn write_string(item: &ClipboardString) -> Result<()> {
         let wide: Vec<u16> = metadata.encode_utf16().chain(Some(0)).collect_vec();
         set_clipboard_bytes(&wide, *CLIPBOARD_METADATA_FORMAT)?;
     }
+    if let Some(html) = item.html.as_deref() {
+        set_clipboard_bytes(&gpui::encode_windows_html_clipboard(html), *CLIPBOARD_HTML_FORMAT)?;
+    }
     Ok(())
 }
 
@@ -235,7 +247,7 @@ fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
 fn read_string() -> Option<ClipboardEntry> {
     let text = get_clipboard_string(CF_UNICODETEXT.0 as u32)?;
     let metadata = read_clipboard_metadata(&text);
-    Some(ClipboardEntry::String(ClipboardString { text, metadata }))
+    Some(ClipboardEntry::String(ClipboardString { text, metadata, html: None }))
 }
 
 fn read_clipboard_metadata(text: &str) -> Option<String> {

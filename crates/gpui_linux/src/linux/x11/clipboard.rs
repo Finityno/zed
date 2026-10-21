@@ -77,7 +77,9 @@ x11rb::atom_manager! {
         TEXT,
         TEXT_MIME_UNKNOWN: b"text/plain",
 
-        // HTML: b"text/html",
+        HTML_MIME: b"text/html",
+        HTML_UTF8_MIME: b"text/html;charset=utf-8",
+        HTML_UTF8_UPPER_MIME: b"text/html;charset=UTF-8",
         // URI_LIST: b"text/uri-list",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
@@ -285,7 +287,7 @@ impl Inner {
     /// `formats` must be a slice of atoms, where each atom represents a target format.
     /// The first format from `formats`, which the clipboard owner supports will be the
     /// format of the return value.
-    fn read(&self, formats: &[Atom], selection: ClipboardKind) -> Result<ClipboardData> {
+    fn read(&self, formats: &[Atom], selection: ClipboardKind, advertised_only: bool) -> Result<ClipboardData> {
         // if we are the current owner, we can get the current clipboard ourselves
         if self.is_owner(selection)? {
             let data = self.selection_of(selection).data.read();
@@ -336,6 +338,11 @@ impl Inner {
                 return Err(Error::ConversionFailure);
             }
             return Ok(data);
+        }
+
+        if advertised_only {
+            // Optional flavors must not add conversion timeouts to ordinary text reads.
+            return Err(Error::ContentNotAvailable);
         }
 
         log::trace!("Falling back on attempting to convert clipboard to each format.");
@@ -984,13 +991,19 @@ impl Clipboard {
     pub(crate) fn set_text(
         &self,
         message: Cow<'_, str>,
+        html: Option<&str>,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
-        let data = vec![ClipboardData {
+        let mut data = vec![ClipboardData {
             bytes: message.into_owned().into_bytes(),
             format: self.inner.atoms.UTF8_STRING,
         }];
+        if let Some(html) = html {
+            for format in [self.inner.atoms.HTML_MIME, self.inner.atoms.HTML_UTF8_MIME, self.inner.atoms.HTML_UTF8_UPPER_MIME] {
+                data.push(ClipboardData { bytes: html.as_bytes().to_vec(), format });
+            }
+        }
         self.inner.write(data, selection, wait)
     }
 
@@ -1043,7 +1056,42 @@ impl Clipboard {
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.extend_from_slice(text_format_atoms);
 
-        let result = self.inner.read(&format_atoms, selection)?;
+        let owner_before = self.inner.server.conn.get_selection_owner(self.inner.atom_of(selection))
+            .map_err(into_unknown)?.reply().map_err(into_unknown)?.owner;
+        let html_formats = [self.inner.atoms.HTML_MIME, self.inner.atoms.HTML_UTF8_MIME, self.inner.atoms.HTML_UTF8_UPPER_MIME];
+        let html = match self.inner.read(&html_formats, selection, true) {
+            Ok(data) if data.bytes.len() <= gpui::MAX_CLIPBOARD_HTML_BYTES => match String::from_utf8(data.bytes) {
+                Ok(html) => Some(html),
+                Err(error) => {
+                    log::warn!("Ignoring invalid UTF-8 HTML clipboard content: {error}");
+                    None
+                }
+            },
+            Ok(_) => {
+                log::warn!("Ignoring oversized HTML clipboard content");
+                None
+            },
+            Err(Error::ContentNotAvailable) => None,
+            Err(error) => {
+                log::debug!("Unable to read optional HTML clipboard flavor: {error}");
+                None
+            }
+        };
+        let result = match self.inner.read(&format_atoms, selection, html.is_some()) {
+            Ok(result) => result,
+            Err(Error::ContentNotAvailable) if html.is_some() => {
+                let owner_after = self.inner.server.conn.get_selection_owner(self.inner.atom_of(selection))
+                    .map_err(into_unknown)?.reply().map_err(into_unknown)?.owner;
+                return html.filter(|_| owner_before == owner_after)
+                    .map(|html| ClipboardItem::new_string(String::new()).with_html(html))
+                    .ok_or(Error::ContentNotAvailable);
+            },
+            Err(error) => return Err(error),
+        };
+        let owner_after = self.inner.server.conn.get_selection_owner(self.inner.atom_of(selection))
+            .map_err(into_unknown)?.reply().map_err(into_unknown)?.owner;
+        // Separate flavor requests can cross a selection ownership change.
+        let html = html.filter(|_| owner_before == owner_after);
 
         log::trace!(
             "read clipboard as format {:?}",
@@ -1054,11 +1102,15 @@ impl Clipboard {
             if result.format == format_atom {
                 let bytes = result.bytes;
                 let id = hash(&bytes);
-                return Ok(ClipboardItem::new_image(&Image {
+                let item = ClipboardItem::new_image(&Image {
                     id,
                     format: image_format,
                     bytes,
-                }));
+                });
+                return Ok(match html {
+                    Some(html) => item.with_html(html),
+                    None => item,
+                });
             }
         }
 
@@ -1069,7 +1121,11 @@ impl Clipboard {
         } else {
             String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)?
         };
-        Ok(ClipboardItem::new_string(text))
+        let item = ClipboardItem::new_string(text);
+        Ok(match html {
+            Some(html) => item.with_html(html),
+            None => item,
+        })
     }
 
     pub fn is_owner(&self, selection: ClipboardKind) -> bool {

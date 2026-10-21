@@ -3503,6 +3503,7 @@ impl ClipboardItem {
             entries: vec![ClipboardEntry::String(ClipboardString {
                 text,
                 metadata: Some(metadata),
+                html: None,
             })],
         }
     }
@@ -3523,13 +3524,32 @@ impl ClipboardItem {
         }
     }
 
+    /// Attach HTML to the first text entry while retaining its text and metadata.
+    pub fn with_html(mut self, html: impl Into<String>) -> Self {
+        let html = html.into();
+        if let Some(ClipboardEntry::String(string)) = self.entries.iter_mut().find(|entry| matches!(entry, ClipboardEntry::String(_))) {
+            string.html = Some(html);
+        } else {
+            self.entries.push(ClipboardEntry::String(ClipboardString::new(String::new()).with_html(html)));
+        }
+        self
+    }
+
+    /// Return the HTML representation, if one is available.
+    pub fn html(&self) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::String(string) => string.html.as_deref(),
+            _ => None,
+        })
+    }
+
     /// Concatenates together all the ClipboardString entries in the item.
     /// Returns None if there were no ClipboardString entries.
     pub fn text(&self) -> Option<String> {
         let mut answer = String::new();
 
         for entry in self.entries.iter() {
-            if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry {
+            if let ClipboardEntry::String(ClipboardString { text, .. }) = entry {
                 answer.push_str(text);
             }
         }
@@ -3850,6 +3870,8 @@ pub struct ClipboardString {
     pub text: String,
     /// Optional metadata associated with this clipboard string.
     pub metadata: Option<String>,
+    /// Optional HTML representation of the same text.
+    pub html: Option<String>,
 }
 
 impl ClipboardString {
@@ -3858,6 +3880,7 @@ impl ClipboardString {
         Self {
             text,
             metadata: None,
+            html: None,
         }
     }
 
@@ -3865,6 +3888,12 @@ impl ClipboardString {
     /// after serializing it as JSON.
     pub fn with_json_metadata<T: Serialize>(mut self, metadata: T) -> Self {
         self.metadata = Some(serde_json::to_string(&metadata).unwrap());
+        self
+    }
+
+    /// Attach an HTML representation without changing the text or metadata.
+    pub fn with_html(mut self, html: impl Into<String>) -> Self {
+        self.html = Some(html.into());
         self
     }
 
@@ -3899,10 +3928,7 @@ impl ClipboardString {
 
 impl From<String> for ClipboardString {
     fn from(value: String) -> Self {
-        Self {
-            text: value,
-            metadata: None,
-        }
+        Self::new(value)
     }
 }
 

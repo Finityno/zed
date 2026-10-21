@@ -83,12 +83,15 @@ impl Pasteboard {
             // Finally, try the various supported image types.
             for format in ImageFormat::iter() {
                 if let Some(item) = self.read_image(format) {
-                    return Some(item);
+                    return Some(match self.read_html() {
+                        Some(html) => item.with_html(html),
+                        None => item,
+                    });
                 }
             }
         }
 
-        None
+        self.read_html().map(|html| ClipboardItem::new_string(String::new()).with_html(html))
     }
 
     fn read_image(&self, format: ImageFormat) -> Option<ClipboardItem> {
@@ -137,7 +140,19 @@ impl Pasteboard {
                     }
                 });
 
-            Some(ClipboardEntry::String(ClipboardString { text, metadata }))
+            Some(ClipboardEntry::String(ClipboardString { text, metadata, html: self.read_html() }))
+        }
+    }
+
+    fn read_html(&self) -> Option<String> {
+        unsafe {
+            let html_type = ns_string("public.html");
+            let data = self.inner.dataForType(html_type);
+            if data == nil || data.length() as usize > gpui::MAX_CLIPBOARD_HTML_BYTES {
+                return None;
+            }
+            let bytes = self.data_for_type(html_type)?;
+            String::from_utf8(bytes).map_err(|error| log::warn!("Invalid HTML clipboard encoding: {error}")).ok()
         }
     }
 
@@ -181,12 +196,17 @@ impl Pasteboard {
                     let mut combined = ClipboardString {
                         text: String::new(),
                         metadata: None,
+                        html: None,
                     };
+                    let mut combined_html = Some(String::new());
 
                     for entry in item.entries {
                         match entry {
                             ClipboardEntry::String(text) => {
                                 combined.text.push_str(&text.text());
+                                if let Some(html) = text.html.as_deref() {
+                                    if let Some(combined_html) = combined_html.as_mut() { combined_html.push_str(html); }
+                                } else { combined_html = None; }
                                 if combined.metadata.is_none() {
                                     combined.metadata = text.metadata;
                                 }
@@ -195,6 +215,7 @@ impl Pasteboard {
                         }
                     }
 
+                    combined.html = combined_html;
                     self.write_plaintext(&combined);
                 }
             }
@@ -212,6 +233,11 @@ impl Pasteboard {
             );
             self.inner
                 .setData_forType(text_bytes, NSPasteboardTypeString);
+
+            if let Some(html) = string.html.as_deref() {
+                let html_bytes = NSData::dataWithBytes_length_(nil, html.as_ptr() as *const c_void, html.len() as u64);
+                self.inner.setData_forType(html_bytes, ns_string("public.html"));
+            }
 
             if let Some(metadata) = string.metadata.as_ref() {
                 let hash_bytes = ClipboardString::text_hash(&string.text).to_be_bytes();
@@ -402,6 +428,15 @@ mod tests {
             pasteboard.read(),
             Some(ClipboardItem::new_string(text_from_other_app.to_string()))
         );
+    }
+
+    #[test]
+    fn test_html_flavor_preserves_text_and_metadata() {
+        let pasteboard = Pasteboard::unique();
+        let item = ClipboardItem::new_string_with_json_metadata("Grüße 東京".into(), vec![1, 2])
+            .with_html("<strong>Grüße 東京</strong>");
+        pasteboard.write(item.clone());
+        assert_eq!(pasteboard.read(), Some(item));
     }
 
     #[test]

@@ -14,6 +14,8 @@ mod asset_cache;
 mod assets;
 mod bounds_tree;
 mod color;
+mod clipboard_html;
+pub use clipboard_html::*;
 /// The default colors used by GPUI.
 pub mod colors;
 #[cfg(feature = "profiler")]
