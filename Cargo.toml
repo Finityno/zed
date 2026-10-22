@@ -761,6 +761,7 @@ objc2-screen-capture-kit = { version = "=0.3.2", default-features = false, featu
     "SCStream",
     "std"
 ] }
+objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
 objc2-user-notifications = { version = "0.3", default-features = false, features = [
     "std",
     "block2",

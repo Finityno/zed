@@ -10,6 +10,7 @@ mod events;
 mod frame_work_interval;
 mod keyboard;
 mod pasteboard;
+mod printing;
 mod system_notifications;
 
 #[cfg(feature = "screen-capture")]

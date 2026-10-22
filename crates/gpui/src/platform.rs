@@ -1322,6 +1322,34 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// A bounded PDF snapshot to submit using a platform-native print dialog.
+#[derive(Clone, Debug)]
+pub struct PrintPdfOptions {
+    /// The document title displayed in the native print UI and spool queue.
+    pub title: String,
+    /// The immutable PDF bytes. Cloning options shares this allocation.
+    pub data: std::sync::Arc<[u8]>,
+}
+
+impl PrintPdfOptions {
+    /// Rejects oversized or non-PDF input before opening native UI.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.data.len() <= 256 * 1024 * 1024, "The PDF exceeds the 256 MiB print limit");
+        anyhow::ensure!(self.data.starts_with(b"%PDF-"), "The print document is not a PDF");
+        anyhow::ensure!(!self.title.trim().is_empty() && self.title.len() <= 1024 && !self.title.contains('\0'), "The print job title must contain between 1 and 1024 bytes without null characters");
+        Ok(())
+    }
+}
+
+/// Completion of a native print interaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrintOutcome {
+    /// The operating system accepted the job; physical output is not guaranteed.
+    Submitted,
+    /// The user or owner cancelled the interaction before completion.
+    Cancelled,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -1369,6 +1397,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
+    /// Opens a native PDF print dialog owned by this window.
+    ///
+    /// Dropping the receiver requests cancellation. Native resources remain retained
+    /// until the dialog/job has acknowledged cancellation or otherwise completed.
+    fn print_pdf(&self, _options: PrintPdfOptions) -> oneshot::Receiver<Result<PrintOutcome>> {
+        let (sender, receiver) = oneshot::channel();
+        if sender.send(Err(anyhow::anyhow!("Native PDF printing is not supported on this platform"))).is_err() {
+            log::debug!("Print receiver closed before the unsupported-platform reply");
+        }
+        receiver
+    }
     fn activate(&self);
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}

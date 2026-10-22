@@ -87,10 +87,28 @@ pub(crate) fn show_dialog<T: Send + 'static>(
     executor: &ForegroundExecutor,
     dialog: impl FnOnce(HWND) -> Result<T> + Send + 'static,
 ) -> oneshot::Receiver<Result<T>> {
+    show_dialog_inner(owner, executor, dialog, None)
+}
+
+pub(crate) fn show_dialog_cancellable<T: Send + 'static>(
+    owner: Option<Rc<DialogOwner>>,
+    executor: &ForegroundExecutor,
+    dialog: impl FnOnce(HWND) -> Result<T> + Send + 'static,
+    cancelled: fn() -> Result<T>,
+) -> oneshot::Receiver<Result<T>> {
+    show_dialog_inner(owner, executor, dialog, Some(cancelled))
+}
+
+fn show_dialog_inner<T: Send + 'static>(
+    owner: Option<Rc<DialogOwner>>,
+    executor: &ForegroundExecutor,
+    dialog: impl FnOnce(HWND) -> Result<T> + Send + 'static,
+    cancelled: Option<fn() -> Result<T>>,
+) -> oneshot::Receiver<Result<T>> {
     let (mut sender, receiver) = oneshot::channel();
     let cancellation = Cancellation::new(owner.as_deref());
     if cancellation.is_requested() {
-        sender.send(Err(anyhow!("dialog owner has closed"))).ok();
+        sender.send(cancelled.map_or_else(||Err(anyhow!("dialog owner has closed")),|cancelled|cancelled())).ok();
         return receiver;
     }
     let hwnd = owner.as_ref().map(|owner| SafeHwnd::from(owner.hwnd));
@@ -106,7 +124,9 @@ pub(crate) fn show_dialog<T: Send + 'static>(
             } else {
                 None
             };
-            if sender.is_canceled() || cancellation.is_requested() {
+            if sender.is_canceled() { return; }
+            if cancellation.is_requested() {
+                sender.send(cancelled.map_or_else(||Err(anyhow!("dialog owner has closed")),|cancelled|cancelled())).ok();
                 return;
             }
             let (result_sender, mut result_receiver) = oneshot::channel();
@@ -119,10 +139,10 @@ pub(crate) fn show_dialog<T: Send + 'static>(
                             let _apartment = Apartment::new()?;
                             let _timer = CancellationTimer::new(cancellation.clone())?;
                             if cancellation.is_requested() {
-                                return Err(anyhow!("dialog cancelled"));
+                                return cancelled.map_or_else(||Err(anyhow!("dialog cancelled")),|cancelled|cancelled());
                             }
                             let result = dialog(hwnd.map(|hwnd| hwnd.as_raw()).unwrap_or_default());
-                            if cancellation.is_requested() {
+                            if cancellation.is_requested() && cancelled.is_none() {
                                 return Err(anyhow!("dialog cancelled"));
                             }
                             result
@@ -203,7 +223,7 @@ unsafe extern "system" fn cancel_dialog(_: HWND, _: u32, _: usize, _: u32) {
     }
 }
 
-fn cancellation_requested() -> bool {
+pub(crate) fn cancellation_requested() -> bool {
     CANCELLATION.with(|slot| {
         slot.borrow()
             .as_ref()

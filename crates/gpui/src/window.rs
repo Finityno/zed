@@ -8178,6 +8178,20 @@ impl Window {
         });
     }
 
+    /// Opens this window's native print dialog for an immutable PDF snapshot.
+    ///
+    /// Dropping the returned receiver requests cancellation. The platform retains
+    /// native resources until completion; callers should distinguish cancellation
+    /// from failure and never infer physical paper output from submission.
+    pub fn print_pdf(&self, options: crate::PrintPdfOptions) -> oneshot::Receiver<anyhow::Result<crate::PrintOutcome>> {
+        if let Err(error) = options.validate() {
+            let (sender, receiver) = oneshot::channel();
+            if sender.send(Err(error)).is_err() { log::debug!("Print receiver closed before input validation finished"); }
+            return receiver;
+        }
+        self.platform_window.print_pdf(options)
+    }
+
     /// Present a platform dialog.
     /// The provided message will be presented, along with buttons for each answer.
     /// When a button is clicked, the returned Receiver will receive the index of the clicked button.

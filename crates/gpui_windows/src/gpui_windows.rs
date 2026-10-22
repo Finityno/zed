@@ -13,6 +13,8 @@ mod display;
 mod events;
 mod keyboard;
 mod platform;
+mod print_geometry;
+mod printing;
 mod system_notifications;
 mod system_settings;
 mod util;

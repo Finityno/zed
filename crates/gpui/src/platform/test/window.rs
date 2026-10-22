@@ -76,6 +76,9 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    print_options: Vec<crate::PrintPdfOptions>,
+    print_pending: VecDeque<futures::channel::oneshot::Sender<anyhow::Result<crate::PrintOutcome>>>,
+    print_reply: Option<Result<crate::PrintOutcome, String>>,
 }
 
 /// A window backed by no platform window at all, used by `TestAppContext`.
@@ -163,8 +166,23 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            print_options: Vec::new(),
+            print_pending: VecDeque::new(),
+            print_reply: Some(Err("Native PDF printing is not configured for this test window".into())),
         })))
     }
+    /// Returns snapshots submitted to this fake native print boundary.
+    pub fn print_options(&self) -> Vec<crate::PrintPdfOptions> { self.0.lock().print_options.clone() }
+
+    /// Sets an immediate native print result, or holds future jobs pending when None.
+    pub fn set_print_reply(&self, reply: Option<Result<crate::PrintOutcome, String>>) { self.0.lock().print_reply = reply; }
+
+    /// Completes the oldest pending fake print request. Returns false after receiver cancellation.
+    pub fn complete_print(&self, result: anyhow::Result<crate::PrintOutcome>) -> bool {
+        let sender = self.0.lock().print_pending.pop_front();
+        sender.is_some_and(|sender| sender.send(result).is_ok())
+    }
+
     /// Runs the frame callback for a frame the window asked for, as the
     /// platform's display link would, returning whether one was asked for.
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -472,6 +490,17 @@ impl PlatformWindow for TestWindow {
                 .expect("platform dropped")
                 .prompt(msg, detail, answers),
         )
+    }
+
+    fn print_pdf(&self, options: crate::PrintPdfOptions) -> futures::channel::oneshot::Receiver<anyhow::Result<crate::PrintOutcome>> {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let mut state = self.0.lock();
+        state.print_options.push(options);
+        if let Some(reply) = state.print_reply.as_ref() {
+            let result = match reply { Ok(outcome) => Ok(*outcome), Err(error) => Err(anyhow::anyhow!(error.clone())) };
+            if sender.send(result).is_err() { log::debug!("Fake print receiver was cancelled"); }
+        } else { state.print_pending.push_back(sender); }
+        receiver
     }
 
     fn activate(&self) {

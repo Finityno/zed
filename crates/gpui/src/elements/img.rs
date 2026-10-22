@@ -254,6 +254,7 @@ struct ImgState {
     frame_index: usize,
     last_frame_time: Option<Instant>,
     started_loading: Option<(Instant, Task<()>)>,
+    _retained_custom_source: Option<ImageSource>,
 }
 
 /// The image layout state between frames
@@ -292,9 +293,18 @@ impl Element for Img {
                     frame_index: 0,
                     last_frame_time: None,
                     started_loading: None,
+                    _retained_custom_source: None,
                 })
             });
 
+            if let Some(state) = &mut state {
+                // Custom callbacks can own external cache leases. The frame's
+                // element arena is cleared even when its paint is retained.
+                state._retained_custom_source = match &self.source {
+                    ImageSource::Custom(_) => Some(self.source.clone()),
+                    _ => None,
+                };
+            }
             let mut frame_index = state.as_ref().map(|state| state.frame_index).unwrap_or(0);
 
             let layout_id = self.interactivity.request_layout(
@@ -833,6 +843,53 @@ mod tests {
                 });
             },
         )
+    }
+
+    #[gpui::test]
+    fn custom_source_owner_survives_frames_and_drops_on_replace_or_unmount(cx: &mut TestAppContext) {
+        use std::sync::{Weak, atomic::{AtomicUsize, Ordering}};
+        struct Owner(Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        fn source(dropped: &Arc<AtomicUsize>) -> (ImageSource, Weak<Owner>) {
+            let owner = Arc::new(Owner(Arc::clone(dropped)));
+            let weak = Arc::downgrade(&owner);
+            let image = test_image(1);
+            (ImageSource::Custom(Arc::new(move |_, _| {
+                assert!(Arc::strong_count(&owner) > 0);
+                Some(Ok(Arc::clone(&image)))
+            })), weak)
+        }
+        fn finish(window: &mut crate::VisualTestContext) {
+            window.update(|window, _| {
+                window.next_frame.finish(&mut window.rendered_frame);
+                std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
+                window.next_frame.clear();
+            });
+        }
+        let window = cx.add_empty_window();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (first, first_owner) = source(&dropped);
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(first).id(TEST_IMG_ID).into_any_element());
+        finish(window);
+        assert!(first_owner.upgrade().is_some());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let (second, second_owner) = source(&dropped);
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(second).id(TEST_IMG_ID).into_any_element());
+        finish(window);
+        assert!(first_owner.upgrade().is_none());
+        assert!(second_owner.upgrade().is_some());
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(ImageSource::Render(test_image(1))).id(TEST_IMG_ID).into_any_element());
+        finish(window);
+        assert!(second_owner.upgrade().is_none());
+        let (third, third_owner) = source(&dropped);
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(third).id(TEST_IMG_ID).into_any_element());
+        finish(window);
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| div().into_any_element());
+        finish(window);
+        assert!(third_owner.upgrade().is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
     }
 
     #[gpui::test]

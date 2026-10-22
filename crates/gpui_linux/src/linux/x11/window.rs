@@ -257,6 +257,7 @@ pub struct Callbacks {
 }
 
 pub struct X11WindowState {
+    printing: super::super::printing::PrintOwner,
     parent: Option<X11WindowStatePtr>,
     children: FxHashSet<xproto::Window>,
     client: X11ClientStatePtr,
@@ -840,6 +841,7 @@ impl X11WindowState {
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
             Ok(Self {
+                printing: super::super::printing::PrintOwner::default(),
                 parent,
                 children: FxHashSet::default(),
                 client,
@@ -898,6 +900,7 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 impl Drop for X11Window {
     fn drop(&mut self) {
         let mut state = self.0.state.borrow_mut();
+        state.printing.close();
 
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
@@ -1231,6 +1234,7 @@ impl X11WindowStatePtr {
 
     pub fn close(&self) {
         let state = self.state.borrow();
+        state.printing.close();
         let client = state.client.clone();
         #[allow(clippy::mutable_key_type)]
         let children = state.children.clone();
@@ -1596,6 +1600,18 @@ impl PlatformWindow for X11Window {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.0.state.borrow_mut().input_handler.take()
+    }
+
+    fn print_pdf(&self, options: gpui::PrintPdfOptions) -> futures::channel::oneshot::Receiver<anyhow::Result<gpui::PrintOutcome>> {
+        let state = self.0.state.borrow();
+        let owner = state.printing.clone();
+        let identifier = ashpd::WindowIdentifier::from_xid(self.0.x_window.into());
+        if let Some(client) = state.client.get_client() {
+            return client.with_common(|common| super::super::printing::print_pdf(options, owner, std::future::ready(Some(identifier)), &common.foreground_executor, &common.background_executor));
+        }
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        if sender.send(Err(anyhow::anyhow!("The print display connection has closed"))).is_err() { log::debug!("Print receiver closed before display lookup"); }
+        receiver
     }
 
     fn prompt(
