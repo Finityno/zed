@@ -72,10 +72,15 @@ fn draw(
     refresh: bool,
 ) -> anyhow::Result<(Vec<String>, FrameWorkStats)> {
     cx.update_window(handle.into(), |_, window, cx| {
+        if refresh {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        } else if window.frame_work_stats().frames == 0 {
+            window.draw(cx).clear(cx);
+        }
+        let result = (snapshot(window), window.frame_work_stats());
         window.reset_frame_work_stats(false);
-        if refresh { window.refresh(); }
-        window.draw(cx).clear(cx);
-        (snapshot(window), window.frame_work_stats())
+        result
     })
 }
 
