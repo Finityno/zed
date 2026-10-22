@@ -7529,6 +7529,7 @@ dependencies = [
  "smallvec",
  "smol",
  "strum 0.28.0",
+ "tempfile",
  "url",
  "uuid",
  "wayland-backend",
@@ -7574,6 +7575,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
+ "objc2-pdf-kit",
  "objc2-screen-capture-kit",
  "objc2-user-notifications",
  "parking_lot",
@@ -11901,6 +11903,17 @@ dependencies = [
  "dispatch2",
  "objc2 0.6.3",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "objc2-pdf-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c14ed801ae810c6ba487cedd7616bb48f9a8e37940042f57e862538e2c7db117"
+dependencies = [
+ "objc2 0.6.3",
+ "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
 ]
 
