@@ -45,7 +45,7 @@ async fn run_request(file: &std::fs::File, identifier: &WindowIdentifier, title:
     let mut responses = MessageStream::for_match_rule(rule, &connection, Some(64)).await?;
     let sender_name = connection.unique_name().context("The print connection has no bus identity")?.as_str().trim_start_matches(':').replace('.', "_");
     let request_prefix = format!("/org/freedesktop/portal/desktop/request/{sender_name}/");
-    let token = format!("gpui_print_{}", ashpd::desktop::HandleToken::default());
+    let token = format!("gpui_print_{}", uuid::Uuid::new_v4().simple());
     let options = HashMap::from([
         ("handle_token", Value::from(token.as_str())),
         ("modal", Value::from(true)),

@@ -3742,7 +3742,7 @@ mod rendered_pixel_tests {
     /// Windows always takes that path in production and macOS can never take it.
     fn sweep_origins(subpixel: bool) -> Option<Vec<String>> {
         let devices = DirectXDevices::new().log_err()?;
-        let text_system = DirectWriteTextSystem::new(&devices).log_err()?;
+        let text_system = DirectWriteTextSystem::new(Some(&devices)).log_err()?;
         DirectXHeadlessRenderer::new()?;
 
         gpui::TestWindow::set_subpixel_rendering_supported(subpixel);
@@ -3899,7 +3899,7 @@ mod rendered_pixel_tests {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
         };
-        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -3913,8 +3913,8 @@ mod rendered_pixel_tests {
             None,
             Arc::new(text_system),
             Some(Box::new(|| {
-                DirectXHeadlessRenderer::new()
-                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+                Ok(DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
             })),
         );
 
@@ -3989,7 +3989,7 @@ mod rendered_pixel_tests {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
         };
-        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -4003,8 +4003,8 @@ mod rendered_pixel_tests {
             None,
             Arc::new(text_system),
             Some(Box::new(|| {
-                DirectXHeadlessRenderer::new()
-                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+                Ok(DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
             })),
         );
 
@@ -4102,7 +4102,7 @@ mod rendered_pixel_tests {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
         };
-        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -4116,8 +4116,8 @@ mod rendered_pixel_tests {
             None,
             Arc::new(text_system),
             Some(Box::new(|| {
-                DirectXHeadlessRenderer::new()
-                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+                Ok(DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
             })),
         );
 
@@ -4254,7 +4254,7 @@ mod rendered_pixel_tests {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
         };
-        let Some(text_system) = DirectWriteTextSystem::new(&devices).log_err() else {
+        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -4268,8 +4268,8 @@ mod rendered_pixel_tests {
             None,
             Arc::new(text_system),
             Some(Box::new(|| {
-                DirectXHeadlessRenderer::new()
-                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
+                Ok(DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
             })),
         );
 
