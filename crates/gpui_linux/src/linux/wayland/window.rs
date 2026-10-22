@@ -100,6 +100,7 @@ struct InProgressConfigure {
 }
 
 pub struct WaylandWindowState {
+    printing: super::super::printing::PrintOwner,
     surface_state: WaylandSurfaceState,
     parent: Option<WaylandWindowStatePtr>,
     /// Child surfaces mapped to whether they block this window's input (dialogs
@@ -605,6 +606,7 @@ impl WaylandWindowState {
         }
 
         Ok(Self {
+            printing: super::super::printing::PrintOwner::default(),
             surface_state,
             parent,
             children: FxHashMap::default(),
@@ -805,6 +807,7 @@ impl Drop for WaylandWindow {
         self.0.frame_loop.set(FrameLoop::Parked);
 
         let mut state = self.0.state.borrow_mut();
+        state.printing.close();
         let surface_id = state.surface.id();
 
         if let Some(parent) = state.parent.as_ref() {
@@ -1604,6 +1607,7 @@ impl WaylandWindowStatePtr {
 
     pub fn close(&self) {
         let state = self.state.borrow();
+        state.printing.close();
         // Closing is deferred to a task, which can run after the client is dropped by a switch to
         // headless mode. The client's window map, and so any child window, is gone with it.
         let client = state.client.try_get_client();
@@ -1927,6 +1931,16 @@ impl PlatformWindow for WaylandWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.borrow_mut().input_handler.take()
+    }
+
+    fn print_pdf(&self, options: gpui::PrintPdfOptions) -> futures::channel::oneshot::Receiver<anyhow::Result<gpui::PrintOutcome>> {
+        let state = self.borrow();
+        let surface = state.surface.clone();
+        let owner = state.printing.clone();
+        let common = state.client.get_client().borrow().common.clone();
+        let common = common.borrow();
+        let identifier = async move { ashpd::WindowIdentifier::from_wayland(&surface).await };
+        super::super::printing::print_pdf(options, owner, identifier, &common.foreground_executor, &common.background_executor)
     }
 
     fn prompt(

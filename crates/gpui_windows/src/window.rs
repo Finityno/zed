@@ -867,6 +867,15 @@ impl PlatformWindow for WindowsWindow {
         self.state.input_handler.take()
     }
 
+    fn print_pdf(&self, options: gpui::PrintPdfOptions) -> Receiver<anyhow::Result<gpui::PrintOutcome>> {
+        crate::dialog::show_dialog_cancellable(
+            Some(Rc::clone(&self.0.dialog_owner)),
+            &self.0.executor,
+            move |owner| crate::printing::print_pdf(owner, options),
+            || Ok(gpui::PrintOutcome::Cancelled),
+        )
+    }
+
     fn prompt(
         &self,
         level: PromptLevel,

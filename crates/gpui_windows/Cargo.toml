@@ -40,6 +40,13 @@ scheduler.workspace = true
 smallvec.workspace = true
 uuid = { workspace = true, features = ["v5"] }
 windows = { workspace = true, features = [
+    "Data_Pdf",
+    "Foundation",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Win32_Storage_Xps",
+    "Win32_System_WinRT",
+    "Win32_UI_Controls_Dialogs",
     "Data_Xml_Dom",
     "UI_Notifications",
     "UI_ViewManagement",

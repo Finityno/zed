@@ -907,6 +907,7 @@ struct MacWindowState {
     native_tabbing: bool,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
+    printing: crate::printing::PrintOwner,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
@@ -1469,6 +1470,7 @@ impl MacWindow {
                     && matches!(kind, WindowKind::Normal | WindowKind::Floating),
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
+                printing: crate::printing::PrintOwner::default(),
                 accesskit_adapter: None,
                 sheet_parent: None,
                 active_context_menu: None,
@@ -1720,6 +1722,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        this.printing.close();
         // `accesskit_macos::SubclassingAdapter::for_window` strong-retains the
         // window's content view, and that content view keeps the `GPUIView` it
         // hosts alive. Together with the `Arc<Mutex<MacWindowState>>` parked in
@@ -2079,6 +2082,20 @@ impl PlatformWindow for MacWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.0.as_ref().lock().input_handler.take()
+    }
+
+    fn print_pdf(&self, options: gpui::PrintPdfOptions) -> oneshot::Receiver<anyhow::Result<gpui::PrintOutcome>> {
+        let (parent, owner, executor) = {
+            let state = self.0.lock();
+            // SAFETY: MacWindow owns this NSWindow; retaining it keeps the object alive
+            // while native completion unwinds after GPUI has closed its owner.
+            let parent = unsafe { Retained::retain(state.native_window as *mut Objc2NSWindow) };
+            (parent, state.printing.clone(), state.foreground_executor.clone())
+        };
+        if let Some(parent) = parent { return crate::printing::print_pdf(parent, self.1, options, owner, &executor); }
+        let (sender, receiver) = oneshot::channel();
+        if sender.send(Err(anyhow::anyhow!("The print window has closed"))).is_err() { log::debug!("Print receiver closed before owner lookup"); }
+        receiver
     }
 
     fn prompt(
@@ -4281,6 +4298,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
+            lock.printing.close();
             (
                 lock.close_callback.take(),
                 lock.simple_fullscreen_state.take(),
