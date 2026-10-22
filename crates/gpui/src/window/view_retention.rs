@@ -50,6 +50,8 @@ pub(crate) use moving::{PositionedState, ViewMove};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod rounded_clip_tests;
 
 use super::{ArenaClearNeeded, PaintIndex, PrepaintStateIndex, Window};
 use crate::{
