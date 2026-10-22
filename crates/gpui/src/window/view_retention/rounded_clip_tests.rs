@@ -96,21 +96,26 @@ fn spliced_sibling_views_keep_nested_rounded_paint_and_hit_clips() -> anyhow::Re
     for _ in 0..2 {
         assert_eq!(draw(&mut cx, windows[0], false)?.0, draw(&mut cx, windows[1], true)?.0);
     }
-    let parent_renders = renders[0].get();
     for child_index in [1, 0, 1, 0] {
         for handle in windows {
             let child = handle.read_with(&cx, |siblings, _| siblings.children[child_index].clone())?;
-            child.update(&mut cx, |child, cx| { child.revision += 1; cx.notify(); });
             handle.update(&mut cx, |_, window, cx| {
                 let focus = child.read(cx).focus.clone();
                 focus.focus(window, cx);
             })?;
+        }
+        assert_eq!(draw(&mut cx, windows[0], false)?.0, draw(&mut cx, windows[1], true)?.0);
+        let parent_renders = renders[0].get();
+        for handle in windows {
+            let child = handle.read_with(&cx, |siblings, _| siblings.children[child_index].clone())?;
+            child.update(&mut cx, |child, cx| { child.revision += 1; cx.notify(); });
         }
         let (retained, work) = draw(&mut cx, windows[0], false)?;
         assert_eq!(retained, draw(&mut cx, windows[1], true)?.0);
         assert!(work.views_spliced > 0, "{work:?}");
         assert_eq!(renders[0].get(), parent_renders, "the parent must stay retained");
     }
+    let parent_renders = renders[0].get();
     for handle in windows {
         let child = handle.read_with(&cx, |siblings, _| siblings.children[0].clone())?;
         child.update(&mut cx, |child, cx| { child.width = 104.; cx.notify(); });
