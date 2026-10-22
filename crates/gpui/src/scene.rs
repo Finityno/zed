@@ -771,6 +771,25 @@ impl Scene {
         self.replay_inside(range, prev_scene, None, None, None);
     }
 
+    /// Splits this finished scene at `split` into the two planes a window
+    /// with a scene overlay presents separately, each finished and moved to
+    /// now.
+    ///
+    /// Replaying copies primitives as they were painted, while the scene
+    /// moves its time-driven primitives in their drawn copies before each
+    /// present (see [`Self::advance_time_animations`]). A present that redraws
+    /// nothing, which is how a shimmer, a pulse or a transition advances,
+    /// would otherwise show both planes at the phase they were painted with.
+    pub fn split_planes_into(&self, split: usize, base: &mut Scene, overlay: &mut Scene) {
+        let split = split.min(self.len());
+        for (plane, range) in [(base, 0..split), (overlay, split..self.len())] {
+            plane.clear();
+            plane.replay(range, self);
+            plane.finish();
+            plane.advance_time_animations();
+        }
+    }
+
     /// Whether every primitive and layer in `range` that reached past its
     /// content mask was clipped by a mask other than `outer`, on each side
     /// it reached past; see [`SceneMove`].
@@ -2033,6 +2052,48 @@ mod tests {
             assert_eq!(sprite.effect.animation, 2);
             assert!((-40.0..=960.0).contains(&sprite.effect.band_origin));
         }
+    }
+
+    /// A window with a scene overlay presents the two planes split from its
+    /// scene. A present that redraws nothing only moves the scene's drawn
+    /// copies, so the planes have to be moved again after the split, or the
+    /// shimmer band and the pulse stay where they were painted.
+    #[test]
+    fn split_planes_show_time_animations_where_they_are_now() {
+        let mut source = Scene::default();
+        let shimmer = source.push_shimmer_animation(ShimmerAnimation {
+            band_start: -40.0,
+            travel: 1000.0,
+            period: std::time::Duration::from_millis(1000),
+            hold: 0.0,
+        });
+        let mut glyph = shimmering_glyph(shimmer);
+        glyph.effect.band_origin = -1000.0;
+        source.insert_primitive(glyph);
+        let quad = opaque_quad();
+        let pulse = source.push_quad_animation(QuadOpacityAnimation {
+            cycle: OpacityCycle::new(
+                std::time::Duration::from_millis(750),
+                [(0.0, 0.5), (0.5, 0.5), (0.75, 0.5), (1.0, 0.5)],
+            ),
+            background: quad.background,
+            border_color: quad.border_color,
+        });
+        source.insert_primitive(Quad {
+            background: quad.background.with_time_animation(pulse),
+            ..quad
+        });
+        source.finish();
+        source.advance_time_animations();
+
+        let mut base = Scene::default();
+        let mut overlay = Scene::default();
+        source.split_planes_into(1, &mut base, &mut overlay);
+
+        assert_eq!(base.monochrome_sprites.len(), 1);
+        assert!((-40.0..=960.0).contains(&base.monochrome_sprites[0].effect.band_origin));
+        assert_eq!(overlay.quads.len(), 1);
+        assert!((overlay.quads[0].background.solid.a - quad.background.solid.a * 0.5).abs() < 1e-6);
     }
 
     fn rolling_in(started_at: std::time::Instant) -> SceneTransition {

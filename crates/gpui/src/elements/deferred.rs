@@ -315,11 +315,8 @@ mod tests {
                 assert!(split < scene.len(), "the overlay plane must not be empty");
 
                 let mut base_plane = crate::Scene::default();
-                base_plane.replay(0..split, scene);
-                base_plane.finish();
                 let mut overlay_plane = crate::Scene::default();
-                overlay_plane.replay(split..scene.len(), scene);
-                overlay_plane.finish();
+                scene.split_planes_into(split, &mut base_plane, &mut overlay_plane);
 
                 let scale_factor = window.scale_factor();
                 assert_eq!(

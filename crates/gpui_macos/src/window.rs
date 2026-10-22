@@ -2768,17 +2768,10 @@ impl PlatformWindow for MacWindow {
         }
         let this = &mut *this;
         let split_start = Instant::now();
-        let split = overlay_start.min(scene.len());
         // The two halves are kept across presents so their vectors hold
         // their capacity, instead of being allocated and freed per frame for
         // as long as the overlay exists.
-        this.base_scene.clear();
-        this.base_scene.replay(0..split, scene);
-        this.base_scene.finish();
-
-        this.overlay_scene.clear();
-        this.overlay_scene.replay(split..scene.len(), scene);
-        this.overlay_scene.finish();
+        scene.split_planes_into(overlay_start, &mut this.base_scene, &mut this.overlay_scene);
 
         this.renderer.note_scene_tiles(&this.overlay_scene);
         let split_duration = split_start.elapsed();
