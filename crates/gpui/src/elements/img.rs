@@ -847,6 +847,7 @@ mod tests {
 
     #[gpui::test]
     fn custom_source_owner_survives_frames_and_drops_on_replace_or_unmount(cx: &mut TestAppContext) {
+        use crate::{AppContext as _, Context, Entity, Render, StyleRefinement};
         use std::sync::{Weak, atomic::{AtomicUsize, Ordering}};
         struct Owner(Arc<AtomicUsize>);
         impl Drop for Owner {
@@ -861,35 +862,61 @@ mod tests {
                 Some(Ok(Arc::clone(&image)))
             })), weak)
         }
-        fn finish(window: &mut crate::VisualTestContext) {
-            window.update(|window, _| {
-                window.next_frame.finish(&mut window.rendered_frame);
-                std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
-                window.next_frame.clear();
-            });
+        struct ImageView {
+            pending: Option<ImageSource>,
+            deferred: bool,
+            renders: Arc<AtomicUsize>,
         }
-        let window = cx.add_empty_window();
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let (first, first_owner) = source(&dropped);
-        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(first).id(TEST_IMG_ID).into_any_element());
-        finish(window);
-        assert!(first_owner.upgrade().is_some());
-        assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        let (second, second_owner) = source(&dropped);
-        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(second).id(TEST_IMG_ID).into_any_element());
-        finish(window);
-        assert!(first_owner.upgrade().is_none());
-        assert!(second_owner.upgrade().is_some());
-        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(ImageSource::Render(test_image(1))).id(TEST_IMG_ID).into_any_element());
-        finish(window);
-        assert!(second_owner.upgrade().is_none());
-        let (third, third_owner) = source(&dropped);
-        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| img(third).id(TEST_IMG_ID).into_any_element());
-        finish(window);
-        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| div().into_any_element());
-        finish(window);
-        assert!(third_owner.upgrade().is_none());
-        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        impl Render for ImageView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.fetch_add(1, Ordering::SeqCst);
+                let source = self.pending.take().expect("only an explicitly changed image may render again");
+                let image = img(source).id(TEST_IMG_ID).size(px(20.));
+                if self.deferred { crate::deferred(image).into_any_element() } else { image.into_any_element() }
+            }
+        }
+        struct RootView { image: Entity<ImageView>, mounted: bool }
+        impl Render for RootView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                if self.mounted {
+                    self.image.clone().cached(StyleRefinement::default().size(px(100.))).into_any_element()
+                } else { div().size(px(100.)).into_any_element() }
+            }
+        }
+        for deferred in [false, true] {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let renders = Arc::new(AtomicUsize::new(0));
+            let (first, first_owner) = source(&dropped);
+            let window = cx.open_window(size(px(100.), px(100.)), |_, cx| RootView {
+                image: cx.new(|_| ImageView { pending: Some(first), deferred, renders: Arc::clone(&renders) }),
+                mounted: true,
+            });
+            cx.run_until_parked();
+            assert!(first_owner.upgrade().is_some());
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            assert_eq!(renders.load(Ordering::SeqCst), 1);
+            window.update(cx, |_, _, cx| cx.notify()).expect("redraw the parent with cached image paint");
+            cx.run_until_parked();
+            assert!(first_owner.upgrade().is_some());
+            assert_eq!(renders.load(Ordering::SeqCst), 1, "cached paint must retain ownership without rendering or storing the source in the view");
+            let (second, second_owner) = source(&dropped);
+            window.update(cx, |root, _, cx| root.image.update(cx, |image, cx| { image.pending = Some(second); cx.notify(); })).expect("replace the custom source");
+            cx.run_until_parked();
+            assert!(first_owner.upgrade().is_none());
+            assert!(second_owner.upgrade().is_some());
+            window.update(cx, |root, _, cx| root.image.update(cx, |image, cx| { image.pending = Some(ImageSource::Render(test_image(1))); cx.notify(); })).expect("replace with a direct render source");
+            cx.run_until_parked();
+            assert!(second_owner.upgrade().is_none());
+            let (third, third_owner) = source(&dropped);
+            window.update(cx, |root, _, cx| root.image.update(cx, |image, cx| { image.pending = Some(third); cx.notify(); })).expect("mount the final custom source");
+            cx.run_until_parked();
+            assert!(third_owner.upgrade().is_some());
+            window.update(cx, |root, _, cx| { root.mounted = false; cx.notify(); }).expect("unmount the image while retaining its entity");
+            cx.run_until_parked();
+            assert!(third_owner.upgrade().is_none());
+            assert_eq!(dropped.load(Ordering::SeqCst), 3);
+            window.update(cx, |_, window, _| window.remove_window()).expect("close the fixture window");
+        }
     }
 
     #[gpui::test]
