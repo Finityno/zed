@@ -97,8 +97,6 @@ struct Inherited {
     element_id_stack: crate::window::ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask_stack: Vec<ContentMask<Pixels>>,
-    rounded_clip: Option<std::sync::Arc<crate::window::RoundedClipRegion>>,
-    gpu_rounded_clip: u32,
     element_offset_stack: Vec<Point<Pixels>>,
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     element_opacity: f32,
@@ -352,7 +350,6 @@ impl Window {
         } else {
             context.content_mask
         };
-        let rounded_clip = context.rounded_clip.clone();
         let inherited = Inherited {
             element_id_stack: mem::replace(
                 &mut self.element_id_stack,
@@ -363,8 +360,6 @@ impl Window {
                 vec![text_style_refinement(&context.text_style)],
             ),
             content_mask_stack: mem::replace(&mut self.content_mask_stack, vec![mask]),
-            rounded_clip: self.rounded_clip.take(),
-            gpu_rounded_clip: self.next_frame.scene.current_rounded_clip,
             element_offset_stack: mem::take(&mut self.element_offset_stack),
             rem_size_override_stack: mem::replace(
                 &mut self.rem_size_override_stack,
@@ -379,7 +374,6 @@ impl Window {
                 mem::replace(&mut self.view_retention.prepaint_groups, groups)
             },
         };
-        self.install_rounded_clip(rounded_clip);
         inherited
     }
 
@@ -387,8 +381,6 @@ impl Window {
         self.element_id_stack = inherited.element_id_stack;
         self.text_style_stack = inherited.text_style_stack;
         self.content_mask_stack = inherited.content_mask_stack;
-        self.rounded_clip = inherited.rounded_clip;
-        self.next_frame.scene.current_rounded_clip = inherited.gpu_rounded_clip;
         self.element_offset_stack = inherited.element_offset_stack;
         self.rem_size_override_stack = inherited.rem_size_override_stack;
         self.element_opacity = inherited.element_opacity;
