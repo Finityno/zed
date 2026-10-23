@@ -2309,6 +2309,101 @@ mod pre_cull_regression_tests {
         assert_eq!(again, recoloured);
     }
 
+    struct FadingLine {
+        transition: Rc<Cell<Option<crate::TimeTransition>>>,
+        line: Rc<RefCell<Option<crate::ShapedLine>>>,
+    }
+
+    impl Render for FadingLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let transition = self.transition.get();
+            let line = self.line.clone();
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, cx| {
+                        let mut line = line.borrow_mut();
+                        let line = line.get_or_insert_with(|| {
+                            let runs = [TextRun {
+                                len: TEXT.len(),
+                                font: font("test"),
+                                color: black(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }];
+                            window
+                                .text_system()
+                                .shape_line(TEXT.into(), FONT_SIZE, &runs, None)
+                        });
+                        let mut paint = |window: &mut Window, cx: &mut crate::App| {
+                            let origin = point(px(10.), px(20.));
+                            line.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
+                                .unwrap();
+                        };
+                        match transition {
+                            Some(transition) => {
+                                window.with_time_transition(transition, |window| paint(window, cx))
+                            }
+                            None => paint(window, cx),
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// A line painted at rest and then painted again in place inside a
+    /// transition, as the outgoing copy of a label whose text changed is,
+    /// fades with the transition rather than standing at rest.
+    #[test]
+    fn a_line_painted_again_inside_a_transition_moves_with_it() {
+        let mut cx = TestAppContext::build_with_text_system(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(InkedTextSystem(NoopTextSystem)),
+        );
+        let transition = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let transition = transition.clone();
+            move |_, _| FadingLine {
+                transition,
+                line: Rc::default(),
+            }
+        });
+        let mut draw = || -> Vec<f32> {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.rendered_frame.scene.advance_time_animations();
+                window
+                    .rendered_frame
+                    .scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| sprite.color.a)
+                    .collect()
+            })
+            .unwrap()
+        };
+        let at_rest = draw();
+        assert!(!at_rest.is_empty());
+        assert!(at_rest.iter().all(|alpha| *alpha == 1.));
+
+        let duration = std::time::Duration::from_secs(600);
+        transition.set(Some(
+            crate::TimeTransition::new(std::time::Instant::now() - duration / 2, duration)
+                .opacity(1., 0.),
+        ));
+        let fading = draw();
+        assert_eq!(fading.len(), at_rest.len());
+        assert!(
+            fading.iter().all(|alpha| (0.3..0.7).contains(alpha)),
+            "half way through, the line is half faded: {fading:?}"
+        );
+    }
+
     /// Tracks the tiles an atlas still holds, so a scene naming one it has
     /// retired is caught.
     #[derive(Default)]
