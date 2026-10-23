@@ -2096,6 +2096,39 @@ mod tests {
         assert!((overlay.quads[0].background.solid.a - quad.background.solid.a * 0.5).abs() < 1e-6);
     }
 
+    /// What a transition covers moves in both planes too, from where it was
+    /// painted: the split copies primitives at rest, so a present that
+    /// redraws nothing would otherwise show a label's outgoing and incoming
+    /// copies stacked at rest until it settles.
+    #[test]
+    fn split_planes_show_transitions_where_they_are_now() {
+        let duration = std::time::Duration::from_secs(600);
+        let mut source = Scene::default();
+        let Some(transition) = source.push_transition(SceneTransition {
+            transition: TimeTransition::new(std::time::Instant::now() - duration / 2, duration)
+                .opacity(1.0, 0.0),
+            scale_factor: 2.0,
+            parent: 0,
+        }) else {
+            panic!("a first transition always fits");
+        };
+        source.set_current_transition(transition);
+        source.insert_primitive(shimmering_glyph(0));
+        source.insert_primitive(opaque_quad());
+        source.set_current_transition(0);
+        source.finish();
+        source.advance_time_animations();
+
+        let mut base = Scene::default();
+        let mut overlay = Scene::default();
+        source.split_planes_into(1, &mut base, &mut overlay);
+
+        let faded = |alpha: f32| (0.3..0.7).contains(&alpha);
+        assert!(faded(base.monochrome_sprites[0].color.a));
+        assert!(overlay.quads[0].background.as_solid().is_some_and(|color| faded(color.a)));
+        assert!(base.transitions_in_flight() && overlay.transitions_in_flight());
+    }
+
     fn rolling_in(started_at: std::time::Instant) -> SceneTransition {
         SceneTransition {
             transition: TimeTransition::new(started_at, std::time::Duration::from_millis(100))
