@@ -459,6 +459,16 @@ impl WindowsPlatform {
         self.inner.state.directx_devices.borrow_mut().take();
     }
 
+    /// Recreates the GPU devices the way a failed resize does, without
+    /// resetting the GPU: what the native recovery tests drive.
+    #[cfg(test)]
+    pub(crate) fn recreate_devices(&self) {
+        self.invalidate_devices.store(true, Ordering::Release);
+        if let Some(worker) = &*self.vsync_worker.borrow() {
+            worker.wake.wake();
+        }
+    }
+
     fn begin_vsync_thread(&self) -> Result<()> {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
             return Ok(());
@@ -487,10 +497,21 @@ impl WindowsPlatform {
                     let mut device_removed = DeviceRemovedWatch::new(&directx_device.device);
                     // Reused every vsync so a frame never allocates on this thread.
                     let mut requested = Vec::new();
+                    // The earliest frame a window asked for with a deadline.
+                    let mut next_deadline = None;
+                    // Whether the last vsync painted a window. While frames
+                    // keep coming (an animation) the worker goes straight to
+                    // the next vsync, as it did before it could park: parking
+                    // and being woken again a moment later, by the paint it
+                    // just asked for re-arming its demand, costs a second
+                    // sleep per frame. One vsync without demand parks it.
+                    let mut painting = false;
                     loop {
-                        // A device removed while parked is noticed here, by
-                        // notification or (without one) by a periodic poll.
-                        wake.wait(device_removed.as_ref());
+                        if !painting {
+                            // A device removed while parked is noticed here, by
+                            // notification or (without one) by a periodic poll.
+                            wake.wait(device_removed.as_ref(), next_deadline);
+                        }
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
@@ -522,16 +543,31 @@ impl WindowsPlatform {
                         // an idle window costs no main-thread wakeup per vsync.
                         // Taking consumes the demand: GPUI re-arms it after
                         // each frame for as long as it still needs frames.
+                        // Demand with a deadline is kept until it falls due.
+                        let now = std::time::Instant::now();
+                        next_deadline = None;
                         requested.extend(all_windows.read().iter().filter_map(|window| {
-                            window.frame_request.take().then(|| {
-                                (
+                            #[cfg(test)]
+                            crate::native_tests::before_frame_request(window.as_raw());
+                            match window.frame_request.take(now) {
+                                FrameDemand::Due => Some((
                                     window.handle,
                                     window.frame_request.clone(),
                                     window.frame_signal.clone(),
-                                )
-                            })
+                                )),
+                                FrameDemand::NotBefore(due_at) => {
+                                    next_deadline = Some(
+                                        next_deadline.map_or(due_at, |next: std::time::Instant| {
+                                            next.min(due_at)
+                                        }),
+                                    );
+                                    None
+                                }
+                                FrameDemand::None => None,
+                            }
                         }));
                         drop(all_windows);
+                        painting = !requested.is_empty();
                         for (hwnd, frame_request, frame_signal) in requested.drain(..) {
                             invalidate_for_frame(
                                 hwnd,
@@ -579,6 +615,8 @@ fn invalidate_for_frame(
             .log_err();
     }
     count_invalidation();
+    #[cfg(test)]
+    crate::native_tests::paint_invalidated(hwnd.as_raw());
 }
 
 fn translate_accelerator(msg: &MSG, is_gpui_window: impl FnOnce() -> bool) -> Option<()> {
@@ -1798,6 +1836,8 @@ fn check_device_lost(device: &ID3D11Device) -> bool {
     match device_state {
         Ok(_) => false,
         Err(err) => {
+            #[cfg(test)]
+            crate::native_tests::device_removed(err.code().0);
             log::error!("DirectX device lost detected: {:?}", err);
             true
         }
@@ -1882,6 +1922,8 @@ fn send_to_windows(
         {
             continue;
         }
+        #[cfg(test)]
+        crate::native_tests::recovery_sending();
         unsafe {
             SendMessageW(
                 hwnd.as_raw(),
@@ -1901,6 +1943,8 @@ fn handle_gpu_device_lost(
     all_windows: &std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
+    #[cfg(test)]
+    crate::native_tests::recovery_started();
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
     std::thread::sleep(std::time::Duration::from_millis(350));
@@ -1944,6 +1988,8 @@ fn handle_gpu_device_lost(
         validation_number,
         None,
     );
+    #[cfg(test)]
+    crate::native_tests::recovery_finished();
     Ok(())
 }
 

@@ -64,6 +64,10 @@ pub(crate) struct TestWindowState {
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
+    /// Deadlines passed to `request_frame_at`, once a test opts in with
+    /// `accept_frame_deadlines`; until then the request is declined, as on a
+    /// platform without demand-driven frames.
+    frame_deadlines: Option<Vec<scheduler::Instant>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
     queued_present_outcomes: VecDeque<PresentOutcome>,
@@ -153,6 +157,7 @@ impl TestWindow {
             appearance_change_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
+            frame_deadlines: None,
             frame_scheduled: false,
             frame_callback_pending: false,
             queued_present_outcomes: VecDeque::new(),
@@ -349,6 +354,18 @@ impl TestWindow {
     /// Returns how many times this window's frame waker has been invoked.
     pub fn frame_wake_count(&self) -> usize {
         self.0.lock().frame_wake_count.get()
+    }
+
+    /// Makes `request_frame_at` succeed and record its deadlines, as a
+    /// platform that can wait for one does.
+    pub fn accept_frame_deadlines(&self) {
+        self.0.lock().frame_deadlines.get_or_insert_with(Vec::new);
+    }
+
+    /// The deadlines passed to `request_frame_at` since
+    /// `accept_frame_deadlines`.
+    pub fn frame_deadlines(&self) -> Vec<scheduler::Instant> {
+        self.0.lock().frame_deadlines.clone().unwrap_or_default()
     }
 
     /// Delivers a frame request to the window, as the platform's frame source
@@ -591,6 +608,16 @@ impl PlatformWindow for TestWindow {
         let mut state = self.0.lock();
         if !state.frame_callback_pending {
             state.frame_scheduled = true;
+        }
+    }
+
+    fn request_frame_at(&self, at: scheduler::Instant) -> bool {
+        match &mut self.0.lock().frame_deadlines {
+            Some(deadlines) => {
+                deadlines.push(at);
+                true
+            }
+            None => false,
         }
     }
 

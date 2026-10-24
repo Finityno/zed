@@ -868,6 +868,8 @@ impl WindowsWindowInner {
 
     fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
+        // A frame deferred by the inactive-window cap is due once active.
+        self.state.frame_request.expedite();
 
         let events = self
             .state
@@ -1446,6 +1448,8 @@ impl WindowsWindowInner {
         {
             panic!("Device lost: {err}");
         }
+        #[cfg(test)]
+        crate::native_tests::recovered();
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
         // between) is treated as a forced render so it both clears
@@ -1489,6 +1493,8 @@ impl WindowsWindowInner {
         // window, and that invalidation must survive to produce the next paint.
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+        #[cfg(test)]
+        crate::native_tests::paint_started(handle);
 
         self.state.direct_manipulation.update();
         // Direct Manipulation runs in manual-update mode: a touchpad gesture
@@ -1528,6 +1534,8 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
+        #[cfg(test)]
+        crate::native_tests::paint_done(handle);
 
         Some(0)
     }

@@ -13,6 +13,8 @@ mod display;
 mod events;
 mod frame_schedule;
 mod keyboard;
+#[cfg(test)]
+mod native_tests;
 mod platform;
 mod print_geometry;
 mod printing;

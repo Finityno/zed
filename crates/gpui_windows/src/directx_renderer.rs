@@ -574,6 +574,8 @@ impl DirectXRenderer {
                 .Present(0, DXGI_PRESENT(0))
         };
         count_present();
+        #[cfg(test)]
+        crate::native_tests::present(self.hwnd, self.direct_composition.is_some(), result.0);
         if !self.logged_first_present {
             self.logged_first_present = true;
             // The launch resize storm in one line: how many swap-chain
