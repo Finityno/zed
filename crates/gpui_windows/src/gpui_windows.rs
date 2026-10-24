@@ -11,6 +11,7 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+mod frame_schedule;
 mod keyboard;
 mod platform;
 mod print_geometry;
@@ -31,6 +32,7 @@ pub(crate) use directx_renderer::*;
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
 pub(crate) use events::*;
+pub(crate) use frame_schedule::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use system_notifications::*;
@@ -41,6 +43,8 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
+#[doc(hidden)]
+pub use frame_schedule::{FrameCounters, frame_counters, vsync_thread_id};
 
 #[cfg(any(feature = "bench-support", feature = "test-support"))]
 pub use directx_renderer::DirectXHeadlessRenderer;

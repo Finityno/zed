@@ -99,11 +99,11 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
-    /// Whether GPUI wants a frame. The platform's vsync thread only
-    /// invalidates windows whose flag is set (consuming it), so an idle
-    /// window is not painted on every vsync. Starts set so the first frame
-    /// draws; shared with the platform's window registry.
-    pub(crate) frame_demand: Arc<AtomicBool>,
+    /// Whether GPUI wants a frame. The platform's vsync thread sleeps until
+    /// some window asks, and only invalidates windows that asked (consuming
+    /// the demand), so an idle window is not painted on every vsync. Shared
+    /// with the platform's window list.
+    pub(crate) frame_request: Arc<FrameRequest>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -153,6 +153,7 @@ impl WindowsWindowState {
         appearance: WindowAppearance,
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
+        frame_wake: Arc<FrameWake>,
         draw_coordinator: Rc<DrawCoordinator>,
     ) -> Result<Self> {
         let scale_factor = {
@@ -186,9 +187,9 @@ impl WindowsWindowState {
         let fullscreen = None;
         let initial_placement = None;
 
-        let frame_demand = Arc::new(AtomicBool::new(true));
+        let frame_request = FrameRequest::new(frame_wake);
         let direct_manipulation =
-            DirectManipulationHandler::new(hwnd, scale_factor, Arc::clone(&frame_demand))
+            DirectManipulationHandler::new(hwnd, scale_factor, Arc::clone(&frame_request))
                 .context("initializing Direct Manipulation")?;
 
         Ok(Self {
@@ -216,7 +217,7 @@ impl WindowsWindowState {
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
-            frame_demand,
+            frame_request,
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -323,6 +324,7 @@ impl WindowsWindowInner {
             context.appearance,
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
+            context.frame_wake.clone(),
             context.draw_coordinator.clone(),
         )?;
 
@@ -504,6 +506,7 @@ struct WindowCreateContext {
     disable_direct_composition: bool,
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
+    frame_wake: Arc<FrameWake>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
 }
@@ -559,6 +562,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            frame_wake,
             draw_coordinator,
         } = creation_info;
         register_window_class(icon);
@@ -656,6 +660,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            frame_wake,
             draw_coordinator,
             parent_hwnd,
         };
@@ -738,6 +743,9 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
         self.0.dialog_owner.close();
+        // Nothing draws a dropped window again; its destruction is deferred
+        // (below) and the vsync thread must not keep invalidating it.
+        self.0.state.frame_request.close();
         unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
         // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
         // resulting visibility report has nothing to notify.
@@ -1127,13 +1135,11 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
-        // Only the shared flag is captured, never the window state, so the
+        // Only the shared request is captured, never the window state, so the
         // waker (stored in GPUI's invalidator, which the request-frame
         // callback owns) cannot keep the window alive.
-        let frame_demand = self.state.frame_demand.clone();
-        Some(Rc::new(move || {
-            frame_demand.store(true, std::sync::atomic::Ordering::Release)
-        }))
+        let frame_request = self.state.frame_request.clone();
+        Some(Rc::new(move || frame_request.request()))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

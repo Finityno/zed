@@ -29,7 +29,10 @@ use windows::{
             Power::*,
             SystemInformation::*,
             SystemServices::POWER_REQUEST_CONTEXT_VERSION,
-            Threading::{POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0},
+            Threading::{
+                GetCurrentThreadId, POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT,
+                REASON_CONTEXT_0,
+            },
         },
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -41,7 +44,7 @@ use gpui::*;
 
 pub(crate) struct TrackedWindow {
     handle: SafeHwnd,
-    frame_demand: Arc<AtomicBool>,
+    frame_request: Arc<FrameRequest>,
     frame_signal: Arc<PlatformFrameSignal>,
 }
 
@@ -51,13 +54,28 @@ impl TrackedWindow {
     }
 }
 
+/// The running `VSyncProvider` worker: what stops it and what wakes it.
+struct VSyncWorker {
+    stop: Arc<AtomicBool>,
+    wake: Arc<FrameWake>,
+}
+
+impl VSyncWorker {
+    /// Not joined: the worker can be sending this thread a message. It exits
+    /// once it wakes, and drops its reference to the devices then.
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.wake();
+    }
+}
+
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[TrackedWindow; 4]>>>,
     /// The windowing mode to start in, applied when `run` starts. Windowed when unset.
     initial_windowing: RefCell<Option<WindowingRequest>>,
-    /// Set to stop the current `VSyncProvider` thread, which runs while windowed.
-    vsync_stop: RefCell<Option<Arc<AtomicBool>>>,
+    /// The current `VSyncProvider` thread, which runs while windowed.
+    vsync_worker: RefCell<Option<VSyncWorker>>,
     // The below members will never change throughout the entire lifecycle of the app.
     /// Created with `headless()`: never windowed, and without a real text system.
     headless: bool,
@@ -275,7 +293,7 @@ impl WindowsPlatform {
             handle,
             raw_window_handles,
             initial_windowing: RefCell::new(None),
-            vsync_stop: RefCell::new(None),
+            vsync_worker: RefCell::new(None),
             headless,
             icon,
             background_executor,
@@ -310,7 +328,7 @@ impl WindowsPlatform {
             });
     }
 
-    fn generate_creation_info(&self) -> WindowCreationInfo {
+    fn generate_creation_info(&self, frame_wake: Arc<FrameWake>) -> WindowCreationInfo {
         WindowCreationInfo {
             icon: self.icon,
             executor: self.foreground_executor.clone(),
@@ -323,6 +341,7 @@ impl WindowsPlatform {
             disable_direct_composition: self.disable_direct_composition,
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
+            frame_wake,
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
         }
     }
@@ -422,16 +441,17 @@ impl WindowsPlatform {
             text_system.handle_gpu_lost(&devices)?;
         }
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
-        self.begin_vsync_thread();
+        if let Err(error) = self.begin_vsync_thread() {
+            self.inner.state.directx_devices.borrow_mut().take();
+            return Err(error);
+        }
         Ok(())
     }
 
     /// Stops vsync and releases the DirectX devices. No window may be open.
     fn detach_gpu(&self) {
-        if let Some(stop) = self.vsync_stop.borrow_mut().take() {
-            // Not joined: the thread can be sending this thread a message. It exits after its
-            // next vsync, and drops its reference to the devices then.
-            stop.store(true, Ordering::Release);
+        if let Some(worker) = self.vsync_worker.borrow_mut().take() {
+            worker.stop();
         }
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.release_gpu();
@@ -439,77 +459,126 @@ impl WindowsPlatform {
         self.inner.state.directx_devices.borrow_mut().take();
     }
 
-    fn begin_vsync_thread(&self) {
+    fn begin_vsync_thread(&self) -> Result<()> {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
-            return;
+            return Ok(());
         };
         let Some(direct_write_text_system) = &self.direct_write_text_system else {
-            return;
+            return Ok(());
         };
+        let wake = FrameWake::new()?;
         let stop = Arc::new(AtomicBool::new(false));
-        *self.vsync_stop.borrow_mut() = Some(stop.clone());
         let mut directx_device = directx_devices;
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
+        let ui_thread = unsafe { GetCurrentThreadId() };
 
         std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
-            .spawn(move || {
-                let vsync_provider = VSyncProvider::new();
-                loop {
-                    let signal_source = vsync_provider.wait_for_vsync();
-                    let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if check_device_lost(&directx_device.device)
-                        || invalidate_devices.fetch_and(false, Ordering::Acquire)
-                    {
-                        if let Err(err) = handle_gpu_device_lost(
-                            &mut directx_device,
-                            platform_window.as_raw(),
-                            validation_number,
-                            &all_windows,
-                            &text_system,
-                        ) {
-                            panic!("Device lost: {err}");
+            .spawn({
+                let wake = wake.clone();
+                let stop = stop.clone();
+                move || {
+                    set_vsync_thread_id(unsafe { GetCurrentThreadId() });
+                    let vsync_provider = VSyncProvider::new();
+                    let mut device_removed = DeviceRemovedWatch::new(&directx_device.device);
+                    // Reused every vsync so a frame never allocates on this thread.
+                    let mut requested = Vec::new();
+                    loop {
+                        // A device removed while parked is noticed here, by
+                        // notification or (without one) by a periodic poll.
+                        wake.wait(device_removed.as_ref());
+                        if stop.load(Ordering::Acquire) {
+                            break;
                         }
-                    }
-                    let Some(all_windows) = all_windows.upgrade() else {
-                        break;
-                    };
-                    for window in all_windows.read().iter() {
-                        // Only windows that asked for a frame are painted, so
-                        // an idle window costs no main-thread wakeup per
-                        // vsync. Swapping consumes the demand: GPUI re-arms
-                        // it after each frame for as long as it still needs
-                        // frames.
-                        if !window.frame_demand.swap(false, Ordering::AcqRel) {
-                            continue;
+                        let signal_source = vsync_provider.wait_for_vsync();
+                        count_vsync_wait();
+                        let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
+                        if stop.load(Ordering::Acquire) {
+                            break;
                         }
-                        unsafe {
-                            if let Some(signal_at) = signal_at {
-                                if IsWindowVisible(window.as_raw()).as_bool()
-                                    && !IsIconic(window.as_raw()).as_bool()
-                                {
-                                    window.frame_signal.record(signal_at, signal_source);
-                                } else {
-                                    // Hidden windows may not consume WM_PAINT until shown again.
-                                    window.frame_signal.take();
-                                }
+                        if check_device_lost(&directx_device.device)
+                            || invalidate_devices.fetch_and(false, Ordering::Acquire)
+                        {
+                            if let Err(err) = handle_gpu_device_lost(
+                                &mut directx_device,
+                                platform_window.as_raw(),
+                                validation_number,
+                                ui_thread,
+                                &all_windows,
+                                &text_system,
+                            ) {
+                                panic!("Device lost: {err}");
                             }
-                            RedrawWindow(Some(window.as_raw()), None, None, RDW_INVALIDATE)
-                                .ok()
-                                .log_err();
+                            device_removed = DeviceRemovedWatch::new(&directx_device.device);
+                        }
+                        let Some(all_windows) = all_windows.upgrade() else {
+                            break;
+                        };
+                        // Only windows that asked for a frame are painted, so
+                        // an idle window costs no main-thread wakeup per vsync.
+                        // Taking consumes the demand: GPUI re-arms it after
+                        // each frame for as long as it still needs frames.
+                        requested.extend(all_windows.read().iter().filter_map(|window| {
+                            window.frame_request.take().then(|| {
+                                (
+                                    window.handle,
+                                    window.frame_request.clone(),
+                                    window.frame_signal.clone(),
+                                )
+                            })
+                        }));
+                        drop(all_windows);
+                        for (hwnd, frame_request, frame_signal) in requested.drain(..) {
+                            invalidate_for_frame(
+                                hwnd,
+                                &frame_request,
+                                &frame_signal,
+                                signal_at,
+                                signal_source,
+                            );
                         }
                     }
                 }
             })
-            .unwrap();
+            .context("spawning the VSyncProvider thread")?;
+        *self.vsync_worker.borrow_mut() = Some(VSyncWorker { stop, wake });
+        Ok(())
     }
+}
+
+/// Asks a window that wanted a frame to paint. Runs with the window list
+/// unlocked, like every call the worker makes to a window.
+fn invalidate_for_frame(
+    hwnd: SafeHwnd,
+    frame_request: &FrameRequest,
+    frame_signal: &PlatformFrameSignal,
+    signal_at: Option<scheduler::Instant>,
+    signal_source: FrameRequestSource,
+) {
+    // Destroyed after its demand was taken.
+    if frame_request.is_closed() {
+        return;
+    }
+    unsafe {
+        if let Some(signal_at) = signal_at {
+            if IsWindowVisible(hwnd.as_raw()).as_bool() && !IsIconic(hwnd.as_raw()).as_bool() {
+                frame_signal.record(signal_at, signal_source);
+            } else {
+                // Hidden windows may not consume WM_PAINT until shown again.
+                frame_signal.take();
+            }
+        }
+        // A hidden or minimized window keeps its update region until it is
+        // shown, so its frame is not lost while the worker sleeps.
+        RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
+            .ok()
+            .log_err();
+    }
+    count_invalidation();
 }
 
 fn translate_accelerator(msg: &MSG, is_gpui_window: impl FnOnce() -> bool) -> Option<()> {
@@ -807,17 +876,21 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        if !self.is_windowed() {
-            return Err(anyhow!("cannot open windows while headless"));
-        }
-        let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
+        let frame_wake = match &*self.vsync_worker.borrow() {
+            Some(worker) if self.is_windowed() => worker.wake.clone(),
+            _ => return Err(anyhow!("cannot open windows while headless")),
+        };
+        let window = WindowsWindow::new(handle, options, self.generate_creation_info(frame_wake))?;
         let handle = window.get_raw_handle();
         window.state.registered_with_platform.set(true);
         self.raw_window_handles.write().push(TrackedWindow {
             handle: handle.into(),
-            frame_demand: window.state.frame_demand.clone(),
+            frame_request: window.state.frame_request.clone(),
             frame_signal: window.state.frame_signal.clone(),
         });
+        // The first frame, and any demand raised while the window was created,
+        // before the worker could see it in the list.
+        window.state.frame_request.request_and_wake();
 
         Ok(Box::new(window))
     }
@@ -1318,10 +1391,18 @@ impl WindowsPlatformInner {
         // Upstream asserts that a close request always names a registered
         // window; `WindowsWindowState::registered_with_platform` is what keeps
         // that true here, by not posting the request at all for a window whose
-        // creation failed before `open_window` could register it.
+        // creation failed before `open_window` could register it. The handle
+        // value can already name a newer window, so the destroyed entry (its
+        // request was closed in `WM_DESTROY`) is the one to remove.
         let index = lock
             .iter()
-            .position(|handle| handle.as_raw() == target_window)
+            .position(|handle| {
+                handle.as_raw() == target_window && handle.frame_request.is_closed()
+            })
+            .or_else(|| {
+                lock.iter()
+                    .position(|handle| handle.as_raw() == target_window)
+            })
             .unwrap();
         lock.remove(index);
 
@@ -1461,8 +1542,8 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
-        if let Some(stop) = self.vsync_stop.borrow_mut().take() {
-            stop.store(true, Ordering::Release);
+        if let Some(worker) = self.vsync_worker.borrow_mut().take() {
+            worker.stop();
         }
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
@@ -1491,6 +1572,8 @@ pub(crate) struct WindowCreationInfo {
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,
+    /// Wakes the `VSyncProvider` worker when the window asks for a frame.
+    pub(crate) frame_wake: Arc<FrameWake>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
 }
@@ -1764,10 +1847,57 @@ fn is_window_station_visible() -> bool {
     result.is_ok() && flags.dwFlags & WSF_VISIBLE as u32 != 0
 }
 
+/// The open windows at one moment, copied out of the platform's list so that
+/// the list is not locked while the caller talks to them.
+fn snapshot_windows(
+    all_windows: &RwLock<SmallVec<[TrackedWindow; 4]>>,
+) -> SmallVec<[(SafeHwnd, Arc<FrameRequest>); 4]> {
+    all_windows
+        .read()
+        .iter()
+        .filter(|window| !window.frame_request.is_closed())
+        .map(|window| (window.handle, window.frame_request.clone()))
+        .collect()
+}
+
+/// Synchronously sends `message` to each window of `windows` that is still open.
+///
+/// Must be called with the window list unlocked. `SendMessageW` blocks until
+/// the UI thread handles the message, and the UI thread takes the list for
+/// writing whenever a window opens or closes: holding even a read lock across
+/// the send leaves each thread waiting on the other. A window destroyed (or
+/// whose handle value was reused by another thread's window) since the
+/// snapshot is skipped; one destroyed during the send makes `SendMessageW`
+/// fail harmlessly, and the receiving window checks `validation_number`.
+fn send_to_windows(
+    windows: &[(SafeHwnd, Arc<FrameRequest>)],
+    ui_thread: u32,
+    message: u32,
+    validation_number: usize,
+    lparam: Option<LPARAM>,
+) {
+    for (hwnd, frame_request) in windows {
+        if frame_request.is_closed()
+            || unsafe { GetWindowThreadProcessId(hwnd.as_raw(), None) } != ui_thread
+        {
+            continue;
+        }
+        unsafe {
+            SendMessageW(
+                hwnd.as_raw(),
+                message,
+                Some(WPARAM(validation_number)),
+                lparam,
+            );
+        }
+    }
+}
+
 fn handle_gpu_device_lost(
     directx_devices: &mut DirectXDevices,
     platform_window: HWND,
     validation_number: usize,
+    ui_thread: u32,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
@@ -1793,29 +1923,27 @@ fn handle_gpu_device_lost(
     if let Some(text_system) = text_system.upgrade() {
         text_system.handle_gpu_lost(&directx_devices)?;
     }
-    if let Some(all_windows) = all_windows.upgrade() {
-        for window in all_windows.read().iter() {
-            unsafe {
-                SendMessageW(
-                    window.as_raw(),
-                    WM_GPUI_GPU_DEVICE_LOST,
-                    Some(WPARAM(validation_number)),
-                    Some(lparam),
-                );
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        for window in all_windows.read().iter() {
-            unsafe {
-                SendMessageW(
-                    window.as_raw(),
-                    WM_GPUI_FORCE_UPDATE_WINDOW,
-                    Some(WPARAM(validation_number)),
-                    None,
-                );
-            }
-        }
-    }
+    // Taken after the platform window has the new devices: a window opened
+    // from here on is created with them, so missing it here is harmless.
+    let Some(windows) = all_windows.upgrade().map(|all_windows| snapshot_windows(&all_windows))
+    else {
+        return Ok(());
+    };
+    send_to_windows(
+        &windows,
+        ui_thread,
+        WM_GPUI_GPU_DEVICE_LOST,
+        validation_number,
+        Some(lparam),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    send_to_windows(
+        &windows,
+        ui_thread,
+        WM_GPUI_FORCE_UPDATE_WINDOW,
+        validation_number,
+        None,
+    );
     Ok(())
 }
 
@@ -2031,5 +2159,210 @@ mod tests {
                 vec![12],
             )),
         );
+    }
+}
+
+#[cfg(test)]
+mod window_broadcast_tests {
+    use std::{
+        sync::{Arc, Once, mpsc},
+        time::{Duration, Instant},
+    };
+
+    use gpui::PlatformFrameSignal;
+    use parking_lot::{Mutex, RwLock};
+    use smallvec::SmallVec;
+    use windows::{
+        Win32::{
+            Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+            System::Threading::GetCurrentThreadId,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+                GetQueueStatus, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
+                QS_SENDMESSAGE, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_USER,
+                WNDCLASSW,
+            },
+        },
+        core::w,
+    };
+
+    use super::{TrackedWindow, send_to_windows, snapshot_windows};
+    use crate::{FrameRequest, FrameWake};
+
+    const TEST_MESSAGE: u32 = WM_USER + 0x200;
+    const STOP_MESSAGE: u32 = WM_USER + 0x201;
+
+    /// Handles that received `TEST_MESSAGE`, as `isize`.
+    static RECEIVED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn receiver_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            TEST_MESSAGE => {
+                RECEIVED.lock().push(hwnd.0 as isize);
+                LRESULT(0)
+            }
+            STOP_MESSAGE => {
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    /// A message-only window owned by the calling thread.
+    fn receiver_window() -> HWND {
+        static REGISTER: Once = Once::new();
+        let class_name = w!("GpuiWindowBroadcastTest");
+        REGISTER.call_once(|| {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(receiver_procedure),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+        });
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class_name,
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap()
+    }
+
+    fn tracked(hwnd: HWND, wake: &Arc<FrameWake>) -> TrackedWindow {
+        TrackedWindow {
+            handle: hwnd.into(),
+            frame_request: FrameRequest::new(wake.clone()),
+            frame_signal: Arc::new(PlatformFrameSignal::new()),
+        }
+    }
+
+    fn received(hwnd: HWND) -> usize {
+        RECEIVED
+            .lock()
+            .iter()
+            .filter(|received| **received == hwnd.0 as isize)
+            .count()
+    }
+
+    /// The hang the device-loss recovery used to leave open: the vsync thread
+    /// held the window list's read lock while `SendMessageW` waited for the UI
+    /// thread, and the UI thread, opening or closing a window, waited for the
+    /// write lock instead of pumping that message. Each waited for the other.
+    ///
+    /// Reproduced without a GPU reset by blocking the sender in the broadcast
+    /// itself: the UI thread does not pump until the sent message is queued
+    /// for it, then takes the write lock as `open_window` would.
+    #[test]
+    fn a_window_can_open_while_the_vsync_thread_waits_on_the_ui_thread() {
+        let hwnd = receiver_window();
+        let wake = FrameWake::new().unwrap();
+        let all_windows = Arc::new(RwLock::new(SmallVec::<[TrackedWindow; 4]>::new()));
+        all_windows.write().push(tracked(hwnd, &wake));
+        let ui_thread = unsafe { GetCurrentThreadId() };
+
+        let sender = std::thread::spawn({
+            let all_windows = all_windows.clone();
+            move || {
+                let windows = snapshot_windows(&all_windows);
+                send_to_windows(&windows, ui_thread, TEST_MESSAGE, 0, None);
+            }
+        });
+
+        // `GetQueueStatus` reports the pending send without dispatching it,
+        // so the sender is still blocked inside `SendMessageW` afterwards.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (unsafe { GetQueueStatus(QS_SENDMESSAGE) } >> 16) & QS_SENDMESSAGE.0 == 0 {
+            assert!(Instant::now() < deadline, "the broadcast never sent");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let opening = all_windows.try_write_for(Duration::from_secs(2));
+        assert!(
+            opening.is_some(),
+            "the window list stayed locked while its holder waited on the UI thread"
+        );
+        drop(opening);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while received(hwnd) == 0 {
+            assert!(Instant::now() < deadline, "the sent message was never handled");
+            let mut message = MSG::default();
+            // Peeking delivers pending sent messages.
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe { DispatchMessageW(&message) };
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        sender.join().unwrap();
+        assert_eq!(received(hwnd), 1);
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    /// A window destroyed since the snapshot (its request closed in
+    /// `WM_DESTROY`), and a handle value now owned by another thread, are
+    /// skipped rather than sent a pointer meant for a live GPUI window.
+    #[test]
+    fn closed_and_foreign_windows_are_not_messaged() {
+        let wake = FrameWake::new().unwrap();
+        let open = receiver_window();
+        let closed = receiver_window();
+
+        let (foreign_sender, foreign_receiver) = mpsc::channel();
+        let foreign_thread = std::thread::spawn(move || {
+            let hwnd = receiver_window();
+            foreign_sender.send(hwnd.0 as isize).unwrap();
+            let mut message = MSG::default();
+            while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+                unsafe { DispatchMessageW(&message) };
+            }
+            unsafe { DestroyWindow(hwnd) }.unwrap();
+        });
+        let foreign = HWND(foreign_receiver.recv().unwrap() as _);
+
+        let all_windows = RwLock::new(SmallVec::<[TrackedWindow; 4]>::new());
+        for hwnd in [open, closed, foreign] {
+            all_windows.write().push(tracked(hwnd, &wake));
+        }
+        let windows = snapshot_windows(&all_windows);
+        assert_eq!(windows.len(), 3);
+        windows[1].1.close();
+
+        // Sent from the owning thread, so delivery is a direct call.
+        send_to_windows(
+            &windows,
+            unsafe { GetCurrentThreadId() },
+            TEST_MESSAGE,
+            0,
+            None,
+        );
+        assert_eq!(received(open), 1);
+        assert_eq!(received(closed), 0);
+        assert_eq!(received(foreign), 0);
+
+        // A snapshot leaves out windows already closed when it is taken.
+        assert_eq!(snapshot_windows(&all_windows).len(), 2);
+
+        unsafe {
+            super::SendMessageW(foreign, STOP_MESSAGE, None, None);
+            DestroyWindow(open).unwrap();
+            DestroyWindow(closed).unwrap();
+        }
+        foreign_thread.join().unwrap();
     }
 }
