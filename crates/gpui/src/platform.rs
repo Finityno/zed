@@ -1465,6 +1465,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Asks for one frame request no earlier than `at`, for demand GPUI
+    /// knows it will not serve sooner: a frame its frame-rate cap refused,
+    /// or the next step of a scene that animates on its own. A platform that
+    /// schedules frames on demand can then sleep until `at` instead of
+    /// delivering requests that are refused one vsync after another.
+    ///
+    /// Any later wake through [`Self::frame_waker`] (a view notified, a
+    /// next-frame callback) supersedes the deadline and asks for the next
+    /// frame as usual, so nothing else waits for `at`.
+    ///
+    /// Returns whether the platform took the request. If not (the default),
+    /// GPUI wakes the frame waker instead, as it does for all other demand.
+    fn request_frame_at(&self, _at: Instant) -> bool {
+        false
+    }
     /// Tells the platform that this window's frames answer the user (their
     /// input, or an animation they started) until `until`, so it may ask the
     /// system to draw them sooner. Frames after it are left on the system's

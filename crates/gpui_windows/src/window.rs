@@ -1146,8 +1146,29 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.request_frame.set(Some(callback));
     }
 
-    fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
-        self.state.callbacks.input.set(Some(callback));
+    fn request_frame_at(&self, at: std::time::Instant) -> bool {
+        self.state.frame_request.request_at(at);
+        true
+    }
+
+    fn on_input(&self, mut callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
+        // Input can change why GPUI deferred a frame (an unfocused window's
+        // cap no longer applies once input arrives at a high rate), so a
+        // deferred frame is asked for at the next vsync again, as it was
+        // before deadlines existed. Nothing is requested otherwise: GPUI asks
+        // for a frame itself when the input changes anything.
+        let frame_request = self.state.frame_request.clone();
+        #[cfg(test)]
+        let hwnd = self.0.hwnd;
+        self.state
+            .callbacks
+            .input
+            .set(Some(Box::new(move |event| {
+                #[cfg(test)]
+                crate::native_tests::input(hwnd);
+                frame_request.expedite();
+                callback(event)
+            })));
     }
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
