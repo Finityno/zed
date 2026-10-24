@@ -96,6 +96,9 @@ struct GammaParams {
 @group(2) @binding(0) var t_sprite: texture_2d<f32>;
 @group(2) @binding(1) var s_sprite: sampler;
 
+// `SpriteEffect::kind`: `0` is plain text, these two are the other cases.
+const SPRITE_EFFECT_SHIMMER: u32 = 1u;
+const SPRITE_EFFECT_MASK: u32 = 2u;
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
@@ -1434,7 +1437,13 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let base_color = input.color;
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
-    let alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    // The contrast and gamma ramp makes glyphs match DirectWrite; an SVG's
+    // alpha mask is not text and is sampled as authored, or every
+    // partial-coverage pixel in the icon is lifted. See `SpriteEffect::MASK_KIND`.
+    var alpha_corrected = sample;
+    if (input.effect_kind != SPRITE_EFFECT_MASK) {
+        alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    }
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
@@ -1446,7 +1455,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     // fragment stage is a dependent memory load per fragment, and the overlay
     // blend below ends in a divide; neither is worth paying on all text for
     // an effect a handful of labels use.
-    if (input.effect_kind == 0u) {
+    if (input.effect_kind != SPRITE_EFFECT_SHIMMER) {
         return rounded_clip_color(blend_color(vec4<f32>(base_color.rgb, 1.0), base_color.a * alpha_corrected), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 

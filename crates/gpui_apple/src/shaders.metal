@@ -3,6 +3,11 @@
 
 using namespace metal;
 
+// `SpriteEffect::kind`: `0` is plain text, these two are the other cases.
+// Metal applies no contrast or gamma ramp to a monochrome sprite, so here a
+// mask tile differs from plain text only in having no shimmer band.
+constant uint SPRITE_EFFECT_SHIMMER = 1u;
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -885,7 +890,7 @@ fragment float4 monochrome_sprite_fragment(
   // from the fragment stage is a dependent memory load per fragment, and the
   // overlay blend below ends in a divide; neither is worth paying on all text
   // for an effect a handful of labels use.
-  if (input.effect_kind == 0u) {
+  if (input.effect_kind != SPRITE_EFFECT_SHIMMER) {
     return (float4(base_color.rgb, base_color.a * sample.a)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
 
