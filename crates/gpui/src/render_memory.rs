@@ -21,8 +21,16 @@ pub struct RenderMemoryGauges {
     pub depth_texture_bytes: u64,
     /// Targets paths are rasterized and composited through: the drawable-sized
     /// intermediate, the tile paths rasterize into and its multisampled
-    /// companion. Reported by the wgpu renderer.
+    /// companion.
     pub path_texture_bytes: u64,
+    /// Scratch textures backdrop blurs (frosted surfaces) run through.
+    pub backdrop_texture_bytes: u64,
+    /// The device's own count of everything the process has allocated on
+    /// it, as of the last frame any renderer drew: the gauges above plus
+    /// drawables-in-waiting, buffers and textures no gauge names. Read from
+    /// `MTLDevice.currentAllocatedSize` on Metal; zero where the platform
+    /// has no such counter.
+    pub device_allocated_bytes: u64,
 }
 
 /// One of the gauges in [`RenderMemoryGauges`].
@@ -38,17 +46,28 @@ pub enum RenderMemoryGauge {
     DepthTextures,
     /// [`RenderMemoryGauges::path_texture_bytes`].
     PathTextures,
+    /// [`RenderMemoryGauges::backdrop_texture_bytes`].
+    BackdropTextures,
 }
 
-const ALL_GAUGES: [RenderMemoryGauge; 5] = [
+const ALL_GAUGES: [RenderMemoryGauge; 6] = [
     RenderMemoryGauge::AtlasMonochrome,
     RenderMemoryGauge::AtlasPolychrome,
     RenderMemoryGauge::InstanceBuffers,
     RenderMemoryGauge::DepthTextures,
     RenderMemoryGauge::PathTextures,
+    RenderMemoryGauge::BackdropTextures,
 ];
 
 static GAUGES: [AtomicU64; ALL_GAUGES.len()] = [const { AtomicU64::new(0) }; ALL_GAUGES.len()];
+static DEVICE_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Records the device's own count of allocated bytes, for
+/// [`RenderMemoryGauges::device_allocated_bytes`]. Every renderer in a process
+/// shares one device, so the latest reading replaces the last.
+pub fn record_device_allocated_bytes(bytes: u64) {
+    DEVICE_ALLOCATED.store(bytes, Ordering::Relaxed);
+}
 
 /// The bytes one holder of device memory — a renderer, an atlas, a buffer
 /// pool — has reported into the process-wide gauges. A report replaces the
@@ -87,7 +106,7 @@ impl Drop for RenderMemoryLedger {
     }
 }
 
-/// The device memory every live renderer holds, summed across windows. Five
+/// The device memory every live renderer holds, summed across windows. A few
 /// atomic loads; callable from any thread with no `App` at hand.
 pub fn render_memory_gauges() -> RenderMemoryGauges {
     let load = |gauge: RenderMemoryGauge| GAUGES[gauge as usize].load(Ordering::Relaxed);
@@ -97,6 +116,8 @@ pub fn render_memory_gauges() -> RenderMemoryGauges {
         instance_buffer_bytes: load(RenderMemoryGauge::InstanceBuffers),
         depth_texture_bytes: load(RenderMemoryGauge::DepthTextures),
         path_texture_bytes: load(RenderMemoryGauge::PathTextures),
+        backdrop_texture_bytes: load(RenderMemoryGauge::BackdropTextures),
+        device_allocated_bytes: DEVICE_ALLOCATED.load(Ordering::Relaxed),
     }
 }
 
@@ -144,6 +165,34 @@ mod tests {
         );
 
         drop(atlas);
-        assert_eq!(render_memory_gauges(), before);
+        // The device count is a reading another test may take meanwhile.
+        assert_eq!(
+            RenderMemoryGauges {
+                device_allocated_bytes: before.device_allocated_bytes,
+                ..render_memory_gauges()
+            },
+            before
+        );
+    }
+
+    #[test]
+    fn backdrop_scratch_and_the_device_count_are_reported() {
+        let before = render_memory_gauges();
+        let mut renderer = RenderMemoryLedger::default();
+        renderer.publish(RenderMemoryGauge::BackdropTextures, 2 * MIB);
+        assert_eq!(
+            render_memory_gauges().backdrop_texture_bytes - before.backdrop_texture_bytes,
+            2 * MIB
+        );
+        drop(renderer);
+        assert_eq!(
+            render_memory_gauges().backdrop_texture_bytes,
+            before.backdrop_texture_bytes
+        );
+
+        // The device count is a reading, not a sum: the latest replaces it.
+        record_device_allocated_bytes(40 * MIB);
+        record_device_allocated_bytes(30 * MIB);
+        assert_eq!(render_memory_gauges().device_allocated_bytes, 30 * MIB);
     }
 }
