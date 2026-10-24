@@ -1,0 +1,482 @@
+//! What GPUI's Windows frame scheduling costs, per idle pattern.
+//!
+//! ```text
+//! cargo run -p gpui_platform --release --example windows_idle_frames -- <case> <out.json> [--seconds N] [--no-dcomp]
+//! ```
+//!
+//! Cases (one per process):
+//!
+//! - `static`: one focused window that never changes. Expect no renders,
+//!   paints, presents or vsync waits.
+//! - `blink`: a focused window whose caret toggles every 500 ms through a
+//!   timer and `cx.notify`, as a text input's does: two renders a second.
+//! - `animation`: continuous `request_animation_frame`, one render per vsync.
+//! - `shimmer`: a static `ShimmerText`, which re-presents at the time
+//!   animation rate (30 fps by default) without rendering.
+//! - `two_windows`: two static windows.
+//! - `unfocused_animation`: the `animation` view in a window that is not
+//!   focused (another window is), held to GPUI's ~30 fps inactive-window cap.
+//! - `verify`: correctness, not cost: 25 notifies and 60 chained
+//!   `on_next_frame` callbacks in each of two windows must all be delivered.
+//!
+//! Measures the process's CPU time and cycles, the cycles of the UI thread
+//! and of the `VSyncProvider` thread, view renders, and the platform's frame
+//! counters, over `--seconds` (default 20) after a 3 second warm-up. Opens
+//! real windows; run it on an interactive desktop.
+
+fn main() {
+    #[cfg(target_os = "windows")]
+    windows_idle_frames::run();
+    #[cfg(not(target_os = "windows"))]
+    eprintln!("This benchmark requires Windows.");
+}
+
+#[cfg(target_os = "windows")]
+mod windows_idle_frames {
+    use gpui::{
+        App, AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _,
+        IntoElement, ParentElement as _, Render, ShimmerText, Styled as _, Window,
+        WindowBounds, WindowHandle, WindowOptions, div, point, px, rgb, size,
+    };
+    use std::{
+        ffi::c_void,
+        fmt::Write as _,
+        path::PathBuf,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetCurrentProcessId() -> u32;
+        fn GetCurrentThread() -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            created: *mut u64,
+            exited: *mut u64,
+            kernel: *mut u64,
+            user: *mut u64,
+        ) -> i32;
+        fn QueryProcessCycleTime(process: *mut c_void, cycles: *mut u64) -> i32;
+        fn QueryThreadCycleTime(thread: *mut c_void, cycles: *mut u64) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry) -> i32;
+        fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry) -> i32;
+        fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut c_void;
+        fn GetThreadDescription(thread: *mut c_void, description: *mut *mut u16) -> i32;
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    #[repr(C)]
+    struct ThreadEntry {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    const TH32CS_SNAPTHREAD: u32 = 0x4;
+    const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+
+    /// The `VSyncProvider` thread, found by its name so this also measures
+    /// builds that predate the platform's frame counters.
+    struct VSyncThread(*mut c_void);
+
+    impl VSyncThread {
+        fn find() -> Option<Self> {
+            unsafe {
+                let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snapshot == INVALID_HANDLE_VALUE {
+                    return None;
+                }
+                let process_id = GetCurrentProcessId();
+                let mut entry = ThreadEntry {
+                    size: std::mem::size_of::<ThreadEntry>() as u32,
+                    usage: 0,
+                    thread_id: 0,
+                    owner_process_id: 0,
+                    base_priority: 0,
+                    delta_priority: 0,
+                    flags: 0,
+                };
+                let mut found = None;
+                let mut more = Thread32First(snapshot, &mut entry) != 0;
+                while more && found.is_none() {
+                    if entry.owner_process_id == process_id {
+                        let thread =
+                            OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, entry.thread_id);
+                        if !thread.is_null() {
+                            if thread_name(thread).as_deref() == Some("VSyncProvider") {
+                                found = Some(VSyncThread(thread));
+                            } else {
+                                CloseHandle(thread);
+                            }
+                        }
+                    }
+                    more = Thread32Next(snapshot, &mut entry) != 0;
+                }
+                CloseHandle(snapshot);
+                found
+            }
+        }
+
+        fn cycles(&self) -> u64 {
+            let mut cycles = 0;
+            unsafe { QueryThreadCycleTime(self.0, &mut cycles) };
+            cycles
+        }
+    }
+
+    impl Drop for VSyncThread {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    unsafe fn thread_name(thread: *mut c_void) -> Option<String> {
+        let mut description = std::ptr::null_mut();
+        if unsafe { GetThreadDescription(thread, &mut description) } < 0 || description.is_null() {
+            return None;
+        }
+        let mut length = 0;
+        while unsafe { *description.add(length) } != 0 {
+            length += 1;
+        }
+        let name =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(description, length) });
+        unsafe { LocalFree(description.cast()) };
+        Some(name)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Sample {
+        process_time_100ns: u64,
+        process_cycles: u64,
+        main_thread_cycles: u64,
+        vsync_thread_cycles: u64,
+        renders: usize,
+        frames: gpui_windows::FrameCounters,
+    }
+
+    fn sample(vsync_thread: Option<&VSyncThread>, renders: &AtomicUsize) -> Sample {
+        let (mut created, mut exited, mut kernel, mut user) = (0, 0, 0, 0);
+        let (mut process_cycles, mut main_thread_cycles) = (0, 0);
+        unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            );
+            QueryProcessCycleTime(GetCurrentProcess(), &mut process_cycles);
+            QueryThreadCycleTime(GetCurrentThread(), &mut main_thread_cycles);
+        }
+        Sample {
+            process_time_100ns: kernel + user,
+            process_cycles,
+            main_thread_cycles,
+            vsync_thread_cycles: vsync_thread.map_or(0, VSyncThread::cycles),
+            renders: renders.load(Ordering::Relaxed),
+            frames: gpui_windows::frame_counters(),
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Case {
+        Static,
+        Blink,
+        Animation,
+        Shimmer,
+        TwoWindows,
+        UnfocusedAnimation,
+        Verify,
+    }
+
+    impl Case {
+        fn parse(name: &str) -> Option<Self> {
+            Some(match name {
+                "static" => Self::Static,
+                "blink" => Self::Blink,
+                "animation" => Self::Animation,
+                "shimmer" => Self::Shimmer,
+                "two_windows" => Self::TwoWindows,
+                "unfocused_animation" => Self::UnfocusedAnimation,
+                "verify" => Self::Verify,
+                _ => return None,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Content {
+        Static,
+        Blink,
+        Animation,
+        Shimmer,
+    }
+
+    struct BenchView {
+        renders: Arc<AtomicUsize>,
+        content: Content,
+        focus_handle: FocusHandle,
+        caret_visible: bool,
+        lit: bool,
+        started_at: Instant,
+        _blink: Option<gpui::Task<()>>,
+    }
+
+    impl BenchView {
+        fn new(content: Content, renders: Arc<AtomicUsize>, cx: &mut Context<Self>) -> Self {
+            let blink = (content == Content::Blink).then(|| {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(500))
+                            .await;
+                        if this
+                            .update(cx, |this, cx| {
+                                this.caret_visible = !this.caret_visible;
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            });
+            Self {
+                renders,
+                content,
+                focus_handle: cx.focus_handle(),
+                caret_visible: true,
+                lit: true,
+                started_at: Instant::now(),
+                _blink: blink,
+            }
+        }
+    }
+
+    impl Render for BenchView {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.fetch_add(1, Ordering::Relaxed);
+            let body = match self.content {
+                Content::Static => div().child("GPUI Windows idle benchmark").into_any_element(),
+                Content::Blink => div()
+                    .flex()
+                    .items_center()
+                    .child("Focused input")
+                    .child(div().w(px(2.)).h(px(18.)).ml_1().when_caret(self.caret_visible))
+                    .into_any_element(),
+                Content::Animation => {
+                    window.request_animation_frame();
+                    let phase = (self.started_at.elapsed().as_secs_f32() * 0.5).fract();
+                    div()
+                        .w(px(600.))
+                        .h(px(24.))
+                        .bg(rgb(0x303236))
+                        .child(div().ml(px(phase * 560.)).w(px(40.)).h_full().bg(rgb(0x65b879)))
+                        .into_any_element()
+                }
+                Content::Shimmer => ShimmerText::new("Thinking about frame scheduling")
+                    .highlight_color(gpui::white())
+                    .into_any_element(),
+            };
+            div()
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .flex()
+                .flex_col()
+                .p_8()
+                .gap_4()
+                .font_family("Segoe UI")
+                .text_color(rgb(0xe8e8e8))
+                .bg(rgb(0x202124))
+                .child(body)
+                .child(
+                    div()
+                        .w(px(320.))
+                        .h(px(180.))
+                        .rounded_lg()
+                        .border_2()
+                        .border_color(if self.lit { rgb(0x65b879) } else { rgb(0x404246) })
+                        .bg(rgb(0x303236)),
+                )
+        }
+    }
+
+    trait WhenCaret {
+        fn when_caret(self, visible: bool) -> Self;
+    }
+
+    impl WhenCaret for gpui::Div {
+        fn when_caret(self, visible: bool) -> Self {
+            if visible { self.bg(rgb(0xe8e8e8)) } else { self }
+        }
+    }
+
+    fn open(
+        cx: &mut App,
+        index: usize,
+        content: Content,
+        renders: &Arc<AtomicUsize>,
+    ) -> WindowHandle<BenchView> {
+        let renders = renders.clone();
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(100. + index as f32 * 660.), px(100.)),
+                    size(px(640.), px(480.)),
+                ))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let view = cx.new(|cx| BenchView::new(content, renders, cx));
+                view.read(cx).focus_handle.clone().focus(window, cx);
+                view
+            },
+        )
+        .expect("opening a benchmark window")
+    }
+
+    fn chain(window: &Window, completed: Rc<AtomicUsize>, remaining: usize) {
+        window.on_next_frame(move |window, _| {
+            completed.fetch_add(1, Ordering::Relaxed);
+            if remaining > 1 {
+                chain(window, completed, remaining - 1);
+            }
+        });
+    }
+
+    pub fn run() {
+        let mut arguments = std::env::args().skip(1);
+        let usage = "usage: windows_idle_frames <static|blink|animation|shimmer|two_windows|unfocused_animation|verify> <out.json> [--seconds N] [--no-dcomp]";
+        let case_name = arguments.next().expect(usage);
+        let case = Case::parse(&case_name).expect(usage);
+        let output = PathBuf::from(arguments.next().expect(usage));
+        let mut seconds = 20.0;
+        let mut direct_composition = true;
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--seconds" => {
+                    seconds = arguments
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .expect(usage)
+                }
+                "--no-dcomp" => direct_composition = false,
+                _ => panic!("{usage}"),
+            }
+        }
+        if !direct_composition {
+            // Read once, when the platform is created below.
+            unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true") };
+        }
+
+        gpui_platform::application().run(move |cx: &mut App| {
+            let renders = Arc::new(AtomicUsize::new(0));
+            let mut windows = Vec::new();
+            match case {
+                Case::Static => windows.push(open(cx, 0, Content::Static, &renders)),
+                Case::Blink => windows.push(open(cx, 0, Content::Blink, &renders)),
+                Case::Animation => windows.push(open(cx, 0, Content::Animation, &renders)),
+                Case::Shimmer => windows.push(open(cx, 0, Content::Shimmer, &renders)),
+                Case::TwoWindows | Case::Verify => {
+                    windows.push(open(cx, 0, Content::Static, &renders));
+                    windows.push(open(cx, 1, Content::Static, &renders));
+                }
+                Case::UnfocusedAnimation => {
+                    // Rendered by the animating window only.
+                    windows.push(open(cx, 0, Content::Animation, &renders));
+                    let focused = open(cx, 1, Content::Static, &Arc::new(AtomicUsize::new(0)));
+                    focused
+                        .update(cx, |_, window, _| window.activate_window())
+                        .ok();
+                    windows.push(focused);
+                }
+            }
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let vsync_thread = VSyncThread::find();
+                let before = sample(vsync_thread.as_ref(), &renders);
+                let start = Instant::now();
+                let mut verify_report = String::new();
+                if case == Case::Verify {
+                    let notified_before = renders.load(Ordering::Relaxed);
+                    for frame in 0..25 {
+                        for window in &windows {
+                            window
+                                .update(cx, |view, _, cx| {
+                                    view.lit = frame % 2 == 0;
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(80))
+                            .await;
+                    }
+                    let update_renders = renders.load(Ordering::Relaxed) - notified_before;
+                    let completed = Rc::new(AtomicUsize::new(0));
+                    for window in &windows {
+                        let completed = completed.clone();
+                        window
+                            .update(cx, |_, window, _| chain(window, completed, 60))
+                            .ok();
+                    }
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
+                    let callbacks = completed.load(Ordering::Relaxed);
+                    write!(
+                        verify_report,
+                        ", \"update_renders\": {update_renders}, \"chained_callbacks\": {callbacks}"
+                    )
+                    .ok();
+                    assert!(update_renders >= 50, "{update_renders} renders for 50 notifies");
+                    assert_eq!(callbacks, 120, "chained next-frame callbacks were stranded");
+                } else {
+                    cx.background_executor()
+                        .timer(Duration::from_secs_f64(seconds))
+                        .await;
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let after = sample(vsync_thread.as_ref(), &renders);
+                let frames = |field: fn(&gpui_windows::FrameCounters) -> u64| {
+                    field(&after.frames) - field(&before.frames)
+                };
+                let json = format!(
+                    "{{\n  \"case\": \"{case_name}\",\n  \"direct_composition\": {direct_composition},\n  \"elapsed_seconds\": {elapsed:.3},\n  \"process_cpu_ms\": {:.3},\n  \"process_cycles\": {},\n  \"main_thread_cycles\": {},\n  \"vsync_thread_found\": {},\n  \"vsync_thread_cycles\": {},\n  \"renders\": {},\n  \"wake_signals\": {},\n  \"worker_wakes\": {},\n  \"vsync_waits\": {},\n  \"invalidations\": {},\n  \"paints\": {},\n  \"presents\": {}{verify_report}\n}}\n",
+                    (after.process_time_100ns - before.process_time_100ns) as f64 / 10_000.0,
+                    after.process_cycles - before.process_cycles,
+                    after.main_thread_cycles - before.main_thread_cycles,
+                    vsync_thread.is_some(),
+                    after.vsync_thread_cycles - before.vsync_thread_cycles,
+                    after.renders - before.renders,
+                    frames(|counters| counters.wake_signals),
+                    frames(|counters| counters.worker_wakes),
+                    frames(|counters| counters.vsync_waits),
+                    frames(|counters| counters.invalidations),
+                    frames(|counters| counters.paints),
+                    frames(|counters| counters.presents),
+                );
+                print!("{json}");
+                std::fs::write(&output, json).expect("writing the result");
+                if case == Case::Static {
+                    assert_eq!(after.renders, before.renders, "a static window rendered");
+                }
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    }
+}
