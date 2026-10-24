@@ -935,7 +935,7 @@ impl DirectXRenderer {
         if !scene.rounded_clips.is_empty() {
             update_buffer(&devices.device_context, buffer, &scene.rounded_clips)?;
         }
-        unsafe { devices.device_context.PSSetShaderResources(3, Some(&[self.rounded_clip_view.clone()])); }
+        unsafe { devices.device_context.PSSetShaderResources(3, Some(std::slice::from_ref(&self.rounded_clip_view))); }
         Ok(())
     }
 

@@ -178,7 +178,7 @@ fn pump_messages()->Result<()> {
     for _ in 0..128 {
         if !unsafe {PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){break;}
         if message.message==WM_QUIT {return Err(Cancelled.into());}
-        unsafe {TranslateMessage(&message);DispatchMessageW(&message);}
+        unsafe {_ = TranslateMessage(&message);DispatchMessageW(&message);}
     }
     Ok(())
 }
