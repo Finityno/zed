@@ -104,6 +104,9 @@ struct TransformationMatrix {
 };
 
 static const float M_PI_F = 3.141592653f;
+// `SpriteEffect::kind`: `0` is plain text, these two are the other cases.
+static const uint SPRITE_EFFECT_SHIMMER = 1u;
+static const uint SPRITE_EFFECT_MASK = 2u;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
 
 float4 to_device_position_impl(float2 position) {
@@ -1384,13 +1387,22 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float4 base_color = input.color;
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
-    float alpha_corrected = apply_contrast_and_gamma_correction(sample, base_color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+    // DirectWrite's contrast and gamma ramp is here to make glyphs match how
+    // the rest of Windows draws text. An SVG's alpha mask is not text: running
+    // it through the ramp lifts every partial-coverage pixel (measured on the
+    // 12px session spinner, whose 0.24-alpha track rendered at 0.33), which
+    // flattens the contrast the icon was authored with and fattens its
+    // antialiased edge. Metal and wgpu apply no ramp at all, which is why only
+    // Windows showed it. Sample such a mask as authored.
+    float alpha_corrected = input.effect_kind == SPRITE_EFFECT_MASK
+        ? sample
+        : apply_contrast_and_gamma_correction(sample, base_color.rgb, grayscale_enhanced_contrast, gamma_ratios);
 
     // Virtually every glyph in the window is unshimmered, so bail out before
     // touching the sprite structured buffer at all: reading it from the pixel
     // stage is a dependent memory load per fragment, and the overlay blend
     // below ends in a divide.
-    if (input.effect_kind == 0u) {
+    if (input.effect_kind != SPRITE_EFFECT_SHIMMER) {
         return rounded_clip_color(float4(base_color.rgb, base_color.a * alpha_corrected), rounded_clip_coverage(input.rounded_clip, input.position.xy));
     }
 
@@ -1428,7 +1440,7 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
     // As above, and the shimmer path additionally costs unshimmered text a
     // second full `apply_contrast_and_gamma_correction3` pass per channel.
-    if (input.effect_kind == 0u) {
+    if (input.effect_kind != SPRITE_EFFECT_SHIMMER) {
         SubpixelSpriteFragmentOutput plain;
         plain.foreground = float4(base_color.rgb, 1.0f);
         plain.alpha = float4(base_color.a * base_alpha_corrected, 1.0f);

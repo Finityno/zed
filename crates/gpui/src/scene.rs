@@ -2652,7 +2652,7 @@ impl SceneMove {
             Primitive::MonochromeSprite(sprite) => {
                 sprite.bounds = self.bounds(sprite.bounds);
                 sprite.content_mask = self.mask(&sprite.content_mask);
-                if sprite.effect.kind != 0 {
+                if sprite.effect.kind == SpriteEffect::SHIMMER_KIND {
                     sprite.effect.origin = sprite.effect.origin + self.delta;
                 }
                 sprite.transformation = self.transformation(sprite.transformation);
@@ -2660,7 +2660,7 @@ impl SceneMove {
             Primitive::SubpixelSprite(sprite) => {
                 sprite.bounds = self.bounds(sprite.bounds);
                 sprite.content_mask = self.mask(&sprite.content_mask);
-                if sprite.effect.kind != 0 {
+                if sprite.effect.kind == SpriteEffect::SHIMMER_KIND {
                     sprite.effect.origin = sprite.effect.origin + self.delta;
                 }
                 sprite.transformation = self.transformation(sprite.transformation);
@@ -3356,13 +3356,15 @@ impl Default for TransformationMatrix {
 }
 
 /// Per-sprite highlight the text fragment shaders apply on top of the glyph
-/// color. The struct is embedded in *every* [`MonochromeSprite`] and
-/// [`SubpixelSprite`], so it is deliberately held to 64 bytes and the shaders
-/// early-out on `kind == 0` before reading it.
+/// color, and what kind of mask the sprite's tile holds. The struct is embedded
+/// in *every* [`MonochromeSprite`] and [`SubpixelSprite`], so it is
+/// deliberately held to 64 bytes and the shaders early-out on a `kind` without
+/// a band before reading it.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct SpriteEffect {
-    /// `0` for plain text, [`SpriteEffect::SHIMMER_KIND`] for the shimmer band.
+    /// `0` for plain text, [`SpriteEffect::SHIMMER_KIND`] for the shimmer band,
+    /// [`SpriteEffect::MASK_KIND`] for a tile that is not text at all.
     pub kind: u32,
     /// Where the band reaches full strength, as a fraction of `band_width`
     /// measured from the trailing edge. `0.5` is a symmetric band; values above
@@ -3401,6 +3403,13 @@ pub struct SpriteEffect {
 
 impl SpriteEffect {
     pub(crate) const SHIMMER_KIND: u32 = 1;
+    /// The tile is an alpha mask that is not a glyph (today: a rasterized SVG).
+    /// Windows renders text through DirectWrite's contrast and gamma ramp and
+    /// its fragment shader reproduces that for every monochrome sprite; an
+    /// icon's mask must be sampled as authored instead, or every
+    /// partial-coverage pixel in it is lifted. The other backends apply no
+    /// ramp, so for them this kind only means "no shimmer band".
+    pub(crate) const MASK_KIND: u32 = 2;
 }
 
 /// How a sweeping shimmer band moves with time, kept beside the scene rather

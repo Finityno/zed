@@ -74,7 +74,7 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
     // below costs it a second full `apply_contrast_and_gamma_correction3` pass
     // (per subpixel channel) plus a storage-buffer read per fragment. Bail out
     // before any of it.
-    if (input.effect_kind == 0u) {
+    if (input.effect_kind != SPRITE_EFFECT_SHIMMER) {
         var plain = SubpixelSpriteFragmentOutput();
         plain.foreground = vec4<f32>(base_color.rgb, 1.0);
         plain.alpha = vec4<f32>(base_color.a * base_alpha_corrected, 1.0);

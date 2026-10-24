@@ -2831,6 +2831,40 @@ pub(crate) fn text_shimmer_disabled() -> bool {
     })
 }
 
+/// Move a transformed SVG's pivot from the point its matrix was built around
+/// onto `center`, the centre of the rect it is actually drawn in.
+///
+/// `Svg::paint` builds the matrix around the element's *unsnapped* centre,
+/// while the sprite rect is snapped to device pixels and its origin rounded, so
+/// the rect's own centre ends up as much as a device pixel from that pivot. A
+/// rotating icon then orbits the offset rather than spinning in place: on a
+/// 12px spinner — 18 device pixels at 150% scaling — over 5% of its diameter,
+/// and fractional scaling is what makes the snap move anything, which is why it
+/// showed up on Windows first. Re-pivoting rather than unsnapping the rect
+/// keeps every icon exactly as pixel-aligned as it was, and makes a quarter
+/// turn of a square land back on its own snapped rect.
+///
+/// The matrix is `T(pivot) · R · T(-pivot)`; the same `R` about `center` is
+/// `T(center - pivot) · M · T(pivot - center)`, so no decomposition is needed.
+fn recentered_transformation(
+    transformation: TransformationMatrix,
+    pivot: Point<ScaledPixels>,
+    center: Point<ScaledPixels>,
+) -> TransformationMatrix {
+    let delta = Point::new(
+        ScaledPixels(center.x.0 - pivot.x.0),
+        ScaledPixels(center.y.0 - pivot.y.0),
+    );
+    if transformation == TransformationMatrix::unit() || (delta.x.0 == 0. && delta.y.0 == 0.) {
+        return transformation;
+    }
+    let back = Point::new(ScaledPixels(-delta.x.0), ScaledPixels(-delta.y.0));
+    TransformationMatrix::unit()
+        .translate(delta)
+        .compose(transformation)
+        .compose(TransformationMatrix::unit().translate(back))
+}
+
 impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
@@ -6265,11 +6299,11 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let bounds = self.snap_bounds(bounds);
+        let snapped_bounds = self.snap_bounds(bounds);
 
         let params = RenderSvgParams {
             path,
-            size: bounds.size.map(|pixels| {
+            size: snapped_bounds.size.map(|pixels| {
                 DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
             }),
         };
@@ -6288,7 +6322,7 @@ impl Window {
         };
         let content_mask = self.snapped_content_mask();
         let svg_bounds = Bounds {
-            origin: bounds.center()
+            origin: snapped_bounds.center()
                 - Point::new(
                     ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
                     ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
@@ -6301,6 +6335,13 @@ impl Window {
         let final_bounds = svg_bounds
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
             .map_size(|size| size.ceil());
+        // `Svg::paint` built the matrix around the element's unsnapped centre,
+        // which the snapping above has since moved away from.
+        let transformation = recentered_transformation(
+            transformation,
+            bounds.center().scale(self.scale_factor()),
+            final_bounds.center(),
+        );
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             rounded_clip: 0,
@@ -6310,7 +6351,12 @@ impl Window {
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),
-            effect: SpriteEffect::default(),
+            // Not a glyph: the Windows fragment shader must sample this mask
+            // without DirectWrite's text contrast and gamma ramp.
+            effect: SpriteEffect {
+                kind: SpriteEffect::MASK_KIND,
+                ..SpriteEffect::default()
+            },
             tile,
             transformation,
         });
@@ -9615,6 +9661,57 @@ mod tests {
         canvas, div, hsla, point, px, rgb, size, util::MIN_RETAINED_CAPACITY,
     };
     use crate::arena::SHRINK_AFTER_DURATION;
+
+    /// Where `transformation` sends `point`, in the same raw units.
+    fn transformed(
+        transformation: crate::TransformationMatrix,
+        point: Point<ScaledPixels>,
+    ) -> (f32, f32) {
+        let [x, y] = [point.x.0, point.y.0];
+        let [[a, b], [c, d]] = transformation.rotation_scale;
+        let [tx, ty] = transformation.translation;
+        (a * x + b * y + tx, c * x + d * y + ty)
+    }
+
+    /// A rotation fixes the point it turns about, so re-pivoting onto the
+    /// drawn rect's centre is exactly "that centre does not move". It used to,
+    /// and the icon orbited the offset. See `recentered_transformation`.
+    #[test]
+    fn a_rotated_svg_turns_about_the_centre_of_the_rect_it_is_drawn_in() {
+        // 12px at 150%: an 18-device-pixel sprite whose element centre lands on
+        // a half pixel, which is what the snapping then rounds away from.
+        let pivot = point(ScaledPixels(159.5), ScaledPixels(80.5));
+        let center = point(ScaledPixels(159.), ScaledPixels(80.));
+        let built = crate::TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(crate::radians(0.7))
+            .translate(point(ScaledPixels(-pivot.x.0), ScaledPixels(-pivot.y.0)));
+
+        let (moved_x, moved_y) = transformed(built, center);
+        assert!(
+            (moved_x - center.x.0).hypot(moved_y - center.y.0) > 0.1,
+            "the matrix as built turns the drawn rect about a point off its centre"
+        );
+
+        let recentered = super::recentered_transformation(built, pivot, center);
+
+        let (fixed_x, fixed_y) = transformed(recentered, center);
+        assert!((fixed_x - center.x.0).abs() < 1e-3);
+        assert!((fixed_y - center.y.0).abs() < 1e-3);
+    }
+
+    /// Nothing to re-pivot, and nothing is touched.
+    #[test]
+    fn an_untransformed_svg_keeps_the_unit_matrix() {
+        assert_eq!(
+            super::recentered_transformation(
+                crate::TransformationMatrix::unit(),
+                point(ScaledPixels(159.5), ScaledPixels(80.5)),
+                point(ScaledPixels(159.), ScaledPixels(80.)),
+            ),
+            crate::TransformationMatrix::unit()
+        );
+    }
 
     #[cfg(feature = "profiler")]
     #[gpui::test]
