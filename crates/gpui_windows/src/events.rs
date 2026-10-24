@@ -170,8 +170,15 @@ impl WindowsWindowInner {
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
-            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            // Sent by the vsync thread. `WM_USER` values are not private to
+            // this process (another app can send or broadcast them), and the
+            // device-lost one carries a pointer, so check the sender.
+            WM_GPUI_FORCE_UPDATE_WINDOW if wparam.0 == self.validation_number => {
+                self.draw_window(handle, true)
+            }
+            WM_GPUI_GPU_DEVICE_LOST if wparam.0 == self.validation_number => {
+                self.handle_device_lost(lparam)
+            }
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             _ => None,
@@ -314,6 +321,8 @@ impl WindowsWindowInner {
             self.state
                 .invalidate_devices
                 .store(true, std::sync::atomic::Ordering::Release);
+            // The vsync thread recreates the devices, and may be asleep.
+            self.state.frame_request.wake_worker();
         }
         // Same dedup as `handle_move_msg`: only a real change fans out to the
         // bounds observers. Keyed on (size, scale) because a DPI change can
@@ -386,6 +395,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        // From here on the handle value may be reused by a new window, which
+        // must not receive this one's frames; see `close_one_window`.
+        self.state.frame_request.close();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -1446,15 +1458,14 @@ impl WindowsWindowInner {
         // A gesture may be starting; `draw_window` polls Direct Manipulation
         // and keeps frames coming while it reports one.
         if self.state.direct_manipulation.on_pointer_hit_test(wparam) {
-            self.state
-                .frame_demand
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_request.request();
         }
         None
     }
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        count_paint();
         let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
             log::debug!("deferring re-entrant draw of window {handle:?}");
             if force_render {
@@ -1469,9 +1480,7 @@ impl WindowsWindowInner {
             // thread may invalidate the window as soon as the demand is set,
             // and validating after that would erase the deferred frame.
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
-            self.state
-                .frame_demand
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_request.request();
             return Some(0);
         };
         // Validate up front for the same reason: anything that asks for a
@@ -1487,9 +1496,7 @@ impl WindowsWindowInner {
         // happens here. Keep frames coming while one may be in progress, or
         // an idle window would freeze the gesture.
         if self.state.direct_manipulation.needs_updates() {
-            self.state
-                .frame_demand
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_request.request();
         }
 
         let events = self.state.direct_manipulation.drain_events();

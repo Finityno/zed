@@ -573,6 +573,7 @@ impl DirectXRenderer {
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
+        count_present();
         if !self.logged_first_present {
             self.logged_first_present = true;
             // The launch resize storm in one line: how many swap-chain
@@ -853,6 +854,8 @@ impl DirectXRenderer {
         // this present draws, before anything idle is retired.
         self.atlas.on_frame_drawn(scene);
 
+        count_present();
+        count_present();
         unsafe {
             self.resources
                 .as_ref()
