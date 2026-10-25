@@ -157,14 +157,12 @@ impl PlatformDisplay for WindowsDisplay {
     }
 }
 
-/// The refresh interval of `hmonitor`'s current mode.
 pub(crate) fn monitor_refresh_interval(hmonitor: HMONITOR) -> Option<std::time::Duration> {
     get_monitor_info(hmonitor)
         .log_err()
         .and_then(|info| refresh_interval_for_device(&info.szDevice))
 }
 
-/// The monitors that `rect`, in screen pixels, overlaps.
 pub(crate) fn monitors_under(rect: RECT) -> SmallVec<[HMONITOR; 4]> {
     let mut monitors: SmallVec<[HMONITOR; 4]> = SmallVec::new();
     unsafe {

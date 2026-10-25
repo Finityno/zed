@@ -2002,9 +2002,8 @@ fn notify_frame_changed(handle: HWND) {
     }
 }
 
-/// The client size a window rectangle of `proposed` gives, keeping the frame
-/// the window has now (`window` and `client` as `GetWindowRect` and
-/// `GetClientRect` report them).
+/// `window` and `client` are the current `GetWindowRect` and `GetClientRect`,
+/// whose difference is the frame the proposed rectangle keeps.
 fn client_size_for(proposed: RECT, window: RECT, client: RECT) -> Size<DevicePixels> {
     let frame_width = (window.right - window.left) - client.right;
     let frame_height = (window.bottom - window.top) - client.bottom;

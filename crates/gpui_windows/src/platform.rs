@@ -557,8 +557,6 @@ impl WindowsPlatform {
     }
 }
 
-/// Asks for the next frame of every window in `windows` that wants one and
-/// whose monitor `ticks` accepts.
 fn tick_windows(
     windows: &[TrackedWindow],
     monitors: &Mutex<WindowMonitors>,

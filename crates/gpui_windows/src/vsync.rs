@@ -184,14 +184,12 @@ impl WindowMonitors {
         entry.0
     }
 
-    /// Forgets windows that are gone.
     pub(crate) fn retain(&mut self, live: impl Fn(isize) -> bool) {
         self.windows.retain(|hwnd, _| live(*hwnd));
     }
 }
 
-/// The monitor with the shortest refresh interval; one whose rate is unknown
-/// counts as the slowest.
+/// A monitor whose rate is unknown counts as the slowest.
 fn fastest(monitors: &[(isize, Option<Duration>)]) -> Option<isize> {
     monitors
         .iter()
