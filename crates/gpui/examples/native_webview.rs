@@ -7,18 +7,14 @@ fn main() {
 mod macos {
     use std::rc::Rc;
 
-    use cocoa::{
-        appkit::NSView,
-        base::{YES, id, nil},
-        foundation::{NSPoint, NSRect, NSSize, NSString},
-    };
     use gpui::{
         App, Bounds, Context, Div, Element, ElementId, GlobalElementId, IntoElement, LayoutId,
         MouseButton, Pixels, Stateful, Style, Window, WindowBounds, WindowOptions, deferred, div,
         prelude::*, px, relative, rgb, size,
     };
     use gpui_platform::application;
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[link(name = "WebKit", kind = "framework")]
@@ -27,8 +23,8 @@ mod macos {
     const PAGE: &str = include_str!("native_webview.html");
 
     struct NativeWebView {
-        parent: id,
-        view: id,
+        parent: *mut AnyObject,
+        view: *mut AnyObject,
     }
 
     impl NativeWebView {
@@ -37,47 +33,42 @@ mod macos {
                 anyhow::anyhow!("failed to get AppKit window handle: {error:?}")
             })?;
             let parent = match window_handle.as_raw() {
-                RawWindowHandle::AppKit(handle) => handle.ns_view.as_ptr() as id,
+                RawWindowHandle::AppKit(handle) => handle.ns_view.as_ptr().cast::<AnyObject>(),
                 _ => anyhow::bail!("native_webview requires an AppKit window"),
             };
 
             unsafe {
-                let configuration: id = msg_send![class!(WKWebViewConfiguration), new];
-                let view: id = msg_send![class!(WKWebView), alloc];
-                let view: id = msg_send![
+                let configuration: Retained<AnyObject> =
+                    msg_send![class!(WKWebViewConfiguration), new];
+                let view: *mut AnyObject = msg_send![class!(WKWebView), alloc];
+                let view: *mut AnyObject = msg_send![
                     view,
-                    initWithFrame: NSRect::new(
-                        NSPoint::new(0., 0.),
-                        NSSize::new(0., 0.),
-                    )
-                    configuration: configuration
+                    initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+                    configuration: &*configuration
                 ];
                 if view.is_null() {
-                    let _: () = msg_send![configuration, release];
                     anyhow::bail!("failed to create WKWebView");
                 }
 
-                let _: () = msg_send![view, setWantsLayer: YES];
-                let layer: id = msg_send![view, layer];
-                let border_color: id = msg_send![
+                let _: () = msg_send![view, setWantsLayer: true];
+                let layer: *mut AnyObject = msg_send![view, layer];
+                let border_color: *mut AnyObject = msg_send![
                     class!(NSColor),
-                    colorWithSRGBRed: 63. / 255.
-                    green: 64. / 255.
-                    blue: 67. / 255.
+                    colorWithSRGBRed: 63. / 255.,
+                    green: 64. / 255.,
+                    blue: 67. / 255.,
                     alpha: 1.
                 ];
-                let border_color: id = msg_send![border_color, CGColor];
-                let _: () = msg_send![layer, setMasksToBounds: YES];
+                let border_color: *mut AnyObject = msg_send![border_color, CGColor];
+                let _: () = msg_send![layer, setMasksToBounds: true];
                 let _: () = msg_send![layer, setCornerRadius: 8.];
                 let _: () = msg_send![layer, setBorderWidth: 1.];
                 let _: () = msg_send![layer, setBorderColor: border_color];
 
-                let html = NSString::alloc(nil).init_str(PAGE);
-                let _: id = msg_send![view, loadHTMLString: html baseURL: nil];
-                parent.addSubview_(view);
-
-                let _: () = msg_send![html, release];
-                let _: () = msg_send![configuration, release];
+                let html = NSString::from_str(PAGE);
+                let _: *mut AnyObject =
+                    msg_send![view, loadHTMLString: &*html, baseURL: std::ptr::null::<AnyObject>()];
+                let _: () = msg_send![parent, addSubview: view];
 
                 Ok(Self { parent, view })
             }
@@ -85,7 +76,7 @@ mod macos {
 
         fn set_bounds(&self, bounds: Bounds<Pixels>) {
             unsafe {
-                let parent_bounds = NSView::bounds(self.parent);
+                let parent_bounds: NSRect = msg_send![self.parent, bounds];
                 let frame = NSRect::new(
                     NSPoint::new(
                         f64::from(bounds.origin.x),
@@ -101,7 +92,7 @@ mod macos {
 
         fn focus_parent(&self) {
             unsafe {
-                let window: id = msg_send![self.view, window];
+                let window: *mut AnyObject = msg_send![self.view, window];
                 if !window.is_null() {
                     let _: bool = msg_send![window, makeFirstResponder: self.parent];
                 }
@@ -112,7 +103,7 @@ mod macos {
     impl Drop for NativeWebView {
         fn drop(&mut self) {
             unsafe {
-                NSView::removeFromSuperview(self.view);
+                let _: () = msg_send![self.view, removeFromSuperview];
                 let _: () = msg_send![self.view, release];
             }
         }

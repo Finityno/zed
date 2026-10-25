@@ -188,10 +188,10 @@ unicode-segmentation.workspace = true
 util_macros.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-# The native_webview example hosts a WKWebView through the legacy cocoa/objc
-# bindings gpui_macos uses; gpui itself does not depend on them.
-cocoa.workspace = true
-objc.workspace = true
+# The native_webview example hosts a WKWebView through objc2 directly; gpui
+# itself does not depend on these bindings.
+objc2.workspace = true
+objc2-foundation.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }

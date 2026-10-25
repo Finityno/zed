@@ -7,34 +7,16 @@ use crate::{
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block2::RcBlock;
-use cocoa::{
-    appkit::{
-        NSApplication, NSBackingStoreBuffered, NSColor, NSControl as _, NSMenu, NSMenuItem, NSEvent, NSEventModifierFlags, NSEventType,
-        NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
-        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode,
-        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-        NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-        NSWindowStyleMask, NSWindowTitleVisibility,
-    },
-    base::{id, nil},
-    foundation::{
-        NSArray, NSAutoreleasePool, NSData, NSDictionary, NSFastEnumeration, NSInteger, NSNotFound,
-        NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect, NSSize, NSString, NSUInteger,
-        NSUserDefaults,
-    },
-};
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keymap, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    NativeMenuItem, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PresentOutcome, PresentReport, PromptButton, PromptLevel, RequestFrameOptions, Rgba,
-    SharedString, Size, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowGlassStyle,
-    WindowKind, WindowParams, WindowVisibility, point, px, size,
-    FrameRequestSource, PlatformFrameSignal,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keymap,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, NativeMenuItem, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PresentOutcome, PresentReport,
+    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowGlassStyle, WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -58,21 +40,20 @@ use objc2::{
 )]
 use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSAppearance, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep,
+    NSAlert, NSAlertStyle, NSAppearance, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep, NSControlStateValueOn,
     NSButton, NSColor, NSDragOperation, NSDraggingContext, NSDraggingImageComponent,
-    NSDraggingImageComponentIconKey, NSDraggingItem, NSEventModifierFlags, NSEventType,
-    NSPasteboardWriting, NSRequestUserAttentionType, NSScreen, NSTrackingArea,
+    NSDraggingImageComponentIconKey, NSDraggingItem, NSEventModifierFlags, NSEventType, NSMenu,
+    NSMenuItem, NSPasteboardWriting, NSRequestUserAttentionType, NSScreen, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow, NSWindowAnimationBehavior,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
+    NSVisualEffectMaterial, NSVisualEffectState, NSWindow,
+    NSWindowAnimationBehavior, NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{
-    NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect,
-    NSSize, NSString, NSUInteger, NSURL,
+    NSActivityOptions, NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint,
+    NSProcessInfo, NSRect, NSSize, NSString, NSUInteger, NSURL,
 };
-use objc2_foundation::{NSActivityOptions, NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSURL};
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
@@ -92,22 +73,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-const WINDOW_STATE_IVAR: &str = "windowState";
-const OVERLAY_INPUT_IVAR: &str = "overlayInputActive";
+const WINDOW_STATE_IVAR: &CStr = c"windowState";
+const OVERLAY_INPUT_IVAR: &CStr = c"overlayInputActive";
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
-static mut WINDOW_CLASS: *const Class = ptr::null();
-static mut PANEL_CLASS: *const Class = ptr::null();
-static mut VIEW_CLASS: *const Class = ptr::null();
-static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
-static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
-static mut OVERLAY_BACKDROP_VIEW_CLASS: *const Class = ptr::null();
-static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const Class = ptr::null();
-static mut WINDOW_STATE_UNARCHIVER_CLASS: *const Class = ptr::null();
-static mut CONTEXT_MENU_TARGET_CLASS: *const Class = ptr::null();
+static mut WINDOW_CLASS: *const AnyClass = ptr::null();
+static mut PANEL_CLASS: *const AnyClass = ptr::null();
+static mut VIEW_CLASS: *const AnyClass = ptr::null();
+static mut OVERLAY_VIEW_CLASS: *const AnyClass = ptr::null();
+static mut BLURRED_VIEW_CLASS: *const AnyClass = ptr::null();
+static mut OVERLAY_BACKDROP_VIEW_CLASS: *const AnyClass = ptr::null();
+static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const AnyClass = ptr::null();
+static mut WINDOW_STATE_UNARCHIVER_CLASS: *const AnyClass = ptr::null();
+static mut CONTEXT_MENU_TARGET_CLASS: *const AnyClass = ptr::null();
 
-const CONTEXT_MENU_SELECTION_IVAR: &str = "contextMenuSelection";
+const CONTEXT_MENU_SELECTION_IVAR: &CStr = c"contextMenuSelection";
 
 // WindowLevel const value ref: https://docs.rs/core-graphics2/0.4.1/src/core_graphics2/window_level.rs.html
 #[allow(non_upper_case_globals)]
@@ -116,34 +97,29 @@ const NSNormalWindowLevel: NSInteger = 0;
 const NSFloatingWindowLevel: NSInteger = 3;
 #[allow(non_upper_case_globals)]
 const NSPopUpWindowLevel: NSInteger = 101;
-#[allow(non_upper_case_globals)]
-const NSWindowAnimationBehaviorUtilityWindow: NSInteger = 4;
-#[allow(non_upper_case_globals)]
-const NSViewLayerContentsRedrawDuringViewResize: NSInteger = 2;
-// https://developer.apple.com/documentation/appkit/nsdragoperation
-type NSDragOperation = NSUInteger;
-#[allow(non_upper_case_globals)]
-const NSDragOperationNone: NSDragOperation = 0;
-#[allow(non_upper_case_globals)]
-const NSDragOperationCopy: NSDragOperation = 1;
-#[allow(non_upper_case_globals)]
-const NSDragOperationMove: NSDragOperation = 16;
-const NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION: NSInteger = 0;
-const NSDRAGGING_CONTEXT_WITHIN_APPLICATION: NSInteger = 1;
 
-extern "C" fn overlay_hit_test(this: &Object, _: Sel, _: NSPoint) -> id {
-    let active = unsafe {
-        let raw: *mut c_void = *this.get_ivar(OVERLAY_INPUT_IVAR);
-        &*(raw as *const AtomicBool)
-    };
-    if active.load(Ordering::Acquire) {
-        this as *const Object as id
-    } else {
-        nil
+/// The `void *` instance variable `name` of `object`, which this file's
+/// classes declare for the state they share with Rust.
+unsafe fn ivar_slot(object: &AnyObject, name: &CStr) -> *mut *mut c_void {
+    unsafe {
+        object
+            .class()
+            .instance_variable(name)
+            .expect("GPUI instance variable")
+            .load_ptr::<*mut c_void>(object)
     }
 }
 
-extern "C" fn handle_overlay_event(this: &Object, selector: Sel, native_event: id) {
+extern "C" fn overlay_hit_test(this: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
+    let active = unsafe { &*(*ivar_slot(this, OVERLAY_INPUT_IVAR) as *const AtomicBool) };
+    if active.load(Ordering::Acquire) {
+        ptr::from_ref(this).cast_mut()
+    } else {
+        ptr::null_mut()
+    }
+}
+
+extern "C" fn handle_overlay_event(this: &AnyObject, selector: Sel, native_event: *mut AnyObject) {
     let window_state = unsafe { get_window_state(this) };
     let native_view = window_state.lock().native_view;
     unsafe {
@@ -161,15 +137,15 @@ pub enum UserTabbingPreference {
 #[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
-        WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
-        PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
-        CONTEXT_MENU_TARGET_CLASS = match ClassDecl::new("GPUIContextMenuTarget", class!(NSObject))
+        WINDOW_CLASS = build_window_class(c"GPUIWindow", class!(NSWindow));
+        PANEL_CLASS = build_window_class(c"GPUIPanel", class!(NSPanel));
+        CONTEXT_MENU_TARGET_CLASS = match ClassBuilder::new(c"GPUIContextMenuTarget", class!(NSObject))
         {
             Some(mut decl) => {
                 decl.add_ivar::<*mut c_void>(CONTEXT_MENU_SELECTION_IVAR);
                 decl.add_method(
                     sel!(handleGPUIContextMenuItem:),
-                    handle_context_menu_item as extern "C" fn(&Object, Sel, id),
+                    handle_context_menu_item as extern "C" fn(_, Sel, *mut AnyObject),
                 );
                 decl.register()
             }
@@ -347,24 +323,24 @@ unsafe fn build_classes() {
             decl.register()
         };
         OVERLAY_VIEW_CLASS = {
-            let mut decl = ClassDecl::new("GPUIOverlayView", class!(NSView)).unwrap();
+            let mut decl = ClassBuilder::new(c"GPUIOverlayView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
             decl.add_ivar::<*mut c_void>(OVERLAY_INPUT_IVAR);
             decl.add_method(
                 sel!(dealloc),
-                dealloc_overlay_view as extern "C" fn(&Object, Sel),
+                dealloc_overlay_view as extern "C" fn(_, Sel),
             );
             decl.add_method(
                 sel!(hitTest:),
-                overlay_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                overlay_hit_test as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
             );
             // Same answer as the base view: while the overlay holds content
             // (a popover left open when the user switched apps) it is the
-            // view AppKit asks, and NSView's default NO would activate the
+            // view AppKit asks, and NSView's default Bool::NO would activate the
             // window and swallow that first click instead of delivering it.
             decl.add_method(
                 sel!(acceptsFirstMouse:),
-                accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
+                accepts_first_mouse as extern "C" fn(_, Sel, *mut AnyObject) -> Bool,
             );
             for selector in [
                 sel!(mouseDown:),
@@ -385,7 +361,7 @@ unsafe fn build_classes() {
             ] {
                 decl.add_method(
                     selector,
-                    handle_overlay_event as extern "C" fn(&Object, Sel, id),
+                    handle_overlay_event as extern "C" fn(_, Sel, *mut AnyObject),
                 );
             }
             decl.register()
@@ -403,14 +379,14 @@ unsafe fn build_classes() {
             decl.register()
         };
         OVERLAY_BACKDROP_VIEW_CLASS = {
-            let mut decl = ClassDecl::new("GPUIOverlayBackdropView", class!(NSView)).unwrap();
+            let mut decl = ClassBuilder::new(c"GPUIOverlayBackdropView", class!(NSView)).unwrap();
             decl.add_method(
                 sel!(makeBackingLayer),
-                overlay_backdrop_backing_layer as extern "C" fn(&Object, Sel) -> id,
+                overlay_backdrop_backing_layer as extern "C" fn(_, Sel) -> *mut AnyObject,
             );
             decl.add_method(
                 sel!(hitTest:),
-                overlay_backdrop_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                overlay_backdrop_hit_test as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
             );
             decl.register()
         };
@@ -480,7 +456,7 @@ extern "C" fn window_state_unarchiver_restoration_options(
         return ptr::null_mut();
     }
     // SAFETY: we look the class up by name and only send it `alloc`/`init`/`autorelease`, all of
-    // which have the standard `-> id` signature. Returning `nil` when the class is absent is valid.
+    // which have the standard `-> *mut AnyObject` signature. Returning `ptr::null_mut()` when the class is absent is valid.
     unsafe {
         match AnyClass::get(c"NSWindowRestorationOptions") {
             Some(class) => {
@@ -503,29 +479,30 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
 
 unsafe fn create_native_context_menu(
     items: &[NativeMenuItem],
-    target: id,
+    target: *mut AnyObject,
     keymap: &Keymap,
     next_tag: &mut NSInteger,
-) -> id {
+) -> *mut AnyObject {
     unsafe {
-        let menu = NSMenu::new(nil);
+        let mtm = MainThreadMarker::new_unchecked();
+        let menu = NSMenu::new(mtm);
         // The items are enabled explicitly below; the target deliberately does not
         // implement `validateMenuItem:`, so automatic enabling must stay off.
-        let _: () = msg_send![menu, setAutoenablesItems: NO];
+        menu.setAutoenablesItems(false);
         for item in items {
-            let ns_item = match item {
-                NativeMenuItem::Separator => NSMenuItem::separatorItem(nil),
+            let ns_item: Retained<NSMenuItem> = match item {
+                NativeMenuItem::Separator => NSMenuItem::separatorItem(mtm),
                 NativeMenuItem::Submenu {
                     name,
                     items,
                     disabled,
                 } => {
-                    let ns_item = NSMenuItem::new(nil).autorelease();
+                    let ns_item = NSMenuItem::new(mtm);
                     let submenu = create_native_context_menu(items, target, keymap, next_tag);
-                    ns_item.setSubmenu_(submenu);
+                    let _: () = msg_send![&*ns_item, setSubmenu: submenu];
                     let _: () = msg_send![submenu, release];
-                    ns_item.setTitle_(ns_string(name));
-                    ns_item.setEnabled_(if *disabled { NO } else { YES });
+                    ns_item.setTitle(&NSString::from_str(name));
+                    ns_item.setEnabled(!*disabled);
                     ns_item
                 }
                 NativeMenuItem::Entry(entry) => {
@@ -536,27 +513,29 @@ unsafe fn create_native_context_menu(
                         &entry.name,
                         sel!(handleGPUIContextMenuItem:),
                         keystrokes,
+                        mtm,
                     );
                     if entry.checked {
-                        ns_item.setState_(NSVisualEffectState::Active);
+                        ns_item.setState(NSControlStateValueOn);
                     }
-                    ns_item.setEnabled_(if entry.disabled { NO } else { YES });
-                    let _: () = msg_send![ns_item, setTarget: target];
-                    let _: () = msg_send![ns_item, setTag: *next_tag];
+                    ns_item.setEnabled(!entry.disabled);
+                    let _: () = msg_send![&*ns_item, setTarget: target];
+                    ns_item.setTag(*next_tag);
                     *next_tag += 1;
                     ns_item
                 }
             };
-            menu.addItem_(ns_item);
+            menu.addItem(&ns_item);
         }
-        menu
+        // Owned (+1) by the caller, which releases it.
+        Retained::into_raw(menu).cast()
     }
 }
 
-extern "C" fn handle_context_menu_item(this: &Object, _: Sel, item: id) {
+extern "C" fn handle_context_menu_item(this: &AnyObject, _: Sel, item: *mut AnyObject) {
     unsafe {
         let selection =
-            *this.get_ivar::<*mut c_void>(CONTEXT_MENU_SELECTION_IVAR) as *mut Cell<isize>;
+            *ivar_slot(this, CONTEXT_MENU_SELECTION_IVAR) as *mut Cell<isize>;
         if selection.is_null() {
             return;
         }
@@ -837,12 +816,12 @@ struct MacWindowState {
     handle: AnyWindowHandle,
     foreground_executor: ForegroundExecutor,
     background_executor: BackgroundExecutor,
-    native_window: id,
-    native_view: NonNull<Object>,
-    overlay_view: Option<NonNull<Object>>,
+    native_window: *mut AnyObject,
+    native_view: NonNull<AnyObject>,
+    overlay_view: Option<NonNull<AnyObject>>,
     overlay_backdrops: Vec<OverlayBackdrop>,
     overlay_input_active: Arc<AtomicBool>,
-    blurred_view: Option<id>,
+    blurred_view: Option<*mut AnyObject>,
     // Requested glass backdrop tint; applied to `blurred_view` when it is an
     // `NSGlassEffectView`, remembered here so recreations reapply it.
     glass_tint: Option<Rgba>,
@@ -923,7 +902,7 @@ struct MacWindowState {
     printing: crate::printing::PrintOwner,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
-    sheet_parent: Option<id>,
+    sheet_parent: Option<*mut AnyObject>,
     /// The most recently presented native context menu. Held here — not
     /// released when its selection is reported — so a stray action message
     /// delivered after the tracking session still lands on live objects; the
@@ -946,8 +925,8 @@ struct MacWindowState {
 /// there.
 struct ActiveContextMenu {
     generation: u64,
-    menu: id,
-    target: id,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     selection: *mut Cell<isize>,
 }
 
@@ -955,15 +934,15 @@ struct ActiveContextMenu {
 /// can be handed to the main queue whole when the last reference goes away on
 /// another thread.
 struct ContextMenuTeardown {
-    menu: id,
-    target: id,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     selection: *mut Cell<isize>,
 }
 
 impl ContextMenuTeardown {
     unsafe fn run(self) {
         unsafe {
-            (*self.target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, ptr::null_mut::<c_void>());
+            *ivar_slot(&*self.target, CONTEXT_MENU_SELECTION_IVAR) = ptr::null_mut();
             let _: () = msg_send![self.menu, release];
             let _: () = msg_send![self.target, release];
             drop(Box::from_raw(self.selection));
@@ -984,8 +963,8 @@ impl Drop for ActiveContextMenu {
             target: self.target,
             selection: self.selection,
         };
-        let is_main_thread: BOOL = unsafe { msg_send![class!(NSThread), isMainThread] };
-        if is_main_thread == YES {
+        let is_main_thread: Bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+        if is_main_thread == Bool::YES {
             unsafe { teardown.run() }
         } else {
             unsafe {
@@ -1128,11 +1107,10 @@ impl MacWindowState {
     /// visible keeps an occluded window at zero; the frame's command buffer
     /// holds its own references until the GPU is done.
     fn release_intermediates_if_occluded(&mut self) {
-        let visible = unsafe {
-            self.native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        };
+        let visible = self
+            .native_window()
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible);
         if visible || self.render_while_hidden {
             return;
         }
@@ -1144,15 +1122,13 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
-        unsafe {
-            if !self.render_while_hidden
-                && !self
-                    .native_window
-                    .occlusionState()
-                    .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-            {
-                return;
-            }
+        if !self.render_while_hidden
+            && !self
+                .native_window()
+                .occlusionState()
+                .contains(NSWindowOcclusionState::Visible)
+        {
+            return;
         }
         let screen: *mut AnyObject = unsafe { msg_send![self.native_window, screen] };
         let Some(display_id) = display_id_for_screen(screen) else {
@@ -1553,18 +1529,19 @@ impl MacWindow {
                         // NSPanel defaults to hiding when the app deactivates. Clear that so
                         // floating windows stay visible above normal windows when focus moves to
                         // another app, matching the expected "always on top" behavior.
-                        let _: () = msg_send![native_window, setFloatingPanel: YES];
-                        let _: () = msg_send![native_window, setHidesOnDeactivate: NO];
+                        let _: () = msg_send![native_window, setFloatingPanel: Bool::YES];
+                        let _: () = msg_send![native_window, setHidesOnDeactivate: Bool::NO];
                         // Let the window float keep above normal windows.
-                        native_window.setLevel_(NSFloatingWindowLevel);
+                        let _: () = msg_send![native_window, setLevel: NSFloatingWindowLevel];
                         // "Always on top" has to hold across Spaces and over
                         // fullscreen apps too, or the panel is simply left
                         // behind on the Space it was opened on.
-                        native_window.setCollectionBehavior_(
-                            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
-                                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
-                        );
-                        native_window.setAcceptsMouseMovedEvents_(YES);
+                        let _: () = msg_send![
+                            native_window,
+                            setCollectionBehavior: NSWindowCollectionBehavior::CanJoinAllSpaces
+                                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                        ];
+                        let _: () = msg_send![native_window, setAcceptsMouseMovedEvents: Bool::YES];
                     } else {
                         let _: () = msg_send![native_window, setLevel: NSNormalWindowLevel];
                         let _: () = msg_send![native_window, setAcceptsMouseMovedEvents: Bool::NO];
@@ -1771,11 +1748,11 @@ impl Drop for MacWindow {
                     if let Some(parent) = sheet_parent {
                         let _: () = msg_send![parent, endSheet: window];
                     }
-                    window.close();
+                    let _: () = msg_send![window, close];
                     drop(accesskit_adapter);
                     drop(last_left_mouse_down_event);
                     drop(active_context_menu);
-                    window.autorelease();
+                    let _: *mut AnyObject = msg_send![window, autorelease];
                 }
             })
             .detach();
@@ -2033,11 +2010,11 @@ impl PlatformWindow for MacWindow {
         // thread on the first application.
         let native_window = self.0.lock().native_window;
         unsafe {
-            let native_appearance: id = match appearance {
+            let native_appearance: *mut AnyObject = match appearance {
                 Some(appearance) => {
                     crate::window_appearance::window_appearance_to_native(appearance)
                 }
-                None => nil,
+                None => ptr::null_mut(),
             };
             let _: () = msg_send![native_window, setAppearance: native_appearance];
         }
@@ -2101,7 +2078,7 @@ impl PlatformWindow for MacWindow {
             let state = self.0.lock();
             // SAFETY: MacWindow owns this NSWindow; retaining it keeps the object alive
             // while native completion unwinds after GPUI has closed its owner.
-            let parent = unsafe { Retained::retain(state.native_window as *mut Objc2NSWindow) };
+            let parent = unsafe { Retained::retain(state.native_window .cast::<NSWindow>()) };
             (parent, state.printing.clone(), state.foreground_executor.clone())
         };
         if let Some(parent) = parent { return crate::printing::print_pdf(parent, self.1, options, owner, &executor); }
@@ -2284,14 +2261,14 @@ impl PlatformWindow for MacWindow {
         this.renderer.update_transparency(transparent_layer);
 
         unsafe {
-            this.native_window.setOpaque_(opaque_window as BOOL);
+            let _: () = msg_send![this.native_window, setOpaque: opaque_window.to_objc()];
             let background_color = if background_appearance == WindowBackgroundAppearance::Opaque
             {
-                NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64)
+                NSColor::colorWithSRGBRed_green_blue_alpha(0f64, 0f64, 0f64, 1f64)
             } else if opaque_window {
                 // Behind the backdrop view; an opaque window needs an opaque
                 // fallback fill.
-                msg_send![class!(NSColor), windowBackgroundColor]
+                NSColor::windowBackgroundColor()
             } else {
                 // Not using `+[NSColor clearColor]` to avoid broken shadow.
                 NSColor::colorWithSRGBRed_green_blue_alpha(0f64, 0f64, 0f64, 0.0001)
@@ -2313,8 +2290,8 @@ impl PlatformWindow for MacWindow {
                 }
             }
             if wants_backdrop_view && this.blurred_view.is_none() {
-                let content_view = this.native_window.contentView();
-                let frame = NSView::bounds(content_view);
+                let content_view: *mut AnyObject = msg_send![this.native_window, contentView];
+                let frame: NSRect = msg_send![content_view, bounds];
                 // On macOS 26+ use the native Liquid Glass material
                 // (`NSGlassEffectView`), which refracts the window's
                 // backdrop with edge lensing and highlights instead of the
@@ -2323,13 +2300,13 @@ impl PlatformWindow for MacWindow {
                 // it always for the opaque-window Mica modes (the glass
                 // view needs a non-opaque window to sample the desktop).
                 let glass_class = if background_appearance == WindowBackgroundAppearance::Blurred {
-                    Class::get("NSGlassEffectView")
+                    AnyClass::get(c"NSGlassEffectView")
                 } else {
                     None
                 };
-                let blur_view: id = if let Some(glass_class) = glass_class {
-                    let view: id = msg_send![glass_class, alloc];
-                    NSView::initWithFrame_(view, frame)
+                let blur_view: *mut AnyObject = if let Some(glass_class) = glass_class {
+                    let view: *mut AnyObject = msg_send![glass_class, alloc];
+                    msg_send![view, initWithFrame: frame]
                 } else if opaque_window {
                     // Mica: a plain, natively-configured visual effect
                     // view with the real sidebar material. BlurredView's
@@ -2337,19 +2314,17 @@ impl PlatformWindow for MacWindow {
                     // tuned for the colorless non-opaque blur; what
                     // remains of them in an opaque window renders as a
                     // glowing wash instead of glass.
-                    let view: id = msg_send![class!(NSVisualEffectView), alloc];
-                    let view: id = NSView::initWithFrame_(view, frame);
-                    NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Sidebar);
-                    NSVisualEffectView::setState_(
-                        view,
-                        NSVisualEffectState::FollowsWindowActiveState,
-                    );
+                    let view: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+                    let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
+                    let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::Sidebar];
+                    let _: () =
+                        msg_send![view, setState: NSVisualEffectState::FollowsWindowActiveState];
                     view
                 } else {
-                    let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
-                    NSView::initWithFrame_(view, frame)
+                    let view: *mut AnyObject = msg_send![BLURRED_VIEW_CLASS, alloc];
+                    msg_send![view, initWithFrame: frame]
                 };
-                blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                let _: () = msg_send![blur_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
                 apply_glass_style(blur_view, this.glass_style);
                 apply_glass_tint(blur_view, this.glass_tint);
 
@@ -2365,10 +2340,10 @@ impl PlatformWindow for MacWindow {
                 // observer hides that one alone, and a Mica backdrop follows
                 // the window's active state through its own material state.
                 if background_appearance == WindowBackgroundAppearance::Blurred {
-                    let is_key = this.native_window.isKeyWindow() == YES;
-                    let _: () = msg_send![blur_view, setHidden: (!is_key) as BOOL];
+                    let is_key = this.native_window().isKeyWindow();
+                    let _: () = msg_send![blur_view, setHidden: (!is_key).to_objc()];
                 }
-                this.blurred_view = Some(blur_view.autorelease());
+                this.blurred_view = Some(msg_send![blur_view, autorelease]);
             }
         }
     }
@@ -2463,9 +2438,9 @@ impl PlatformWindow for MacWindow {
 
         unsafe {
             let selection = Box::into_raw(Box::new(Cell::new(-1isize)));
-            let target: id = msg_send![target_class, alloc];
-            let target: id = msg_send![target, init];
-            (*target).set_ivar(CONTEXT_MENU_SELECTION_IVAR, selection as *mut c_void);
+            let target: *mut AnyObject = msg_send![target_class, alloc];
+            let target: *mut AnyObject = msg_send![target, init];
+            *ivar_slot(&*target, CONTEXT_MENU_SELECTION_IVAR) = selection.cast::<c_void>();
 
             let mut next_tag: NSInteger = 0;
             let ns_menu = create_native_context_menu(&menu, target, keymap, &mut next_tag);
@@ -2489,7 +2464,7 @@ impl PlatformWindow for MacWindow {
             lock.active_context_menu = Some(Arc::clone(&invocation));
             drop(lock);
 
-            let native_view: id = msg_send![native_view, retain];
+            let native_view: *mut AnyObject = msg_send![native_view, retain];
 
             let ns_position = NSPoint::new(
                 f64::from(position.x),
@@ -2526,10 +2501,10 @@ impl PlatformWindow for MacWindow {
                         let _: () = msg_send![native_view, release];
                         return;
                     }
-                    let _: BOOL = msg_send![
+                    let _: Bool = msg_send![
                         invocation.menu,
-                        popUpMenuPositioningItem: nil
-                        atLocation: ns_position
+                        popUpMenuPositioningItem: ptr::null_mut::<AnyObject>(),
+                        atLocation: ns_position,
                         inView: native_view
                     ];
                     // The chosen item's action message can be delivered through
@@ -2831,19 +2806,19 @@ impl PlatformWindow for MacWindow {
             // Re-adding the overlay on repeat calls restores it to the top.
             if let Some(overlay_view) = this.overlay_view {
                 unsafe {
-                    let native_view = this.native_view.as_ptr() as id;
-                    let overlay_view = overlay_view.as_ptr() as id;
-                    let _: id = msg_send![overlay_view, retain];
-                    NSView::removeFromSuperview(overlay_view);
-                    native_view.addSubview_(overlay_view);
+                    let native_view = this.native_view.as_ptr();
+                    let overlay_view = overlay_view.as_ptr();
+                    let _: *mut AnyObject = msg_send![overlay_view, retain];
+                    let _: () = msg_send![overlay_view, removeFromSuperview];
+                    let _: () = msg_send![native_view, addSubview: overlay_view];
                     let _: () = msg_send![overlay_view, release];
                     // The backdrop views belong between the native children
                     // and the overlay, so they follow it above the new child.
                     for backdrop in &this.overlay_backdrops {
                         let _: () = msg_send![
                             native_view,
-                            addSubview: backdrop.view.as_ptr() as id
-                            positioned: NSWindowOrderingMode::NSWindowBelow
+                            addSubview: backdrop.view.as_ptr(),
+                            positioned: NSWindowOrderingMode::Below,
                             relativeTo: overlay_view
                         ];
                     }
@@ -2853,44 +2828,42 @@ impl PlatformWindow for MacWindow {
         }
 
         unsafe {
-            let native_view = this.native_view.as_ptr() as id;
-            let frame = NSView::bounds(native_view);
-            let overlay_view: id = msg_send![OVERLAY_VIEW_CLASS, alloc];
-            let overlay_view = NSView::initWithFrame_(overlay_view, frame);
+            let native_view = this.native_view.as_ptr();
+            let frame: NSRect = msg_send![native_view, bounds];
+            let overlay_view: *mut AnyObject = msg_send![OVERLAY_VIEW_CLASS, alloc];
+            let overlay_view: *mut AnyObject = msg_send![overlay_view, initWithFrame: frame];
             anyhow::ensure!(
                 !overlay_view.is_null(),
                 "failed to create GPUI overlay NSView"
             );
-            (*overlay_view).set_ivar(
-                WINDOW_STATE_IVAR,
-                Arc::into_raw(window_state) as *const c_void,
-            );
-            (*overlay_view).set_ivar(
-                OVERLAY_INPUT_IVAR,
-                Arc::into_raw(this.overlay_input_active.clone()) as *const c_void,
-            );
+            *ivar_slot(&*overlay_view, WINDOW_STATE_IVAR) =
+                Arc::into_raw(window_state).cast_mut().cast::<c_void>();
+            *ivar_slot(&*overlay_view, OVERLAY_INPUT_IVAR) =
+                Arc::into_raw(this.overlay_input_active.clone()).cast_mut().cast::<c_void>();
 
             let mut overlay_renderer =
                 renderer::new_overlay_renderer(this.renderer_context.clone(), &this.renderer);
             let scale_factor = this.scale_factor();
             overlay_renderer
                 .update_drawable_size(this.content_size().to_device_pixels(scale_factor));
-            if let Some(layer) = overlay_renderer.layer() {
-                let _: () = msg_send![layer, setContentsScale: scale_factor as f64];
+            let overlay_layer = overlay_renderer.layer_ptr().cast::<AnyObject>();
+            if !overlay_layer.is_null() {
+                let _: () = msg_send![overlay_layer, setContentsScale: scale_factor as f64];
             }
 
-            overlay_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
-            overlay_view.setWantsLayer(YES);
-            let _: () = msg_send![overlay_view, setLayer: overlay_renderer.layer_ptr()];
+            let _: () = msg_send![overlay_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
+            let _: () = msg_send![overlay_view, setWantsLayer: Bool::YES];
+            let _: () = msg_send![overlay_view, setLayer: overlay_layer];
             let _: () = msg_send![
                 overlay_view,
-                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
+                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize
             ];
 
             // wry has already inserted WKWebView by the time this API is called.
             // Adding the overlay last places it above the WebView in AppKit's
             // back-to-front subview order.
-            native_view.addSubview_(overlay_view.autorelease());
+            let overlay_view: *mut AnyObject = msg_send![overlay_view, autorelease];
+            let _: () = msg_send![native_view, addSubview: overlay_view];
             this.overlay_view = NonNull::new(overlay_view);
             this.overlay_renderer = Some(overlay_renderer);
         }
@@ -2912,7 +2885,7 @@ impl PlatformWindow for MacWindow {
         // autoreleased), so removing it deallocates the view, which drops the
         // window-state and input-flag references its ivars carried.
         unsafe {
-            NSView::removeFromSuperview(overlay_view.as_ptr() as id);
+            let _: () = msg_send![overlay_view.as_ptr(), removeFromSuperview];
         }
         // Dropping the renderer releases the overlay's CAMetalLayer and its
         // drawables. Its borrowed intermediates were handed back to the base
@@ -3257,10 +3230,10 @@ unsafe fn is_gpui_window(window: *mut AnyObject) -> bool {
 /// responds to `setStyle:`; the plain visual-effect fallbacks are left
 /// untouched. Raw values: 0 = regular, 1 = clear (verified by reading the
 /// property back).
-unsafe fn apply_glass_style(view: id, style: WindowGlassStyle) {
+unsafe fn apply_glass_style(view: *mut AnyObject, style: WindowGlassStyle) {
     unsafe {
-        let responds: BOOL = msg_send![view, respondsToSelector: sel!(setStyle:)];
-        if responds == YES {
+        let responds: Bool = msg_send![view, respondsToSelector: sel!(setStyle:)];
+        if responds == Bool::YES {
             let style_value: NSInteger = match style {
                 WindowGlassStyle::Regular => 0,
                 WindowGlassStyle::Clear => 1,
@@ -3273,26 +3246,24 @@ unsafe fn apply_glass_style(view: id, style: WindowGlassStyle) {
 /// Applies `tint` to a glass backdrop view. Only `NSGlassEffectView` responds
 /// to `setTintColor:`; the plain visual-effect fallbacks are left untouched.
 /// `None` restores the untinted adaptive material.
-unsafe fn apply_glass_tint(view: id, tint: Option<Rgba>) {
+unsafe fn apply_glass_tint(view: *mut AnyObject, tint: Option<Rgba>) {
     unsafe {
-        let responds: BOOL = msg_send![view, respondsToSelector: sel!(setTintColor:)];
-        if responds == YES {
-            let color: id = match tint {
-                Some(tint) => NSColor::colorWithSRGBRed_green_blue_alpha_(
-                    nil,
+        let responds: Bool = msg_send![view, respondsToSelector: sel!(setTintColor:)];
+        if responds == Bool::YES {
+            let color = tint.map(|tint| {
+                NSColor::colorWithSRGBRed_green_blue_alpha(
                     tint.r as f64,
                     tint.g as f64,
                     tint.b as f64,
                     tint.a as f64,
-                ),
-                None => nil,
-            };
-            let _: () = msg_send![view, setTintColor: color];
+                )
+            });
+            let _: () = msg_send![view, setTintColor: color.as_deref()];
         }
     }
 }
 
-unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {
+unsafe fn get_window_state(object: &AnyObject) -> Arc<Mutex<MacWindowState>> {
     unsafe {
         let raw = *object
             .class()
@@ -3357,10 +3328,10 @@ fn add_mouse_tracking_area(native_view: &NSView) {
     native_view.addTrackingArea(&tracking_area);
 }
 
-extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
+extern "C" fn dealloc_overlay_view(this: &AnyObject, _: Sel) {
     unsafe {
         drop_window_state(this);
-        let raw: *mut c_void = *this.get_ivar(OVERLAY_INPUT_IVAR);
+        let raw: *mut c_void = *ivar_slot(this, OVERLAY_INPUT_IVAR);
         drop(Arc::from_raw(raw as *const AtomicBool));
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
@@ -3370,10 +3341,10 @@ extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
 // sees a WKWebView child the Metal planes cannot. A within-window
 // NSVisualEffectView would not do: its materials may blur a cached image of
 // the window, which never includes a layer-hosted WebKit view.
-extern "C" fn overlay_backdrop_backing_layer(_: &Object, _: Sel) -> id {
+extern "C" fn overlay_backdrop_backing_layer(_: &AnyObject, _: Sel) -> *mut AnyObject {
     unsafe {
-        let layer: id = msg_send![class!(CABackdropLayer), layer];
-        let _: () = msg_send![layer, setAllowsInPlaceFiltering: NO];
+        let layer: *mut AnyObject = msg_send![class!(CABackdropLayer), layer];
+        let _: () = msg_send![layer, setAllowsInPlaceFiltering: Bool::NO];
         // Sampling at half resolution halves the blur's cost and is
         // indistinguishable under a gaussian this wide.
         let _: () = msg_send![layer, setScale: 0.5f64];
@@ -3381,14 +3352,14 @@ extern "C" fn overlay_backdrop_backing_layer(_: &Object, _: Sel) -> id {
     }
 }
 
-extern "C" fn overlay_backdrop_hit_test(_: &Object, _: Sel, _: NSPoint) -> id {
-    nil
+extern "C" fn overlay_backdrop_hit_test(_: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
+    ptr::null_mut()
 }
 
 /// The native blur under one frosted surface on the overlay plane, and the
 /// filter settings last applied to it.
 struct OverlayBackdrop {
-    view: NonNull<Object>,
+    view: NonNull<AnyObject>,
     blur_radius: f64,
     saturation: f64,
 }
@@ -3422,21 +3393,21 @@ impl MacWindowState {
                     backdrop.remove();
                 }
             }
-            let native_view = self.native_view.as_ptr() as id;
+            let native_view = self.native_view.as_ptr();
             for index in 0..blur_count {
                 let blur = self.overlay_scene.backdrop_blurs[index];
                 if index == self.overlay_backdrops.len() {
-                    let view: id = msg_send![OVERLAY_BACKDROP_VIEW_CLASS, alloc];
-                    let view = NSView::initWithFrame_(view, NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)));
+                    let view: *mut AnyObject = msg_send![OVERLAY_BACKDROP_VIEW_CLASS, alloc];
+                    let view: *mut AnyObject = msg_send![view, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))];
                     let Some(view) = NonNull::new(view) else {
                         break;
                     };
-                    let _: () = msg_send![view.as_ptr() as id, setWantsLayer: YES];
+                    let _: () = msg_send![view.as_ptr(), setWantsLayer: Bool::YES];
                     let _: () = msg_send![
                         native_view,
-                        addSubview: view.as_ptr() as id
-                        positioned: NSWindowOrderingMode::NSWindowBelow
-                        relativeTo: overlay_view.as_ptr() as id
+                        addSubview: view.as_ptr(),
+                        positioned: NSWindowOrderingMode::Below,
+                        relativeTo: overlay_view.as_ptr()
                     ];
                     self.overlay_backdrops.push(OverlayBackdrop {
                         view,
@@ -3445,7 +3416,7 @@ impl MacWindowState {
                     });
                 }
                 let backdrop = &mut self.overlay_backdrops[index];
-                let view = backdrop.view.as_ptr() as id;
+                let view = backdrop.view.as_ptr();
                 let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
                 let x = f64::from(bounds.origin.x.0) / scale;
                 let width = (f64::from(bounds.size.width.0) / scale).max(0.);
@@ -3454,12 +3425,12 @@ impl MacWindowState {
                 let _: () = msg_send![view, setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))];
                 let _: () = msg_send![view, setAlphaValue: f64::from(blur.opacity.clamp(0., 1.))];
 
-                let layer: id = msg_send![view, layer];
+                let layer: *mut AnyObject = msg_send![view, layer];
                 if layer.is_null() {
                     continue;
                 }
                 let _: () = msg_send![layer, setCornerRadius: f64::from(blur.corner_radii.top_left.0) / scale];
-                let _: () = msg_send![layer, setMasksToBounds: YES];
+                let _: () = msg_send![layer, setMasksToBounds: Bool::YES];
                 let blur_radius = f64::from(blur.blur_radius.0) / scale;
                 let saturation = f64::from(blur.saturation);
                 if backdrop.blur_radius != blur_radius || backdrop.saturation != saturation {
@@ -3467,20 +3438,20 @@ impl MacWindowState {
                     backdrop.saturation = saturation;
                     // The render server copies the filters it is given, so
                     // changing a value means handing it a new array.
-                    let gaussian: id =
+                    let gaussian: *mut AnyObject =
                         msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
-                    let radius_value: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
-                    let _: () = msg_send![gaussian, setValue: radius_value forKey: ns_string("inputRadius")];
+                    let radius_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
+                    let _: () = msg_send![gaussian, setValue: radius_value, forKey: ns_string("inputRadius")];
                     // Clamp at the view's edges rather than fading to
                     // transparent, as the Metal pass clamps at its copy's.
-                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
-                    let _: () = msg_send![gaussian, setValue: yes forKey: ns_string("inputNormalizeEdges")];
-                    let saturate: id =
+                    let yes: *mut AnyObject = msg_send![class!(NSNumber), numberWithBool: Bool::YES];
+                    let _: () = msg_send![gaussian, setValue: yes, forKey: ns_string("inputNormalizeEdges")];
+                    let saturate: *mut AnyObject =
                         msg_send![class!(CAFilter), filterWithType: ns_string("colorSaturate")];
-                    let amount: id = msg_send![class!(NSNumber), numberWithDouble: saturation];
-                    let _: () = msg_send![saturate, setValue: amount forKey: ns_string("inputAmount")];
-                    let filters: id =
-                        msg_send![class!(NSArray), arrayWithObjects: [gaussian, saturate].as_ptr() count: 2usize];
+                    let amount: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: saturation];
+                    let _: () = msg_send![saturate, setValue: amount, forKey: ns_string("inputAmount")];
+                    let filters: *mut AnyObject =
+                        msg_send![class!(NSArray), arrayWithObjects: [gaussian, saturate].as_ptr(), count: 2usize];
                     let _: () = msg_send![layer, setFilters: filters];
                 }
             }
@@ -3499,14 +3470,14 @@ impl OverlayBackdrop {
     /// `alloc` returned, which this struct held alongside the superview's.
     fn remove(self) {
         unsafe {
-            let view = self.view.as_ptr() as id;
-            NSView::removeFromSuperview(view);
+            let view = self.view.as_ptr();
+            let _: () = msg_send![view, removeFromSuperview];
             let _: () = msg_send![view, release];
         }
     }
 }
 
-extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
+extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
     // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
     // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
     // below is a valid NSCursor.
@@ -3685,7 +3656,7 @@ extern "C" fn handle_key_event(
             // If we're composing, send the key to the input handler first;
             // otherwise we only send to the input handler if we don't have a matching binding.
             // The input handler may call `do_command_by_selector` if it doesn't know how to handle
-            // a key. If it does so, it will return YES so we won't send the key twice.
+            // a key. If it does so, it will return Bool::YES so we won't send the key twice.
             // We also do this for non-printing keys (like arrow keys and escape) as the IME menu
             // may need them even if there is no marked text;
             // however we skip keys with control or the input handler adds control-characters to the buffer.
@@ -3996,33 +3967,31 @@ fn report_visibility(window_state: &Arc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
-    unsafe {
-        if lock
-            .native_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        {
-            lock.renderer.restore_drawables();
-            if let Some(renderer) = lock.overlay_renderer.as_mut() {
-                renderer.restore_drawables();
-            }
-            lock.move_traffic_light();
-            lock.start_display_link();
-        } else if !lock.render_while_hidden {
-            lock.stop_display_link();
-            // Nothing paints an occluded window, so its drawable-sized
-            // intermediate textures can go; the first draw after it becomes
-            // visible again recreates them. Its in-flight drawable counts
-            // start afresh too, so one raised by a lost presented handler
-            // does not outlive the stretch of presenting it happened in.
-            lock.renderer.release_intermediate_textures();
-            lock.renderer.forget_drawables_in_flight();
-            lock.renderer.release_drawables();
-            if let Some(renderer) = lock.overlay_renderer.as_mut() {
-                renderer.release_intermediate_textures();
-                renderer.forget_drawables_in_flight();
-                renderer.release_drawables();
-            }
+    if lock
+        .native_window()
+        .occlusionState()
+        .contains(NSWindowOcclusionState::Visible)
+    {
+        lock.renderer.restore_drawables();
+        if let Some(renderer) = lock.overlay_renderer.as_mut() {
+            renderer.restore_drawables();
+        }
+        lock.move_traffic_light();
+        lock.start_display_link();
+    } else if !lock.render_while_hidden {
+        lock.stop_display_link();
+        // Nothing paints an occluded window, so its drawable-sized
+        // intermediate textures can go; the first draw after it becomes
+        // visible again recreates them. Its in-flight drawable counts
+        // start afresh too, so one raised by a lost presented handler
+        // does not outlive the stretch of presenting it happened in.
+        lock.renderer.release_intermediate_textures();
+        lock.renderer.forget_drawables_in_flight();
+        lock.renderer.release_drawables();
+        if let Some(renderer) = lock.overlay_renderer.as_mut() {
+            renderer.release_intermediate_textures();
+            renderer.forget_drawables_in_flight();
+            renderer.release_drawables();
         }
     }
     drop(lock);
@@ -4138,9 +4107,10 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
 
     lock.renderer.update_drawable_size(drawable_size);
     if let Some(renderer) = lock.overlay_renderer.as_mut() {
-        if let Some(layer) = renderer.layer() {
+        let overlay_layer = renderer.layer_ptr().cast::<AnyObject>();
+        if !overlay_layer.is_null() {
             unsafe {
-                let _: () = msg_send![layer, setContentsScale: scale_factor as f64];
+                let _: () = msg_send![overlay_layer, setContentsScale: scale_factor as f64];
             }
         }
         renderer.update_drawable_size(drawable_size);
@@ -4222,13 +4192,13 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
             // Active windows stay near-clear so the blur shows through.
             let background_color = if is_active {
                 // Not using `+[NSColor clearColor]` to avoid broken shadow.
-                NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
+                NSColor::colorWithSRGBRed_green_blue_alpha(0f64, 0f64, 0f64, 0.0001)
             } else {
-                msg_send![class!(NSColor), textBackgroundColor]
+                NSColor::textBackgroundColor()
             };
-            lock.native_window.setBackgroundColor_(background_color);
+            let _: () = msg_send![lock.native_window, setBackgroundColor: &*background_color];
             if let Some(blur_view) = lock.blurred_view {
-                let _: () = msg_send![blur_view, setHidden: (!is_active) as BOOL];
+                let _: () = msg_send![blur_view, setHidden: (!is_active).to_objc()];
             }
         }
     }
@@ -4270,7 +4240,7 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
         // Asked before the window-state lock is taken, so nothing AppKit does in answering can
         // find it held.
         let shares_a_tab_group = unsafe {
-            let tabbed_windows: id = msg_send![native_window, tabbedWindows];
+            let tabbed_windows: *mut AnyObject = msg_send![native_window, tabbedWindows];
             !tabbed_windows.is_null() && {
                 let count: NSUInteger = msg_send![tabbed_windows, count];
                 count > 1
@@ -4422,7 +4392,7 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
         // A present deferred here would be retried on the next display
         // refresh, outside the transaction, and show stretched until then.
         // That cannot happen while the layer's `nextDrawable` waits for a
-        // drawable, where a nil drops the frame instead; an acquire that can
+        // drawable, where a ptr::null_mut() drops the frame instead; an acquire that can
         // give up without one has to keep this present in the transaction.
         lock.set_presents_with_transaction(true);
         lock.stop_display_link();
@@ -4644,7 +4614,7 @@ extern "C" fn do_command_by_selector(this: &AnyObject, _: Sel, _: Sel) {
     state.as_ref().lock().event_callback = event_callback;
 }
 
-extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
+extern "C" fn view_did_change_effective_appearance(this: &AnyObject, _: Sel) {
     // The reentrancy hazard here (`setAppearance:` fires this observer
     // synchronously, so a programmatic appearance change made while GPUI holds
     // an `App` borrow would re-enter it) is handled upstream in

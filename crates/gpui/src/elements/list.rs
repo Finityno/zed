@@ -3001,7 +3001,7 @@ mod test {
                     div()
                         .h(px(20.))
                         .w_full()
-                        .on_scroll_wheel(move |_, _, cx| {
+                        .on_scroll(move |_, _, cx| {
                             child_saw_event.set(true);
                             cx.stop_propagation();
                         })
@@ -4268,7 +4268,7 @@ mod test {
                         div()
                             .size_full()
                             .block_mouse_except_scroll()
-                            .on_scroll_wheel(move |_, _, cx| on_item_scroll(cx)),
+                            .on_scroll(move |_, _, cx| on_item_scroll(cx)),
                     )
                     .into_any()
             })

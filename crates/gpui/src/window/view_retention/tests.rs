@@ -687,7 +687,7 @@ impl Oracle {
                     self.cx
                         .update_window(window.into(), |_, window, cx| {
                             window.dispatch_event(
-                                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                                crate::PlatformInput::Scroll(crate::ScrollEvent {
                                     position: viewport.center(),
                                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(delta))),
                                     modifiers: Modifiers::default(),
@@ -1901,7 +1901,7 @@ fn a_wheel_scroll_builds_the_views_reading_the_list() {
     let viewport = list_state.viewport_bounds();
     cx.update_window(window.into(), |_, window, cx| {
         window.dispatch_event(
-            crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+            crate::PlatformInput::Scroll(crate::ScrollEvent {
                 position: viewport.center(),
                 delta: crate::ScrollDelta::Pixels(point(px(0.), px(-100.))),
                 modifiers: Modifiers::default(),
@@ -1968,7 +1968,7 @@ fn a_wheel_scroll_does_not_notify_the_view_drawing_the_list() {
     for _ in 0..3 {
         cx.update_window(window.into(), |_, window, cx| {
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                crate::PlatformInput::Scroll(crate::ScrollEvent {
                     position: viewport.center(),
                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(-30.))),
                     modifiers: Modifiers::default(),
@@ -4158,7 +4158,7 @@ fn rows_with_scrollers_scrolled_by_the_wheel_are_not_built_after() {
         let position = point(viewport.origin.x + px(160.), viewport.center().y);
         cx.update_window(window.into(), |_, window, cx| {
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                crate::PlatformInput::Scroll(crate::ScrollEvent {
                     position,
                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(-10.))),
                     modifiers: Modifiers::default(),
@@ -4287,7 +4287,7 @@ fn a_wheel_scroll_under_the_pointer_draws_one_frame_a_wheel_event() {
     for event in 0..12 {
         cx.update_window(window.into(), |_, window, cx| {
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                crate::PlatformInput::Scroll(crate::ScrollEvent {
                     position: pointer,
                     delta: crate::ScrollDelta::Pixels(point(px(0.), px(-15.))),
                     modifiers: Modifiers::default(),

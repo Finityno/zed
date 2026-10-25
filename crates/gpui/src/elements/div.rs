@@ -18,7 +18,7 @@
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, BackGestureEvent, Bounds,
     ClickEvent, DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
-    ExternalDragPayloadSource, FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox,
+    ExternalDragPayloadSource, FileDropEvent, FocusHandle, GlobalElementId, Hitbox,
     HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
     KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent,
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
@@ -6700,7 +6700,7 @@ mod tests {
         });
 
         for _ in 0..wheels {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: point(px(10.), px(10.)),
                 delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
                 ..Default::default()
@@ -6721,7 +6721,7 @@ mod tests {
                 .size(px(100.))
                 .overflow_scroll()
                 .track_scroll(&self.handle)
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .on_scroll(|_, _, cx| cx.stop_propagation())
                 .child(div().w(px(100.)).h(px(400.)))
         }
     }
@@ -6743,7 +6743,7 @@ mod tests {
             .into_any_element()
         });
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(10.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
             ..Default::default()
@@ -6805,7 +6805,7 @@ mod tests {
         cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
             cx.new(|_| OwnHandlerFreeScroller { handle: view_handle }).into_any_element()
         });
-        let wheel = || ScrollWheelEvent {
+        let wheel = || ScrollEvent {
             position: point(px(10.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(60.))),
             ..Default::default()
@@ -6861,7 +6861,7 @@ mod tests {
                 outer: view_outer, inner: view_inner, chain_at_bounds_only: true,
             }).into_any_element()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(10.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(40.))),
             ..Default::default()
@@ -6925,7 +6925,7 @@ mod tests {
         });
 
         for delta in deltas {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: point(px(10.), px(10.)),
                 delta: *delta,
                 modifiers: Modifiers {
@@ -7056,7 +7056,7 @@ mod tests {
             .into_any_element()
         });
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta,
             ..Default::default()
@@ -7164,7 +7164,7 @@ mod tests {
         });
 
         for _ in 0..3 {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: point(px(10.), px(10.)),
                 delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
                 touch_phase: crate::TouchPhase::Moved,

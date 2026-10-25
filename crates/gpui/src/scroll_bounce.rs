@@ -1,4 +1,4 @@
-use crate::{App, EntityId, Global, Pixels, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, px};
+use crate::{App, EntityId, Global, Pixels, ScrollDelta, ScrollEvent, TouchPhase, Window, px};
 use scheduler::Instant;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -133,7 +133,7 @@ impl ScrollBounce {
         &self,
         excess: Pixels,
         viewport_height: Pixels,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         view: EntityId,
         window: &mut Window,
         cx: &mut App,
@@ -196,7 +196,7 @@ impl Window {
         bounce: &ScrollBounce,
         excess: Pixels,
         extent: Pixels,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         view: EntityId,
         cx: &mut App,
     ) {

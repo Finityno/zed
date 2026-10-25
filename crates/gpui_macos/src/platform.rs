@@ -378,23 +378,25 @@ impl MacPlatform {
                 }
             }
 
-            item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            // SAFETY: a freshly allocated item, initialized once.
+            item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
                 &NSString::from_str(name),
                 Some(selector),
                 &NSString::from_str(key_to_native(keystroke.key()).as_ref()),
-            );
+            ) };
             if Self::os_version() >= Version::new(12, 0, 0) {
                 item.setAllowsAutomaticKeyEquivalentLocalization(false);
             }
             item.setKeyEquivalentModifierMask(mask);
         } else {
-            item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            // SAFETY: a freshly allocated item, initialized once.
+            item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
                 &NSString::from_str(name),
                 Some(selector),
                 &NSString::from_str(""),
-            );
+            ) };
         }
         item
     }

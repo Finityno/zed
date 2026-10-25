@@ -7277,7 +7277,7 @@ impl Window {
         // anything but a wheel or a key reaches them.
         if !matches!(
             event,
-            PlatformInput::ScrollWheel(_) | PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_)
+            PlatformInput::Scroll(_) | PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_)
         ) {
             self.settle_moved_views(cx);
         }
