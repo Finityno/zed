@@ -781,6 +781,18 @@ impl DirectWriteState {
             }
             m => m,
         };
+        // Grayscale is what a translucent (Mica) window gets. Windows' own
+        // apps render it symmetric and without grid fitting; the recommended
+        // mode snaps stems to the pixel grid at 100% scale, which reads
+        // hard-edged beside them.
+        let (rendering_mode, grid_fit_mode) = if params.subpixel_rendering {
+            (rendering_mode, grid_fit_mode)
+        } else {
+            (
+                DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+                DWRITE_GRID_FIT_MODE_DISABLED,
+            )
+        };
 
         let antialias_mode = if params.subpixel_rendering {
             DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE
