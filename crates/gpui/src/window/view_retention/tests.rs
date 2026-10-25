@@ -5248,6 +5248,9 @@ impl Render for CaretField {
 struct CaretHolder {
     field: Entity<CaretField>,
     cached: bool,
+    /// An overlay of the holder's own drawn after the frame, as a menu, a
+    /// popover or a toast is.
+    deferred_overlay: bool,
 }
 
 impl Render for CaretHolder {
@@ -5263,16 +5266,20 @@ impl Render for CaretHolder {
             .size_full()
             .child(field)
             .child(div().child("a label beside the field"))
+            .when(self.deferred_overlay, |this| {
+                this.child(deferred(div().w(px(10.)).h(px(10.)).child("overlay")))
+            })
     }
 }
 
 /// An entity a view reads only while it paints (an input's caret, read by
 /// its text element) is a dependency like anything read while it is built:
 /// notifying it draws the window again, and the frame paints the new value,
-/// with and without a cached view around the field.
+/// with and without a cached view around the field, and with an overlay the
+/// holder defers, which is drawn again from the last frame with it.
 #[test]
 fn an_entity_read_only_while_painting_draws_the_view_again() {
-    for cached in [false, true] {
+    for (cached, deferred_overlay) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut cx = TestAppContext::single();
         cx.update(|cx| cx.set_view_retention(true));
         let caret = cx.new(|_| PaintedCaret(true));
@@ -5282,7 +5289,11 @@ fn an_entity_read_only_while_painting_draws_the_view_again() {
             let painted = painted.clone();
             |_| CaretField { caret, painted }
         });
-        let window = cx.add_window(move |_, _| CaretHolder { field, cached });
+        let window = cx.add_window(move |_, _| CaretHolder {
+            field,
+            cached,
+            deferred_overlay,
+        });
         draw_caret(&mut cx, window);
         cx.run_until_parked();
         draw_caret(&mut cx, window);
@@ -5303,14 +5314,14 @@ fn an_entity_read_only_while_painting_draws_the_view_again() {
                 .unwrap();
             assert!(
                 work.frames > 0,
-                "blink {blink} (cached: {cached}) drew no frame: {work:?}"
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}) drew no frame: {work:?}"
             );
             // Only the field that read the caret is built; the holder is
             // drawn again around it, and nothing else is built or copied.
             assert_eq!(
                 (work.frames, work.views_rendered, work.views_spliced, work.views_reused),
                 (1, 1, 1, 1),
-                "blink {blink} (cached: {cached}): {work:?}"
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}): {work:?}"
             );
             assert_eq!(
                 work.view_rebuilds,
@@ -5318,12 +5329,12 @@ fn an_entity_read_only_while_painting_draws_the_view_again() {
                     entity_changed: 1,
                     ..Default::default()
                 },
-                "blink {blink} (cached: {cached}) built for another reason: {work:?}"
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}) built for another reason: {work:?}"
             );
             assert_eq!(
                 painted.borrow().last(),
                 Some(&visible),
-                "blink {blink} (cached: {cached}) was not painted: {work:?}"
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}) was not painted: {work:?}"
             );
         }
     }

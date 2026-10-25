@@ -24,8 +24,12 @@
 //!   (the window's, or a list item's), moves nothing outside the gap;
 //!   otherwise what was built of the splice is rolled back and the view is
 //!   built instead;
-//! - it deferred nothing (a deferred draw of a view nested in it is drawn
-//!   after the frame, out of the stretches);
+//! - the views it builds deferred nothing last frame (a deferred draw is
+//!   drawn after the frame, out of the stretches, so one of a gap's could
+//!   not be told apart from those copied); the deferred draws in the
+//!   stretches it copies (a menu, a popover, a toast of its own) are copied
+//!   with them and drawn again from the last frame, as a view drawn again
+//!   whole draws its own;
 //! - each gap can be built on its own: it is an entity or an [`AnyView`],
 //!   was laid out with nodes it kept (or is a cached view, laid out at its
 //!   bounds), is not under an image cache, a text shimmer or a time
@@ -231,10 +235,6 @@ impl Window {
     fn splice_gaps(&self, previous: usize, cx: &App) -> Option<Splice> {
         let records = &self.rendered_frame.retained_views.records;
         let record = &records[previous];
-        let prepaint = &record.prepaint_range;
-        if prepaint.start.deferred_draws_index != prepaint.end.deferred_draws_index {
-            return None;
-        }
         let mut gaps = SmallVec::new();
         let mut index = previous + 1;
         while index <= previous + record.nested {
@@ -251,7 +251,10 @@ impl Window {
                 index += nested.nested + 1;
                 continue;
             }
-            if !Self::buildable_on_its_own(nested, record) {
+            let deferred = &nested.prepaint_range;
+            if !Self::buildable_on_its_own(nested, record)
+                || deferred.start.deferred_draws_index != deferred.end.deferred_draws_index
+            {
                 return None;
             }
             gaps.push(index);
@@ -263,11 +266,15 @@ impl Window {
     /// Copies last frame's prepaint of `range` as [`Window::reuse_prepaint`]
     /// does, leaving the dispatch nodes it enters open in `dispatch` for
     /// what follows to hang off. A spliced view defers nothing.
+    /// Copies last frame's prepaint `range` of the spliced view, returning
+    /// false if a deferred draw in it hangs off a dispatch node that was not
+    /// copied, which the splice cannot draw again.
+    #[must_use]
     fn copy_prepaint_stretch(
         &mut self,
         range: Range<PrepaintStateIndex>,
         dispatch: &mut OpenDispatchCopy,
-    ) {
+    ) -> bool {
         let rendered = &mut self.rendered_frame;
         let next = &mut self.next_frame;
         next.hitboxes.extend(
@@ -312,6 +319,37 @@ impl Window {
         if contains_focus {
             self.next_frame.focus = self.focus;
         }
+        // Drawn again from the last frame after the frame, as a view drawn
+        // again whole has its own drawn (see `Window::reuse_prepaint_moved`).
+        // In order, at this stretch's place, so the indices the records
+        // copied along hold stay in step with them.
+        let deferred = range.start.deferred_draws_index..range.end.deferred_draws_index;
+        for index in deferred {
+            let deferred_draw = &self.rendered_frame.deferred_draws[index];
+            let Some(parent_node) = dispatch.copied(deferred_draw.parent_node) else {
+                return false;
+            };
+            let copy = crate::window::DeferredDraw {
+                current_view: deferred_draw.current_view,
+                parent_node,
+                element_id_stack: deferred_draw.element_id_stack.clone(),
+                text_style_stack: deferred_draw.text_style_stack.clone(),
+                content_mask: deferred_draw.content_mask,
+                rounded_clip: deferred_draw.rounded_clip.clone(),
+                rem_size: deferred_draw.rem_size,
+                priority: deferred_draw.priority,
+                beneath_native_surfaces: deferred_draw.beneath_native_surfaces,
+                element: None,
+                absolute_offset: deferred_draw.absolute_offset,
+                prepaint_range: deferred_draw.prepaint_range.clone(),
+                paint_range: deferred_draw.paint_range.clone(),
+                // Its reads are the spliced view's own, carried in its record.
+                enclosing_views: Default::default(),
+                retained_records: deferred_draw.retained_records.clone(),
+            };
+            self.next_frame.deferred_draws.push(copy);
+        }
+        true
     }
 
     /// Copies last frame's records `records`, whose prepaint was copied from
@@ -605,7 +643,10 @@ impl Window {
                 (gap_record.prepaint_range.clone(), gap_record.nested)
             };
             let stretch_start = self.prepaint_index();
-            self.copy_prepaint_stretch(cursor.clone()..gap_range.start.clone(), &mut dispatch);
+            if !self.copy_prepaint_stretch(cursor.clone()..gap_range.start.clone(), &mut dispatch)
+            {
+                return self.abandon_splice_prepaint(&mut dispatch);
+            }
             self.copy_records(
                 next_record..gap,
                 (&cursor, &stretch_start),
@@ -633,12 +674,7 @@ impl Window {
                 }
             };
             let Some((entity, prepaint)) = self.prepaint_gap(gap, cx) else {
-                self.next_frame
-                    .dispatch_tree
-                    .close_copied_to(&mut dispatch.open, None);
-                self.take_hover_reads();
-                self.view_retention.view_stack.pop();
-                return None;
+                return self.abandon_splice_prepaint(&mut dispatch);
             };
             prepainted.push(PrepaintedGap {
                 previous: gap,
@@ -651,7 +687,9 @@ impl Window {
             next_record = gap + gap_nested + 1;
         }
         let stretch_start = self.prepaint_index();
-        self.copy_prepaint_stretch(cursor.clone()..prepaint_range.end, &mut dispatch);
+        if !self.copy_prepaint_stretch(cursor.clone()..prepaint_range.end, &mut dispatch) {
+            return self.abandon_splice_prepaint(&mut dispatch);
+        }
         self.copy_records(
             next_record..last + 1,
             (&cursor, &stretch_start),
@@ -700,6 +738,17 @@ impl Window {
             gaps: prepainted,
             copied,
         }))
+    }
+
+    /// Leaves a splice that cannot be drawn: what it prepainted is rolled back
+    /// by the transaction around it, and the view is built instead.
+    fn abandon_splice_prepaint(&mut self, dispatch: &mut OpenDispatchCopy) -> Option<ViewPrepaint> {
+        self.next_frame
+            .dispatch_tree
+            .close_copied_to(&mut dispatch.open, None);
+        self.take_hover_reads();
+        self.view_retention.view_stack.pop();
+        None
     }
 
     /// Paints the view [`Window::splice_prepaint`] prepainted: last frame's
