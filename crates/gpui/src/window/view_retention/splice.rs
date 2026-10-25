@@ -726,6 +726,12 @@ impl Window {
             range.start.hitboxes_index..range.end.hitboxes_index
         };
 
+        // What the gaps read as they paint (an input's caret, read by its
+        // text element) is what this view read too. Its dependencies were
+        // put together as it prepainted, before the gaps painted, so without
+        // this the next frame would draw it again whole, gaps and all, from a
+        // record that never saw those reads.
+        let painted_reads = cx.begin_recording_dependencies();
         let start = self.paint_index();
         let mut stretches: Vec<(crate::window::PaintIndex, crate::window::PaintIndex)> =
             Vec::with_capacity(gaps.len() + 1);
@@ -789,6 +795,7 @@ impl Window {
             }
         }
 
+        let painted_reads = cx.finish_recording_dependencies(painted_reads);
         self.take_hover_reads();
         self.view_retention.view_stack.pop();
         // The groups the gaps resolved outside the view, besides its own.
@@ -808,6 +815,7 @@ impl Window {
             let record = &mut self.next_frame.retained_views.records[*index];
             record.paint_range = start..end;
             record.paint = PaintStatus::Painted { source: None };
+            record.dependencies = record.dependencies.union(&painted_reads.all);
             record.paint_context = current.clone();
             record.paint_mask = paint_mask;
             if !new_groups.is_empty() {
