@@ -119,7 +119,13 @@ impl MonitorClock {
     /// `None` means the output is gone and the clock should stop.
     pub(crate) fn wait(&self) -> Option<FrameRequestSource> {
         let started = Instant::now();
-        unsafe { self.output.WaitForVBlank() }.ok()?;
+        // Fails once the output is detached (a monitor unplugged); the
+        // compositor clock takes the monitor's windows over from here.
+        unsafe { self.output.WaitForVBlank() }
+            .inspect_err(|error| {
+                log::info!("vblank clock for monitor {} stopped: {error}", self.monitor)
+            })
+            .ok()?;
         // Like DwmFlush, the wait returns at once while the monitor sleeps;
         // without this the thread would spin.
         if started.elapsed() < VSYNC_INTERVAL_THRESHOLD {
