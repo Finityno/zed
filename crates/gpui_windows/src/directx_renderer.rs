@@ -573,7 +573,7 @@ impl DirectXRenderer {
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
-        count_present();
+        count(Count::Present);
         #[cfg(test)]
         crate::native_tests::present(self.hwnd, self.direct_composition.is_some(), result.0);
         if !self.logged_first_present {
@@ -856,8 +856,8 @@ impl DirectXRenderer {
         // this present draws, before anything idle is retired.
         self.atlas.on_frame_drawn(scene);
 
-        count_present();
-        count_present();
+        count(Count::Present);
+        count(Count::Present);
         unsafe {
             self.resources
                 .as_ref()

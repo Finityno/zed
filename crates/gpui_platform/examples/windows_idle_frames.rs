@@ -16,6 +16,9 @@
 //! - `two_windows`: two static windows.
 //! - `unfocused_animation`: the `animation` view in a window that is not
 //!   focused (another window is), held to GPUI's ~30 fps inactive-window cap.
+//! - `streaming`: what an agent turn streaming in looks like: a transcript
+//!   view notified 24 times a second as its text grows, a spinner view
+//!   notified 30 times a second by a timer, and a shimmering label.
 //! - `verify`: correctness, not cost: 25 notifies and 60 chained
 //!   `on_next_frame` callbacks in each of two windows must all be delivered.
 //!
@@ -198,6 +201,7 @@ mod windows_idle_frames {
         Blink,
         Animation,
         Shimmer,
+        Streaming,
         TwoWindows,
         UnfocusedAnimation,
         Verify,
@@ -210,6 +214,7 @@ mod windows_idle_frames {
                 "blink" => Self::Blink,
                 "animation" => Self::Animation,
                 "shimmer" => Self::Shimmer,
+                "streaming" => Self::Streaming,
                 "two_windows" => Self::TwoWindows,
                 "unfocused_animation" => Self::UnfocusedAnimation,
                 "verify" => Self::Verify,
@@ -224,6 +229,70 @@ mod windows_idle_frames {
         Blink,
         Animation,
         Shimmer,
+        Streaming,
+    }
+
+    const STREAMED_WORDS: [&str; 8] = [
+        "frames", "are", "scheduled", "on", "demand,", "so", "nothing", "spins",
+    ];
+
+    /// Notifies itself every `interval`, running `step` first.
+    fn every<T: 'static>(
+        interval: Duration,
+        cx: &mut Context<T>,
+        step: impl Fn(&mut T) + 'static,
+    ) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(interval).await;
+                if this
+                    .update(cx, |this, cx| {
+                        step(this);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// A transcript whose text grows by a word per streamed chunk.
+    struct StreamedText {
+        words: usize,
+        renders: Arc<AtomicUsize>,
+        _stream: gpui::Task<()>,
+    }
+
+    impl Render for StreamedText {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.fetch_add(1, Ordering::Relaxed);
+            let text = (0..self.words)
+                .map(|word| STREAMED_WORDS[word % STREAMED_WORDS.len()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            div().w(px(560.)).child(text)
+        }
+    }
+
+    /// A spinner ticked by a timer, as an app's paced decorative ticker is.
+    struct Spinner {
+        phase: usize,
+        renders: Arc<AtomicUsize>,
+        _tick: gpui::Task<()>,
+    }
+
+    impl Render for Spinner {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.fetch_add(1, Ordering::Relaxed);
+            div().flex().gap_1().children((0..8).map(|dot| {
+                div()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(if dot == self.phase % 8 { rgb(0xe8e8e8) } else { rgb(0x404246) })
+            }))
+        }
     }
 
     struct BenchView {
@@ -233,6 +302,7 @@ mod windows_idle_frames {
         caret_visible: bool,
         lit: bool,
         started_at: Instant,
+        streamed: Option<(gpui::Entity<Spinner>, gpui::Entity<StreamedText>)>,
         _blink: Option<gpui::Task<()>>,
     }
 
@@ -256,10 +326,29 @@ mod windows_idle_frames {
                     }
                 })
             });
+            let streamed = (content == Content::Streaming).then(|| {
+                let spinner = cx.new(|cx| Spinner {
+                    phase: 0,
+                    renders: renders.clone(),
+                    _tick: every(Duration::from_micros(33_333), cx, |spinner: &mut Spinner| {
+                        spinner.phase += 1
+                    }),
+                });
+                let text = cx.new(|cx| StreamedText {
+                    words: 0,
+                    renders: renders.clone(),
+                    _stream: every(Duration::from_micros(41_667), cx, |text: &mut StreamedText| {
+                        // Keep the transcript to a screenful, as a list would.
+                        text.words = (text.words + 1) % 400
+                    }),
+                });
+                (spinner, text)
+            });
             Self {
                 renders,
                 content,
                 focus_handle: cx.focus_handle(),
+                streamed,
                 caret_visible: true,
                 lit: true,
                 started_at: Instant::now(),
@@ -292,6 +381,20 @@ mod windows_idle_frames {
                 Content::Shimmer => ShimmerText::new("Thinking about frame scheduling")
                     .highlight_color(gpui::white())
                     .into_any_element(),
+                Content::Streaming => {
+                    let (spinner, text) = self.streamed.clone().expect("streaming views");
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div().flex().gap_2().child(spinner).child(
+                                ShimmerText::new("Thinking").highlight_color(gpui::white()),
+                            ),
+                        )
+                        .child(text)
+                        .into_any_element()
+                }
             };
             div()
                 .track_focus(&self.focus_handle)
@@ -361,7 +464,7 @@ mod windows_idle_frames {
 
     pub fn run() {
         let mut arguments = std::env::args().skip(1);
-        let usage = "usage: windows_idle_frames <static|blink|animation|shimmer|two_windows|unfocused_animation|verify> <out.json> [--seconds N] [--no-dcomp]";
+        let usage = "usage: windows_idle_frames <static|blink|animation|shimmer|streaming|two_windows|unfocused_animation|verify> <out.json> [--seconds N] [--no-dcomp]";
         let case_name = arguments.next().expect(usage);
         let case = Case::parse(&case_name).expect(usage);
         let output = PathBuf::from(arguments.next().expect(usage));
@@ -392,6 +495,7 @@ mod windows_idle_frames {
                 Case::Blink => windows.push(open(cx, 0, Content::Blink, &renders)),
                 Case::Animation => windows.push(open(cx, 0, Content::Animation, &renders)),
                 Case::Shimmer => windows.push(open(cx, 0, Content::Shimmer, &renders)),
+                Case::Streaming => windows.push(open(cx, 0, Content::Streaming, &renders)),
                 Case::TwoWindows | Case::Verify => {
                     windows.push(open(cx, 0, Content::Static, &renders));
                     windows.push(open(cx, 1, Content::Static, &renders));
@@ -451,23 +555,43 @@ mod windows_idle_frames {
                 }
                 let elapsed = start.elapsed().as_secs_f64();
                 let after = sample(vsync_thread.as_ref(), &renders);
-                let frames = |field: fn(&gpui_windows::FrameCounters) -> u64| {
-                    field(&after.frames) - field(&before.frames)
+                let counters = {
+                    let (a, b) = (after.frames, before.frames);
+                    [
+                        ("wake_signals", a.wake_signals - b.wake_signals),
+                        ("request_wakes", a.request_wakes - b.request_wakes),
+                        (
+                            "deadline_request_wakes",
+                            a.deadline_request_wakes - b.deadline_request_wakes,
+                        ),
+                        ("expedite_wakes", a.expedite_wakes - b.expedite_wakes),
+                        ("worker_wakes", a.worker_wakes - b.worker_wakes),
+                        ("deadline_wakeups", a.deadline_wakeups - b.deadline_wakeups),
+                        ("vsync_waits", a.vsync_waits - b.vsync_waits),
+                        (
+                            "vsyncs_without_paint",
+                            a.vsyncs_without_paint - b.vsyncs_without_paint,
+                        ),
+                        (
+                            "vsync_waits_skipped",
+                            a.vsync_waits_skipped - b.vsync_waits_skipped,
+                        ),
+                        ("invalidations", a.invalidations - b.invalidations),
+                        ("paints", a.paints - b.paints),
+                        ("presents", a.presents - b.presents),
+                    ]
+                    .iter()
+                    .map(|(name, value)| format!(",\n  \"{name}\": {value}"))
+                    .collect::<String>()
                 };
                 let json = format!(
-                    "{{\n  \"case\": \"{case_name}\",\n  \"direct_composition\": {direct_composition},\n  \"elapsed_seconds\": {elapsed:.3},\n  \"process_cpu_ms\": {:.3},\n  \"process_cycles\": {},\n  \"main_thread_cycles\": {},\n  \"vsync_thread_found\": {},\n  \"vsync_thread_cycles\": {},\n  \"renders\": {},\n  \"wake_signals\": {},\n  \"worker_wakes\": {},\n  \"vsync_waits\": {},\n  \"invalidations\": {},\n  \"paints\": {},\n  \"presents\": {}{verify_report}\n}}\n",
+                    "{{\n  \"case\": \"{case_name}\",\n  \"direct_composition\": {direct_composition},\n  \"elapsed_seconds\": {elapsed:.3},\n  \"process_cpu_ms\": {:.3},\n  \"process_cycles\": {},\n  \"main_thread_cycles\": {},\n  \"vsync_thread_found\": {},\n  \"vsync_thread_cycles\": {},\n  \"renders\": {}{counters}{verify_report}\n}}\n",
                     (after.process_time_100ns - before.process_time_100ns) as f64 / 10_000.0,
                     after.process_cycles - before.process_cycles,
                     after.main_thread_cycles - before.main_thread_cycles,
                     vsync_thread.is_some(),
                     after.vsync_thread_cycles - before.vsync_thread_cycles,
                     after.renders - before.renders,
-                    frames(|counters| counters.wake_signals),
-                    frames(|counters| counters.worker_wakes),
-                    frames(|counters| counters.vsync_waits),
-                    frames(|counters| counters.invalidations),
-                    frames(|counters| counters.paints),
-                    frames(|counters| counters.presents),
                 );
                 print!("{json}");
                 std::fs::write(&output, json).expect("writing the result");
