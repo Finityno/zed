@@ -197,7 +197,11 @@ impl DirectWriteTextSystem {
             let mut result = None;
             components
                 .factory
-                .GetSystemFontCollection(false, &mut result, true)?;
+                // Checking for updates here blocks the first window on a font
+                // collection rebuild (tens of milliseconds). A font installed
+                // since the last rebuild is still found: a lookup that misses
+                // rebuilds the collection in `select_and_cache_font`.
+                .GetSystemFontCollection(false, &mut result, false)?;
             result.context("Failed to get system font collection")?
         };
         let custom_font_set = unsafe { components.builder.CreateFontSet()? };
@@ -2062,6 +2066,36 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn a_font_missing_from_a_stale_collection_is_found_after_a_rebuild() -> Result<()> {
+        let text_system = DirectWriteTextSystem::new(None)?;
+        // Startup takes the collection without checking for updates, so it
+        // may lack fonts installed since; an empty collection stands in for
+        // that.
+        let empty_collection = unsafe {
+            let empty_font_set = text_system.components.builder.CreateFontSet()?;
+            text_system
+                .components
+                .factory
+                .CreateFontCollectionFromFontSet(&empty_font_set)?
+        };
+        text_system.state.write().system_font_collection = empty_collection;
+        let has_segoe_ui = |text_system: &DirectWriteTextSystem| {
+            text_system
+                .all_font_names()
+                .iter()
+                .any(|name| name == "Segoe UI")
+        };
+        assert!(!has_segoe_ui(&text_system));
+
+        text_system.font_id(&Font {
+            family: "Segoe UI".into(),
+            ..Default::default()
+        })?;
+        assert!(has_segoe_ui(&text_system));
+        Ok(())
     }
 
     #[test]
