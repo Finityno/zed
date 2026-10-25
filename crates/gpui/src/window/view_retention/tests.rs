@@ -5354,3 +5354,161 @@ fn draw_caret(cx: &mut TestAppContext, window: WindowHandle<CaretHolder>) {
     cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
         .unwrap();
 }
+
+/// A square that counts its builds and changes colour when toggled.
+struct Toggled {
+    lit: bool,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Toggled {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .w(px(20.))
+            .h(px(20.))
+            .bg(if self.lit { PALETTE[1] } else { PALETTE[2] })
+    }
+}
+
+/// A view holding another, beside an overlay it defers when `overlay` is
+/// set, as a panel defers a popover beside its composer.
+struct Overlaid {
+    held: Entity<Toggled>,
+    overlay: bool,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Overlaid {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .size_full()
+            .child(self.held.clone())
+            .when(self.overlay, |this| {
+                this.child(deferred(div().w(px(8.)).h(px(8.)).bg(PALETTE[3])))
+            })
+    }
+}
+
+/// The window's root: the overlaid view, and a view beside it that is never
+/// built again after the first frame.
+struct OverlaidRoot {
+    overlaid: Entity<Overlaid>,
+    beside: Entity<Toggled>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for OverlaidRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .size_full()
+            .flex()
+            .child(self.overlaid.clone())
+            .child(self.beside.clone())
+    }
+}
+
+/// A view notified inside another, inside the root, is built alone: the
+/// views around it are drawn again around it. Afterwards, a frame with
+/// nothing changed builds nothing: what the spliced root read is as of when
+/// it was found unchanged, not as of the oldest view copied along with it,
+/// which would count the root's own change before the splice as a change
+/// again.
+#[test]
+fn a_view_inside_spliced_views_is_built_alone() {
+    view_inside_spliced_views_is_built_alone(false);
+}
+
+fn view_inside_spliced_views_is_built_alone(overlay: bool) {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    // The builds of the root, the overlaid view and the held view, in the
+    // window drawing views again.
+    let renders: [Rc<Cell<usize>>; 3] = Default::default();
+    let windows = [renders.clone(), Default::default()].map(|renders| {
+        cx.add_window(move |_, cx| OverlaidRoot {
+            overlaid: cx.new(|cx| Overlaid {
+                held: cx.new(|_| Toggled {
+                    lit: false,
+                    renders: renders[2].clone(),
+                }),
+                overlay,
+                renders: renders[1].clone(),
+            }),
+            beside: cx.new(|_| Toggled {
+                lit: false,
+                renders: Rc::new(Cell::new(0)),
+            }),
+            renders: renders[0].clone(),
+        })
+    });
+    // Draws the first window as it is, and the second from scratch, and
+    // checks the two agree; returns the first's work.
+    let frame = |cx: &mut TestAppContext| {
+        let (retained, work) = cx
+            .update_window(windows[0].into(), |_, window, cx| {
+                if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                let work = window.frame_work_stats();
+                window.reset_frame_work_stats(false);
+                (describe_frame(window), work)
+            })
+            .unwrap();
+        let from_scratch = cx
+            .update_window(windows[1].into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                describe_frame(window)
+            })
+            .unwrap();
+        assert_eq!(first_difference(&retained, &from_scratch), None);
+        assert_eq!(
+            retained
+                .iter()
+                .any(|line| line.contains(&format!("{:?}", PALETTE[3]))),
+            overlay,
+            "the overlay is drawn when deferred"
+        );
+        work
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    // The root built after its own change, the views in it drawn again whole.
+    for window in windows {
+        window
+            .update(&mut cx, |_, _, cx| cx.notify())
+            .unwrap();
+    }
+    frame(&mut cx);
+    for toggle in 0..3 {
+        let before: Vec<usize> = renders.iter().map(|count| count.get()).collect();
+        for window in windows {
+            let held = window
+                .read_with(&cx, |root, cx| root.overlaid.read(cx).held.clone())
+                .unwrap();
+            held.update(&mut cx, |held, cx| {
+                held.lit = !held.lit;
+                cx.notify();
+            });
+        }
+        let work = frame(&mut cx);
+        assert_eq!(work.views_rendered, 1, "toggle {toggle}: {work:?}");
+        assert_eq!(work.views_spliced, 2, "toggle {toggle}: {work:?}");
+        let built: Vec<usize> = renders
+            .iter()
+            .zip(&before)
+            .map(|(count, before)| count.get() - before)
+            .collect();
+        assert_eq!(built, vec![0, 0, 1], "toggle {toggle}");
+
+        let work = frame(&mut cx);
+        assert_eq!(
+            (work.views_rendered, work.views_spliced),
+            (0, 0),
+            "toggle {toggle}: nothing changed, yet {work:?}"
+        );
+    }
+}

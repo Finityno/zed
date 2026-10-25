@@ -568,6 +568,13 @@ pub(crate) fn query<T: 'static, R>(
     result
 }
 
+/// The global and entity update generations at one moment.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DependencyGenerations {
+    globals: u64,
+    updates: u64,
+}
+
 /// Where a recording started by [`App::begin_recording_dependencies`] begins.
 pub(crate) struct DependencyRecording {
     entities: usize,
@@ -615,6 +622,35 @@ impl RenderDependencies {
     pub(crate) fn written_up_to(&self, writes: u64) -> Self {
         Self {
             floor: self.floor.max(writes),
+            ..self.clone()
+        }
+    }
+
+    /// The same dependencies, known unchanged as of `checked` (see
+    /// [`App::dependency_generations`]): a copied view's, checked before it
+    /// was copied. Without this, a set unioned with one checked earlier is
+    /// as of that earlier generation, and every change since then to what
+    /// either set read, though already seen, counts as a change.
+    pub(crate) fn checked_as_of(&self, checked: DependencyGenerations) -> Self {
+        Self {
+            generation: self.generation.max(checked.globals),
+            updates: self.updates.max(checked.updates),
+            ..self.clone()
+        }
+    }
+
+    /// The same dependencies, with `version` read now if it was not read.
+    pub(crate) fn with_state_read(&self, version: &StateVersion) -> Self {
+        if self.states.iter().any(|(read, _)| read.same_state(version)) {
+            return self.clone();
+        }
+        Self {
+            states: self
+                .states
+                .iter()
+                .cloned()
+                .chain([(version.clone(), version.get())])
+                .collect(),
             ..self.clone()
         }
     }
@@ -740,6 +776,15 @@ impl App {
             globals: self.dependencies.global_read_log.clone(),
             recordings: self.entities.access_log.recordings.clone(),
             untracked: self.entities.access_log.untracked.clone(),
+        }
+    }
+
+    /// The generations a dependency check made now is made as of, as a
+    /// recording begun now would hold them.
+    pub(crate) fn dependency_generations(&self) -> DependencyGenerations {
+        DependencyGenerations {
+            globals: self.dependencies.global_generation,
+            updates: self.entities.access_log.update_generation,
         }
     }
 

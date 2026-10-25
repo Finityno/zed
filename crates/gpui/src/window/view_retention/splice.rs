@@ -37,7 +37,7 @@
 
 use super::{
     HoverRead, PaintStatus, ViewPrepaint, ViewRebuildReason, ViewRecord, ViewSource,
-    dependencies::DependencyChange,
+    dependencies::{DependencyChange, DependencyGenerations},
 };
 use crate::{
     App, ContentMask, ElementId, EntityId, GlobalElementId, GroupHitboxes, LayoutId, Pixels,
@@ -52,6 +52,9 @@ use std::{mem, ops::Range};
 pub(crate) struct Splice {
     pub(super) previous: usize,
     pub(super) gaps: SmallVec<[usize; 4]>,
+    /// When what the view read itself, and what the views copied along read,
+    /// was found unchanged.
+    checked: DependencyGenerations,
 }
 
 /// What a spliced view's prepaint leaves for its paint.
@@ -233,6 +236,7 @@ impl Window {
     /// built, the outermost of each, if there are some and each can be
     /// built on its own.
     fn splice_gaps(&self, previous: usize, cx: &App) -> Option<Splice> {
+        let checked = cx.dependency_generations();
         let records = &self.rendered_frame.retained_views.records;
         let record = &records[previous];
         let mut gaps = SmallVec::new();
@@ -260,7 +264,11 @@ impl Window {
             gaps.push(index);
             index += nested.nested + 1;
         }
-        (!gaps.is_empty()).then_some(Splice { previous, gaps })
+        (!gaps.is_empty()).then_some(Splice {
+            previous,
+            gaps,
+            checked,
+        })
     }
 
     /// Copies last frame's prepaint of `range` as [`Window::reuse_prepaint`]
@@ -447,6 +455,12 @@ impl Window {
         let record = &self.rendered_frame.retained_views.records[gap];
         let id = record.id.clone();
         let entity = view_entity(&id).expect("a gap is a view");
+        // As a view that opted out does when it is reached in a view being
+        // built (see `Window::reusable_view`): the views around it are
+        // drawn on every frame it is drawn in.
+        if cx.non_retainable_views.contains(&entity) {
+            super::dependencies::note_state_read(&self.view_retention.every_frame);
+        }
         let bounds = record.context.bounds;
         let layout_scope = record.layout_scope;
         let source = &record.source;
@@ -550,7 +564,11 @@ impl Window {
     }
 
     fn splice_prepaint_inner(&mut self, splice: Splice, cx: &mut App) -> Option<ViewPrepaint> {
-        let Splice { previous, gaps } = splice;
+        let Splice {
+            previous,
+            gaps,
+            checked,
+        } = splice;
         let (prepaint_range, last, dependencies, own_hovers) = {
             let source = &self.rendered_frame.retained_views;
             let record = &source.records[previous];
@@ -708,15 +726,23 @@ impl Window {
         views.open.retain(|open| *open != index);
         let nested = views.records.len() - index - 1;
         // What it read, and the hovers it was drawn by: its own, and those
-        // of the views nested in it, copied or built.
-        let mut dependencies = views.records[index].own_dependencies.clone();
+        // of the views nested in it, copied or built, as of when they were
+        // checked, as a view built now would have them: what changed before
+        // was looked at and changed nothing.
+        let mut dependencies = views.records[index].own_dependencies.checked_as_of(checked);
         let mut all_hovers: Vec<HoverRead> = own_hovers.to_vec();
         let mut unsettled = false;
         let mut stays_put = views.records[index].stays_put;
         let mut nested_index = index + 1;
         while nested_index <= index + nested {
             let record = &views.records[nested_index];
-            dependencies = dependencies.union(&record.dependencies);
+            dependencies = dependencies.union(&record.dependencies.checked_as_of(checked));
+            // A gap that opted out is built on every frame, and so is drawn
+            // in a view that is drawn on every frame, spliced around it.
+            if view_entity(&record.id).is_some_and(|view| cx.non_retainable_views.contains(&view))
+            {
+                dependencies = dependencies.with_state_read(&self.view_retention.every_frame);
+            }
             all_hovers.extend_from_slice(&record.hovers);
             unsettled |= record.unsettled;
             stays_put |= record.stays_put;
