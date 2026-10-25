@@ -378,9 +378,11 @@ mod tests {
         );
         // Older kernels fill an earlier revision of `task_vm_info`, without
         // the counter.
-        if crate::window::is_macos_version_at_least(
-            cocoa::foundation::NSOperatingSystemVersion::new(12, 0, 0),
-        ) {
+        if objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion
+            >= 12
+        {
             assert!(
                 after.decompressions.is_some(),
                 "macOS 12 and later report decompressions"

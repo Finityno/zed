@@ -700,28 +700,137 @@ vertex BackdropBlurVertexOutput backdrop_blur_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-// Blending is off for this pipeline: the fragment replaces the framebuffer
-// pixel, so wherever the effect is partial (the anti-aliased rounded edge, a
-// fade) it mixes with the unblurred copy of that same pixel itself. Both
-// textures are premultiplied copies of the region at `source_origin`.
-fragment float4 backdrop_blur_fragment(
+struct BackdropBlurPassVertexOutput {
+  float4 position [[position]];
+};
+
+// The viewport of a blur pass is exactly the scratch rect it writes, so the
+// unit square spans it.
+vertex BackdropBlurPassVertexOutput backdrop_blur_pass_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurPassInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  return BackdropBlurPassVertexOutput{
+      float4(unit_vertex.x * 2. - 1., 1. - unit_vertex.y * 2., 0., 1.)};
+}
+
+// Where along one axis the first pass reads for scratch texel `texel`, as
+// (first sample, step between samples, sample count). Texel 0 and the last
+// texel are a pad holding the region's own outermost pixel row or column,
+// so the gaussian, which clamps at the scratch's edges, repeats the region's
+// edge pixels as an exact clamp at full resolution would, not the average of
+// the outermost block. Every texel between stands for a block of
+// `downsample` pixels, read at the corners shared by pairs of pixels so each
+// linear sample averages two of them.
+float3 backdrop_blur_block_samples(uint texel, uint last, float origin, float low, float high,
+                                   float downsample) {
+  if (texel == 0u) {
+    return float3(low, 0., 1.);
+  }
+  if (texel == last) {
+    return float3(high, 0., 1.);
+  }
+  float block = origin + float(texel - 1u) * downsample;
+  if (downsample < 2.) {
+    return float3(block + 0.5, 0., 1.);
+  }
+  return float3(block + 1., 2., downsample * 0.5);
+}
+
+// The first pass: the region of the target being drawn, box-averaged down
+// into the scratch, `downsample` source pixels per texel on each axis, inside
+// a one-texel pad of edge pixels (see `backdrop_blur_block_samples`). Samples
+// are clamped to the region, so a block that runs past its edge repeats the
+// edge pixels, and nothing outside the surface bleeds in across its outline.
+fragment float4 backdrop_blur_downsample_fragment(
+    BackdropBlurPassVertexOutput input [[stage_in]],
+    constant BackdropBlurPass *pass [[buffer(BackdropBlurPassInputIndex_Pass)]],
+    texture2d<float> source [[texture(BackdropBlurPassInputIndex_Source)]]) {
+  constexpr sampler pixels(coord::pixel, filter::linear, address::clamp_to_edge);
+  float downsample = pass->downsample;
+  float2 origin = float2(pass->source_origin.x, pass->source_origin.y);
+  float2 low = origin + 0.5;
+  float2 high = origin + float2(pass->source_size.x, pass->source_size.y) - 0.5;
+  uint2 texel = uint2(input.position.xy);
+  uint2 last = uint2(pass->scratch_size.x, pass->scratch_size.y) - 1u;
+  float3 columns = backdrop_blur_block_samples(texel.x, last.x, origin.x, low.x, high.x, downsample);
+  float3 rows = backdrop_blur_block_samples(texel.y, last.y, origin.y, low.y, high.y, downsample);
+  float4 sum = float4(0.);
+  for (uint row = 0; row < uint(rows.z); row++) {
+    float y = clamp(rows.x + float(row) * rows.y, low.y, high.y);
+    for (uint column = 0; column < uint(columns.z); column++) {
+      float x = clamp(columns.x + float(column) * columns.y, low.x, high.x);
+      sum += source.sample(pixels, float2(x, y));
+    }
+  }
+  return sum / (rows.z * columns.z);
+}
+
+// One half of the separable gaussian, between two scratch textures, along
+// `axis`. `taps` pairs neighbouring texels into one linear sample each
+// (offset, weight); the first is the centre. Clamping each sample to the
+// outermost texel centres repeats the edge, as the region's own edges are.
+float4 backdrop_blur_along(float2 axis, float2 position, constant BackdropBlurPass *pass,
+                           constant float2 *taps, texture2d<float> source) {
+  constexpr sampler pixels(coord::pixel, filter::linear, address::clamp_to_edge);
+  float2 high = float2(pass->scratch_size.x, pass->scratch_size.y) - 0.5;
+  float4 sum = taps[0].y * source.sample(pixels, position);
+  for (uint tap = 1; tap <= pass->taps; tap++) {
+    float2 offset = axis * taps[tap].x;
+    sum += taps[tap].y * (source.sample(pixels, clamp(position - offset, float2(0.5), high)) +
+                          source.sample(pixels, clamp(position + offset, float2(0.5), high)));
+  }
+  return sum;
+}
+
+fragment float4 backdrop_blur_horizontal_fragment(
+    BackdropBlurPassVertexOutput input [[stage_in]],
+    constant BackdropBlurPass *pass [[buffer(BackdropBlurPassInputIndex_Pass)]],
+    constant float2 *taps [[buffer(BackdropBlurPassInputIndex_Taps)]],
+    texture2d<float> source [[texture(BackdropBlurPassInputIndex_Source)]]) {
+  return backdrop_blur_along(float2(1., 0.), input.position.xy, pass, taps, source);
+}
+
+fragment float4 backdrop_blur_vertical_fragment(
+    BackdropBlurPassVertexOutput input [[stage_in]],
+    constant BackdropBlurPass *pass [[buffer(BackdropBlurPassInputIndex_Pass)]],
+    constant float2 *taps [[buffer(BackdropBlurPassInputIndex_Taps)]],
+    texture2d<float> source [[texture(BackdropBlurPassInputIndex_Source)]]) {
+  return backdrop_blur_along(float2(0., 1.), input.position.xy, pass, taps, source);
+}
+
+struct BackdropBlurFragmentOutput {
+  float4 color [[color(0), index(0)]];
+  float4 keep [[color(0), index(1)]];
+};
+
+// Dual-source blending turns `color + destination * (1 - keep.a)` into
+// `mix(destination, frosted, coverage)`: wherever the effect is partial (the
+// anti-aliased rounded edge, a fade) the framebuffer pixel itself shows
+// through, alpha included, without a copy of the region to read it from.
+// The blurred scratch is upsampled with linear filtering. Scratch texel
+// i + 1's centre stands for the centre of block i, at source position
+// `source_origin + downsample * (i + 0.5)`, and the pads either side stand
+// for the half block beyond each edge, so a pixel between the outermost
+// block's centre and the region's edge falls between that block and the pad.
+fragment BackdropBlurFragmentOutput backdrop_blur_fragment(
     BackdropBlurFragmentInput input [[stage_in]],
     constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
-    constant float2 *source_origin [[buffer(BackdropBlurInputIndex_SourceOrigin)]],
-    texture2d<float> backdrop [[texture(BackdropBlurInputIndex_Backdrop)]],
+    constant BackdropBlurPass *pass [[buffer(BackdropBlurInputIndex_Pass)]],
     texture2d<float> blurred [[texture(BackdropBlurInputIndex_Blurred)]]) {
+  constexpr sampler pixels(coord::pixel, filter::linear, address::clamp_to_edge);
   BackdropBlur blur = blurs[input.blur_id];
-  uint2 texel = uint2(max(input.position.xy - *source_origin, float2(0.)));
-  texel = min(texel, uint2(backdrop.get_width() - 1, backdrop.get_height() - 1));
-  float4 original = backdrop.read(texel);
-  float4 frosted = blurred.read(texel);
+  float2 origin = float2(pass->source_origin.x, pass->source_origin.y);
+  float2 high = float2(pass->scratch_size.x, pass->scratch_size.y) - 0.5;
+  float2 position = clamp((input.position.xy - origin) / pass->downsample + 1., float2(0.5), high);
+  float4 frosted = blurred.sample(pixels, position);
 
   float luma = dot(frosted.rgb, float3(0.2126, 0.7152, 0.0722));
   frosted.rgb = clamp(mix(float3(luma), frosted.rgb, blur.saturation), 0., frosted.a);
 
   float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
   float coverage = saturate(0.5 - distance) * saturate(blur.opacity);
-  return mix(original, frosted, coverage);
+  return BackdropBlurFragmentOutput{frosted * coverage, float4(coverage)};
 }
 
 struct UnderlineVertexOutput {
