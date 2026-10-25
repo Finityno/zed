@@ -499,24 +499,97 @@ impl WindowsPlatform {
                     let mut requested = Vec::new();
                     // The earliest frame a window asked for with a deadline.
                     let mut next_deadline = None;
-                    // Whether the last vsync painted a window. While frames
-                    // keep coming (an animation) the worker goes straight to
-                    // the next vsync, as it did before it could park: parking
-                    // and being woken again a moment later, by the paint it
-                    // just asked for re-arming its demand, costs a second
-                    // sleep per frame. One vsync without demand parks it.
+                    // After a vsync that painted, the worker either goes
+                    // straight to the next vsync or parks. While frames come
+                    // back to back (an animation, dense streaming) waiting is
+                    // cheaper: parking costs a wake each time the paint it
+                    // just asked for re-arms its demand. For a frame on its
+                    // own (a notify, a blink, a time animation's step)
+                    // parking is: waiting costs a vsync nothing asked for.
+                    // Which one the frames are doing is learned as they come.
                     let mut painting = false;
+                    let mut next_frame_follows = FollowingFrames::default();
+                    // Whether the vsync just processed came straight after one
+                    // that painted, and so says whether frames followed it.
+                    let mut straight_after_paint = false;
+                    let back_to_back = vsync_provider.interval().max(BACK_TO_BACK_FLOOR);
                     loop {
                         if !painting {
-                            // A device removed while parked is noticed here, by
-                            // notification or (without one) by a periodic poll.
-                            wake.wait(device_removed.as_ref(), next_deadline);
+                            // Park until a window asks for a frame. The worker
+                            // says it is parked, and until when, before it
+                            // looks at the windows a last time: a request made
+                            // before that found it awake and did not wake it,
+                            // and is seen here instead.
+                            let Some(windows) = all_windows.upgrade() else {
+                                break;
+                            };
+                            let mut deadline = next_deadline;
+                            wake.clear_signal();
+                            let park = loop {
+                                wake.arm(deadline);
+                                let (due, earliest) =
+                                    earliest_demand(&windows.read(), std::time::Instant::now());
+                                if due {
+                                    break false;
+                                }
+                                if earliest == deadline {
+                                    break true;
+                                }
+                                deadline = earliest;
+                            };
+                            // Not kept while parked: the list going away is
+                            // how the worker learns the platform did.
+                            drop(windows);
+                            if park {
+                                let parked_at = std::time::Instant::now();
+                                let parked_after_paint = straight_after_paint;
+                                straight_after_paint = false;
+                                // A device removed while parked is noticed here, by
+                                // notification or (without one) by a periodic poll.
+                                let reason = wake.wait(device_removed.as_ref());
+                                wake.disarm();
+                                // Woken again within about a frame of a paint,
+                                // the next frame followed it back to back.
+                                if parked_after_paint {
+                                    next_frame_follows.learn(
+                                        reason == WakeReason::Requested
+                                            && parked_at.elapsed() <= back_to_back,
+                                    );
+                                }
+                                if stop.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                // Woken with nothing due (a deadline moved, a
+                                // demand an earlier vsync already took), the
+                                // worker sleeps again rather than wait for a
+                                // vsync to paint nothing.
+                                let device_check = matches!(
+                                    reason,
+                                    WakeReason::DeviceRemoved | WakeReason::TimedOut
+                                ) || invalidate_devices.load(Ordering::Acquire);
+                                if !device_check {
+                                    let Some(windows) = all_windows.upgrade() else {
+                                        break;
+                                    };
+                                    // The timer may fire a hair before the
+                                    // deadline it was set for.
+                                    let now = std::time::Instant::now() + DEADLINE_SLACK;
+                                    let (due, deadline) = earliest_demand(&windows.read(), now);
+                                    if !due {
+                                        next_deadline = deadline;
+                                        count(Count::VsyncWaitSkipped);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                wake.disarm();
+                            }
                         }
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
                         let signal_source = vsync_provider.wait_for_vsync();
-                        count_vsync_wait();
+                        count(Count::VsyncWait);
                         let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                         if stop.load(Ordering::Acquire) {
                             break;
@@ -543,8 +616,9 @@ impl WindowsPlatform {
                         // an idle window costs no main-thread wakeup per vsync.
                         // Taking consumes the demand: GPUI re-arms it after
                         // each frame for as long as it still needs frames.
-                        // Demand with a deadline is kept until it falls due.
-                        let now = std::time::Instant::now();
+                        // Demand with a deadline is kept until it falls due,
+                        // give or take the slack GPUI allows for vsync jitter.
+                        let now = std::time::Instant::now() + DEADLINE_SLACK;
                         next_deadline = None;
                         requested.extend(all_windows.read().iter().filter_map(|window| {
                             #[cfg(test)]
@@ -567,7 +641,15 @@ impl WindowsPlatform {
                             }
                         }));
                         drop(all_windows);
-                        painting = !requested.is_empty();
+                        let painted = !requested.is_empty();
+                        if !painted {
+                            count(Count::VsyncWithoutPaint);
+                        }
+                        if straight_after_paint {
+                            next_frame_follows.learn(painted);
+                        }
+                        painting = painted && next_frame_follows.likely();
+                        straight_after_paint = painted;
                         for (hwnd, frame_request, frame_signal) in requested.drain(..) {
                             invalidate_for_frame(
                                 hwnd,
@@ -584,6 +666,51 @@ impl WindowsPlatform {
         *self.vsync_worker.borrow_mut() = Some(VSyncWorker { stop, wake });
         Ok(())
     }
+}
+
+/// How often a paint has been followed by another frame within about a
+/// refresh, recently: a running average, so that a few frames of a new
+/// pattern are enough to change what the worker does after a paint.
+#[derive(Default)]
+struct FollowingFrames(f32);
+
+impl FollowingFrames {
+    fn learn(&mut self, followed: bool) {
+        self.0 = self.0 * 0.75 + if followed { 0.25 } else { 0.0 };
+    }
+
+    fn likely(&self) -> bool {
+        self.0 >= 0.5
+    }
+}
+
+/// The shortest park after which the next frame still counts as following
+/// the last one back to back: a frame's paint can take longer than a
+/// refresh of a fast display without the animation having stopped.
+const BACK_TO_BACK_FLOOR: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// How far ahead of a deadline the worker counts it as due once woken: a
+/// waitable timer can fire a little early, and the vsync waited for next
+/// lands after the deadline anyway.
+const DEADLINE_SLACK: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Whether any window's demand is due at `now`, and the earliest deadline
+/// of those deferred, without consuming anything.
+fn earliest_demand(
+    windows: &[TrackedWindow],
+    now: std::time::Instant,
+) -> (bool, Option<std::time::Instant>) {
+    let mut deadline: Option<std::time::Instant> = None;
+    for window in windows {
+        match window.frame_request.peek(now) {
+            FrameDemand::Due => return (true, None),
+            FrameDemand::NotBefore(due_at) => {
+                deadline = Some(deadline.map_or(due_at, |earliest| earliest.min(due_at)));
+            }
+            FrameDemand::None => {}
+        }
+    }
+    (false, deadline)
 }
 
 /// Asks a window that wanted a frame to paint. Runs with the window list
@@ -614,7 +741,7 @@ fn invalidate_for_frame(
             .ok()
             .log_err();
     }
-    count_invalidation();
+    count(Count::Invalidation);
     #[cfg(test)]
     crate::native_tests::paint_invalidated(hwnd.as_raw());
 }

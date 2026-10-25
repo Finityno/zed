@@ -7327,7 +7327,18 @@ impl Window {
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
-            self.input_rate_tracker.borrow_mut().record_input();
+            let became_high_rate = {
+                let mut tracker = self.input_rate_tracker.borrow_mut();
+                let was_high_rate = tracker.is_high_rate();
+                tracker.record_input();
+                !was_high_rate && tracker.is_high_rate()
+            };
+            // High-rate input lifts an unfocused window's frame-rate cap, so
+            // a frame deferred by the cap is due now. The window is already
+            // dirty, so nothing else wakes a platform holding it until then.
+            if became_high_rate {
+                self.invalidator.wake_platform();
+            }
             self.extend_interactive_frames();
         }
         #[cfg(feature = "profiler")]
