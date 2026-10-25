@@ -3685,7 +3685,7 @@ mod submission_retention_tests {
             return;
         }
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut renderer = MetalRenderer::new(Arc::clone(&pool), false);
+        let mut renderer = MetalRenderer::new(Arc::clone(&pool), false, false);
         renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
         let submissions: Vec<_> = (0..MAX_UNFINISHED_SUBMISSIONS)
             .map(|_| InFlightSubmission::try_acquire(&renderer.unfinished_submissions))
@@ -3710,7 +3710,7 @@ mod submission_retention_tests {
             return;
         }
         let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         let submissions: Vec<_> = (0..MAX_UNFINISHED_SUBMISSIONS)
             .map(|_| InFlightSubmission::try_acquire(&renderer.unfinished_submissions))
             .collect();
@@ -4424,7 +4424,7 @@ mod present_report_tests {
     #[test]
     fn a_layer_backed_draw_reports_acquire_encode_and_commit_separately() {
         let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
 
         let report = renderer.draw(&solid_quad_scene(32.));
@@ -4456,7 +4456,7 @@ mod present_report_tests {
     #[test]
     fn noting_a_drawable_counts_it_in_flight_before_its_handler_can_run() {
         let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         let layer = renderer.layer.clone().expect("a window renderer has a layer");
 
@@ -4480,7 +4480,7 @@ mod present_report_tests {
     #[test]
     fn a_zero_size_layer_drops_the_present_without_asking_for_a_drawable() {
         let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         let drawable_size = renderer
             .layer()
             .expect("a window renderer has a layer")
@@ -4524,7 +4524,7 @@ mod present_report_tests {
     #[test]
     fn a_missing_drawable_defers_only_a_bounded_run_on_a_layer_that_can_time_out() {
         let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
 
         assert_eq!(
             renderer.missing_drawable_outcome(false),
@@ -4559,7 +4559,7 @@ mod present_report_tests {
     #[test]
     fn an_in_flight_count_above_the_layer_maximum_is_clamped_flagged_and_forgotten() {
         let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         let layer = renderer.layer.clone().expect("a window renderer has a layer");
         let maximum = layer.maximum_drawable_count() as u8;
         assert_eq!(renderer.read_drawables_in_flight(&layer), (0, false));
@@ -5435,7 +5435,7 @@ mod hidden_drawable_tests {
     /// be shader-readable in every build, not only in test builds.
     #[test]
     fn window_drawables_can_be_sampled() {
-        let renderer = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let renderer = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         let layer = renderer.layer().expect("a window renderer has a layer");
         assert!(!layer.framebuffer_only());
     }
@@ -5445,7 +5445,7 @@ mod hidden_drawable_tests {
     /// gets that size back when shown.
     #[test]
     fn a_hidden_window_shrinks_its_drawables_and_restores_the_latest_size() {
-        let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(size(DevicePixels(3456), DevicePixels(2168)));
         assert_eq!(layer_size(&renderer), (3456., 2168.));
 
