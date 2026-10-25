@@ -53,6 +53,8 @@ mod apple_build {
             "Shadow".into(),
             "BackdropBlurInputIndex".into(),
             "BackdropBlur".into(),
+            "BackdropBlurPassInputIndex".into(),
+            "BackdropBlurPass".into(),
             "QuadInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),

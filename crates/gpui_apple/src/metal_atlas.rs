@@ -529,7 +529,7 @@ mod tests {
 
         // Re-inserting A must allocate a fresh tile on a new texture,
         // NOT return a stale tile referencing the deleted texture.
-        let tile_a2 = insert_tile(&atlas, key_a.clone(), small);
+        let tile_a2 = insert_tile(&atlas, key_a, small);
 
         // The texture must actually exist — this would panic before the fix.
         assert!(atlas.metal_texture(tile_a2.texture_id).is_some());
@@ -577,12 +577,12 @@ mod tests {
         let big_key_a = make_image_key(2, 0);
         let big_key_b = make_image_key(3, 0);
 
-        let keeper_tile = insert_tile(&atlas, keeper_key.clone(), small);
+        let keeper_tile = insert_tile(&atlas, keeper_key, small);
         let tile_a = insert_tile(&atlas, big_key_a.clone(), big);
         assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
 
         atlas.remove(&big_key_a);
-        let tile_b = insert_tile(&atlas, big_key_b.clone(), big);
+        let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
     }
 
@@ -686,7 +686,7 @@ mod tests {
         assert!(atlas.texture_is_live(hot.texture_id));
         let mut rebuilt = false;
         let again = atlas
-            .get_or_insert_with(hot_key.clone(), &mut || {
+            .get_or_insert_with(hot_key, &mut || {
                 rebuilt = true;
                 Ok(None)
             })
@@ -726,7 +726,7 @@ mod tests {
         assert!(!atlas.texture_is_live(hot.texture_id));
 
         // The next glyph gets a fresh page rather than a stale tile.
-        let reinserted = insert_tile(&atlas, cold_key.clone(), small);
+        let reinserted = insert_tile(&atlas, cold_key, small);
         assert!(atlas.texture_is_live(reinserted.texture_id));
         assert!(atlas.metal_texture(reinserted.texture_id).is_some());
     }
