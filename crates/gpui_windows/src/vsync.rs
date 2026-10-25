@@ -115,19 +115,18 @@ impl MonitorClock {
         clocks
     }
 
-    /// Blocks until the monitor's next vblank. `false` means the output is
-    /// gone and the clock should stop.
-    pub(crate) fn wait(&self) -> bool {
+    /// Blocks until the monitor's next vblank and says what ended the wait;
+    /// `None` means the output is gone and the clock should stop.
+    pub(crate) fn wait(&self) -> Option<FrameRequestSource> {
         let started = Instant::now();
-        if unsafe { self.output.WaitForVBlank() }.is_err() {
-            return false;
-        }
+        unsafe { self.output.WaitForVBlank() }.ok()?;
         // Like DwmFlush, the wait returns at once while the monitor sleeps;
         // without this the thread would spin.
         if started.elapsed() < VSYNC_INTERVAL_THRESHOLD {
             std::thread::sleep(self.interval);
+            return Some(FrameRequestSource::LocalSchedule);
         }
-        true
+        Some(FrameRequestSource::NativeCallback)
     }
 }
 

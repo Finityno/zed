@@ -488,7 +488,9 @@ impl WindowsPlatform {
                                     monitors.clone(),
                                 );
                                 move || {
-                                    while clock.wait() && !stop.load(Ordering::Acquire) {
+                                    while let Some(source) = clock.wait()
+                                        && !stop.load(Ordering::Acquire)
+                                    {
                                         let signal_at =
                                             PlatformFrameSignal::capture(scheduler::Instant::now);
                                         let Some(all_windows) = all_windows.upgrade() else {
@@ -498,7 +500,7 @@ impl WindowsPlatform {
                                             &all_windows.read(),
                                             &monitors,
                                             signal_at,
-                                            FrameRequestSource::NativeCallback,
+                                            source,
                                             |window_monitor| window_monitor == monitor,
                                         );
                                     }

@@ -540,8 +540,10 @@ pub struct ScrollEvent {
     /// How many mouse wheel notches the scroll is, on `delta`'s axes, before
     /// the platform scaled each to its lines-per-notch setting (three by
     /// default on Windows, X11 and Wayland). Fractional on high-resolution
-    /// wheels; `None` where the platform reports no notches, as on macOS and
-    /// for trackpads and touch.
+    /// wheels. X11's XInput scrolling cannot tell a trackpad from a wheel, so
+    /// there a trackpad reports its device's scroll increments as notches.
+    /// `None` where the platform reports no notches: macOS, the web, Windows
+    /// precision touchpads, Wayland's continuous scrolling and touch.
     pub wheel_notches: Option<Point<f32>>,
 }
 
