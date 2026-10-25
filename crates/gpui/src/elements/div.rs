@@ -4424,6 +4424,12 @@ impl GroupHitboxes {
     pub(crate) fn pop_group(&mut self, name: &SharedString) {
         if let Some(stack) = self.0.get_mut(name) {
             stack.pop();
+            // The window keeps this map for its whole life and `tops` walks
+            // every key for each retained view it paints, so a name left with
+            // an empty stack would cost every later frame something forever.
+            if stack.is_empty() {
+                self.0.remove(name);
+            }
         }
     }
 
@@ -4941,6 +4947,30 @@ mod tests {
     };
     use std::cell::Cell;
     use std::rc::Weak;
+
+    /// A group whose containers have all been popped leaves no entry behind,
+    /// so the map holds only the groups around what is being drawn.
+    #[test]
+    fn popped_groups_leave_no_entries() {
+        let mut groups = GroupHitboxes::default();
+        let hitbox = HitboxId::placeholder();
+        for row in 0..100 {
+            let name = SharedString::from(format!("row-{row}"));
+            groups.push_group(name.clone(), hitbox);
+            groups.push_group(name.clone(), hitbox);
+            groups.pop_group(&name);
+            assert_eq!(groups.top(&name), Some(hitbox));
+            groups.pop_group(&name);
+            assert_eq!(groups.top(&name), None);
+        }
+        assert!(groups.0.is_empty());
+        assert!(groups.tops().is_empty());
+
+        groups.push_group("outer".into(), hitbox);
+        groups.push_group("inner".into(), hitbox);
+        groups.pop_group(&"inner".into());
+        assert_eq!(groups.tops(), vec![(SharedString::from("outer"), hitbox)]);
+    }
 
     /// Empty listener lists and unset accessibility properties take a
     /// pointer each and allocate nothing, and read as empty; the first item
