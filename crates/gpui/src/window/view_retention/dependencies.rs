@@ -639,6 +639,14 @@ impl RenderDependencies {
         }
     }
 
+    /// The generations this set is as of: those its recording began at.
+    pub(crate) fn generations(&self) -> DependencyGenerations {
+        DependencyGenerations {
+            globals: self.generation,
+            updates: self.updates,
+        }
+    }
+
     /// The same dependencies, with `version` read now if it was not read.
     pub(crate) fn with_state_read(&self, version: &StateVersion) -> Self {
         if self.states.iter().any(|(read, _)| read.same_state(version)) {

@@ -1209,6 +1209,14 @@ pub(crate) struct DeferredDraw {
     enclosing_views: view_retention::EnclosingViews,
     /// The records of the retained views it drew, in its frame's records.
     retained_records: Range<usize>,
+    /// Whether it drew one retained view and nothing else (`deferred(view)`),
+    /// whose reads are then that view's alone: drawn again from the last
+    /// frame, the view is built where it was if it has to be, rather than
+    /// the views it was deferred from.
+    one_view: bool,
+    /// The view it drew, built again this frame though the draw was copied
+    /// from the last one; see [`Window::rebuild_deferred_view`].
+    rebuilt: Option<view_retention::splice::RebuiltDeferredView>,
 }
 
 pub(crate) struct Frame {
@@ -4452,6 +4460,9 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        if mem::take(&mut self.view_retention.refresh_after_frame) {
+            self.refresh();
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -5012,16 +5023,38 @@ impl Window {
                             });
                         });
                     });
-                    self.finish_deferred_view(recording, cx);
+                    let records = records_start..self.retained_records_len();
+                    let one_view = self.drew_one_view_prepaint(&records, &prepaint_start);
+                    self.finish_deferred_view(recording, one_view.then_some(records.start), false, cx);
                     self.prepainting_deferred_draw_beneath_native_surfaces = None;
-                    self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
-                    records_start..self.retained_records_len()
+                    let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
+                    deferred_draw.element = Some(element);
+                    deferred_draw.one_view = one_view;
+                    records
                 } else {
-                    self.reuse_prepaint(prepaint_range.clone());
-                    let records = self.next_frame.deferred_draws[deferred_draw_ix]
-                        .retained_records
-                        .clone();
-                    self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
+                    let (records, one_view) = {
+                        let deferred_draw = &self.next_frame.deferred_draws[deferred_draw_ix];
+                        (deferred_draw.retained_records.clone(), deferred_draw.one_view)
+                    };
+                    let rebuilt = if one_view {
+                        self.with_rendered_view(current_view, |window| {
+                            window.rebuild_deferred_view(
+                                &records,
+                                &prepaint_range,
+                                &enclosing_views,
+                                cx,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(rebuilt) = rebuilt {
+                        self.next_frame.deferred_draws[deferred_draw_ix].rebuilt = Some(rebuilt);
+                        records_start..self.retained_records_len()
+                    } else {
+                        self.reuse_prepaint(prepaint_range.clone());
+                        self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
+                    }
                 };
                 self.rounded_clip = previous_rounded_clip;
                 self.next_frame.scene.current_rounded_clip = previous_gpu_clip;
@@ -5077,7 +5110,26 @@ impl Window {
                         });
                     })
                 });
-                self.finish_deferred_view(recording, cx);
+                let one_view = deferred_draw.one_view
+                    && self.drew_one_view_paint(&deferred_draw.retained_records, &paint_start);
+                if deferred_draw.one_view && !one_view {
+                    // Its prepaint left the view's reads to the view alone;
+                    // its paint drew more, so the views it was deferred
+                    // from take them after all.
+                    self.give_deferred_reads_to_enclosing(
+                        &deferred_draw.enclosing_views,
+                        &deferred_draw.retained_records,
+                    );
+                }
+                deferred_draw.one_view = one_view;
+                let view = one_view.then_some(deferred_draw.retained_records.start);
+                self.finish_deferred_view(recording, view, true, cx);
+            } else if let Some(mut rebuilt) = deferred_draw.rebuilt.take() {
+                let current_view = deferred_draw.current_view;
+                self.with_rendered_view(current_view, |window| {
+                    window.paint_rebuilt_deferred_view(&mut rebuilt, cx)
+                });
+                deferred_draw = &mut deferred_draws[deferred_draw_ix];
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
                 let records = deferred_draw.retained_records.clone();
@@ -5184,6 +5236,7 @@ impl Window {
             self.next_frame.focus = self.focus;
         }
 
+        let inside_notified = self.inside_notified_view();
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
@@ -5204,8 +5257,10 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                     // Drawn from the last frame: what it read is part of the
                     // records copied along with the views it came from.
-                    enclosing_views: Default::default(),
+                    enclosing_views: view_retention::EnclosingViews::copied(inside_notified),
                     retained_records: deferred_draw.retained_records.clone(),
+                    one_view: deferred_draw.one_view,
+                    rebuilt: None,
                 }),
         );
     }
@@ -5920,6 +5975,8 @@ impl Window {
             paint_range: PaintIndex::default()..PaintIndex::default(),
             enclosing_views: self.enclosing_views(),
             retained_records: 0..0,
+            one_view: false,
+            rebuilt: None,
         });
     }
 
