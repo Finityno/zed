@@ -183,10 +183,13 @@ impl WindowMonitors {
                 std::mem::size_of::<RECT>() as u32,
             )
         };
-        let under = if visible.is_ok() {
-            monitors_under(bounds)
-        } else {
-            Default::default()
+        // The nearest monitor stands in below when the frame is unknown.
+        let under = match visible {
+            Ok(()) => monitors_under(bounds),
+            Err(error) => {
+                log::debug!("visible frame of window {hwnd:?} unavailable: {error}");
+                Default::default()
+            }
         };
         let rated: Vec<(isize, Option<Duration>)> = under
             .into_iter()
