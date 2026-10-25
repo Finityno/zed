@@ -336,6 +336,8 @@ impl WindowsWindowInner {
             self.state
                 .invalidate_devices
                 .store(true, std::sync::atomic::Ordering::Release);
+            // The compositor clock recreates the devices, and may be asleep.
+            self.state.frame_request.wake_device_owner();
         }
         // Same dedup as `handle_move_msg`: only a real change fans out to the
         // bounds observers. Keyed on (size, scale) because a DPI change can
@@ -408,6 +410,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        // From here on the handle value may be reused by a new window, which
+        // must not receive this one's frames; see `close_one_window`.
+        self.state.frame_request.close();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -880,6 +885,8 @@ impl WindowsWindowInner {
 
     fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
+        // A frame deferred by the inactive-window cap is due once active.
+        self.state.frame_request.expedite();
 
         let events = self
             .state
@@ -1479,6 +1486,8 @@ impl WindowsWindowInner {
         {
             panic!("Device lost: {err}");
         }
+        #[cfg(test)]
+        crate::native_tests::recovered();
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
         // between) is treated as a forced render so it both clears
@@ -1491,15 +1500,14 @@ impl WindowsWindowInner {
         // A gesture may be starting; `draw_window` polls Direct Manipulation
         // and keeps frames coming while it reports one.
         if self.state.direct_manipulation.on_pointer_hit_test(wparam) {
-            self.state
-                .frame_demand
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_request.request();
         }
         None
     }
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        count(Count::Paint);
         let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
             log::debug!("deferring re-entrant draw of window {handle:?}");
             if force_render {
@@ -1514,9 +1522,7 @@ impl WindowsWindowInner {
             // thread may invalidate the window as soon as the demand is set,
             // and validating after that would erase the deferred frame.
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
-            self.state
-                .frame_demand
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_request.request();
             return Some(0);
         };
         // Validate up front for the same reason: anything that asks for a
@@ -1525,6 +1531,8 @@ impl WindowsWindowInner {
         // window, and that invalidation must survive to produce the next paint.
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+        #[cfg(test)]
+        crate::native_tests::paint_started(handle);
 
         self.state.direct_manipulation.update();
         // Direct Manipulation runs in manual-update mode: a touchpad gesture
@@ -1532,9 +1540,7 @@ impl WindowsWindowInner {
         // happens here. Keep frames coming while one may be in progress, or
         // an idle window would freeze the gesture.
         if self.state.direct_manipulation.needs_updates() {
-            self.state
-                .frame_demand
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_request.request();
         }
 
         let events = self.state.direct_manipulation.drain_events();
@@ -1566,6 +1572,8 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
+        #[cfg(test)]
+        crate::native_tests::paint_done(handle);
 
         Some(0)
     }
