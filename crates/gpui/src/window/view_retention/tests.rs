@@ -5232,3 +5232,543 @@ fn frame_work_transcript() {
         }
     }
 }
+
+/// A caret toggled by a timer, read only while its text element paints.
+struct PaintedCaret(bool);
+
+struct CaretField {
+    caret: Entity<PaintedCaret>,
+    painted: Rc<std::cell::RefCell<Vec<bool>>>,
+}
+
+impl Render for CaretField {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let caret = self.caret.clone();
+        let painted = self.painted.clone();
+        div().w(px(40.)).h(px(20.)).child(
+            crate::canvas(
+                |_, _, _| {},
+                move |_, _, _, cx| painted.borrow_mut().push(caret.read(cx).0),
+            )
+            .size_full(),
+        )
+    }
+}
+
+struct CaretHolder {
+    field: Entity<CaretField>,
+    cached: bool,
+    /// An overlay of the holder's own drawn after the frame, as a menu, a
+    /// popover or a toast is.
+    deferred_overlay: bool,
+}
+
+impl Render for CaretHolder {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let field = if self.cached {
+            crate::AnyView::from(self.field.clone())
+                .cached(StyleRefinement::default().w(px(40.)).h(px(20.)))
+                .into_any_element()
+        } else {
+            self.field.clone().into_any_element()
+        };
+        div()
+            .size_full()
+            .child(field)
+            .child(div().child("a label beside the field"))
+            .when(self.deferred_overlay, |this| {
+                this.child(deferred(div().w(px(10.)).h(px(10.)).child("overlay")))
+            })
+    }
+}
+
+/// An entity a view reads only while it paints (an input's caret, read by
+/// its text element) is a dependency like anything read while it is built:
+/// notifying it draws the window again, and the frame paints the new value,
+/// with and without a cached view around the field, and with an overlay the
+/// holder defers, which is drawn again from the last frame with it.
+#[test]
+fn an_entity_read_only_while_painting_draws_the_view_again() {
+    for (cached, deferred_overlay) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| cx.set_view_retention(true));
+        let caret = cx.new(|_| PaintedCaret(true));
+        let painted = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let field = cx.new({
+            let caret = caret.clone();
+            let painted = painted.clone();
+            |_| CaretField { caret, painted }
+        });
+        let window = cx.add_window(move |_, _| CaretHolder {
+            field,
+            cached,
+            deferred_overlay,
+        });
+        draw_caret(&mut cx, window);
+        cx.run_until_parked();
+        draw_caret(&mut cx, window);
+        assert_eq!(painted.borrow().last(), Some(&true));
+
+        for (blink, visible) in [false, true, false, true].into_iter().enumerate() {
+            cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false))
+                .unwrap();
+            caret.update(&mut cx, |caret, cx| {
+                caret.0 = visible;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // The notification alone must ask for the frame: nothing here
+            // draws the window.
+            let work = cx
+                .update_window(window.into(), |_, window, _| window.frame_work_stats())
+                .unwrap();
+            assert!(
+                work.frames > 0,
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}) drew no frame: {work:?}"
+            );
+            // Only the field that read the caret is built; the holder is
+            // drawn again around it, and nothing else is built or copied.
+            assert_eq!(
+                (work.frames, work.views_rendered, work.views_spliced, work.views_reused),
+                (1, 1, 1, 1),
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}): {work:?}"
+            );
+            assert_eq!(
+                work.view_rebuilds,
+                crate::ViewRebuildCounts {
+                    entity_changed: 1,
+                    ..Default::default()
+                },
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}) built for another reason: {work:?}"
+            );
+            assert_eq!(
+                painted.borrow().last(),
+                Some(&visible),
+                "blink {blink} (cached: {cached}, overlay: {deferred_overlay}) was not painted: {work:?}"
+            );
+        }
+    }
+}
+
+fn draw_caret(cx: &mut TestAppContext, window: WindowHandle<CaretHolder>) {
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+        .unwrap();
+}
+
+/// A square that counts its builds and changes colour when toggled.
+struct Toggled {
+    lit: bool,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Toggled {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .w(px(20.))
+            .h(px(20.))
+            .bg(if self.lit { PALETTE[1] } else { PALETTE[2] })
+    }
+}
+
+/// A view holding another, beside an overlay it defers when `overlay` is
+/// set, as a panel defers a popover beside its composer.
+struct Overlaid {
+    held: Entity<Toggled>,
+    overlay: bool,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Overlaid {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .size_full()
+            .child(self.held.clone())
+            .when(self.overlay, |this| {
+                this.child(deferred(div().w(px(8.)).h(px(8.)).bg(PALETTE[3])))
+            })
+    }
+}
+
+/// The window's root: the overlaid view, and a view beside it that is never
+/// built again after the first frame.
+struct OverlaidRoot {
+    overlaid: Entity<Overlaid>,
+    beside: Entity<Toggled>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for OverlaidRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .size_full()
+            .flex()
+            .child(self.overlaid.clone())
+            .child(self.beside.clone())
+    }
+}
+
+/// A view notified inside another, inside the root, is built alone: the
+/// views around it are drawn again around it. Afterwards, a frame with
+/// nothing changed builds nothing: what the spliced root read is as of when
+/// it was found unchanged, not as of the oldest view copied along with it,
+/// which would count the root's own change before the splice as a change
+/// again.
+#[test]
+fn a_view_inside_spliced_views_is_built_alone() {
+    view_inside_spliced_views_is_built_alone(false);
+}
+
+fn view_inside_spliced_views_is_built_alone(overlay: bool) {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    // The builds of the root, the overlaid view and the held view, in the
+    // window drawing views again.
+    let renders: [Rc<Cell<usize>>; 3] = Default::default();
+    let windows = [renders.clone(), Default::default()].map(|renders| {
+        cx.add_window(move |_, cx| OverlaidRoot {
+            overlaid: cx.new(|cx| Overlaid {
+                held: cx.new(|_| Toggled {
+                    lit: false,
+                    renders: renders[2].clone(),
+                }),
+                overlay,
+                renders: renders[1].clone(),
+            }),
+            beside: cx.new(|_| Toggled {
+                lit: false,
+                renders: Rc::new(Cell::new(0)),
+            }),
+            renders: renders[0].clone(),
+        })
+    });
+    // Draws the first window as it is, and the second from scratch, and
+    // checks the two agree; returns the first's work.
+    let frame = |cx: &mut TestAppContext| {
+        let (retained, work) = cx
+            .update_window(windows[0].into(), |_, window, cx| {
+                if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                let work = window.frame_work_stats();
+                window.reset_frame_work_stats(false);
+                (describe_frame(window), work)
+            })
+            .unwrap();
+        let from_scratch = cx
+            .update_window(windows[1].into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                describe_frame(window)
+            })
+            .unwrap();
+        assert_eq!(first_difference(&retained, &from_scratch), None);
+        assert_eq!(
+            retained
+                .iter()
+                .any(|line| line.contains(&format!("{:?}", PALETTE[3]))),
+            overlay,
+            "the overlay is drawn when deferred"
+        );
+        work
+    };
+    frame(&mut cx);
+    frame(&mut cx);
+    // The root built after its own change, the views in it drawn again whole.
+    for window in windows {
+        window
+            .update(&mut cx, |_, _, cx| cx.notify())
+            .unwrap();
+    }
+    frame(&mut cx);
+    for toggle in 0..3 {
+        let before: Vec<usize> = renders.iter().map(|count| count.get()).collect();
+        for window in windows {
+            let held = window
+                .read_with(&cx, |root, cx| root.overlaid.read(cx).held.clone())
+                .unwrap();
+            held.update(&mut cx, |held, cx| {
+                held.lit = !held.lit;
+                cx.notify();
+            });
+        }
+        let work = frame(&mut cx);
+        assert_eq!(work.views_rendered, 1, "toggle {toggle}: {work:?}");
+        assert_eq!(work.views_spliced, 2, "toggle {toggle}: {work:?}");
+        let built: Vec<usize> = renders
+            .iter()
+            .zip(&before)
+            .map(|(count, before)| count.get() - before)
+            .collect();
+        assert_eq!(built, vec![0, 0, 1], "toggle {toggle}");
+
+        let work = frame(&mut cx);
+        assert_eq!(
+            (work.views_rendered, work.views_spliced),
+            (0, 0),
+            "toggle {toggle}: nothing changed, yet {work:?}"
+        );
+    }
+}
+
+/// The same, with an overlay deferred by the view around the one notified:
+/// both views around it are still drawn again around it, the overlay copied
+/// with the view that deferred it.
+#[test]
+fn a_view_beside_a_deferred_overlay_is_built_alone() {
+    view_inside_spliced_views_is_built_alone(true);
+}
+
+/// What a deferred composer's caret reads: one model read only while
+/// painting, one read as it renders, which sets its width.
+struct CaretModels {
+    painted: Entity<usize>,
+    rendered: Entity<usize>,
+}
+
+/// The input inside the composer: its width follows the rendered model, and
+/// it paints a caret whose colour follows the painted one.
+struct DeferredInput {
+    painted: Entity<usize>,
+    rendered: Entity<usize>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for DeferredInput {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let width = 20. + *self.rendered.read(cx) as f32 * 5.;
+        let painted = self.painted.clone();
+        div().w(px(width)).h(px(12.)).bg(PALETTE[2]).child(
+            crate::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, cx| {
+                    let lit = painted.read(cx).is_multiple_of(2);
+                    window.paint_quad(crate::fill(bounds, PALETTE[if lit { 1 } else { 3 }]));
+                },
+            )
+            .w(px(2.))
+            .h(px(10.)),
+        )
+    }
+}
+
+/// The composer, drawn deferred by the host.
+struct DeferredComposer {
+    input: Entity<DeferredInput>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for DeferredComposer {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div().p(px(4.)).bg(PALETTE[0]).child(self.input.clone())
+    }
+}
+
+/// A panel that draws its composer deferred, after the rest of the window.
+struct ComposerHost {
+    composer: Entity<DeferredComposer>,
+    ticks: usize,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for ComposerHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(SharedString::from(format!("ticked {}", self.ticks)))
+            .child(crate::deferred(self.composer.clone()))
+    }
+}
+
+/// A view drawn deferred is the views it holds: a change to what they read
+/// while painting (a caret blinking) builds only them, inside the deferred
+/// view drawn again around them, while the view that deferred it is drawn
+/// again whole from the last frame. Every other change builds what it did,
+/// and every frame matches one drawn from scratch.
+#[test]
+fn a_change_inside_a_deferred_view_builds_only_what_it_holds() {
+    let mut cx = super::super::layout_retention_tests::text_system_context(0);
+    cx.update(|cx| cx.set_view_retention(true));
+    // The builds of the host, the composer and the input, in the window
+    // drawing views again.
+    let renders: [Rc<Cell<usize>>; 3] = Default::default();
+    let mut models = Vec::new();
+    let windows = [renders.clone(), Default::default()].map(|renders| {
+        let caret = CaretModels {
+            painted: cx.new(|_| 0),
+            rendered: cx.new(|_| 0),
+        };
+        let (painted, rendered) = (caret.painted.clone(), caret.rendered.clone());
+        models.push(caret);
+        cx.add_window(move |_, cx| ComposerHost {
+            composer: cx.new(|cx| DeferredComposer {
+                input: cx.new(|_| DeferredInput {
+                    painted,
+                    rendered,
+                    renders: renders[2].clone(),
+                }),
+                renders: renders[1].clone(),
+            }),
+            ticks: 0,
+            renders: renders[0].clone(),
+        })
+    });
+    let draw = |cx: &mut TestAppContext| {
+        let [(retained, work), (from_scratch, _)] = windows.map(|window| {
+            cx.update_window(window.into(), |_, window, cx| {
+                if window.handle.window_id() == windows[1].window_id() {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                } else if window.frame_work_stats().frames == 0 {
+                    window.draw(cx).clear(cx);
+                }
+                let frame = (describe_frame(window), window.frame_work_stats());
+                window.reset_frame_work_stats(false);
+                frame
+            })
+            .unwrap()
+        });
+        assert_eq!(first_difference(&retained, &from_scratch), None);
+        work
+    };
+    let built = |before: &[usize]| -> Vec<usize> {
+        renders
+            .iter()
+            .zip(before)
+            .map(|(count, before)| count.get() - before)
+            .collect()
+    };
+    draw(&mut cx);
+    draw(&mut cx);
+    for round in 0..3 {
+        // The caret: only the input is built, inside the composer drawn
+        // again around it; the host is drawn again whole.
+        let before: Vec<usize> = renders.iter().map(|count| count.get()).collect();
+        for caret in &models {
+            caret.painted.update(&mut cx, |painted, cx| {
+                *painted += 1;
+                cx.notify();
+            });
+        }
+        let work = draw(&mut cx);
+        assert_eq!(built(&before), vec![0, 0, 1], "round {round}: {work:?}");
+        assert_eq!(work.views_spliced, 1, "round {round}: {work:?}");
+        let work = draw(&mut cx);
+        assert_eq!(work.views_rendered, 0, "round {round}, unchanged: {work:?}");
+
+        // What the input renders, changing its width: built with the views
+        // around it, as before.
+        for caret in &models {
+            caret.rendered.update(&mut cx, |rendered, cx| {
+                *rendered += 1;
+                cx.notify();
+            });
+        }
+        let work = draw(&mut cx);
+        assert!(work.views_rendered >= 1, "round {round}: {work:?}");
+        draw(&mut cx);
+
+        // The input and the host notified.
+        for window in windows {
+            let input = window
+                .read_with(&cx, |host, cx| host.composer.read(cx).input.clone())
+                .unwrap();
+            input.update(&mut cx, |_, cx| cx.notify());
+        }
+        draw(&mut cx);
+        for window in windows {
+            window
+                .update(&mut cx, |host, _, cx| {
+                    host.ticks += 1;
+                    cx.notify();
+                })
+                .unwrap();
+        }
+        draw(&mut cx);
+        let work = draw(&mut cx);
+        assert_eq!(work.views_rendered, 0, "round {round}, unchanged: {work:?}");
+    }
+}
+
+/// A change inside a deferred view that cannot be built where it was (it
+/// cannot be built on its own, or asks for another layout than it had)
+/// never shows the frame before: the frame is drawn again from scratch
+/// before it is presented, and matches one drawn from scratch. Both are
+/// forced here: neither happens to the views a test can build, which
+/// change layout only through what they render, and that the views around
+/// them are built for.
+#[test]
+fn a_deferred_view_that_cannot_be_built_where_it_was_has_the_frame_drawn_from_scratch() {
+    use super::splice::DeferredRebuildRefusal;
+    for refusal in [DeferredRebuildRefusal::NotOnItsOwn, DeferredRebuildRefusal::AnotherLayout] {
+        super::splice::force_deferred_rebuild_refusal(Some(refusal));
+        let mut cx = super::super::layout_retention_tests::text_system_context(0);
+        cx.update(|cx| cx.set_view_retention(true));
+        let mut painted_models = Vec::new();
+        let windows = [(); 2].map(|_| {
+            let painted = cx.new(|_| 0);
+            let rendered = cx.new(|_| 0);
+            painted_models.push(painted.clone());
+            cx.add_window(move |_, cx| ComposerHost {
+                composer: cx.new(|cx| DeferredComposer {
+                    input: cx.new(|_| DeferredInput {
+                        painted,
+                        rendered,
+                        renders: Rc::new(Cell::new(0)),
+                    }),
+                    renders: Rc::new(Cell::new(0)),
+                }),
+                ticks: 0,
+                renders: Rc::new(Cell::new(0)),
+            })
+        });
+        let draw = |cx: &mut TestAppContext| {
+            let [(retained, work), (from_scratch, _)] = windows.map(|window| {
+                cx.update_window(window.into(), |_, window, cx| {
+                    if window.handle.window_id() == windows[1].window_id() {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    } else if window.frame_work_stats().frames == 0 {
+                        window.draw(cx).clear(cx);
+                    }
+                    let frame = (describe_frame(window), window.frame_work_stats());
+                    window.reset_frame_work_stats(false);
+                    frame
+                })
+                .unwrap()
+            });
+            assert_eq!(first_difference(&retained, &from_scratch), None, "{refusal:?}");
+            work
+        };
+        draw(&mut cx);
+        let work = draw(&mut cx);
+        assert_eq!(work.views_rendered, 0, "{refusal:?}: {work:?}");
+        for blink in 0..3 {
+            for painted in &painted_models {
+                painted.update(&mut cx, |painted, cx| {
+                    *painted += 1;
+                    cx.notify();
+                });
+            }
+            let work = draw(&mut cx);
+            assert_eq!(
+                work.redrawn_from_scratch, 1,
+                "{refusal:?}, blink {blink}: the frame was drawn again from scratch: {work:?}"
+            );
+            let work = draw(&mut cx);
+            assert_eq!(
+                (work.views_rendered, work.redrawn_from_scratch),
+                (0, 0),
+                "{refusal:?}, blink {blink}, unchanged: {work:?}"
+            );
+        }
+        super::splice::force_deferred_rebuild_refusal(None);
+    }
+}

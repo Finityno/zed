@@ -24,8 +24,14 @@
 //!   (the window's, or a list item's), moves nothing outside the gap;
 //!   otherwise what was built of the splice is rolled back and the view is
 //!   built instead;
-//! - it deferred nothing (a deferred draw of a view nested in it is drawn
-//!   after the frame, out of the stretches);
+//! - the deferred draws in the stretches it copies (a menu, a popover, a
+//!   toast of its own or of a view copied along) are copied with them and
+//!   drawn again from the last frame, as a view drawn again whole draws its
+//!   own, hung off the dispatch nodes they hung off; a gap's own deferred
+//!   draws are not copied, since its prepaint range is not: a gap spliced
+//!   in turn copies its own, and a gap built would defer them afresh, but
+//!   one that deferred something is not built in a gap (see
+//!   [`Window::splice_gaps`]);
 //! - each gap can be built on its own: it is an entity or an [`AnyView`],
 //!   was laid out with nodes it kept (or is a cached view, laid out at its
 //!   bounds), is not under an image cache, a text shimmer or a time
@@ -33,7 +39,7 @@
 
 use super::{
     HoverRead, PaintStatus, ViewPrepaint, ViewRebuildReason, ViewRecord, ViewSource,
-    dependencies::DependencyChange,
+    dependencies::{DependencyChange, DependencyGenerations},
 };
 use crate::{
     App, ContentMask, ElementId, EntityId, GlobalElementId, GroupHitboxes, LayoutId, Pixels,
@@ -48,6 +54,9 @@ use std::{mem, ops::Range};
 pub(crate) struct Splice {
     pub(super) previous: usize,
     pub(super) gaps: SmallVec<[usize; 4]>,
+    /// When what the view read itself, and what the views copied along read,
+    /// was found unchanged.
+    checked: DependencyGenerations,
 }
 
 /// What a spliced view's prepaint leaves for its paint.
@@ -69,6 +78,31 @@ struct PrepaintedGap {
     /// Its element's dispatch node in this frame.
     node: DispatchNodeId,
     prepaint: ViewPrepaint,
+}
+
+/// The one view a deferred draw copied from the last frame drew, built (or
+/// spliced) where it was because something in it had to be built.
+pub(crate) struct RebuiltDeferredView(PrepaintedGap);
+
+/// Why a test has [`Window::rebuild_deferred_view`] refuse, which no view a
+/// test can build makes it do, to check what the frame shows then.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DeferredRebuildRefusal {
+    NotOnItsOwn,
+    AnotherLayout,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_REFUSAL: std::cell::Cell<Option<DeferredRebuildRefusal>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Has deferred views refuse to be built where they were, on this thread.
+#[cfg(test)]
+pub(crate) fn force_deferred_rebuild_refusal(refusal: Option<DeferredRebuildRefusal>) {
+    FORCED_REFUSAL.set(refusal);
 }
 
 /// Last frame's dispatch nodes copied stretch by stretch, with the nodes the
@@ -187,6 +221,18 @@ impl Window {
         None
     }
 
+    /// Whether the view last frame's `record` stands for has to be built
+    /// itself, and not only drawn again around views nested in it: it was
+    /// notified, or has another reason of its own (see
+    /// [`Window::prepaint_gap`], which splices any other gap in turn).
+    fn builds_itself(&self, record: &ViewRecord, cx: &App) -> bool {
+        let Some(entity) = view_entity(&record.id) else {
+            return true;
+        };
+        self.view_retention.notified.contains(&entity)
+            || self.rebuild_reason_besides_dirty(record, entity, cx).is_some()
+    }
+
     /// Whether the view `record` stands for can be built on its own, inside
     /// `around`, drawn again around it.
     fn buildable_on_its_own(record: &ViewRecord, around: &ViewRecord) -> bool {
@@ -229,12 +275,9 @@ impl Window {
     /// built, the outermost of each, if there are some and each can be
     /// built on its own.
     fn splice_gaps(&self, previous: usize, cx: &App) -> Option<Splice> {
+        let checked = cx.dependency_generations();
         let records = &self.rendered_frame.retained_views.records;
         let record = &records[previous];
-        let prepaint = &record.prepaint_range;
-        if prepaint.start.deferred_draws_index != prepaint.end.deferred_draws_index {
-            return None;
-        }
         let mut gaps = SmallVec::new();
         let mut index = previous + 1;
         while index <= previous + record.nested {
@@ -254,20 +297,42 @@ impl Window {
             if !Self::buildable_on_its_own(nested, record) {
                 return None;
             }
+            // A gap that has to be built itself and deferred something last
+            // frame still has the view built instead. Built in a gap, a view
+            // that then asks for another layout is built a second time, with
+            // the view the splice falls back to; refusing these up front
+            // keeps that second build off views that defer (an entry with a
+            // menu), which were built once before deferred draws could be
+            // copied. A gap spliced in turn copies what it deferred and
+            // builds only what is nested in it.
+            let deferred = &nested.prepaint_range;
+            if deferred.start.deferred_draws_index != deferred.end.deferred_draws_index
+                && self.builds_itself(nested, cx)
+            {
+                return None;
+            }
             gaps.push(index);
             index += nested.nested + 1;
         }
-        (!gaps.is_empty()).then_some(Splice { previous, gaps })
+        (!gaps.is_empty()).then_some(Splice {
+            previous,
+            gaps,
+            checked,
+        })
     }
 
     /// Copies last frame's prepaint of `range` as [`Window::reuse_prepaint`]
     /// does, leaving the dispatch nodes it enters open in `dispatch` for
     /// what follows to hang off. A spliced view defers nothing.
+    /// Copies last frame's prepaint `range` of the spliced view, returning
+    /// false if a deferred draw in it hangs off a dispatch node that was not
+    /// copied, which the splice cannot draw again.
+    #[must_use]
     fn copy_prepaint_stretch(
         &mut self,
         range: Range<PrepaintStateIndex>,
         dispatch: &mut OpenDispatchCopy,
-    ) {
+    ) -> bool {
         let rendered = &mut self.rendered_frame;
         let next = &mut self.next_frame;
         next.hitboxes.extend(
@@ -312,6 +377,39 @@ impl Window {
         if contains_focus {
             self.next_frame.focus = self.focus;
         }
+        // Drawn again from the last frame after the frame, as a view drawn
+        // again whole has its own drawn (see `Window::reuse_prepaint_moved`).
+        // In order, at this stretch's place, so the indices the records
+        // copied along hold stay in step with them.
+        let deferred = range.start.deferred_draws_index..range.end.deferred_draws_index;
+        for index in deferred {
+            let deferred_draw = &self.rendered_frame.deferred_draws[index];
+            let Some(parent_node) = dispatch.copied(deferred_draw.parent_node) else {
+                return false;
+            };
+            let copy = crate::window::DeferredDraw {
+                current_view: deferred_draw.current_view,
+                parent_node,
+                element_id_stack: deferred_draw.element_id_stack.clone(),
+                text_style_stack: deferred_draw.text_style_stack.clone(),
+                content_mask: deferred_draw.content_mask,
+                rounded_clip: deferred_draw.rounded_clip.clone(),
+                rem_size: deferred_draw.rem_size,
+                priority: deferred_draw.priority,
+                beneath_native_surfaces: deferred_draw.beneath_native_surfaces,
+                element: None,
+                absolute_offset: deferred_draw.absolute_offset,
+                prepaint_range: deferred_draw.prepaint_range.clone(),
+                paint_range: deferred_draw.paint_range.clone(),
+                // Its reads are the spliced view's own, carried in its record.
+                enclosing_views: super::EnclosingViews::copied(self.inside_notified_view()),
+                retained_records: deferred_draw.retained_records.clone(),
+                one_view: deferred_draw.one_view,
+                rebuilt: None,
+            };
+            self.next_frame.deferred_draws.push(copy);
+        }
+        true
     }
 
     /// Copies last frame's records `records`, whose prepaint was copied from
@@ -409,6 +507,12 @@ impl Window {
         let record = &self.rendered_frame.retained_views.records[gap];
         let id = record.id.clone();
         let entity = view_entity(&id).expect("a gap is a view");
+        // As a view that opted out does when it is reached in a view being
+        // built (see `Window::reusable_view`): the views around it are
+        // drawn on every frame it is drawn in.
+        if cx.non_retainable_views.contains(&entity) {
+            super::dependencies::note_state_read(&self.view_retention.every_frame);
+        }
         let bounds = record.context.bounds;
         let layout_scope = record.layout_scope;
         let source = &record.source;
@@ -512,7 +616,11 @@ impl Window {
     }
 
     fn splice_prepaint_inner(&mut self, splice: Splice, cx: &mut App) -> Option<ViewPrepaint> {
-        let Splice { previous, gaps } = splice;
+        let Splice {
+            previous,
+            gaps,
+            checked,
+        } = splice;
         let (prepaint_range, last, dependencies, own_hovers) = {
             let source = &self.rendered_frame.retained_views;
             let record = &source.records[previous];
@@ -570,6 +678,7 @@ impl Window {
                 paint_context: record.paint_context.clone(),
                 dependencies: record.own_dependencies.written_up_to(writes_now),
                 own_dependencies: record.own_dependencies.written_up_to(writes_now),
+                prepaint_dependencies: record.own_dependencies.written_up_to(writes_now),
                 hovers: own_hovers.clone(),
                 own_hovers: own_hovers.clone(),
                 groups: record.groups.clone(),
@@ -605,7 +714,10 @@ impl Window {
                 (gap_record.prepaint_range.clone(), gap_record.nested)
             };
             let stretch_start = self.prepaint_index();
-            self.copy_prepaint_stretch(cursor.clone()..gap_range.start.clone(), &mut dispatch);
+            if !self.copy_prepaint_stretch(cursor.clone()..gap_range.start.clone(), &mut dispatch)
+            {
+                return self.abandon_splice_prepaint(&mut dispatch);
+            }
             self.copy_records(
                 next_record..gap,
                 (&cursor, &stretch_start),
@@ -633,12 +745,7 @@ impl Window {
                 }
             };
             let Some((entity, prepaint)) = self.prepaint_gap(gap, cx) else {
-                self.next_frame
-                    .dispatch_tree
-                    .close_copied_to(&mut dispatch.open, None);
-                self.take_hover_reads();
-                self.view_retention.view_stack.pop();
-                return None;
+                return self.abandon_splice_prepaint(&mut dispatch);
             };
             prepainted.push(PrepaintedGap {
                 previous: gap,
@@ -651,7 +758,9 @@ impl Window {
             next_record = gap + gap_nested + 1;
         }
         let stretch_start = self.prepaint_index();
-        self.copy_prepaint_stretch(cursor.clone()..prepaint_range.end, &mut dispatch);
+        if !self.copy_prepaint_stretch(cursor.clone()..prepaint_range.end, &mut dispatch) {
+            return self.abandon_splice_prepaint(&mut dispatch);
+        }
         self.copy_records(
             next_record..last + 1,
             (&cursor, &stretch_start),
@@ -670,15 +779,26 @@ impl Window {
         views.open.retain(|open| *open != index);
         let nested = views.records.len() - index - 1;
         // What it read, and the hovers it was drawn by: its own, and those
-        // of the views nested in it, copied or built.
-        let mut dependencies = views.records[index].own_dependencies.clone();
+        // of the views nested in it, copied or built, as of when they were
+        // checked, as a view built now would have them: what changed before
+        // was looked at and changed nothing.
+        let mut dependencies = views.records[index].own_dependencies.checked_as_of(checked);
+        let mut prepaint_dependencies = dependencies.clone();
         let mut all_hovers: Vec<HoverRead> = own_hovers.to_vec();
         let mut unsettled = false;
         let mut stays_put = views.records[index].stays_put;
         let mut nested_index = index + 1;
         while nested_index <= index + nested {
             let record = &views.records[nested_index];
-            dependencies = dependencies.union(&record.dependencies);
+            dependencies = dependencies.union(&record.dependencies.checked_as_of(checked));
+            prepaint_dependencies = prepaint_dependencies
+                .union(&record.prepaint_dependencies.checked_as_of(checked));
+            // A gap that opted out is built on every frame, and so is drawn
+            // in a view that is drawn on every frame, spliced around it.
+            if view_entity(&record.id).is_some_and(|view| cx.non_retainable_views.contains(&view))
+            {
+                dependencies = dependencies.with_state_read(&self.view_retention.every_frame);
+            }
             all_hovers.extend_from_slice(&record.hovers);
             unsettled |= record.unsettled;
             stays_put |= record.stays_put;
@@ -688,6 +808,7 @@ impl Window {
         record.prepaint_range = start..end;
         record.nested = nested;
         record.dependencies = dependencies;
+        record.prepaint_dependencies = prepaint_dependencies;
         record.hovers = all_hovers.into();
         record.unsettled = unsettled;
         record.stays_put = stays_put;
@@ -700,6 +821,125 @@ impl Window {
             gaps: prepainted,
             copied,
         }))
+    }
+
+    /// Leaves a splice that cannot be drawn: what it prepainted is rolled back
+    /// by the transaction around it, and the view is built instead.
+    fn abandon_splice_prepaint(&mut self, dispatch: &mut OpenDispatchCopy) -> Option<ViewPrepaint> {
+        self.next_frame
+            .dispatch_tree
+            .close_copied_to(&mut dispatch.open, None);
+        self.take_hover_reads();
+        self.view_retention.view_stack.pop();
+        None
+    }
+
+    /// For a deferred draw copied from the last frame that drew one view,
+    /// the views `records` there in `prepaint_range` (see
+    /// [`Window::drew_one_view_prepaint`]), builds the view where it was if
+    /// something in it has to be built, as a gap of a splice is built (or
+    /// spliced in turn). `None`, with nothing done, to draw it again from the
+    /// last frame: nothing in it has to be built, or it cannot be built on
+    /// its own, which then has the frame drawn again from scratch before it
+    /// is presented.
+    pub(crate) fn rebuild_deferred_view(
+        &mut self,
+        records: &Range<usize>,
+        prepaint_range: &Range<PrepaintStateIndex>,
+        enclosing: &super::EnclosingViews,
+        cx: &mut App,
+    ) -> Option<RebuiltDeferredView> {
+        let view = {
+            let source = &self.rendered_frame.retained_views.records;
+            let view = super::one_view(source, records)?;
+            if !super::prepaint_spans(&source[view].prepaint_range, prepaint_range) {
+                return None;
+            }
+            view
+        };
+        let inside_notified = mem::replace(
+            &mut self.view_retention.deferred_inside_notified,
+            enclosing.inside_notified(),
+        );
+        let rebuilt = self.rebuild_deferred_view_at(view, cx);
+        self.view_retention.deferred_inside_notified = inside_notified;
+        rebuilt
+    }
+
+    fn rebuild_deferred_view_at(&mut self, view: usize, cx: &mut App) -> Option<RebuiltDeferredView> {
+        let (needs_building, buildable) = {
+            let records = &self.rendered_frame.retained_views.records;
+            let record = &records[view];
+            let needs_building = (view..=view + record.nested)
+                .any(|inner| self.own_rebuild_reason(&records[inner], cx).is_some());
+            (needs_building, Self::buildable_on_its_own(record, record))
+        };
+        #[cfg(test)]
+        let buildable =
+            buildable && FORCED_REFUSAL.get() != Some(DeferredRebuildRefusal::NotOnItsOwn);
+        if !needs_building {
+            return None;
+        }
+        if !buildable {
+            // Copied as it was, it shows what it read last frame, so this
+            // frame is drawn again from scratch before it is presented.
+            self.view_retention.redraw_from_scratch = true;
+            return None;
+        }
+        let built = self.transact(|window| {
+            let node = window.next_frame.dispatch_tree.push_node();
+            let built = window.prepaint_gap(view, cx);
+            #[cfg(test)]
+            let built = built.filter(|_| {
+                FORCED_REFUSAL.get() != Some(DeferredRebuildRefusal::AnotherLayout)
+            });
+            window.next_frame.dispatch_tree.pop_node();
+            built.map(|(entity, prepaint)| (node, entity, prepaint)).ok_or(())
+        });
+        let Ok((node, entity, prepaint)) = built else {
+            // It asked for another layout than the one it had, which only the
+            // views around it can lay out: as above, this frame is drawn
+            // again from scratch before it is presented.
+            self.view_retention.redraw_from_scratch = true;
+            return None;
+        };
+        Some(RebuiltDeferredView(PrepaintedGap {
+            previous: view,
+            entity,
+            id: self.rendered_frame.retained_views.records[view].id.clone(),
+            node,
+            prepaint,
+        }))
+    }
+
+    /// Paints the view [`Window::rebuild_deferred_view`] built, where it was
+    /// painted last frame.
+    pub(crate) fn paint_rebuilt_deferred_view(
+        &mut self,
+        rebuilt: &mut RebuiltDeferredView,
+        cx: &mut App,
+    ) {
+        let gap = &mut rebuilt.0;
+        let inherited = self.enter_gap(gap.previous, true);
+        let (glass, opacity_cycles) = {
+            let record = &self.rendered_frame.retained_views.records[gap.previous];
+            (
+                record.paint_context.glass_content,
+                record.paint_context.opacity_cycle,
+            )
+        };
+        let glass_before = mem::replace(&mut self.glass_content, glass);
+        let cycles_before = mem::replace(
+            &mut self.opacity_cycle_stack,
+            opacity_cycles.into_iter().collect(),
+        );
+        let shimmers_before = mem::take(&mut self.text_shimmer_stack);
+        self.next_frame.dispatch_tree.set_active_node(gap.node);
+        self.paint_retained_view(gap.entity, ViewName::default(), &gap.id, &mut gap.prepaint, cx);
+        self.text_shimmer_stack = shimmers_before;
+        self.opacity_cycle_stack = cycles_before;
+        self.glass_content = glass_before;
+        self.leave_gap(inherited, true);
     }
 
     /// Paints the view [`Window::splice_prepaint`] prepainted: last frame's
@@ -726,6 +966,12 @@ impl Window {
             range.start.hitboxes_index..range.end.hitboxes_index
         };
 
+        // What the gaps read as they paint (an input's caret, read by its
+        // text element) is what this view read too. Its dependencies were
+        // put together as it prepainted, before the gaps painted, so without
+        // this the next frame would draw it again whole, gaps and all, from a
+        // record that never saw those reads.
+        let painted_reads = cx.begin_recording_dependencies();
         let start = self.paint_index();
         let mut stretches: Vec<(crate::window::PaintIndex, crate::window::PaintIndex)> =
             Vec::with_capacity(gaps.len() + 1);
@@ -789,6 +1035,7 @@ impl Window {
             }
         }
 
+        let painted_reads = cx.finish_recording_dependencies(painted_reads);
         self.take_hover_reads();
         self.view_retention.view_stack.pop();
         // The groups the gaps resolved outside the view, besides its own.
@@ -808,6 +1055,7 @@ impl Window {
             let record = &mut self.next_frame.retained_views.records[*index];
             record.paint_range = start..end;
             record.paint = PaintStatus::Painted { source: None };
+            record.dependencies = record.dependencies.union(&painted_reads.all);
             record.paint_context = current.clone();
             record.paint_mask = paint_mask;
             if !new_groups.is_empty() {

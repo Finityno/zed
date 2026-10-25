@@ -222,6 +222,11 @@ struct ViewRecord {
     /// What the view read itself, outside the views nested in it, and what
     /// it deferred.
     own_dependencies: RenderDependencies,
+    /// What the view, and the views nested in it, read before painting: all
+    /// of `dependencies` but what was read only while painting (a caret).
+    /// What a deferred draw of this one view gives the views it was deferred
+    /// from; see [`Window::finish_deferred_view`].
+    prepaint_dependencies: RenderDependencies,
     /// The hovers the view was drawn by, likewise, and its own.
     hovers: Rc<[HoverRead]>,
     own_hovers: Rc<[HoverRead]>,
@@ -290,6 +295,7 @@ impl ViewRecord {
             paint_context: self.paint_context.clone(),
             dependencies: self.dependencies.written_up_to(writes_now),
             own_dependencies: self.own_dependencies.written_up_to(writes_now),
+            prepaint_dependencies: self.prepaint_dependencies.written_up_to(writes_now),
             hovers: self.hovers.clone(),
             own_hovers: self.own_hovers.clone(),
             groups: self.groups.clone(),
@@ -473,6 +479,10 @@ pub(crate) struct ViewRetention {
     /// Whether the deferred draw being drawn was deferred from inside a view
     /// notified since the last frame; see [`EnclosingViews`].
     deferred_inside_notified: bool,
+    /// Set by a frame that drew something from the frame before it which it
+    /// had to build and could not where it was: the frame is drawn again from
+    /// scratch before it is presented (see [`Window::draw`]).
+    pub(crate) redraw_from_scratch: bool,
     /// [`crate::key_dispatch::DispatchTree::action_fingerprint`] of the frame
     /// last drawn, to tell when which actions are available changed, if it
     /// was worked out: only frames with a view that read the actions need it.
@@ -533,6 +543,7 @@ impl ViewRetention {
             nested_states: Vec::new(),
             open_recordings: 0,
             deferred_inside_notified: false,
+            redraw_from_scratch: false,
             actions_fingerprint: None,
             drawn_font_generation: 0,
             drawing_font_generation: 0,
@@ -563,6 +574,69 @@ pub(crate) struct EnclosingViews {
     /// The entities whose reads the views around it leave out (see
     /// [`crate::Context::untrack_reads_of`]), which it leaves out too.
     untracked: SmallVec<[EntityId; 2]>,
+}
+
+/// The record at the start of `records` if it is the one view they hold,
+/// with the views nested in it.
+fn one_view(records: &[ViewRecord], range: &Range<usize>) -> Option<usize> {
+    let view = records.get(range.start)?;
+    (range.end <= records.len() && view.nested + 1 == range.len()).then_some(range.start)
+}
+
+/// Whether a view prepainted in `view` was all of what was prepainted in
+/// `draw`, but for the dispatch node its element pushed first.
+fn prepaint_spans(view: &Range<PrepaintStateIndex>, draw: &Range<PrepaintStateIndex>) -> bool {
+    let (start, outer) = (&view.start, &draw.start);
+    let starts = start.hitboxes_index == outer.hitboxes_index
+        && start.tooltips_index == outer.tooltips_index
+        && start.deferred_draws_index == outer.deferred_draws_index
+        && start.positioned_states_index == outer.positioned_states_index
+        && start.autoscroll_requests_index == outer.autoscroll_requests_index
+        && start.accessed_element_states_index == outer.accessed_element_states_index
+        && start.line_layout_index == outer.line_layout_index
+        && (start.dispatch_tree_index == outer.dispatch_tree_index
+            || start.dispatch_tree_index == outer.dispatch_tree_index + 1);
+    let (end, outer) = (&view.end, &draw.end);
+    starts
+        && end.hitboxes_index == outer.hitboxes_index
+        && end.tooltips_index == outer.tooltips_index
+        && end.deferred_draws_index == outer.deferred_draws_index
+        && end.positioned_states_index == outer.positioned_states_index
+        && end.autoscroll_requests_index == outer.autoscroll_requests_index
+        && end.accessed_element_states_index == outer.accessed_element_states_index
+        && end.line_layout_index == outer.line_layout_index
+        && end.dispatch_tree_index == outer.dispatch_tree_index
+}
+
+/// Whether a view painted in `view` was all of what was painted in `draw`.
+fn paint_spans(view: &Range<PaintIndex>, draw: &Range<PaintIndex>) -> bool {
+    let same = |a: &PaintIndex, b: &PaintIndex| {
+        a.scene_index == b.scene_index
+            && a.window_control_hitboxes_index == b.window_control_hitboxes_index
+            && a.mouse_listeners_index == b.mouse_listeners_index
+            && a.input_handlers_index == b.input_handlers_index
+            && a.cursor_styles_index == b.cursor_styles_index
+            && a.accessed_element_states_index == b.accessed_element_states_index
+            && a.tab_handle_index == b.tab_handle_index
+            && a.painted_positions_index == b.painted_positions_index
+            && a.line_layout_index == b.line_layout_index
+    };
+    same(&view.start, &draw.start) && same(&view.end, &draw.end)
+}
+
+impl EnclosingViews {
+    /// For a deferred draw copied from the last frame along with the views
+    /// it was deferred from, drawn inside a view notified since then or not.
+    pub(crate) fn copied(inside_notified: bool) -> Self {
+        Self {
+            inside_notified,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn inside_notified(&self) -> bool {
+        self.inside_notified
+    }
 }
 
 /// Something deferred from retained views, being drawn.
@@ -714,11 +788,22 @@ impl RetainedViews {
         index
     }
 
-    fn add_dependencies(&mut self, records: &[usize], dependencies: &RenderDependencies) {
+    /// Adds `dependencies`, read drawing something the views `records`
+    /// deferred, to what they read themselves; read `before_painting`, also
+    /// to what they read before painting.
+    fn add_dependencies(
+        &mut self,
+        records: &[usize],
+        dependencies: &RenderDependencies,
+        before_painting: bool,
+    ) {
         for &index in records {
             let record = &mut self.records[index];
             record.dependencies = record.dependencies.union(dependencies);
             record.own_dependencies = record.own_dependencies.union(dependencies);
+            if before_painting {
+                record.prepaint_dependencies = record.prepaint_dependencies.union(dependencies);
+            }
         }
     }
 
@@ -1013,7 +1098,7 @@ impl Window {
 
     /// Whether the view being drawn, or one around it, was notified since the
     /// last frame.
-    fn inside_notified_view(&self) -> bool {
+    pub(crate) fn inside_notified_view(&self) -> bool {
         let notified = &self.view_retention.notified;
         self.view_retention.deferred_inside_notified
             || (!notified.is_empty()
@@ -1380,6 +1465,7 @@ impl Window {
                 paint_context: record.paint_context.clone(),
                 dependencies: record.dependencies.written_up_to(writes_now),
                 own_dependencies: record.own_dependencies.written_up_to(writes_now),
+                prepaint_dependencies: record.prepaint_dependencies.written_up_to(writes_now),
                 hovers: record.hovers.clone(),
                 own_hovers: record.own_hovers.clone(),
                 groups: record.groups.clone(),
@@ -1499,6 +1585,7 @@ impl Window {
                 paint_context: PaintContext::default(),
                 dependencies: RenderDependencies::default(),
                 own_dependencies: RenderDependencies::default(),
+                prepaint_dependencies: RenderDependencies::default(),
                 hovers: Rc::new([]),
                 own_hovers: Rc::new([]),
                 groups: Rc::new([]),
@@ -1590,6 +1677,7 @@ impl Window {
             ),
             None => (dependencies.all, dependencies.own),
         };
+        record.prepaint_dependencies = record.dependencies.clone();
         record.hovers = hovers;
         record.own_hovers = own_hovers;
         record.fresh_hitboxes = recording.hitboxes_start..hitboxes_end;
@@ -1754,9 +1842,22 @@ impl Window {
 
     /// Ends `recording`, adding what the deferred draw read, and the hovers it
     /// was drawn by, to the retained views it was deferred from.
+    ///
+    /// When it drew one view, `one_view` (this frame's record; see
+    /// [`Window::drew_one_view_prepaint`]), what that view and the views in
+    /// it read while painting is left to their records: drawn again from the
+    /// last frame, the draw builds the view where it was if any of it has to
+    /// be (see [`Window::rebuild_deferred_view`]), and a read made while
+    /// painting changes nothing about where anything is laid out, so the
+    /// views it was deferred from need not be built for it. A caret blinking
+    /// in a deferred composer would otherwise build every view around the
+    /// composer on each blink. What they read before painting (rendering,
+    /// laid out in the tree of the views it was deferred from) stays theirs.
     pub(crate) fn finish_deferred_view(
         &mut self,
         recording: Option<DeferredViewRecording>,
+        one_view: Option<usize>,
+        painting: bool,
         cx: &mut App,
     ) {
         let Some(recording) = recording else {
@@ -1770,8 +1871,80 @@ impl Window {
         let enclosing = &recording.enclosing.views;
         let views = &mut self.next_frame.retained_views;
         // What a view deferred is part of drawing it, so it is its own.
-        views.add_dependencies(enclosing, &dependencies.all);
-        views.add_hovers(enclosing, &self.view_retention.hovers[recording.hovers_start..]);
+        match one_view {
+            Some(view) => {
+                // The view was checked, or built, after the recording began:
+                // what it read is unchanged as of then.
+                let own = if painting {
+                    dependencies.own
+                } else {
+                    dependencies.own.union(
+                        &views.records[view]
+                            .prepaint_dependencies
+                            .checked_as_of(dependencies.all.generations()),
+                    )
+                };
+                views.add_dependencies(enclosing, &own, !painting);
+                if !painting {
+                    let hovers = views.records[view].hovers.clone();
+                    views.add_hovers(enclosing, &hovers);
+                }
+            }
+            None => {
+                views.add_dependencies(enclosing, &dependencies.all, !painting);
+                views.add_hovers(enclosing, &self.view_retention.hovers[recording.hovers_start..]);
+            }
+        }
+    }
+
+    /// Whether a deferred draw prepainted from `start` until now drew the
+    /// retained views `records` (of this frame) and nothing else: one view,
+    /// with the views nested in it, inside the dispatch node of its element.
+    pub(crate) fn drew_one_view_prepaint(
+        &self,
+        records: &Range<usize>,
+        start: &PrepaintStateIndex,
+    ) -> bool {
+        let records_made = &self.next_frame.retained_views.records;
+        let Some(view) = one_view(records_made, records) else {
+            return false;
+        };
+        prepaint_spans(
+            &records_made[view].prepaint_range,
+            &(start.clone()..self.prepaint_index()),
+        )
+    }
+
+    /// Whether a deferred draw painted from `start` until now painted the one
+    /// view its prepaint drew, `records` (of this frame), and nothing else.
+    pub(crate) fn drew_one_view_paint(&self, records: &Range<usize>, start: &PaintIndex) -> bool {
+        let records_made = &self.next_frame.retained_views.records;
+        let Some(view) = one_view(records_made, records) else {
+            return false;
+        };
+        let view = &records_made[view];
+        matches!(view.paint, PaintStatus::Painted { .. })
+            && paint_spans(&view.paint_range, &(start.clone()..self.paint_index()))
+    }
+
+    /// Adds what the views `records` drawn in a deferred draw read, and the
+    /// hovers they were drawn by, to the views it was deferred from, as for
+    /// any deferred draw that is not one view.
+    pub(crate) fn give_deferred_reads_to_enclosing(
+        &mut self,
+        enclosing: &EnclosingViews,
+        records: &Range<usize>,
+    ) {
+        let views = &mut self.next_frame.retained_views;
+        let Some(view) = one_view(&views.records, records) else {
+            return;
+        };
+        let (dependencies, hovers) = {
+            let view = &views.records[view];
+            (view.dependencies.clone(), view.hovers.clone())
+        };
+        views.add_dependencies(&enclosing.views, &dependencies, false);
+        views.add_hovers(&enclosing.views, &hovers);
     }
 
     /// The records made from here on, for a deferred draw to note which

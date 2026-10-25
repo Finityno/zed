@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 pub struct FrameWorkStats {
     /// Frames drawn.
     pub frames: u64,
+    /// Of those, frames drawn a second time from scratch before being
+    /// presented, because a view drawn deferred had to be built and could
+    /// not be built where it was.
+    pub redrawn_from_scratch: u64,
     /// Elements whose layout was requested: every element built.
     pub elements: u64,
     /// Views rendered, whether plain or cached ones that could not be reused.

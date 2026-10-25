@@ -1,9 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -42,7 +39,7 @@ pub(crate) struct DirectManipulationHandler {
 const CONTACT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 impl DirectManipulationHandler {
-    pub fn new(window: HWND, scale_factor: f32, frame_demand: Arc<AtomicBool>) -> Result<Self> {
+    pub fn new(window: HWND, scale_factor: f32, frame_request: Arc<FrameRequest>) -> Result<Self> {
         unsafe {
             let manager: IDirectManipulationManager =
                 CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER)?;
@@ -84,7 +81,7 @@ impl DirectManipulationHandler {
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
-                    frame_demand,
+                    frame_request,
                 )
                 .into();
 
@@ -194,7 +191,7 @@ struct DirectManipulationEventHandler {
     scroll_phase: Cell<TouchPhase>,
     is_momentum: Cell<bool>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
-    frame_demand: Arc<AtomicBool>,
+    frame_request: Arc<FrameRequest>,
 }
 
 impl DirectManipulationEventHandler {
@@ -202,7 +199,7 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
-        frame_demand: Arc<AtomicBool>,
+        frame_request: Arc<FrameRequest>,
     ) -> Self {
         Self {
             window,
@@ -214,7 +211,7 @@ impl DirectManipulationEventHandler {
             scroll_phase: Cell::new(TouchPhase::Started),
             is_momentum: Cell::new(false),
             pending_events,
-            frame_demand,
+            frame_request,
         }
     }
 
@@ -276,10 +273,9 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         // A gesture can start long after the contact's grace period, for
         // example when fingers rest before panning. Ask for frames here so
         // `draw_window` resumes calling `update`, which the gesture needs to
-        // advance in manual-update mode.
-        if current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA {
-            self.frame_demand.store(true, Ordering::Release);
-        }
+        // advance in manual-update mode. Ending one queues a phase-ended
+        // event below, which only a frame drains, so every change asks.
+        self.frame_request.request();
 
         // A new gesture interrupted inertia, so end the old sequence.
         if current == DIRECTMANIPULATION_RUNNING && previous == DIRECTMANIPULATION_INERTIA {

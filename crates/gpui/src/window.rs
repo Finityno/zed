@@ -1209,6 +1209,14 @@ pub(crate) struct DeferredDraw {
     enclosing_views: view_retention::EnclosingViews,
     /// The records of the retained views it drew, in its frame's records.
     retained_records: Range<usize>,
+    /// Whether it drew one retained view and nothing else (`deferred(view)`),
+    /// whose reads are then that view's alone: drawn again from the last
+    /// frame, the view is built where it was if it has to be, rather than
+    /// the views it was deferred from.
+    one_view: bool,
+    /// The view it drew, built again this frame though the draw was copied
+    /// from the last one; see [`Window::rebuild_deferred_view`].
+    rebuilt: Option<view_retention::splice::RebuiltDeferredView>,
 }
 
 pub(crate) struct Frame {
@@ -2216,22 +2224,34 @@ impl Window {
                 let now = Instant::now();
                 #[cfg_attr(not(feature = "profiler"), expect(unused_variables))]
                 if let Some((min_interval, limit)) = min_frame_interval {
+                    // Frame requests arrive on vsync, so a cap that is a whole
+                    // number of refreshes lands a hair early or late. The
+                    // time-animation slack keeps a 30 fps cap at 30 fps on a
+                    // 60, 120 or 240 Hz display, instead of jitter turning
+                    // every other interval into one refresh more.
                     if let Some(last_frame) = last_frame_time.get()
-                        && now.duration_since(last_frame) < min_interval
+                        && let allowed_at = last_frame
+                            + min_interval.saturating_sub(TIME_ANIMATION_FRAME_SLACK)
+                        && now < allowed_at
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
-                        // Deferred by throttling: ask demand-driven platforms to retry.
-                        handle
+                        // Deferred by throttling: ask demand-driven platforms to
+                        // retry once the cap allows a frame. The demand that
+                        // entered this branch (a deferred forced render, pending
+                        // next-frame callbacks, a dirty unfocused window) is
+                        // still unserved; platforms that stop requesting frames
+                        // for idle windows need a wakeup to deliver the retry.
+                        let retry_scheduled = handle
                             .update(&mut cx, |_, window, _| {
                                 window.platform_window.schedule_frame();
+                                window.platform_window.request_frame_at(allowed_at)
                             })
-                            .log_err();
-                        // The demand that entered this branch (a deferred forced
-                        // render or pending next-frame callbacks) is still
-                        // unserved; platforms that stop requesting frames for
-                        // idle windows need a wakeup to deliver the retry.
-                        invalidator.wake_platform();
+                            .log_err()
+                            .unwrap_or(false);
+                        if !retry_scheduled {
+                            invalidator.wake_platform();
+                        }
                         #[cfg(feature = "profiler")]
                         profiler::journal::record_frame_skipped(
                             window_id,
@@ -2282,12 +2302,8 @@ impl Window {
                         && presented_within(time_transition_frame_interval()))
                     || (scene_animates.get()
                         && last_present_at.get().is_none_or(|last_present| {
-                            let interval = if active.get() {
-                                time_animation_frame_interval()
-                            } else {
-                                time_animation_frame_interval()
-                                    .max(inactive_frame_interval.unwrap_or_default())
-                            };
+                            let interval =
+                                scene_animation_interval(active.get(), inactive_frame_interval);
                             // Frame requests arrive on vsync, so an interval
                             // that is a whole number of refreshes lands a hair
                             // early or late; without the slack, 30 fps on a
@@ -2377,15 +2393,36 @@ impl Window {
                 // and needs no follow-up unless it was deferred, which
                 // `present_owed` covers. A missed wake leaves the window frozen until unrelated
                 // activity, so this errs toward waking.
-                if invalidator.is_dirty()
+                //
+                // When the scene animating or transitioning is the only
+                // reason, the next useful request is when its next step is
+                // due, so a platform that can wait for that is asked to.
+                let needs_next_frame_now = invalidator.is_dirty()
                     || !next_frame_callbacks.borrow().is_empty()
-                    || scene_animates.get()
-                    || scene_transitioning.get()
                     || present_owed
                     || deferred_force_render
-                    || input_rate_tracker.borrow().is_high_rate()
-                {
+                    || input_rate_tracker.borrow().is_high_rate();
+                if needs_next_frame_now {
                     invalidator.wake_platform();
+                } else if scene_animates.get() || scene_transitioning.get() {
+                    let next_step_scheduled = next_time_animation_present_at(
+                        last_present_at.get(),
+                        scene_animates.get(),
+                        scene_transitioning.get(),
+                        active.get(),
+                        inactive_frame_interval,
+                    )
+                    .is_some_and(|due_at| {
+                        handle
+                            .update(&mut cx, |_, window, _| {
+                                window.platform_window.request_frame_at(due_at)
+                            })
+                            .log_err()
+                            .unwrap_or(false)
+                    });
+                    if !next_step_scheduled {
+                        invalidator.wake_platform();
+                    }
                 }
                 #[cfg(feature = "profiler")]
                 if !should_draw {
@@ -2810,6 +2847,40 @@ pub fn set_time_animation_frame_interval(interval: Duration) {
 
 fn time_animation_frame_interval() -> Duration {
     Duration::from_nanos(TIME_ANIMATION_FRAME_NANOS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// How often a scene that animates on its own presents: an inactive window
+/// never faster than its inactive frame interval.
+fn scene_animation_interval(active: bool, inactive_frame_interval: Option<Duration>) -> Duration {
+    if active {
+        time_animation_frame_interval()
+    } else {
+        time_animation_frame_interval().max(inactive_frame_interval.unwrap_or_default())
+    }
+}
+
+/// When the frame loop's next present of a scene that animates or
+/// transitions on its own falls due, by the same cadence (and slack) its
+/// `needs_present` check applies. `None` when it is due now: nothing has
+/// presented yet.
+fn next_time_animation_present_at(
+    last_present: Option<Instant>,
+    animates: bool,
+    transitioning: bool,
+    active: bool,
+    inactive_frame_interval: Option<Duration>,
+) -> Option<Instant> {
+    let last_present = last_present?;
+    let due_after = |interval: Duration| {
+        last_present + interval.saturating_sub(TIME_ANIMATION_FRAME_SLACK)
+    };
+    let animation = animates
+        .then(|| due_after(scene_animation_interval(active, inactive_frame_interval)));
+    let transition = transitioning.then(|| due_after(time_transition_frame_interval()));
+    match (animation, transition) {
+        (Some(animation), Some(transition)) => Some(animation.min(transition)),
+        (animation, transition) => animation.or(transition),
+    }
 }
 
 /// Sets how often a window presents while a [`TimeTransition`] in its scene
@@ -4217,7 +4288,16 @@ impl Window {
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
-        let arena_clear_needed = self.draw_frame(cx);
+        let mut arena_clear_needed = self.draw_frame(cx);
+        if mem::take(&mut self.view_retention.redraw_from_scratch) {
+            // A view drawn deferred had to be built and could not be where
+            // it was, so the frame shows it as it was last frame: it is
+            // drawn again from scratch before anything presents it.
+            arena_clear_needed.clear(cx);
+            self.refreshing = true;
+            arena_clear_needed = self.draw_frame(cx);
+            self.frame_work.stats.redrawn_from_scratch += 1;
+        }
         if cx.view_retention() {
             return self.verify_retained_frame(arena_clear_needed, cx);
         }
@@ -4949,16 +5029,38 @@ impl Window {
                             });
                         });
                     });
-                    self.finish_deferred_view(recording, cx);
+                    let records = records_start..self.retained_records_len();
+                    let one_view = self.drew_one_view_prepaint(&records, &prepaint_start);
+                    self.finish_deferred_view(recording, one_view.then_some(records.start), false, cx);
                     self.prepainting_deferred_draw_beneath_native_surfaces = None;
-                    self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
-                    records_start..self.retained_records_len()
+                    let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
+                    deferred_draw.element = Some(element);
+                    deferred_draw.one_view = one_view;
+                    records
                 } else {
-                    self.reuse_prepaint(prepaint_range.clone());
-                    let records = self.next_frame.deferred_draws[deferred_draw_ix]
-                        .retained_records
-                        .clone();
-                    self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
+                    let (records, one_view) = {
+                        let deferred_draw = &self.next_frame.deferred_draws[deferred_draw_ix];
+                        (deferred_draw.retained_records.clone(), deferred_draw.one_view)
+                    };
+                    let rebuilt = if one_view {
+                        self.with_rendered_view(current_view, |window| {
+                            window.rebuild_deferred_view(
+                                &records,
+                                &prepaint_range,
+                                &enclosing_views,
+                                cx,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(rebuilt) = rebuilt {
+                        self.next_frame.deferred_draws[deferred_draw_ix].rebuilt = Some(rebuilt);
+                        records_start..self.retained_records_len()
+                    } else {
+                        self.reuse_prepaint(prepaint_range.clone());
+                        self.copy_deferred_records(records, &prepaint_range.start, &prepaint_start, cx)
+                    }
                 };
                 self.rounded_clip = previous_rounded_clip;
                 self.next_frame.scene.current_rounded_clip = previous_gpu_clip;
@@ -5014,7 +5116,26 @@ impl Window {
                         });
                     })
                 });
-                self.finish_deferred_view(recording, cx);
+                let one_view = deferred_draw.one_view
+                    && self.drew_one_view_paint(&deferred_draw.retained_records, &paint_start);
+                if deferred_draw.one_view && !one_view {
+                    // Its prepaint left the view's reads to the view alone;
+                    // its paint drew more, so the views it was deferred
+                    // from take them after all.
+                    self.give_deferred_reads_to_enclosing(
+                        &deferred_draw.enclosing_views,
+                        &deferred_draw.retained_records,
+                    );
+                }
+                deferred_draw.one_view = one_view;
+                let view = one_view.then_some(deferred_draw.retained_records.start);
+                self.finish_deferred_view(recording, view, true, cx);
+            } else if let Some(mut rebuilt) = deferred_draw.rebuilt.take() {
+                let current_view = deferred_draw.current_view;
+                self.with_rendered_view(current_view, |window| {
+                    window.paint_rebuilt_deferred_view(&mut rebuilt, cx)
+                });
+                deferred_draw = &mut deferred_draws[deferred_draw_ix];
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
                 let records = deferred_draw.retained_records.clone();
@@ -5121,6 +5242,7 @@ impl Window {
             self.next_frame.focus = self.focus;
         }
 
+        let inside_notified = self.inside_notified_view();
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
@@ -5141,8 +5263,10 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                     // Drawn from the last frame: what it read is part of the
                     // records copied along with the views it came from.
-                    enclosing_views: Default::default(),
+                    enclosing_views: view_retention::EnclosingViews::copied(inside_notified),
                     retained_records: deferred_draw.retained_records.clone(),
+                    one_view: deferred_draw.one_view,
+                    rebuilt: None,
                 }),
         );
     }
@@ -5857,6 +5981,8 @@ impl Window {
             paint_range: PaintIndex::default()..PaintIndex::default(),
             enclosing_views: self.enclosing_views(),
             retained_records: 0..0,
+            one_view: false,
+            rebuilt: None,
         });
     }
 
@@ -7307,7 +7433,18 @@ impl Window {
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
-            self.input_rate_tracker.borrow_mut().record_input();
+            let became_high_rate = {
+                let mut tracker = self.input_rate_tracker.borrow_mut();
+                let was_high_rate = tracker.is_high_rate();
+                tracker.record_input();
+                !was_high_rate && tracker.is_high_rate()
+            };
+            // High-rate input lifts an unfocused window's frame-rate cap, so
+            // a frame deferred by the cap is due now. The window is already
+            // dirty, so nothing else wakes a platform holding it until then.
+            if became_high_rate {
+                self.invalidator.wake_platform();
+            }
             self.extend_interactive_frames();
         }
         #[cfg(feature = "profiler")]
@@ -10996,6 +11133,111 @@ mod tests {
         test_window.simulate_frame_request(RequestFrameOptions::default());
         assert!(renders.get() > drawn, "an active window redraws at once");
         assert_eq!(test_window.frame_wake_count(), baseline, "and defers nothing");
+    }
+
+    /// A frame the inactive-window cap refuses is asked for again for when
+    /// the cap allows it, from a platform that can wait for a deadline,
+    /// rather than on every request until then.
+    #[gpui::test]
+    fn test_throttled_frame_is_requested_for_when_the_cap_allows_it(cx: &mut TestAppContext) {
+        let interval = Duration::from_secs(3600);
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    inactive_frame_interval: Some(interval),
+                    ..Default::default()
+                },
+                {
+                    let renders = renders.clone();
+                    move |_, cx| cx.new(|_| CountsRenders(renders))
+                },
+            )
+            .unwrap()
+        });
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let drawn_at = std::time::Instant::now();
+        test_window.accept_frame_deadlines();
+        let invalidator = window
+            .update(cx, |_, window, _| window.invalidator.clone())
+            .unwrap();
+        invalidator.set_dirty(true);
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let deadlines = test_window.frame_deadlines();
+        assert_eq!(deadlines.len(), 1, "the refused frame is asked for once");
+        assert!(
+            deadlines[0] >= drawn_at + interval - Duration::from_secs(1)
+                && deadlines[0] <= std::time::Instant::now() + interval,
+            "for when the cap allows the next frame"
+        );
+        assert_eq!(
+            test_window.frame_wake_count(),
+            baseline,
+            "instead of waking the frame source for the next request"
+        );
+    }
+
+    /// A scene that animates on its own, with nothing else to draw, asks for
+    /// its next step's frame from a platform that can wait for it, instead of
+    /// waking for every request in between; one that cannot is woken as
+    /// before.
+    #[gpui::test]
+    fn test_time_animation_asks_for_its_next_step(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let presented_at = std::time::Instant::now();
+        let animate = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, _| {
+                    window.scene_animates.set(true);
+                    window.last_present_at.set(Some(presented_at));
+                })
+                .unwrap();
+        };
+
+        animate(cx);
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            test_window.frame_wake_count() > baseline,
+            "a platform without deadlines is woken for the next request"
+        );
+
+        test_window.accept_frame_deadlines();
+        animate(cx);
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let inactive_frame_interval = WindowOptions::default().inactive_frame_interval;
+        assert_eq!(
+            test_window.frame_deadlines(),
+            vec![
+                presented_at
+                    + super::scene_animation_interval(false, inactive_frame_interval)
+                    - super::TIME_ANIMATION_FRAME_SLACK
+            ],
+            "the next step is asked for when its present falls due"
+        );
+        assert_eq!(test_window.frame_wake_count(), baseline);
+
+        // Other demand still asks for the next frame at once: here an
+        // animation whose callback schedules the next one, in an active
+        // window so the inactive-window cap does not defer it.
+        test_window.simulate_active_status_change(true);
+        animate(cx);
+        window
+            .update(cx, |_, window, _| {
+                window.on_next_frame(|window, _| window.on_next_frame(|_, _| {}))
+            })
+            .unwrap();
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(test_window.frame_wake_count() > baseline);
     }
 
     #[gpui::test]

@@ -48,6 +48,11 @@ impl VSyncProvider {
         Self { interval, f }
     }
 
+    /// The display refresh interval measured when this provider was made.
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
+    }
+
     pub(crate) fn wait_for_vsync(&self) -> FrameRequestSource {
         let vsync_start = Instant::now();
         let wait_succeeded = (self.f)();
@@ -133,6 +138,11 @@ impl MonitorClock {
             }
         }
         clocks
+    }
+
+    /// The monitor's refresh interval when the clock was made.
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
     }
 
     /// Blocks until the monitor's next vblank and says what ended the wait;
