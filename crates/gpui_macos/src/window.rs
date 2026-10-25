@@ -3974,6 +3974,10 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             .occlusionState()
             .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
         {
+            lock.renderer.restore_drawables();
+            if let Some(renderer) = lock.overlay_renderer.as_mut() {
+                renderer.restore_drawables();
+            }
             lock.move_traffic_light();
             lock.start_display_link();
         } else if !lock.render_while_hidden {
@@ -3985,9 +3989,11 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             // does not outlive the stretch of presenting it happened in.
             lock.renderer.release_intermediate_textures();
             lock.renderer.forget_drawables_in_flight();
+            lock.renderer.release_drawables();
             if let Some(renderer) = lock.overlay_renderer.as_mut() {
                 renderer.release_intermediate_textures();
                 renderer.forget_drawables_in_flight();
+                renderer.release_drawables();
             }
         }
     }

@@ -259,6 +259,10 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// The size the window wants its drawables at, kept while
+    /// [`Self::release_drawables`] has them shrunk.
+    drawable_size: Size<DevicePixels>,
+    drawables_released: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -275,7 +279,9 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
-    backdrop_blurs_pipeline_state: metal::RenderPipelineState,
+    /// `None` where the device cannot build a dual-source blend: frosted
+    /// surfaces then paint their tint over an unblurred backdrop.
+    backdrop_blurs_pipeline_state: Option<metal::RenderPipelineState>,
     backdrop_blur_downsample_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_horizontal_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_vertical_pipeline_state: metal::RenderPipelineState,
@@ -914,6 +920,8 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            drawable_size: Size::default(),
+            drawables_released: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -988,10 +996,42 @@ impl MetalRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
-        if let Some(layer) = &self.layer {
+        self.drawable_size = size;
+        if let Some(layer) = &self.layer
+            && !self.drawables_released
+        {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
         self.update_intermediate_textures(size);
+    }
+
+    /// Shrinks the layer's drawables to a single pixel while the window is
+    /// not visible. The layer keeps a pool of window-sized drawables (three at
+    /// most, 29 MB each for a full-screen retina window) for as long as their
+    /// size stands, whether or not anything presents; a new size retires the
+    /// pool. What the window last showed stays as the layer's contents, so
+    /// that one drawable remains and the window comes back showing it.
+    /// Measured on a window hidden with Cmd-H and on one minimized to the
+    /// Dock: two drawables went to one, and back to two once shown.
+    /// [`Self::restore_drawables`] brings the size back before the next
+    /// frame.
+    pub fn release_drawables(&mut self) {
+        if let Some(layer) = &self.layer {
+            self.drawables_released = true;
+            layer.set_drawable_size(CGSize::new(1., 1.));
+        }
+    }
+
+    /// Undoes [`Self::release_drawables`] at the size the window has now.
+    pub fn restore_drawables(&mut self) {
+        if !self.drawables_released {
+            return;
+        }
+        self.drawables_released = false;
+        if let Some(layer) = &self.layer {
+            let size = self.drawable_size;
+            layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
+        }
     }
 
     /// Drops the depth and path intermediate textures while the window is not
@@ -1234,6 +1274,10 @@ impl MetalRenderer {
         if right <= left || bottom <= top {
             return Ok(command_encoder);
         }
+        let Some(composite) = self.backdrop_blurs_pipeline_state.clone() else {
+            return Ok(command_encoder);
+        };
+        let composite = &composite;
         let width = (right - left) as u64;
         let height = (bottom - top) as u64;
         #[cfg(test)]
@@ -1319,7 +1363,7 @@ impl MetalRenderer {
                 return Err(error);
             }
         };
-        command_encoder.set_render_pipeline_state(&self.backdrop_blurs_pipeline_state);
+        command_encoder.set_render_pipeline_state(composite);
         command_encoder.set_vertex_buffer(
             BackdropBlurInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1639,6 +1683,15 @@ impl MetalRenderer {
                 return dropped(PresentBreakdown::default());
             }
         };
+        // A frame drawn while the drawables are shrunk would present a single
+        // pixel over what the window shows when it comes back; it stays owed
+        // and is drawn once the size is restored.
+        if self.drawables_released {
+            return PresentReport {
+                outcome: PresentOutcome::Deferred,
+                breakdown,
+            };
+        }
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
@@ -2999,11 +3052,12 @@ fn build_opaque_quads_pipeline_state(
 /// `mix(destination, frosted, coverage)` on every channel. The blurred region
 /// replaces what was there, alpha included, so a frosted region over a
 /// translucent window keeps the window's translucency instead of adding to it.
+/// `None`, logged, on a device whose driver refuses the dual-source blend.
 fn build_backdrop_blur_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
+) -> Option<metal::RenderPipelineState> {
     let vertex_fn = library
         .get_function("backdrop_blur_vertex", None)
         .expect("error locating vertex function");
@@ -3028,7 +3082,8 @@ fn build_backdrop_blur_pipeline_state(
 
     device
         .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+        .map_err(|error| log::error!("backdrop blurs are unavailable on this device: {error}"))
+        .ok()
 }
 
 /// One of the two backdrop blur passes: unblended, into a scratch texture,
@@ -5074,35 +5129,35 @@ mod backdrop_blur_memory_tests {
             (16., 1.4, 0.93, vec![None, Some(1), Some(2), Some(4)]),
             (48., 1.0, 0.65, vec![None, Some(4)]),
         ] {
-          let tint = gpui::hsla(0., 0., 0.1, tint_alpha);
-          for downsample in downsamples {
-            renderer.backdrop_downsample_override = downsample;
-            for region in [(500u32, 300u32, 600u32, 400u32), (1300, 600, 300, 400)] {
-                let (left, top, width, height) = region;
-                let bounds = rect(left as f32, top as f32, width as f32, height as f32);
-                let reference = reference_frost(&source, region, sigma as f64, saturation as f64);
-                for tinted in [false, true] {
-                    let rendered = renderer
-                        .render_scene_to_image(
-                            &detailed_scene(&[bounds], sigma, saturation, tinted.then_some(tint)),
-                            ACCURACY_TARGET,
-                        )
-                        .expect("headless render succeeds");
-                    let expected = if tinted {
-                        under_tint(&reference, 0.1, tint_alpha as f64)
-                    } else {
-                        reference.clone()
-                    };
-                    let (largest, mean, over_one, worst) =
-                        frost_error(&rendered, &expected, region);
-                    println!(
-                        "[backdrop-accuracy] sigma {sigma} downsample {downsample:?} {} region {width}x{height} at ({left},{top}): largest {largest:.2} at {worst:?} in the region, mean {mean:.3}, over one step {:.4}%",
-                        if tinted { "tinted" } else { "frost " },
-                        over_one * 100.
-                    );
+            let tint = gpui::hsla(0., 0., 0.1, tint_alpha);
+            for downsample in downsamples {
+                renderer.backdrop_downsample_override = downsample;
+                for region in [(500u32, 300u32, 600u32, 400u32), (1300, 600, 300, 400)] {
+                    let (left, top, width, height) = region;
+                    let bounds = rect(left as f32, top as f32, width as f32, height as f32);
+                    let reference = reference_frost(&source, region, sigma as f64, saturation as f64);
+                    for tinted in [false, true] {
+                        let rendered = renderer
+                            .render_scene_to_image(
+                                &detailed_scene(&[bounds], sigma, saturation, tinted.then_some(tint)),
+                                ACCURACY_TARGET,
+                            )
+                            .expect("headless render succeeds");
+                        let expected = if tinted {
+                            under_tint(&reference, 0.1, tint_alpha as f64)
+                        } else {
+                            reference.clone()
+                        };
+                        let (largest, mean, over_one, worst) =
+                            frost_error(&rendered, &expected, region);
+                        println!(
+                            "[backdrop-accuracy] sigma {sigma} downsample {downsample:?} {} region {width}x{height} at ({left},{top}): largest {largest:.2} at {worst:?} in the region, mean {mean:.3}, over one step {:.4}%",
+                            if tinted { "tinted" } else { "frost " },
+                            over_one * 100.
+                        );
+                    }
                 }
             }
-          }
         }
     }
 
@@ -5322,5 +5377,47 @@ mod backdrop_blur_timing_tests {
                 "[backdrop-gpu] {label}: {extra:.3} ms over the plain frame ({plain_frame:.3} ms), median of 200 alternating pairs"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod hidden_drawable_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{DevicePixels, PresentOutcome, Scene, size};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn layer_size(renderer: &MetalRenderer) -> (f64, f64) {
+        let layer = renderer.layer().expect("a window renderer has a layer");
+        let drawable = layer.drawable_size();
+        (drawable.width, drawable.height)
+    }
+
+    /// A hidden window's layer holds single-pixel drawables, keeps the size
+    /// the window wants through resizes made meanwhile, draws nothing, and
+    /// gets that size back when shown.
+    #[test]
+    fn a_hidden_window_shrinks_its_drawables_and_restores_the_latest_size() {
+        let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        renderer.update_drawable_size(size(DevicePixels(3456), DevicePixels(2168)));
+        assert_eq!(layer_size(&renderer), (3456., 2168.));
+
+        renderer.release_drawables();
+        assert_eq!(layer_size(&renderer), (1., 1.));
+        renderer.update_drawable_size(size(DevicePixels(1728), DevicePixels(1084)));
+        assert_eq!(layer_size(&renderer), (1., 1.), "a resize while hidden waits");
+
+        let mut scene = Scene::default();
+        scene.finish();
+        assert_eq!(
+            renderer.draw(&scene).outcome,
+            PresentOutcome::Deferred,
+            "a frame drawn while hidden stays owed instead of presenting a pixel"
+        );
+
+        renderer.restore_drawables();
+        assert_eq!(layer_size(&renderer), (1728., 1084.));
+        renderer.restore_drawables();
+        assert_eq!(layer_size(&renderer), (1728., 1084.), "restoring twice is harmless");
     }
 }

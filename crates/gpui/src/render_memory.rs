@@ -191,8 +191,10 @@ mod tests {
         );
 
         // The device count is a reading, not a sum: the latest replaces it.
+        let previous = DEVICE_ALLOCATED.load(Ordering::Relaxed);
         record_device_allocated_bytes(40 * MIB);
         record_device_allocated_bytes(30 * MIB);
         assert_eq!(render_memory_gauges().device_allocated_bytes, 30 * MIB);
+        record_device_allocated_bytes(previous);
     }
 }
