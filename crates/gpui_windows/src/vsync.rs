@@ -14,7 +14,7 @@ use windows::Win32::{
             DWM_TIMING_INFO, DWMWA_EXTENDED_FRAME_BOUNDS, DwmFlush, DwmGetCompositionTimingInfo,
             DwmGetWindowAttribute,
         },
-        Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput},
+        Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1, IDXGIOutput},
         Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
     },
     System::Performance::QueryPerformanceFrequency,
@@ -97,12 +97,32 @@ impl MonitorClock {
         let Some(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }).log_err() else {
             return Vec::new();
         };
+        // Enumeration ends with DXGI_ERROR_NOT_FOUND; any other error is
+        // worth a line, since its outputs fall back to the compositor clock.
+        fn enumerated<T>(result: windows::core::Result<T>, what: &str) -> Option<T> {
+            match result {
+                Ok(item) => Some(item),
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => None,
+                Err(error) => {
+                    log::warn!("could not enumerate {what} for vblank clocks: {error}");
+                    None
+                }
+            }
+        }
         let mut clocks = Vec::new();
-        for adapter in (0..).map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok()) {
-            for output in (0..).map_while(|index| unsafe { adapter.EnumOutputs(index) }.ok()) {
-                if let Ok(description) = unsafe { output.GetDesc() }
-                    && description.AttachedToDesktop.as_bool()
-                {
+        for adapter in (0..).map_while(|index| {
+            enumerated(unsafe { factory.EnumAdapters1(index) }, "a DXGI adapter")
+        }) {
+            for output in (0..).map_while(|index| {
+                enumerated(unsafe { adapter.EnumOutputs(index) }, "a DXGI output")
+            }) {
+                let Some(description) = unsafe { output.GetDesc() }
+                    .context("describing a DXGI output for its vblank clock")
+                    .log_err()
+                else {
+                    continue;
+                };
+                if description.AttachedToDesktop.as_bool() {
                     clocks.push(Self {
                         monitor: description.Monitor.0 as isize,
                         interval: monitor_refresh_interval(description.Monitor)
