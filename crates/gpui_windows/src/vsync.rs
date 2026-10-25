@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -7,10 +8,19 @@ use anyhow::{Context, Result};
 use gpui::FrameRequestSource;
 use gpui_util::ResultExt;
 use windows::Win32::{
-    Foundation::HWND,
-    Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
+    Foundation::{HWND, RECT},
+    Graphics::{
+        Dwm::{
+            DWM_TIMING_INFO, DWMWA_EXTENDED_FRAME_BOUNDS, DwmFlush, DwmGetCompositionTimingInfo,
+            DwmGetWindowAttribute,
+        },
+        Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput},
+        Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
+    },
     System::Performance::QueryPerformanceFrequency,
 };
+
+use crate::{monitor_refresh_interval, monitors_under};
 
 static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
     let mut frequency = 0;
@@ -59,6 +69,137 @@ impl VSyncProvider {
     }
 }
 
+/// How long a monitor's refresh rate is trusted before it is read again, so a
+/// mode change is followed.
+const MONITOR_REFRESH_TTL: Duration = Duration::from_secs(1);
+/// How long a window's monitor is trusted before it is looked up again, so a
+/// window dragged to another monitor follows it.
+const WINDOW_MONITOR_TTL: Duration = Duration::from_millis(100);
+
+/// One monitor's vblank, from the DXGI output that drives it. The compositor
+/// clock `VSyncProvider` waits on runs at the fastest display's rate, so a
+/// window on a 144 Hz monitor beside a 240 Hz one drew frames its monitor
+/// never showed; each monitor's own clock ticks the windows on it instead.
+pub(crate) struct MonitorClock {
+    pub(crate) monitor: isize,
+    output: IDXGIOutput,
+    interval: Duration,
+}
+
+// SAFETY: DXGI objects are free-threaded, and each clock is moved to the one
+// thread that waits on it.
+unsafe impl Send for MonitorClock {}
+
+impl MonitorClock {
+    /// A clock for every output of every adapter, so the monitors on both the
+    /// integrated and the discrete GPU of a hybrid laptop get one.
+    pub(crate) fn all() -> Vec<Self> {
+        let Some(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }).log_err() else {
+            return Vec::new();
+        };
+        let mut clocks = Vec::new();
+        for adapter in (0..).map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok()) {
+            for output in (0..).map_while(|index| unsafe { adapter.EnumOutputs(index) }.ok()) {
+                if let Ok(description) = unsafe { output.GetDesc() }
+                    && description.AttachedToDesktop.as_bool()
+                {
+                    clocks.push(Self {
+                        monitor: description.Monitor.0 as isize,
+                        interval: monitor_refresh_interval(description.Monitor)
+                            .unwrap_or(DEFAULT_VSYNC_INTERVAL),
+                        output,
+                    });
+                }
+            }
+        }
+        clocks
+    }
+
+    /// Blocks until the monitor's next vblank. `false` means the output is
+    /// gone and the clock should stop.
+    pub(crate) fn wait(&self) -> bool {
+        let started = Instant::now();
+        if unsafe { self.output.WaitForVBlank() }.is_err() {
+            return false;
+        }
+        // Like DwmFlush, the wait returns at once while the monitor sleeps;
+        // without this the thread would spin.
+        if started.elapsed() < VSYNC_INTERVAL_THRESHOLD {
+            std::thread::sleep(self.interval);
+        }
+        true
+    }
+}
+
+/// Which monitor's clock ticks each window: the fastest monitor its visible
+/// frame overlaps, so a window across two monitors draws at the faster one's
+/// rate and neither half of it lags.
+#[derive(Default)]
+pub(crate) struct WindowMonitors {
+    windows: HashMap<isize, (isize, Instant)>,
+    refresh: HashMap<isize, (Option<Duration>, Instant)>,
+}
+
+impl WindowMonitors {
+    pub(crate) fn of(&mut self, hwnd: HWND, now: Instant) -> isize {
+        if let Some((monitor, checked)) = self.windows.get(&(hwnd.0 as isize))
+            && now.duration_since(*checked) < WINDOW_MONITOR_TTL
+        {
+            return *monitor;
+        }
+        let mut bounds = RECT::default();
+        // The visible frame, not the window rect, whose invisible resize
+        // border reaches into the neighbouring monitor.
+        let visible = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut bounds as *mut RECT as *mut _,
+                std::mem::size_of::<RECT>() as u32,
+            )
+        };
+        let under = if visible.is_ok() {
+            monitors_under(bounds)
+        } else {
+            Default::default()
+        };
+        let rated: Vec<(isize, Option<Duration>)> = under
+            .into_iter()
+            .map(|monitor| (monitor.0 as isize, self.refresh_of(monitor, now)))
+            .collect();
+        let monitor = fastest(&rated).unwrap_or_else(|| {
+            unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize
+        });
+        self.windows.insert(hwnd.0 as isize, (monitor, now));
+        monitor
+    }
+
+    fn refresh_of(&mut self, monitor: HMONITOR, now: Instant) -> Option<Duration> {
+        let entry = self
+            .refresh
+            .entry(monitor.0 as isize)
+            .or_insert_with(|| (monitor_refresh_interval(monitor), now));
+        if now.duration_since(entry.1) > MONITOR_REFRESH_TTL {
+            *entry = (monitor_refresh_interval(monitor), now);
+        }
+        entry.0
+    }
+
+    /// Forgets windows that are gone.
+    pub(crate) fn retain(&mut self, live: impl Fn(isize) -> bool) {
+        self.windows.retain(|hwnd, _| live(*hwnd));
+    }
+}
+
+/// The monitor with the shortest refresh interval; one whose rate is unknown
+/// counts as the slowest.
+fn fastest(monitors: &[(isize, Option<Duration>)]) -> Option<isize> {
+    monitors
+        .iter()
+        .min_by_key(|(_, interval)| interval.unwrap_or(Duration::MAX))
+        .map(|(monitor, _)| *monitor)
+}
+
 fn get_dwm_interval() -> Result<Duration> {
     let mut timing_info = DWM_TIMING_INFO {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
@@ -87,6 +228,15 @@ fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_across_monitors_follows_the_fastest_one() {
+        let milliseconds = |value: f64| Some(Duration::from_secs_f64(value / 1000.));
+        assert_eq!(fastest(&[(1, milliseconds(6.94)), (2, milliseconds(4.17))]), Some(2));
+        assert_eq!(fastest(&[(1, None), (2, milliseconds(16.67))]), Some(2));
+        assert_eq!(fastest(&[(1, milliseconds(6.94))]), Some(1));
+        assert_eq!(fastest(&[]), None);
+    }
 
     #[test]
     fn successful_compositor_wait_reports_native_callback() {
