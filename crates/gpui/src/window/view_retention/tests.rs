@@ -5232,3 +5232,99 @@ fn frame_work_transcript() {
         }
     }
 }
+
+/// A caret toggled by a timer, read only while its text element paints.
+struct PaintedCaret(bool);
+
+struct CaretField {
+    caret: Entity<PaintedCaret>,
+    painted: Rc<std::cell::RefCell<Vec<bool>>>,
+}
+
+impl Render for CaretField {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let caret = self.caret.clone();
+        let painted = self.painted.clone();
+        div().w(px(40.)).h(px(20.)).child(
+            crate::canvas(
+                |_, _, _| {},
+                move |_, _, _, cx| painted.borrow_mut().push(caret.read(cx).0),
+            )
+            .size_full(),
+        )
+    }
+}
+
+struct CaretHolder {
+    field: Entity<CaretField>,
+    cached: bool,
+}
+
+impl Render for CaretHolder {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let field = if self.cached {
+            crate::AnyView::from(self.field.clone())
+                .cached(StyleRefinement::default().w(px(40.)).h(px(20.)))
+                .into_any_element()
+        } else {
+            self.field.clone().into_any_element()
+        };
+        div()
+            .size_full()
+            .child(field)
+            .child(div().child("a label beside the field"))
+    }
+}
+
+/// An entity a view reads only while it paints (an input's caret, read by
+/// its text element) is a dependency like anything read while it is built:
+/// notifying it draws the window again, and the frame paints the new value,
+/// with and without a cached view around the field.
+#[test]
+fn an_entity_read_only_while_painting_draws_the_view_again() {
+    for cached in [false, true] {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| cx.set_view_retention(true));
+        let caret = cx.new(|_| PaintedCaret(true));
+        let painted = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let field = cx.new({
+            let caret = caret.clone();
+            let painted = painted.clone();
+            |_| CaretField { caret, painted }
+        });
+        let window = cx.add_window(move |_, _| CaretHolder { field, cached });
+        draw_caret(&mut cx, window);
+        cx.run_until_parked();
+        draw_caret(&mut cx, window);
+        assert_eq!(painted.borrow().last(), Some(&true));
+
+        for (blink, visible) in [false, true, false, true].into_iter().enumerate() {
+            cx.update_window(window.into(), |_, window, _| window.reset_frame_work_stats(false))
+                .unwrap();
+            caret.update(&mut cx, |caret, cx| {
+                caret.0 = visible;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // The notification alone must ask for the frame: nothing here
+            // draws the window.
+            let work = cx
+                .update_window(window.into(), |_, window, _| window.frame_work_stats())
+                .unwrap();
+            assert!(
+                work.frames > 0,
+                "blink {blink} (cached: {cached}) drew no frame: {work:?}"
+            );
+            assert_eq!(
+                painted.borrow().last(),
+                Some(&visible),
+                "blink {blink} (cached: {cached}) was not painted: {work:?}"
+            );
+        }
+    }
+}
+
+fn draw_caret(cx: &mut TestAppContext, window: WindowHandle<CaretHolder>) {
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+        .unwrap();
+}
