@@ -84,6 +84,27 @@ struct PrepaintedGap {
 /// spliced) where it was because something in it had to be built.
 pub(crate) struct RebuiltDeferredView(PrepaintedGap);
 
+/// Why a test has [`Window::rebuild_deferred_view`] refuse, which no view a
+/// test can build makes it do, to check what the frame shows then.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DeferredRebuildRefusal {
+    NotOnItsOwn,
+    AnotherLayout,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_REFUSAL: std::cell::Cell<Option<DeferredRebuildRefusal>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Has deferred views refuse to be built where they were, on this thread.
+#[cfg(test)]
+pub(crate) fn force_deferred_rebuild_refusal(refusal: Option<DeferredRebuildRefusal>) {
+    FORCED_REFUSAL.set(refusal);
+}
+
 /// Last frame's dispatch nodes copied stretch by stretch, with the nodes the
 /// copy is inside of left open between stretches.
 #[derive(Default)]
@@ -819,7 +840,8 @@ impl Window {
     /// something in it has to be built, as a gap of a splice is built (or
     /// spliced in turn). `None`, with nothing done, to draw it again from the
     /// last frame: nothing in it has to be built, or it cannot be built on
-    /// its own, which then has the window built again on the next frame.
+    /// its own, which then has the frame drawn again from scratch before it
+    /// is presented.
     pub(crate) fn rebuild_deferred_view(
         &mut self,
         records: &Range<usize>,
@@ -852,25 +874,33 @@ impl Window {
                 .any(|inner| self.own_rebuild_reason(&records[inner], cx).is_some());
             (needs_building, Self::buildable_on_its_own(record, record))
         };
+        #[cfg(test)]
+        let buildable =
+            buildable && FORCED_REFUSAL.get() != Some(DeferredRebuildRefusal::NotOnItsOwn);
         if !needs_building {
             return None;
         }
         if !buildable {
-            // Copied as it was, it shows what it read last frame; the frame
-            // after builds every view, this one with the rest.
-            self.view_retention.refresh_after_frame = true;
+            // Copied as it was, it shows what it read last frame, so this
+            // frame is drawn again from scratch before it is presented.
+            self.view_retention.redraw_from_scratch = true;
             return None;
         }
         let built = self.transact(|window| {
             let node = window.next_frame.dispatch_tree.push_node();
             let built = window.prepaint_gap(view, cx);
+            #[cfg(test)]
+            let built = built.filter(|_| {
+                FORCED_REFUSAL.get() != Some(DeferredRebuildRefusal::AnotherLayout)
+            });
             window.next_frame.dispatch_tree.pop_node();
             built.map(|(entity, prepaint)| (node, entity, prepaint)).ok_or(())
         });
         let Ok((node, entity, prepaint)) = built else {
-            // It asked for another layout than the one it had: copied as it
-            // was for this frame, and built with the views around it next.
-            self.view_retention.refresh_after_frame = true;
+            // It asked for another layout than the one it had, which only the
+            // views around it can lay out: as above, this frame is drawn
+            // again from scratch before it is presented.
+            self.view_retention.redraw_from_scratch = true;
             return None;
         };
         Some(RebuiltDeferredView(PrepaintedGap {

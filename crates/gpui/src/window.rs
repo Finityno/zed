@@ -4288,7 +4288,16 @@ impl Window {
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
-        let arena_clear_needed = self.draw_frame(cx);
+        let mut arena_clear_needed = self.draw_frame(cx);
+        if mem::take(&mut self.view_retention.redraw_from_scratch) {
+            // A view drawn deferred had to be built and could not be where
+            // it was, so the frame shows it as it was last frame: it is
+            // drawn again from scratch before anything presents it.
+            arena_clear_needed.clear(cx);
+            self.refreshing = true;
+            arena_clear_needed = self.draw_frame(cx);
+            self.frame_work.stats.redrawn_from_scratch += 1;
+        }
         if cx.view_retention() {
             return self.verify_retained_frame(arena_clear_needed, cx);
         }
@@ -4460,9 +4469,6 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
-        if mem::take(&mut self.view_retention.refresh_after_frame) {
-            self.refresh();
-        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the

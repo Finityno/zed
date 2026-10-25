@@ -480,8 +480,9 @@ pub(crate) struct ViewRetention {
     /// notified since the last frame; see [`EnclosingViews`].
     deferred_inside_notified: bool,
     /// Set by a frame that drew something from the frame before it which it
-    /// could not build where it was: the next frame builds every view.
-    pub(crate) refresh_after_frame: bool,
+    /// had to build and could not where it was: the frame is drawn again from
+    /// scratch before it is presented (see [`Window::draw`]).
+    pub(crate) redraw_from_scratch: bool,
     /// [`crate::key_dispatch::DispatchTree::action_fingerprint`] of the frame
     /// last drawn, to tell when which actions are available changed, if it
     /// was worked out: only frames with a view that read the actions need it.
@@ -542,7 +543,7 @@ impl ViewRetention {
             nested_states: Vec::new(),
             open_recordings: 0,
             deferred_inside_notified: false,
-            refresh_after_frame: false,
+            redraw_from_scratch: false,
             actions_fingerprint: None,
             drawn_font_generation: 0,
             drawing_font_generation: 0,

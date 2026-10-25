@@ -5696,3 +5696,79 @@ fn a_change_inside_a_deferred_view_builds_only_what_it_holds() {
         assert_eq!(work.views_rendered, 0, "round {round}, unchanged: {work:?}");
     }
 }
+
+/// A change inside a deferred view that cannot be built where it was (it
+/// cannot be built on its own, or asks for another layout than it had)
+/// never shows the frame before: the frame is drawn again from scratch
+/// before it is presented, and matches one drawn from scratch. Both are
+/// forced here: neither happens to the views a test can build, which
+/// change layout only through what they render, and that the views around
+/// them are built for.
+#[test]
+fn a_deferred_view_that_cannot_be_built_where_it_was_has_the_frame_drawn_from_scratch() {
+    use super::splice::DeferredRebuildRefusal;
+    for refusal in [DeferredRebuildRefusal::NotOnItsOwn, DeferredRebuildRefusal::AnotherLayout] {
+        super::splice::force_deferred_rebuild_refusal(Some(refusal));
+        let mut cx = super::super::layout_retention_tests::text_system_context(0);
+        cx.update(|cx| cx.set_view_retention(true));
+        let mut painted_models = Vec::new();
+        let windows = [(); 2].map(|_| {
+            let painted = cx.new(|_| 0);
+            let rendered = cx.new(|_| 0);
+            painted_models.push(painted.clone());
+            cx.add_window(move |_, cx| ComposerHost {
+                composer: cx.new(|cx| DeferredComposer {
+                    input: cx.new(|_| DeferredInput {
+                        painted,
+                        rendered,
+                        renders: Rc::new(Cell::new(0)),
+                    }),
+                    renders: Rc::new(Cell::new(0)),
+                }),
+                ticks: 0,
+                renders: Rc::new(Cell::new(0)),
+            })
+        });
+        let draw = |cx: &mut TestAppContext| {
+            let [(retained, work), (from_scratch, _)] = windows.map(|window| {
+                cx.update_window(window.into(), |_, window, cx| {
+                    if window.handle.window_id() == windows[1].window_id() {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    } else if window.frame_work_stats().frames == 0 {
+                        window.draw(cx).clear(cx);
+                    }
+                    let frame = (describe_frame(window), window.frame_work_stats());
+                    window.reset_frame_work_stats(false);
+                    frame
+                })
+                .unwrap()
+            });
+            assert_eq!(first_difference(&retained, &from_scratch), None, "{refusal:?}");
+            work
+        };
+        draw(&mut cx);
+        let work = draw(&mut cx);
+        assert_eq!(work.views_rendered, 0, "{refusal:?}: {work:?}");
+        for blink in 0..3 {
+            for painted in &painted_models {
+                painted.update(&mut cx, |painted, cx| {
+                    *painted += 1;
+                    cx.notify();
+                });
+            }
+            let work = draw(&mut cx);
+            assert_eq!(
+                work.redrawn_from_scratch, 1,
+                "{refusal:?}, blink {blink}: the frame was drawn again from scratch: {work:?}"
+            );
+            let work = draw(&mut cx);
+            assert_eq!(
+                (work.views_rendered, work.redrawn_from_scratch),
+                (0, 0),
+                "{refusal:?}, blink {blink}, unchanged: {work:?}"
+            );
+        }
+        super::splice::force_deferred_rebuild_refusal(None);
+    }
+}
