@@ -5305,6 +5305,21 @@ fn an_entity_read_only_while_painting_draws_the_view_again() {
                 work.frames > 0,
                 "blink {blink} (cached: {cached}) drew no frame: {work:?}"
             );
+            // Only the field that read the caret is built; the holder is
+            // drawn again around it, and nothing else is built or copied.
+            assert_eq!(
+                (work.frames, work.views_rendered, work.views_spliced, work.views_reused),
+                (1, 1, 1, 1),
+                "blink {blink} (cached: {cached}): {work:?}"
+            );
+            assert_eq!(
+                work.view_rebuilds,
+                crate::ViewRebuildCounts {
+                    entity_changed: 1,
+                    ..Default::default()
+                },
+                "blink {blink} (cached: {cached}) built for another reason: {work:?}"
+            );
             assert_eq!(
                 painted.borrow().last(),
                 Some(&visible),
