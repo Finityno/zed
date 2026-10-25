@@ -110,6 +110,7 @@ impl WindowsWindowInner {
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
             WM_SIZING => self.handle_sizing_msg(handle, lparam),
+            WM_WINDOWPOSCHANGING => self.handle_window_pos_changing_msg(handle, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
             WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
             WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
@@ -315,6 +316,51 @@ impl WindowsWindowInner {
         let current = size(DevicePixels(client.right), DevicePixels(client.bottom));
         if new_size != current {
             self.handle_size_change(new_size, self.state.scale_factor.get(), true);
+            self.draw_window(handle, true);
+        }
+        None
+    }
+
+    /// The window is about to be moved or resized: by a program
+    /// (`SetWindowPos`, `MoveWindow`) as well as interactively. A new size
+    /// gets its frame drawn now, before the window takes it, as an
+    /// interactive resize does in [`Self::handle_sizing_msg`]: drawn after
+    /// `WM_SIZE`, the shown window kept the old frame at its old size for a
+    /// composition or more, with whatever was behind the window showing in
+    /// the part it had grown by. A resize `WM_SIZING` has drawn for already
+    /// matches the size the window has now and is not drawn again. A window
+    /// changing between maximized, minimized and restored changes its frame
+    /// as well, which the proposed rectangle cannot tell, and so does one
+    /// moving to a monitor with another DPI: those are left to `WM_SIZE`.
+    fn handle_window_pos_changing_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        // SAFETY: WM_WINDOWPOSCHANGING's lparam points at the proposed position.
+        let position = unsafe { *(lparam.0 as *const WINDOWPOS) };
+        if position.flags.contains(SWP_NOSIZE)
+            || position.flags.contains(SWP_FRAMECHANGED)
+            || !unsafe { IsWindowVisible(handle) }.as_bool()
+            || unsafe { IsIconic(handle) }.as_bool()
+            || unsafe { IsZoomed(handle) }.as_bool()
+            || self.state.is_fullscreen()
+            // The frame's thickness changes with the DPI too.
+            || self.state.handling_dpi_change.get()
+        {
+            return None;
+        }
+        let proposed = RECT {
+            left: position.x,
+            top: position.y,
+            right: position.x + position.cx,
+            bottom: position.y + position.cy,
+        };
+        let (mut window, mut client) = (RECT::default(), RECT::default());
+        unsafe {
+            GetWindowRect(handle, &mut window).log_err();
+            GetClientRect(handle, &mut client).log_err();
+        }
+        let new_size = client_size_for(proposed, window, client);
+        let scale_factor = self.state.scale_factor.get();
+        if new_size.to_pixels(scale_factor) != self.state.logical_size.get() {
+            self.handle_size_change(new_size, scale_factor, true);
             self.draw_window(handle, true);
         }
         None
