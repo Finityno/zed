@@ -6934,6 +6934,7 @@ mod tests {
                 },
                 touch_phase: crate::TouchPhase::Moved,
                 is_momentum: false,
+                source: crate::ScrollSource::Pointer,
             });
         }
 

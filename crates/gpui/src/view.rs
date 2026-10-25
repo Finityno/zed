@@ -123,8 +123,16 @@ impl View for AnyView {
 
 impl AnyView {
     /// Renders the view, as drawing it as an element does.
+    #[cfg(not(gpui_hot_reload))]
     pub(crate) fn render_any(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         (self.render)(self, window, cx)
+    }
+
+    /// Renders the view through the jump table, as `render` does, so a
+    /// retained rebuild runs the patched render after a hot reload.
+    #[cfg(gpui_hot_reload)]
+    pub(crate) fn render_any(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        subsecond::HotFn::current(self.render).call((self, window, cx))
     }
 }
 

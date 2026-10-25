@@ -19,7 +19,7 @@ impl Render for ClippedChild {
             .h(px(120.))
             .rounded(px(8.))
             .overflow_hidden()
-            .child(div().size_full().bg(if self.revision % 2 == 0 { crate::red() } else { crate::blue() }).occlude())
+            .child(div().size_full().bg(if self.revision.is_multiple_of(2) { crate::red() } else { crate::blue() }).occlude())
     }
 }
 

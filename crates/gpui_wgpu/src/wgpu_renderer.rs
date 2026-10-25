@@ -596,6 +596,9 @@ struct BackdropTextures {
     width: u32,
     height: u32,
     downsample: u32,
+    /// What the three textures hold, for the backdrop gauge: only `backdrop`
+    /// is kept as a texture, the other two live on through their views.
+    bytes: u64,
     backdrop: wgpu::Texture,
     backdrop_view: wgpu::TextureView,
     horizontal_view: wgpu::TextureView,
@@ -614,9 +617,9 @@ impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
         self.depth_texture = None;
         self.depth_view = None;
-        self.release_path_targets();
         self.backdrop_textures.clear();
         self.backdrop_frame = None;
+        self.release_path_targets();
     }
 
     /// Dropping is enough here too: submitted work keeps what it uses alive.
@@ -625,6 +628,7 @@ impl WgpuResources {
         self.backdrop_params_buffer = None;
         self.backdrop_frame = None;
         self.backdrop_frame_blitter = None;
+        self.publish_target_memory();
     }
 
     /// Reported wherever the targets change, not only per frame, so a release
@@ -639,10 +643,18 @@ impl WgpuResources {
         .into_iter()
         .map(|texture| texture_bytes(texture.as_ref()))
         .sum();
+        let backdrop = self
+            .backdrop_textures
+            .iter()
+            .map(|textures| textures.bytes)
+            .sum::<u64>()
+            + texture_bytes(self.backdrop_frame.as_ref().map(|frame| &frame.texture));
         self.render_memory
             .publish(RenderMemoryGauge::DepthTextures, depth);
         self.render_memory
             .publish(RenderMemoryGauge::PathTextures, paths);
+        self.render_memory
+            .publish(RenderMemoryGauge::BackdropTextures, backdrop);
     }
 
     /// Dropping is enough: wgpu keeps a texture alive until the submitted work
@@ -3018,6 +3030,7 @@ impl WgpuRendererCore {
         };
         let handles = (frame.texture.clone(), frame.view.clone());
         resources.backdrop_frame = Some(frame);
+        resources.publish_target_memory();
         handles
     }
 
@@ -3080,6 +3093,9 @@ impl WgpuRendererCore {
                     width,
                     height,
                     downsample,
+                    bytes: texture_bytes(Some(&backdrop))
+                        + texture_bytes(Some(&horizontal))
+                        + texture_bytes(Some(&blurred)),
                     backdrop_view: view(&backdrop),
                     horizontal_view: view(&horizontal),
                     blurred_view: view(&blurred),
@@ -3088,6 +3104,7 @@ impl WgpuRendererCore {
             }
         };
         resources.backdrop_textures.push(textures);
+        resources.publish_target_memory();
     }
 
     /// Runs `blur` while the main pass is ended: copies the region the blur
@@ -4448,6 +4465,48 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backdrop_scratch_is_counted_while_resident() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let backdrop_bytes = |renderer: &WgpuHeadlessRenderer| {
+            renderer
+                .core
+                .resources
+                .render_memory
+                .published(RenderMemoryGauge::BackdropTextures)
+        };
+        let bounds = gpui::Bounds {
+            origin: gpui::point(ScaledPixels(4.), ScaledPixels(4.)),
+            size: gpui::size(ScaledPixels(24.), ScaledPixels(24.)),
+        };
+        let mut blur_scene = Scene::default();
+        blur_scene.insert_backdrop_blur(gpui::BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(8.),
+            saturation: 1.,
+            opacity: 1.,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+        });
+        blur_scene.finish();
+        let empty_scene = Scene::default();
+
+        renderer.render_scene(&blur_scene, device_size(32, 32))?;
+        assert!(!renderer.core.resources.backdrop_textures.is_empty());
+        // The copy of the region alone is 24x24 at four bytes per texel.
+        assert!(backdrop_bytes(&renderer) >= 24 * 24 * 4);
+        assert!(gpui::render_memory_gauges().backdrop_texture_bytes >= backdrop_bytes(&renderer));
+
+        for _ in 0..BACKDROP_IDLE_FRAMES {
+            renderer.render_scene(&empty_scene, device_size(32, 32))?;
+        }
+        assert!(renderer.core.resources.backdrop_textures.is_empty());
+        assert_eq!(backdrop_bytes(&renderer), 0);
+        Ok(())
+    }
+
     /// A hidden window's renderer: no surface, the core of `headless` moved in
     /// and a fresh one left behind. There is no window to create a real
     /// surface for, so the core is handed back to draw the re-shown frame.
@@ -4476,6 +4535,7 @@ mod tests {
                 desired_maximum_frame_latency: 2,
                 alpha_mode: wgpu::CompositeAlphaMode::Opaque,
                 view_formats: vec![],
+                color_space: wgpu::SurfaceColorSpace::Auto,
             },
             atlas,
             transparent_alpha_mode: wgpu::CompositeAlphaMode::Opaque,
@@ -4752,6 +4812,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rare_pipelines_are_compiled_on_first_draw() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;

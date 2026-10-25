@@ -77,9 +77,18 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 
     let result: Result<()> = (|| {
         unsafe { EmptyClipboard()? };
-        for entry in item.entries() {
+        // Each string entry replaces CF_UNICODETEXT, so the last one is the
+        // text a reader gets; HTML from an earlier entry would describe
+        // different content.
+        let last_string = item
+            .entries()
+            .iter()
+            .rposition(|entry| matches!(entry, ClipboardEntry::String(_)));
+        for (index, entry) in item.entries().iter().enumerate() {
             match entry {
-                ClipboardEntry::String(string) => write_string(string)?,
+                ClipboardEntry::String(string) => {
+                    write_string(string, Some(index) == last_string)?
+                }
                 ClipboardEntry::Image(image) => write_image(image)?,
                 ClipboardEntry::ExternalPaths(_) => {}
             }
@@ -186,7 +195,7 @@ fn is_image_format(format: u32) -> bool {
     IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
 }
 
-fn write_string(item: &ClipboardString) -> Result<()> {
+fn write_string(item: &ClipboardString, with_html: bool) -> Result<()> {
     // CF_UNICODETEXT is null-terminated, so replace embedded NUL characters with spaces.
     let text = if item.text.contains('\0') {
         Cow::Owned(item.text.replace('\0', " "))
@@ -203,7 +212,7 @@ fn write_string(item: &ClipboardString) -> Result<()> {
         let wide: Vec<u16> = metadata.encode_utf16().chain(Some(0)).collect_vec();
         set_clipboard_bytes(&wide, *CLIPBOARD_METADATA_FORMAT)?;
     }
-    if let Some(html) = item.html.as_deref() {
+    if with_html && let Some(html) = item.html.as_deref() {
         set_clipboard_bytes(&gpui::encode_windows_html_clipboard(html), *CLIPBOARD_HTML_FORMAT)?;
     }
     Ok(())

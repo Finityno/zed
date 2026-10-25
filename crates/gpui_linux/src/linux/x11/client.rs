@@ -3364,7 +3364,7 @@ mod tests {
     // touch the event loop's idle or source lists.
     #[test]
     fn frame_request_from_an_idle_callback_resumes_through_the_ping() {
-        let mut event_loop = EventLoop::<'static, usize>::try_new().expect("event loop");
+        let mut event_loop = calloop::EventLoop::<'static, usize>::try_new().expect("event loop");
         let handle = event_loop.handle();
         let (resume_ping, resume_ping_source) =
             calloop::ping::make_ping().expect("resume ping");

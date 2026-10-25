@@ -693,6 +693,7 @@ impl Oracle {
                                     modifiers: Modifiers::default(),
                                     touch_phase: crate::TouchPhase::Moved,
                                     is_momentum: false,
+                                    source: crate::ScrollSource::Pointer,
                                 }),
                                 cx,
                             );
@@ -1907,6 +1908,7 @@ fn a_wheel_scroll_builds_the_views_reading_the_list() {
                 modifiers: Modifiers::default(),
                 touch_phase: crate::TouchPhase::Moved,
                 is_momentum: false,
+                source: crate::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -1974,6 +1976,7 @@ fn a_wheel_scroll_does_not_notify_the_view_drawing_the_list() {
                     modifiers: Modifiers::default(),
                     touch_phase: crate::TouchPhase::Moved,
                     is_momentum: false,
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );
@@ -4164,6 +4167,7 @@ fn rows_with_scrollers_scrolled_by_the_wheel_are_not_built_after() {
                     modifiers: Modifiers::default(),
                     touch_phase: crate::TouchPhase::Moved,
                     is_momentum: false,
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );
@@ -4293,6 +4297,7 @@ fn a_wheel_scroll_under_the_pointer_draws_one_frame_a_wheel_event() {
                     modifiers: Modifiers::default(),
                     touch_phase: crate::TouchPhase::Moved,
                     is_momentum: false,
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );
