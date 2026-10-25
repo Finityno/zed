@@ -320,6 +320,11 @@ impl WindowsWindowInner {
         None
     }
 
+    /// Draws and presents a frame for a window that is about to be shown.
+    pub(crate) fn draw_before_shown(&self, handle: HWND) {
+        self.draw_window(handle, true);
+    }
+
     fn handle_size_change(
         &self,
         device_size: Size<DevicePixels>,

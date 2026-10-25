@@ -2016,8 +2016,6 @@ impl Window {
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
-        let content_size = platform_window.content_size();
-        let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new(handle.window_id());
@@ -2043,6 +2041,11 @@ impl Window {
             WindowBounds::Maximized(_) => platform_window.zoom(),
             WindowBounds::Windowed(_) => {}
         }
+        // Read once the window is in the mode it opens in: a platform that
+        // sizes a still-hidden window for it (Windows, for a maximized one)
+        // has the first frame laid out at the size the window is shown at.
+        let content_size = platform_window.content_size();
+        let scale_factor = platform_window.scale_factor();
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;
         let a11y_active_flag = Arc::new(AtomicBool::new(false));
