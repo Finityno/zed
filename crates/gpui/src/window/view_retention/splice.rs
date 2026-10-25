@@ -24,12 +24,14 @@
 //!   (the window's, or a list item's), moves nothing outside the gap;
 //!   otherwise what was built of the splice is rolled back and the view is
 //!   built instead;
-//! - the views it builds deferred nothing last frame (a deferred draw is
-//!   drawn after the frame, out of the stretches, so one of a gap's could
-//!   not be told apart from those copied); the deferred draws in the
-//!   stretches it copies (a menu, a popover, a toast of its own) are copied
-//!   with them and drawn again from the last frame, as a view drawn again
-//!   whole draws its own;
+//! - the deferred draws in the stretches it copies (a menu, a popover, a
+//!   toast of its own or of a view copied along) are copied with them and
+//!   drawn again from the last frame, as a view drawn again whole draws its
+//!   own, hung off the dispatch nodes they hung off; a gap's own deferred
+//!   draws are not copied, since its prepaint range is not: a gap spliced
+//!   in turn copies its own, and a gap built would defer them afresh, but
+//!   one that deferred something is not built in a gap (see
+//!   [`Window::splice_gaps`]);
 //! - each gap can be built on its own: it is an entity or an [`AnyView`],
 //!   was laid out with nodes it kept (or is a cached view, laid out at its
 //!   bounds), is not under an image cache, a text shimmer or a time
@@ -194,6 +196,18 @@ impl Window {
         None
     }
 
+    /// Whether the view last frame's `record` stands for has to be built
+    /// itself, and not only drawn again around views nested in it: it was
+    /// notified, or has another reason of its own (see
+    /// [`Window::prepaint_gap`], which splices any other gap in turn).
+    fn builds_itself(&self, record: &ViewRecord, cx: &App) -> bool {
+        let Some(entity) = view_entity(&record.id) else {
+            return true;
+        };
+        self.view_retention.notified.contains(&entity)
+            || self.rebuild_reason_besides_dirty(record, entity, cx).is_some()
+    }
+
     /// Whether the view `record` stands for can be built on its own, inside
     /// `around`, drawn again around it.
     fn buildable_on_its_own(record: &ViewRecord, around: &ViewRecord) -> bool {
@@ -255,9 +269,20 @@ impl Window {
                 index += nested.nested + 1;
                 continue;
             }
+            if !Self::buildable_on_its_own(nested, record) {
+                return None;
+            }
+            // A gap that has to be built itself and deferred something last
+            // frame still has the view built instead. Built in a gap, a view
+            // that then asks for another layout is built a second time, with
+            // the view the splice falls back to; refusing these up front
+            // keeps that second build off views that defer (an entry with a
+            // menu), which were built once before deferred draws could be
+            // copied. A gap spliced in turn copies what it deferred and
+            // builds only what is nested in it.
             let deferred = &nested.prepaint_range;
-            if !Self::buildable_on_its_own(nested, record)
-                || deferred.start.deferred_draws_index != deferred.end.deferred_draws_index
+            if deferred.start.deferred_draws_index != deferred.end.deferred_draws_index
+                && self.builds_itself(nested, cx)
             {
                 return None;
             }

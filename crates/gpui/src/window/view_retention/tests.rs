@@ -5512,3 +5512,11 @@ fn view_inside_spliced_views_is_built_alone(overlay: bool) {
         );
     }
 }
+
+/// The same, with an overlay deferred by the view around the one notified:
+/// both views around it are still drawn again around it, the overlay copied
+/// with the view that deferred it.
+#[test]
+fn a_view_beside_a_deferred_overlay_is_built_alone() {
+    view_inside_spliced_views_is_built_alone(true);
+}
