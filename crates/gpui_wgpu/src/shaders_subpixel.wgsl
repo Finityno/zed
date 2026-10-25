@@ -7,11 +7,11 @@
 struct SubpixelSprite {
     order: u32,
     pad: u32,
+    tile: AtlasTile,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
     effect: SpriteEffect,
-    tile: AtlasTile,
     transformation: TransformationMatrix,
     rounded_clip: u32,
     clip_padding: u32,

@@ -1,28 +1,29 @@
-use cocoa::{
-    appkit::{NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight},
-    base::id,
-    foundation::NSString,
-};
+use crate::NSStringExt;
 use gpui::WindowAppearance;
-use objc::{class, msg_send, sel, sel_impl};
-use std::ffi::CStr;
+use objc2::{msg_send, rc::Retained, runtime::AnyObject};
+use objc2_app_kit::{NSAppearance, NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight};
+use objc2_foundation::NSString;
 
-pub(crate) unsafe fn window_appearance_from_native(appearance: id) -> WindowAppearance {
-    let name: id = msg_send![appearance, name];
+pub(crate) fn window_appearance_from_native(appearance: Option<&NSAppearance>) -> WindowAppearance {
+    let Some(appearance) = appearance else {
+        return WindowAppearance::Light;
+    };
     unsafe {
-        if name == NSAppearanceNameVibrantLight {
+        let name: Option<Retained<NSString>> = msg_send![appearance, name];
+        let Some(name) = name else {
+            return WindowAppearance::Light;
+        };
+        let name_ptr = Retained::as_ptr(&name).cast::<AnyObject>();
+        if name_ptr == std::ptr::from_ref(NSAppearanceNameVibrantLight).cast() {
             WindowAppearance::VibrantLight
-        } else if name == NSAppearanceNameVibrantDark {
+        } else if name_ptr == std::ptr::from_ref(NSAppearanceNameVibrantDark).cast() {
             WindowAppearance::VibrantDark
-        } else if name == NSAppearanceNameAqua {
+        } else if name_ptr == NSAppearanceNameAqua {
             WindowAppearance::Light
-        } else if name == NSAppearanceNameDarkAqua {
+        } else if name_ptr == NSAppearanceNameDarkAqua {
             WindowAppearance::Dark
         } else {
-            println!(
-                "unknown appearance: {:?}",
-                CStr::from_ptr(name.UTF8String())
-            );
+            println!("unknown appearance: {:?}", name_ptr.cast_mut().to_str());
             WindowAppearance::Light
         }
     }
@@ -30,20 +31,20 @@ pub(crate) unsafe fn window_appearance_from_native(appearance: id) -> WindowAppe
 
 /// Returns the retained `NSAppearance` for the given appearance, for
 /// `-[NSWindow setAppearance:]`.
-pub(crate) unsafe fn window_appearance_to_native(appearance: WindowAppearance) -> id {
+pub(crate) unsafe fn window_appearance_to_native(appearance: WindowAppearance) -> *mut AnyObject {
     unsafe {
-        let name: id = match appearance {
+        let name: *const AnyObject = match appearance {
             WindowAppearance::Light => NSAppearanceNameAqua,
             WindowAppearance::Dark => NSAppearanceNameDarkAqua,
-            WindowAppearance::VibrantLight => NSAppearanceNameVibrantLight,
-            WindowAppearance::VibrantDark => NSAppearanceNameVibrantDark,
+            WindowAppearance::VibrantLight => std::ptr::from_ref(NSAppearanceNameVibrantLight).cast(),
+            WindowAppearance::VibrantDark => std::ptr::from_ref(NSAppearanceNameVibrantDark).cast(),
         };
-        msg_send![class!(NSAppearance), appearanceNamed: name]
+        msg_send![objc2::class!(NSAppearance), appearanceNamed: name]
     }
 }
 
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
-    pub static NSAppearanceNameAqua: id;
-    pub static NSAppearanceNameDarkAqua: id;
+    pub static NSAppearanceNameAqua: *mut AnyObject;
+    pub static NSAppearanceNameDarkAqua: *mut AnyObject;
 }

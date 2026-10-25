@@ -12,6 +12,7 @@ use gpui::{
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
 
+use core_graphics::color_space::{CGColorSpace, kCGColorSpaceDisplayP3};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CAMetalLayer, CommandQueue, MTLCompareFunction, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
@@ -124,8 +125,9 @@ pub unsafe fn new_renderer(
     _native_view: *mut c_void,
     _bounds: gpui::Size<f32>,
     transparent: bool,
+    use_display_p3: bool,
 ) -> Renderer {
-    MetalRenderer::new(context, transparent)
+    MetalRenderer::new(context, transparent, use_display_p3)
 }
 
 pub fn new_overlay_renderer(context: self::Context, base: &Renderer) -> Renderer {
@@ -259,6 +261,9 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// Whether the layer renders in Display P3; an overlay plane's layer
+    /// matches its window's.
+    use_display_p3: bool,
     /// The size the window wants its drawables at, kept while
     /// [`Self::release_drawables`] has them shrunk.
     drawable_size: Size<DevicePixels>,
@@ -502,20 +507,26 @@ pub struct PathRasterizationVertex {
 
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
-    pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
+    pub fn new(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+        use_display_p3: bool,
+    ) -> Self {
         let device = Self::create_device();
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
-        let layer = Self::new_layer(&device, transparent);
+        let layer = Self::new_layer(&device, transparent, use_display_p3);
 
-        Self::new_internal(
+        let mut renderer = Self::new_internal(
             device,
             Some(layer),
             !transparent,
             instance_buffer_pool,
             None,
             None,
-        )
+        );
+        renderer.use_display_p3 = use_display_p3;
+        renderer
     }
 
     /// Creates a renderer for a CAMetalLayer owned by a platform view.
@@ -529,19 +540,46 @@ impl MetalRenderer {
         let layer = unsafe {
             metal::MetalLayerRef::from_ptr(ptr::from_ref(layer).cast_mut().cast::<CAMetalLayer>())
         }.to_owned();
-        Self::configure_layer(&layer, &device, transparent);
+        Self::configure_layer(&layer, &device, transparent, false);
         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool, None, None)
     }
 
-    fn new_layer(device: &metal::Device, transparent: bool) -> metal::MetalLayer {
+    fn new_layer(device: &metal::Device, transparent: bool, use_display_p3: bool) -> metal::MetalLayer {
         let layer = metal::MetalLayer::new();
-        Self::configure_layer(&layer, device, transparent);
+        Self::configure_layer(&layer, device, transparent, use_display_p3);
         layer
     }
 
-    fn configure_layer(layer: &metal::MetalLayerRef, device: &metal::DeviceRef, transparent: bool) {
+    fn configure_layer(
+        layer: &metal::MetalLayerRef,
+        device: &metal::DeviceRef,
+        transparent: bool,
+        use_display_p3: bool,
+    ) {
         layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        // metal-rs doesn't bind these setters, so view the same object through
+        // objc2's typed CAMetalLayer binding.
+        let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
+        if use_display_p3 {
+            // SAFETY: The constant is extern, from Core Graphics
+            let display_p3_name = unsafe { kCGColorSpaceDisplayP3 };
+            if let Some(display_p3_color_space) = CGColorSpace::create_with_name(display_p3_name) {
+                // SAFETY: `layer` is a CAMetalLayer and the color space remains valid for the call.
+                // 'metal-rs' does not expose CAMetalLayer's typed `colorspace` setter.
+                // Could be replaced with a native binding via objc2-* in future
+                unsafe {
+                    let _: () = objc2::msg_send![
+                        objc2_layer,
+                        setColorspace: display_p3_color_space.as_ptr().cast::<c_void>()
+                    ];
+                }
+            } else {
+                log::error!("unable to create the Display P3 color space");
+            }
+        }
+        // Support direct-to-display rendering if the window is not transparent
+        // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         // Core Animation's default three, deliberately.
         //
@@ -573,9 +611,6 @@ impl MetalRenderer {
         // frosts pays the display path's lost optimisation as well; the app
         // frosts its composer in every window, so it would anyway.
         layer.set_framebuffer_only(false);
-        // metal-rs doesn't bind these setters, so view the same object through
-        // objc2's typed CAMetalLayer binding.
-        let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
         objc2_layer.setAllowsNextDrawableTimeout(false);
         objc2_layer.setNeedsDisplayOnBoundsChange(true);
         // UIKit sizes a view's backing layer itself; only AppKit-hosted
@@ -593,7 +628,7 @@ impl MetalRenderer {
         transparent: bool,
     ) -> Self {
         let device = self.device.clone();
-        let layer = Self::new_layer(&device, transparent);
+        let layer = Self::new_layer(&device, transparent, self.use_display_p3);
         let mut renderer = Self::new_internal(
             device,
             Some(layer),
@@ -922,6 +957,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            use_display_p3: false,
             drawable_size: Size::default(),
             drawables_released: false,
             is_apple_gpu,

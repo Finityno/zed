@@ -1368,9 +1368,11 @@ impl X11Client {
                                 ScrollDirection::Left => Point::new(SCROLL_LINES, 0.0),
                                 ScrollDirection::Right => Point::new(-SCROLL_LINES, 0.0),
                             };
-                            window.handle_input(PlatformInput::ScrollWheel(
-                                make_scroll_wheel_event(position, scroll_delta, modifiers),
-                            ));
+                            window.handle_input(PlatformInput::Scroll(make_scroll_wheel_event(
+                                position,
+                                scroll_delta,
+                                modifiers,
+                            )));
                         }
                     }
                     None => {
@@ -1456,7 +1458,7 @@ impl X11Client {
                     let scroll_delta = get_scroll_delta_and_update_state(pointer, &event);
                     drop(state);
                     if let Some(scroll_delta) = scroll_delta {
-                        window.handle_input(PlatformInput::ScrollWheel(make_scroll_wheel_event(
+                        window.handle_input(PlatformInput::Scroll(make_scroll_wheel_event(
                             position,
                             scroll_delta,
                             modifiers,
@@ -2716,7 +2718,7 @@ fn make_scroll_wheel_event(
     position: Point<Pixels>,
     scroll_delta: Point<f32>,
     modifiers: Modifiers,
-) -> gpui::ScrollWheelEvent {
+) -> gpui::ScrollEvent {
     // When shift is held down, vertical scrolling turns into horizontal scrolling.
     let delta = if modifiers.shift {
         Point {
@@ -2726,12 +2728,13 @@ fn make_scroll_wheel_event(
     } else {
         scroll_delta
     };
-    gpui::ScrollWheelEvent {
+    gpui::ScrollEvent {
         position,
         delta: ScrollDelta::Lines(delta),
         modifiers,
         touch_phase: TouchPhase::default(),
         is_momentum: false,
+        source: gpui::ScrollSource::Pointer,
     }
 }
 

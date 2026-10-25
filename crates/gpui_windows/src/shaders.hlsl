@@ -1300,11 +1300,11 @@ struct SpriteEffect {
 struct MonochromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
     Hsla color;
     SpriteEffect effect;
-    AtlasTile tile;
     TransformationMatrix transformation;
     uint rounded_clip;
     uint clip_padding;
@@ -1481,12 +1481,12 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 struct PolychromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     uint grayscale;
     float opacity;
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
-    AtlasTile tile;
     uint rounded_clip;
     uint clip_padding;
 };

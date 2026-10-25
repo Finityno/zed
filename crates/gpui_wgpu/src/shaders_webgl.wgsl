@@ -223,11 +223,11 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),
+        read_atlas_tile(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_hsla(&cursor),
         read_sprite_effect(&cursor),
-        read_atlas_tile(&cursor),
         read_transformation(&cursor),
             read_word(&cursor),
         read_word(&cursor),
@@ -239,12 +239,12 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
+        read_atlas_tile(&cursor),
         read_word(&cursor),
         read_f32(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
-        read_atlas_tile(&cursor),
             read_word(&cursor),
         read_word(&cursor),
     );
