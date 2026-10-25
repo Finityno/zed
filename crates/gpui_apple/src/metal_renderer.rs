@@ -566,10 +566,12 @@ impl MetalRenderer {
         // documents 2 and 3 as the only permitted values, so there is no
         // middle ground to take instead.
         layer.set_maximum_drawable_count(3);
-        // Allow texture reading for visual tests and UI automation screenshots
-        // (captures without ScreenCaptureKit). Only debug builds pay the
-        // presentation cost, even when `test-support` is compiled in.
-        #[cfg(all(feature = "test-support", debug_assertions))]
+        // Backdrop blurs sample the drawable they frost (the downsample pass
+        // reads the region beneath a surface straight out of it), which Metal
+        // allows only for a texture that is not framebuffer-only. Visual tests
+        // and UI automation screenshots read it back too. A window that never
+        // frosts pays the display path's lost optimisation as well; the app
+        // frosts its composer in every window, so it would anyway.
         layer.set_framebuffer_only(false);
         // metal-rs doesn't bind these setters, so view the same object through
         // objc2's typed CAMetalLayer binding.
@@ -5391,6 +5393,15 @@ mod hidden_drawable_tests {
         let layer = renderer.layer().expect("a window renderer has a layer");
         let drawable = layer.drawable_size();
         (drawable.width, drawable.height)
+    }
+
+    /// Frosting samples the drawable it blurs, so a window's drawables must
+    /// be shader-readable in every build, not only in test builds.
+    #[test]
+    fn window_drawables_can_be_sampled() {
+        let renderer = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        let layer = renderer.layer().expect("a window renderer has a layer");
+        assert!(!layer.framebuffer_only());
     }
 
     /// A hidden window's layer holds single-pixel drawables, keeps the size
