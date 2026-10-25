@@ -109,6 +109,7 @@ impl WindowsWindowInner {
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
+            WM_SIZING => self.handle_sizing_msg(handle, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
             WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
             WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
@@ -294,6 +295,29 @@ impl WindowsWindowInner {
 
         self.handle_size_change(new_size, scale_factor, should_resize_renderer);
         Some(0)
+    }
+
+    /// An interactive resize is about to give the window the rectangle in
+    /// `lparam`. Its frame is drawn now, before the window takes the size:
+    /// drawn after `WM_SIZE`, the frame reached DWM a composition after the
+    /// larger window did, and the backdrop showed in a strip along the
+    /// dragged edge. Drawn first, a frame can at most be clipped by a window
+    /// that has not grown yet, which leaves nothing missing.
+    fn handle_sizing_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        // SAFETY: WM_SIZING's lparam points at the proposed window rectangle.
+        let proposed = unsafe { *(lparam.0 as *const RECT) };
+        let (mut window, mut client) = (RECT::default(), RECT::default());
+        unsafe {
+            GetWindowRect(handle, &mut window).log_err();
+            GetClientRect(handle, &mut client).log_err();
+        }
+        let new_size = client_size_for(proposed, window, client);
+        let current = size(DevicePixels(client.right), DevicePixels(client.bottom));
+        if new_size != current {
+            self.handle_size_change(new_size, self.state.scale_factor.get(), true);
+            self.draw_window(handle, true);
+        }
+        None
     }
 
     fn handle_size_change(
@@ -1975,5 +1999,42 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+/// The client size a window rectangle of `proposed` gives, keeping the frame
+/// the window has now (`window` and `client` as `GetWindowRect` and
+/// `GetClientRect` report them).
+fn client_size_for(proposed: RECT, window: RECT, client: RECT) -> Size<DevicePixels> {
+    let frame_width = (window.right - window.left) - client.right;
+    let frame_height = (window.bottom - window.top) - client.bottom;
+    let width = (proposed.right - proposed.left) - frame_width;
+    let height = (proposed.bottom - proposed.top) - frame_height;
+    size(DevicePixels(width.max(1)), DevicePixels(height.max(1)))
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    // Not `super::*`: gpui's glob import brings its own `test` attribute.
+    use super::client_size_for;
+    use gpui::{DevicePixels, size};
+    use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn a_sizing_rect_maps_to_the_client_size_it_gives() {
+        // An 816x639 window around an 800x600 client: 16 px of side borders
+        // and 39 of caption and bottom border.
+        let window = RECT { left: 100, top: 50, right: 916, bottom: 689 };
+        let client = RECT { left: 0, top: 0, right: 800, bottom: 600 };
+        let grown = RECT { left: 100, top: 50, right: 1156, bottom: 829 };
+        assert_eq!(
+            client_size_for(grown, window, client),
+            size(DevicePixels(1040), DevicePixels(740))
+        );
+        let collapsed = RECT { left: 100, top: 50, right: 110, bottom: 60 };
+        assert_eq!(
+            client_size_for(collapsed, window, client),
+            size(DevicePixels(1), DevicePixels(1))
+        );
     }
 }
