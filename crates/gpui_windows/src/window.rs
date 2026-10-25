@@ -433,6 +433,15 @@ impl WindowsWindowInner {
         let Some(open_status) = self.state.initial_placement.take() else {
             return Ok(());
         };
+        // Presented before it is shown, at the size it is shown at (see
+        // `configure_created_window` and `size_hidden_as_maximized`). The
+        // frame `open_window` drew was not presented, so the window showed
+        // what was behind it until its first paint. A fullscreen window is
+        // given its size only as it is shown, so its first frame waits for
+        // that paint.
+        if !matches!(open_status.state, WindowOpenState::Fullscreen) {
+            self.draw_before_shown(self.hwnd);
+        }
         match open_status.state {
             WindowOpenState::Maximized => unsafe {
                 // Show maximized in the same call that sets the restore rect.
@@ -442,6 +451,17 @@ impl WindowsWindowInner {
                 // window before it maximizes.
                 let mut placement = open_status.placement;
                 placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+                // A client-decorated window was sized for the maximized
+                // window while hidden (see `size_hidden_as_maximized`), and
+                // its first frames were drawn at that size. Maximized from
+                // there, it keeps the size; the placement below then only
+                // sets its restore rect. Placed first, it was shown at the
+                // restore rect and maximized from it, and a frame drawn at
+                // the restore size showed in the maximized window.
+                if self.hide_title_bar {
+                    // The return value is the previous visibility, not an error.
+                    let _was_visible = ShowWindow(self.hwnd, SW_SHOWMAXIMIZED);
+                }
                 SetWindowPlacement(self.hwnd, &placement)
                     .context("failed to set window placement")?;
             },
@@ -1116,6 +1136,11 @@ impl PlatformWindow for WindowsWindow {
                 ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE).ok().log_err();
             } else if let Some(mut status) = self.state.initial_placement.take() {
                 status.state = WindowOpenState::Maximized;
+                if self.0.hide_title_bar {
+                    size_hidden_as_maximized(self.0.hwnd, &status.placement)
+                        .context("sizing a hidden window as it will be maximized")
+                        .log_err();
+                }
                 self.state.initial_placement.set(Some(status));
             }
         }
@@ -1823,12 +1848,66 @@ fn configure_created_window(
         }
         unsafe { SetWindowPlacement(hwnd, &placement)? };
     } else {
+        // Placed now, still hidden: GPUI draws the first frame before the
+        // window is shown, at the size it has then. Left at the size
+        // `CW_USEDEFAULT` gave it until `activate` applied the placement,
+        // that frame was laid out for another size, and the window showed
+        // it until the next one.
+        let mut hidden = placement;
+        hidden.showCmd = SW_HIDE.0 as u32;
+        unsafe { SetWindowPlacement(hwnd, &hidden)? };
         this.state.initial_placement.set(Some(WindowOpenStatus {
             placement,
             state: WindowOpenState::Windowed,
         }));
     }
     Ok(())
+}
+
+/// Sizes a hidden window to the client area it will have once shown
+/// maximized, so the frames drawn before it is shown are laid out for that
+/// size. Only for client-decorated windows, whose maximized client area is
+/// the monitor's work area (see `handle_calc_client_size`).
+fn size_hidden_as_maximized(hwnd: HWND, placement: &WINDOWPLACEMENT) -> Result<()> {
+    let monitor = unsafe { MonitorFromRect(&placement.rcNormalPosition, MONITOR_DEFAULTTONEAREST) };
+    let work = get_monitor_info(monitor)?.monitorInfo.rcWork;
+    let (mut window, mut client) = (RECT::default(), RECT::default());
+    let mut client_origin = POINT::default();
+    unsafe {
+        GetWindowRect(hwnd, &mut window)?;
+        GetClientRect(hwnd, &mut client)?;
+        ClientToScreen(hwnd, &mut client_origin).ok()?;
+    }
+    let rect = window_rect_for_client(work, window, client, client_origin);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        )?
+    };
+    Ok(())
+}
+
+/// The window rectangle that puts the client area exactly over `target`,
+/// keeping the frame the window has now (`window` and `client` as
+/// `GetWindowRect` and `GetClientRect` report them, the client's top-left
+/// corner at `client_origin` on screen).
+fn window_rect_for_client(target: RECT, window: RECT, client: RECT, client_origin: POINT) -> RECT {
+    let left_frame = client_origin.x - window.left;
+    let top_frame = client_origin.y - window.top;
+    let right_frame = (window.right - window.left) - client.right - left_frame;
+    let bottom_frame = (window.bottom - window.top) - client.bottom - top_frame;
+    RECT {
+        left: target.left - left_frame,
+        top: target.top - top_frame,
+        right: target.right + right_frame,
+        bottom: target.bottom + bottom_frame,
+    }
 }
 
 fn retrieve_window_placement(
@@ -2017,6 +2096,28 @@ mod tests {
         assert_eq!(
             state.update(MouseButton::Right, point(DevicePixels(10), DevicePixels(0))),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod hidden_sizing_tests {
+    // Not `super::*`: gpui's glob import brings its own `test` attribute.
+    use super::window_rect_for_client;
+    use windows::Win32::Foundation::{POINT, RECT};
+
+    #[test]
+    fn the_window_rect_puts_the_client_over_the_target() {
+        // A client-decorated window: 8 px resize borders on the left, right
+        // and bottom, none on top, its 1000x700 client at (108, 50).
+        let window = RECT { left: 100, top: 50, right: 1116, bottom: 758 };
+        let client = RECT { left: 0, top: 0, right: 1000, bottom: 700 };
+        let client_origin = POINT { x: 108, y: 50 };
+        // A 3840x2088 work area below a top taskbar 72 px tall.
+        let work = RECT { left: 0, top: 72, right: 3840, bottom: 2160 };
+        assert_eq!(
+            window_rect_for_client(work, window, client, client_origin),
+            RECT { left: -8, top: 72, right: 3848, bottom: 2168 }
         );
     }
 }
