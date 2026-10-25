@@ -537,6 +537,12 @@ pub struct ScrollEvent {
     pub is_momentum: bool,
     /// The kind of input that produced this scroll.
     pub source: ScrollSource,
+    /// How many mouse wheel notches the scroll is, on `delta`'s axes, before
+    /// the platform scaled each to its lines-per-notch setting (three by
+    /// default on Windows, X11 and Wayland). Fractional on high-resolution
+    /// wheels; `None` where the platform reports no notches, as on macOS and
+    /// for trackpads and touch.
+    pub wheel_notches: Option<Point<f32>>,
 }
 
 /// The former name of [`ScrollEvent`].

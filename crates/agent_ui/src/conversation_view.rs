@@ -7078,6 +7078,7 @@ pub(crate) mod tests {
             touch_phase: gpui::TouchPhase::Moved,
             is_momentum: false,
             source: gpui::ScrollSource::Pointer,
+            wheel_notches: None,
         });
         cx.run_until_parked();
 

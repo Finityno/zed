@@ -670,6 +670,7 @@ impl WebWindowInner {
                 touch_phase: TouchPhase::Moved,
                 is_momentum: false,
                 source: ScrollSource::Pointer,
+                wheel_notches: None,
             }));
         })
     }

@@ -292,6 +292,7 @@ pub(crate) unsafe fn platform_input_from_native(
                     is_momentum,
                     modifiers: read_modifiers(native_event),
                     source: ScrollSource::Pointer,
+                    wheel_notches: None,
                 })
             }),
             NSEventType::LeftMouseDragged

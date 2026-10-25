@@ -5592,6 +5592,7 @@ mod tests {
             touch_phase: TouchPhase::Moved,
             is_momentum: false,
             source: gpui::ScrollSource::Pointer,
+            wheel_notches: None,
         });
         cx.run_until_parked();
         let rendered = rendered_text
@@ -7997,6 +7998,7 @@ mod tests {
             touch_phase: TouchPhase::Moved,
             is_momentum: false,
             source: gpui::ScrollSource::Pointer,
+            wheel_notches: None,
         });
         cx.run_until_parked();
 
@@ -8095,6 +8097,7 @@ mod tests {
             touch_phase: TouchPhase::Moved,
             is_momentum: false,
             source: gpui::ScrollSource::Pointer,
+            wheel_notches: None,
         });
         cx.run_until_parked();
 

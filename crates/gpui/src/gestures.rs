@@ -1203,6 +1203,7 @@ fn scroll_event(
         touch_phase,
         is_momentum: false,
         source: ScrollSource::Touch,
+        wheel_notches: None,
     }
 }
 

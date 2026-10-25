@@ -2713,6 +2713,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 touch_phase: TouchPhase::Moved,
                                 is_momentum: false,
                                 source: ScrollSource::Pointer,
+                                wheel_notches: None,
                             });
                             drop(state);
                             window.handle_input(input);
@@ -2727,6 +2728,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                             touch_phase: TouchPhase::Moved,
                             is_momentum: false,
                             source: ScrollSource::Pointer,
+                            // Each notch was scaled to SCROLL_LINES lines.
+                            wheel_notches: Some(discrete.map(|lines| lines / SCROLL_LINES)),
                         });
                         drop(state);
                         window.handle_input(input);

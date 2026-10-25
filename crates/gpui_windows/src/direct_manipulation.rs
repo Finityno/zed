@@ -232,6 +232,7 @@ impl DirectManipulationEventHandler {
                         touch_phase: TouchPhase::Ended,
                         is_momentum: self.is_momentum.get(),
                         source: ScrollSource::Pointer,
+                        wheel_notches: None,
                     }));
             }
             GestureKind::Pinch => {
@@ -397,6 +398,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                         touch_phase,
                         is_momentum: self.is_momentum.get(),
                         source: ScrollSource::Pointer,
+                        wheel_notches: None,
                     }));
             }
             GestureKind::Pinch => {

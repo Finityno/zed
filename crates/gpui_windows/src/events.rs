@@ -631,8 +631,12 @@ impl WindowsWindowInner {
                 .get(),
         };
 
-        let wheel_distance =
-            (wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_amount as f32;
+        let wheel_notches = wparam.signed_hiword() as f32 / WHEEL_DELTA as f32;
+        let wheel_distance = wheel_notches * wheel_scroll_amount as f32;
+        let on_axis = |value: f32| match modifiers.shift {
+            true => Point { x: value, y: 0.0 },
+            false => Point { x: 0.0, y: value },
+        };
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),
@@ -640,20 +644,12 @@ impl WindowsWindowInner {
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         let input = PlatformInput::Scroll(ScrollEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
-            delta: ScrollDelta::Lines(match modifiers.shift {
-                true => Point {
-                    x: wheel_distance,
-                    y: 0.0,
-                },
-                false => Point {
-                    y: wheel_distance,
-                    x: 0.0,
-                },
-            }),
+            delta: ScrollDelta::Lines(on_axis(wheel_distance)),
             modifiers,
             touch_phase: TouchPhase::Moved,
             is_momentum: false,
             source: ScrollSource::Pointer,
+            wheel_notches: Some(on_axis(wheel_notches)),
         });
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
@@ -677,8 +673,8 @@ impl WindowsWindowInner {
             .wheel_scroll_chars
             .get();
 
-        let wheel_distance =
-            (-wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_chars as f32;
+        let wheel_notches = -wparam.signed_hiword() as f32 / WHEEL_DELTA as f32;
+        let wheel_distance = wheel_notches * wheel_scroll_chars as f32;
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),
@@ -694,6 +690,10 @@ impl WindowsWindowInner {
             touch_phase: TouchPhase::Moved,
             is_momentum: false,
             source: ScrollSource::Pointer,
+            wheel_notches: Some(Point {
+                x: wheel_notches,
+                y: 0.0,
+            }),
         });
         let handled = !func(event).propagate;
         self.state.callbacks.input.set(Some(func));
