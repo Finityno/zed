@@ -596,3 +596,258 @@ impl DirectXRenderer {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{DirectXDevices, DirectXRenderer};
+    use gpui::{
+        BackdropBlur, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Point,
+        Quad, ScaledPixels, Scene, Size,
+    };
+    use gpui_util::ResultExt as _;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(color),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    fn headless_renderer() -> Option<DirectXRenderer> {
+        let devices = DirectXDevices::new().log_err()?;
+        DirectXRenderer::new_windowless(&devices, true).log_err()
+    }
+
+    /// Opaque quads beneath a blur take the depth prepass, so they are in the
+    /// framebuffer before the blur copies it and hide what they cover; an
+    /// opaque quad above the blur paints after it and is never frosted into
+    /// the surface beneath.
+    #[test]
+    fn a_frosted_frame_keeps_paint_order_around_the_blur() {
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("SKIPPED: no D3D11 adapter or headless renderer");
+            return;
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 200., 100.), gpui::hsla(0., 1., 0.5, 1.)));
+        scene.insert_primitive(quad(rect(0., 0., 100., 100.), gpui::hsla(1. / 3., 1., 0.5, 1.)));
+        let frosted = rect(50., 0., 100., 100.);
+        scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(4.),
+            saturation: 1.,
+            opacity: 1.,
+            bounds: frosted,
+            content_mask: ContentMask { bounds: frosted },
+            corner_radii: Corners::default(),
+        });
+        scene.insert_primitive(quad(rect(120., 0., 80., 100.), gpui::hsla(2. / 3., 1., 0.5, 1.)));
+        scene.finish();
+        assert!(
+            !scene.opaque_quad_indices.is_empty(),
+            "the quads beneath the blur take the prepass"
+        );
+
+        renderer
+            .resize(gpui::size(DevicePixels(200), DevicePixels(100)))
+            .expect("resizing the headless target succeeds");
+        let image = renderer
+            .render_to_image(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("headless render succeeds");
+        let pixel = |x: u32| image.get_pixel(x, 50).0;
+        assert_eq!(pixel(25)[..3], [0, 255, 0], "green over red, outside the blur");
+        assert_eq!(pixel(130)[..3], [0, 0, 255], "the quad above the blur covers it");
+        assert_eq!(pixel(175)[..3], [0, 0, 255]);
+        assert!(pixel(101)[1] > 0, "green blurs across the frost's left half");
+        for x in 100..120 {
+            let [red, green, blue, _] = pixel(x);
+            assert!(
+                blue <= 1 && red > 0,
+                "the frost at x={x} blurs red and green only, got {:?}",
+                [red, green, blue]
+            );
+        }
+    }
+
+    const TARGET: Size<DevicePixels> = Size {
+        width: DevicePixels(3456),
+        height: DevicePixels(2168),
+    };
+
+    /// A window's surfaces stacked the way an app paints them: a background,
+    /// a frame, cards and panels each covering most of the window, rows of
+    /// text-sized fills on top, and a frosted composer card near the bottom.
+    fn stacked_scene(layers: usize, frost_composer: bool) -> Scene {
+        let mut scene = Scene::default();
+        let width = TARGET.width.0 as f32;
+        let height = TARGET.height.0 as f32;
+        for layer in 0..layers {
+            let inset = layer as f32 * 8.;
+            let lightness = 0.08 + layer as f32 * 0.01;
+            scene.insert_primitive(quad(
+                rect(inset, inset, width - inset * 2., height - inset * 2.),
+                gpui::hsla(0.6, 0.05, lightness, 1.),
+            ));
+        }
+        let mut y = 200.;
+        while y < height - 400. {
+            let mut x = 400.;
+            while x < width - 400. {
+                scene.insert_primitive(quad(rect(x, y, 14., 22.), gpui::hsla(0., 0., 0.9, 1.)));
+                x += 18.;
+            }
+            y += 44.;
+        }
+        let composer = rect(1000., 1800., 1400., 260.);
+        if frost_composer {
+            scene.push_layer(composer);
+            scene.insert_backdrop_blur(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(16.),
+                saturation: 1.4,
+                opacity: 1.,
+                bounds: composer,
+                content_mask: ContentMask { bounds: composer },
+                corner_radii: Corners::all(ScaledPixels(16.)),
+            });
+            scene.insert_primitive(quad(composer, gpui::hsla(0., 0., 0.1, 0.93)));
+            scene.pop_layer();
+        } else {
+            scene.insert_primitive(quad(composer, gpui::hsla(0., 0., 0.1, 0.93)));
+        }
+        scene.finish();
+        scene
+    }
+
+    /// GPU milliseconds `scene` takes to render, from a pair of timestamp
+    /// queries around the frame.
+    fn gpu_milliseconds(renderer: &mut DirectXRenderer, scene: &Scene) -> f64 {
+        use windows::Win32::Foundation::S_OK;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC, D3D11_QUERY_TIMESTAMP,
+            D3D11_QUERY_TIMESTAMP_DISJOINT, ID3D11DeviceContext, ID3D11Query,
+        };
+        use windows::core::Interface as _;
+
+        // `GetData` maps S_FALSE, "not ready yet", to `Ok`, so the HRESULT is
+        // read through the vtable instead.
+        fn wait_for<T: Default>(context: &ID3D11DeviceContext, query: &ID3D11Query) -> T {
+            let mut data = T::default();
+            loop {
+                let result = unsafe {
+                    (windows::core::Interface::vtable(context).GetData)(
+                        context.as_raw(),
+                        query.as_raw(),
+                        &mut data as *mut T as *mut _,
+                        std::mem::size_of::<T>() as u32,
+                        0,
+                    )
+                };
+                if result == S_OK {
+                    return data;
+                }
+                assert!(result.is_ok(), "GetData failed: {result:?}");
+                std::hint::spin_loop();
+            }
+        }
+
+        let devices = renderer.devices.as_ref().expect("devices");
+        let device = devices.device.clone();
+        let context = devices.device_context.clone();
+        let create = |kind| {
+            let mut query = None;
+            unsafe {
+                device
+                    .CreateQuery(
+                        &D3D11_QUERY_DESC {
+                            Query: kind,
+                            MiscFlags: 0,
+                        },
+                        Some(&mut query),
+                    )
+                    .expect("creating a query");
+            }
+            query.expect("query created")
+        };
+        let disjoint = create(D3D11_QUERY_TIMESTAMP_DISJOINT);
+        let start = create(D3D11_QUERY_TIMESTAMP);
+        let end = create(D3D11_QUERY_TIMESTAMP);
+        unsafe {
+            context.Begin(&disjoint);
+            context.End(&start);
+        }
+        renderer.render(scene, [0.0, 0.0, 0.0, 1.0]).expect("frame renders");
+        unsafe {
+            context.End(&end);
+            context.End(&disjoint);
+        }
+        let start_ticks: u64 = wait_for(&context, &start);
+        let end_ticks: u64 = wait_for(&context, &end);
+        let disjoint: D3D11_QUERY_DATA_TIMESTAMP_DISJOINT = wait_for(&context, &disjoint);
+        if disjoint.Disjoint.as_bool() {
+            return f64::NAN;
+        }
+        end_ticks.saturating_sub(start_ticks) as f64 * 1000. / disjoint.Frequency as f64
+    }
+
+    fn median(mut values: Vec<f64>) -> f64 {
+        values.retain(|value| value.is_finite());
+        values.sort_by(f64::total_cmp);
+        values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
+    }
+
+    /// Run with `--ignored --nocapture`; prints what a frame of overlapping
+    /// opaque surfaces costs with a frosted composer over them, against the
+    /// same frame unfrosted.
+    #[test]
+    #[ignore = "measurement, prints GPU time of a frosted frame over stacked surfaces"]
+    fn measure_backdrop_blur_gpu_time_over_stacked_surfaces() {
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("SKIPPED: no D3D11 adapter or headless renderer");
+            return;
+        };
+        renderer
+            .resize(TARGET)
+            .expect("resizing the headless target succeeds");
+        for layers in [4, 12] {
+            let plain = stacked_scene(layers, false);
+            let frosted = stacked_scene(layers, true);
+            for _ in 0..10 {
+                gpu_milliseconds(&mut renderer, &plain);
+                gpu_milliseconds(&mut renderer, &frosted);
+            }
+            let mut plain_times = Vec::new();
+            let mut frosted_times = Vec::new();
+            for _ in 0..200 {
+                plain_times.push(gpu_milliseconds(&mut renderer, &plain));
+                frosted_times.push(gpu_milliseconds(&mut renderer, &frosted));
+            }
+            let plain_frame = median(plain_times);
+            let frosted_frame = median(frosted_times);
+            println!(
+                "[backdrop-gpu] {layers} stacked surfaces + frosted composer: {frosted_frame:.3} ms, {:.3} ms over the plain frame ({plain_frame:.3} ms); {} of {} quads prepassed; median of 200 alternating pairs",
+                frosted_frame - plain_frame,
+                frosted.opaque_quad_indices.len(),
+                frosted.quads.len(),
+            );
+        }
+    }
+}
