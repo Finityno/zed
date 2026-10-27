@@ -2929,8 +2929,9 @@ fn new_command_encoder_for_texture<'a>(
             depth_attachment.set_load_action(metal::MTLLoadAction::Load);
         } else {
             // A memoryless depth attachment has nothing to load. Only a
-            // frame with a backdrop blur resumes its pass on one, and such a
-            // frame has no opaque prepass, so its depth is still all zero.
+            // frame with a backdrop blur resumes its pass on one, and only
+            // quads beneath its first blur take the opaque prepass, so
+            // nothing drawn from here on can be occluded by what was lost.
             depth_attachment.set_load_action(metal::MTLLoadAction::Clear);
             depth_attachment.set_clear_depth(0.0);
         }
@@ -4959,6 +4960,57 @@ mod backdrop_blur_memory_tests {
         );
     }
 
+    /// Opaque quads beneath a blur take the depth prepass, so they are in the
+    /// framebuffer before the blur samples it and hide what they cover; an
+    /// opaque quad above the blur paints after it and is never frosted into
+    /// the surface beneath.
+    #[test]
+    fn a_frosted_frame_keeps_paint_order_around_the_blur() {
+        let target = Size {
+            width: DevicePixels(200),
+            height: DevicePixels(100),
+        };
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 200., 100.), gpui::hsla(0., 1., 0.5, 1.)));
+        scene.insert_primitive(quad(rect(0., 0., 100., 100.), gpui::hsla(1. / 3., 1., 0.5, 1.)));
+        let frosted = rect(50., 0., 100., 100.);
+        scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(4.),
+            saturation: 1.,
+            opacity: 1.,
+            bounds: frosted,
+            content_mask: ContentMask { bounds: frosted },
+            corner_radii: Corners::default(),
+        });
+        scene.insert_primitive(quad(rect(120., 0., 80., 100.), gpui::hsla(2. / 3., 1., 0.5, 1.)));
+        scene.finish();
+        assert!(
+            !scene.opaque_quad_indices.is_empty(),
+            "the quads beneath the blur take the prepass"
+        );
+
+        let image = renderer
+            .render_scene_to_image(&scene, target)
+            .expect("headless render succeeds");
+        let pixel = |x: u32| image.get_pixel(x, 50).0;
+        assert_eq!(pixel(25)[..3], [0, 255, 0], "green over red, outside the blur");
+        assert_eq!(pixel(130)[..3], [0, 0, 255], "the quad above the blur covers it");
+        assert_eq!(pixel(175)[..3], [0, 0, 255]);
+        assert!(pixel(101)[1] > 0, "green blurs across the frost's left half");
+        for x in 100..120 {
+            let [red, green, blue, _] = pixel(x);
+            assert!(
+                blue <= 1 && red > 0,
+                "the frost at x={x} blurs red and green only, got {:?}",
+                [red, green, blue]
+            );
+        }
+    }
+
     /// Every frosted surface of a frame runs through one downsampled scratch
     /// pair, which is all the device memory frosting holds: nothing hides
     /// in a cache the gauges cannot see, as Metal Performance Shaders' did.
@@ -5413,6 +5465,73 @@ mod backdrop_blur_timing_tests {
             let (extra, plain_frame) = gpu_milliseconds(&mut renderer, &plain, &frosted, 200);
             println!(
                 "[backdrop-gpu] {label}: {extra:.3} ms over the plain frame ({plain_frame:.3} ms), median of 200 alternating pairs"
+            );
+        }
+    }
+
+    /// A window's surfaces stacked the way an app paints them: a background,
+    /// a frame, cards and panels each covering most of the window, rows of
+    /// text-sized fills on top, and a frosted composer card near the bottom.
+    fn stacked_scene(layers: usize, frost_composer: bool) -> Scene {
+        let mut scene = Scene::default();
+        let width = TARGET.width.0 as f32;
+        let height = TARGET.height.0 as f32;
+        for layer in 0..layers {
+            let inset = layer as f32 * 8.;
+            let lightness = 0.08 + layer as f32 * 0.01;
+            scene.insert_primitive(quad(
+                rect(inset, inset, width - inset * 2., height - inset * 2.),
+                gpui::hsla(0.6, 0.05, lightness, 1.),
+            ));
+        }
+        let mut y = 200.;
+        while y < height - 400. {
+            let mut x = 400.;
+            while x < width - 400. {
+                scene.insert_primitive(quad(rect(x, y, 14., 22.), gpui::hsla(0., 0., 0.9, 1.)));
+                x += 18.;
+            }
+            y += 44.;
+        }
+        if frost_composer {
+            let composer = rect(1000., 1800., 1400., 260.);
+            scene.push_layer(composer);
+            scene.insert_backdrop_blur(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(16.),
+                saturation: 1.4,
+                opacity: 1.,
+                bounds: composer,
+                content_mask: ContentMask { bounds: composer },
+                corner_radii: Corners::all(ScaledPixels(16.)),
+            });
+            scene.insert_primitive(quad(composer, gpui::hsla(0., 0., 0.1, 0.93)));
+            scene.pop_layer();
+        } else {
+            scene.insert_primitive(quad(
+                rect(1000., 1800., 1400., 260.),
+                gpui::hsla(0., 0., 0.1, 0.93),
+            ));
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Run with `--ignored --nocapture`; prints what one frosted surface costs
+    /// a frame whose opaque surfaces overlap, against the same frame unfrosted.
+    #[test]
+    #[ignore = "measurement, prints GPU time of a frosted frame over stacked surfaces"]
+    fn measure_backdrop_blur_gpu_time_over_stacked_surfaces() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        for layers in [4, 12] {
+            let plain = stacked_scene(layers, false);
+            let frosted = stacked_scene(layers, true);
+            gpu_milliseconds(&mut renderer, &plain, &frosted, 10);
+            let (extra, plain_frame) = gpu_milliseconds(&mut renderer, &plain, &frosted, 200);
+            println!(
+                "[backdrop-gpu] {layers} stacked surfaces + frosted composer: {extra:.3} ms over the plain frame ({plain_frame:.3} ms), median of 200 alternating pairs"
             );
         }
     }

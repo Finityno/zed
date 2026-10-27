@@ -1195,19 +1195,27 @@ impl Scene {
     fn partition_quads(&mut self) {
         self.blended_quad_indices.clear();
         self.opaque_quad_indices.clear();
-        // The depth prepass draws every opaque quad before anything else,
-        // including those above a backdrop blur, which the blur would then
-        // sample and paint over; a frame with a blur paints in plain
-        // back-to-front order instead.
+        // The depth prepass draws every opaque quad before anything else. A
+        // quad above a backdrop blur would then be in the framebuffer when the
+        // blur samples it, so only quads beneath the first blur take the
+        // prepass; everything from the first blur up paints back to front.
+        // Frosted surfaces sit near the top of the window, so this keeps the
+        // prepass for nearly every opaque surface a frosted frame paints:
+        // without it, each surface stacked under a frosted composer is shaded
+        // in full on every frame.
         let partitioning_enabled = opaque_quad_partitioning_enabled()
-            && self.quads.len() <= MAX_DEPTH_PARTITIONED_QUADS
-            && self.backdrop_blurs.is_empty();
+            && self.quads.len() <= MAX_DEPTH_PARTITIONED_QUADS;
+        let prepass_below = self
+            .backdrop_blurs
+            .first()
+            .map_or(DrawOrder::MAX, |blur| blur.order);
         for (quad_id, quad) in self.quads.iter().enumerate() {
             // A quad whose opacity animates may be solid in this frame and
             // translucent in the next without the scene being rebuilt, so it
             // always takes the blended pass; so does one a transition moves
             // or fades.
             let has_opaque_core = partitioning_enabled
+                && quad.order < prepass_below
                 && quad.background.time_animation() == 0
                 && quad.background.time_transition() == 0
                 && quad.has_opaque_core();
@@ -1759,11 +1767,27 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_with_a_backdrop_blur_skips_the_opaque_prepass() {
+    fn only_quads_beneath_the_first_backdrop_blur_take_the_opaque_prepass() {
         let mut scene = frosted_card_scene();
         scene.finish();
-        assert!(scene.opaque_quad_indices.is_empty());
-        assert_eq!(scene.blended_quad_indices.len(), 2);
+        let blur_order = scene.backdrop_blurs[0].order;
+        let prepassed: Vec<_> = scene
+            .opaque_quad_indices
+            .iter()
+            .map(|&index| scene.quads[index as usize].order)
+            .collect();
+        assert_eq!(prepassed.len(), 1, "the quad under the frosted card");
+        assert!(prepassed[0] < blur_order);
+        let blended: Vec<_> = scene
+            .blended_quad_indices
+            .iter()
+            .map(|&index| scene.quads[index as usize].order)
+            .collect();
+        assert_eq!(
+            blended,
+            vec![blur_order],
+            "the card's own fill paints over the blur, back to front"
+        );
     }
 
     #[test]
