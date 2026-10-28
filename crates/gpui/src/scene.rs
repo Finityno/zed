@@ -583,9 +583,7 @@ impl Scene {
         // A turning sprite reaches the square it sweeps, not just its own
         // rectangle, so that is what it is culled and ordered by.
         let reach = match &primitive {
-            Primitive::MonochromeSprite(sprite) if sprite.effect.animation & ROTATION_ANIMATION != 0 => {
-                swept_by_turning(&sprite.bounds)
-            }
+            Primitive::MonochromeSprite(sprite) => monochrome_sprite_extent(sprite),
             primitive => *primitive.bounds(),
         };
         let clipped_bounds = reach.intersect(&primitive.content_mask().bounds);
@@ -852,7 +850,7 @@ impl Scene {
             }
             PaintOperation::MonochromeSprite(index) => {
                 let sprite = &self.painted_monochrome_sprites[*index as usize];
-                clipped(&sprite.bounds, &sprite.content_mask)
+                clipped(&monochrome_sprite_extent(sprite), &sprite.content_mask)
             }
             PaintOperation::SubpixelSprite(index) => {
                 let sprite = &self.painted_subpixel_sprites[*index as usize];
@@ -1264,7 +1262,7 @@ impl Scene {
             }
             let sprite = &self.monochrome_sprites[index as usize];
             rects.extend(DamageRect::covering(
-                &swept_by_turning(&sprite.bounds),
+                &swept_by_turning(&sprite.bounds, painted),
                 &sprite.content_mask,
                 viewport,
             ));
@@ -3113,6 +3111,53 @@ mod tests {
         );
     }
 
+    /// The square a sprite sweeps follows the transformation it is painted
+    /// with: one painted at twice its size reaches twice as far.
+    #[test]
+    fn a_scaled_turning_sprite_sweeps_its_scaled_corners() {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(100.), ScaledPixels(200.)),
+            size: Size {
+                width: ScaledPixels(20.),
+                height: ScaledPixels(20.),
+            },
+        };
+        let center = bounds.center();
+        let doubled = TransformationMatrix::unit()
+            .translate(center)
+            .scale(Size { width: 2., height: 2. })
+            .translate(point(ScaledPixels(-center.x.0), ScaledPixels(-center.y.0)));
+        let swept = swept_by_turning(&bounds, doubled);
+        let reach = 2. * (200f32).sqrt();
+        assert!((swept.origin.x.0 - (110. - reach)).abs() < 1e-3);
+        assert!((swept.size.height.0 - 2. * reach).abs() < 1e-3);
+        assert!(swept.bottom().0 > 238.28, "a 45 degree corner at y = 238.28 must be inside");
+    }
+
+    /// A retained view moved within its mask refuses the move when a turning
+    /// sprite's swept corners would cross an edge its own rectangle only
+    /// touches.
+    #[test]
+    fn a_turning_sprite_is_clipped_by_the_square_it_sweeps_when_moved() {
+        let mut scene = Scene::default();
+        let mut sprite = turning_sprite(&mut scene, 800);
+        sprite.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                size: Size {
+                    width: ScaledPixels(120.),
+                    height: ScaledPixels(400.),
+                },
+            },
+        };
+        scene.insert_primitive(sprite);
+        let outer = [0.0, 0.0, 120.0, 400.0];
+        assert!(
+            !scene.clipped_only_inside(0..scene.paint_operations.len(), outer),
+            "the swept corners reach past the right edge the rectangle only touches"
+        );
+    }
+
     /// A present that only turns a spinner damages the square its corners
     /// sweep, and nothing else.
     #[test]
@@ -3358,9 +3403,7 @@ pub(crate) fn primitive_extent(primitive: &Primitive) -> Bounds<ScaledPixels> {
             let margin = shadow.blur_radius * 3.;
             shadow.bounds.dilate(margin)
         }
-        Primitive::MonochromeSprite(sprite) if sprite.effect.animation & ROTATION_ANIMATION != 0 => {
-            swept_by_turning(&sprite.bounds)
-        }
+        Primitive::MonochromeSprite(sprite) => monochrome_sprite_extent(sprite),
         primitive => *primitive.bounds(),
     }
 }
@@ -3392,17 +3435,46 @@ fn turned(
         .compose(carried)
 }
 
-/// The square `bounds` stays inside while turning about its centre.
-pub(crate) fn swept_by_turning(bounds: &Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+/// Where a monochrome sprite can draw: its rectangle, or for one that turns,
+/// the square it sweeps.
+fn monochrome_sprite_extent(sprite: &MonochromeSprite) -> Bounds<ScaledPixels> {
+    if sprite.effect.animation & ROTATION_ANIMATION != 0 {
+        swept_by_turning(&sprite.bounds, sprite.transformation)
+    } else {
+        sprite.bounds
+    }
+}
+
+/// The square a sprite of `bounds`, drawn through `painted`, stays inside
+/// while turning about its centre as shown: centred there, as far out as
+/// its farthest transformed corner.
+pub(crate) fn swept_by_turning(
+    bounds: &Bounds<ScaledPixels>,
+    painted: TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    let [[a, b], [c, d]] = painted.rotation_scale;
+    let shown = |x: f32, y: f32| {
+        (
+            a * x + b * y + painted.translation[0],
+            c * x + d * y + painted.translation[1],
+        )
+    };
     let center = bounds.center();
-    let reach = ScaledPixels(
-        (bounds.size.width.0.powi(2) + bounds.size.height.0.powi(2)).sqrt() / 2.0,
-    );
+    let (center_x, center_y) = shown(center.x.0, center.y.0);
+    let (left, top) = (bounds.left().0, bounds.top().0);
+    let (right, bottom) = (bounds.right().0, bounds.bottom().0);
+    let reach = [(left, top), (right, top), (left, bottom), (right, bottom)]
+        .into_iter()
+        .map(|(x, y)| {
+            let (x, y) = shown(x, y);
+            ((x - center_x).powi(2) + (y - center_y).powi(2)).sqrt()
+        })
+        .fold(0f32, f32::max);
     Bounds {
-        origin: Point::new(center.x - reach, center.y - reach),
+        origin: Point::new(ScaledPixels(center_x - reach), ScaledPixels(center_y - reach)),
         size: Size {
-            width: reach * 2.0,
-            height: reach * 2.0,
+            width: ScaledPixels(reach * 2.0),
+            height: ScaledPixels(reach * 2.0),
         },
     }
 }
@@ -4086,10 +4158,12 @@ pub struct SpriteEffect {
     /// Half-width of the core, as a fraction of `band_width`.
     pub core_spread: f32,
     /// One more than the index of the [`ShimmerAnimation`] in the owning
-    /// scene that moves `band_origin` with time, or `0` for a still band. The
-    /// shaders never read it (they see it as padding); the scene rewrites
-    /// `band_origin` from it before every present, so a sweeping shimmer
-    /// animates without its view drawing again.
+    /// scene that moves `band_origin` with time, or `0` for a still band; or,
+    /// with [`ROTATION_ANIMATION`] set, one more than the index of the
+    /// [`RotationAnimation`] that turns the sprite. The shaders never read it
+    /// (they see it as padding); the scene rewrites `band_origin`, or the
+    /// sprite's transformation, from it before every present, so a sweeping
+    /// shimmer or a turning spinner animates without its view drawing again.
     pub animation: u32,
     /// Color the band blends towards at full intensity.
     pub highlight_color: Hsla,
