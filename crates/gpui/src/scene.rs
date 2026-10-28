@@ -3058,6 +3058,21 @@ mod tests {
             );
             let (x, y) = apply(moved, 115., 203.);
             assert!((x - 125.).abs() < 1e-3 && (y - 203.).abs() < 1e-3, "moved one orbited to ({x}, {y})");
+            // A scaled matrix does not commute with the move: unless it is
+            // carried along, the sprite is scaled about where it was laid
+            // out and shows at (120, 196).
+            let doubled = TransformationMatrix::unit()
+                .translate(point(ScaledPixels(110.), ScaledPixels(210.)))
+                .scale(Size { width: 2., height: 2. })
+                .translate(point(ScaledPixels(-110.), ScaledPixels(-210.)));
+            let moved = turned(
+                doubled,
+                point(ScaledPixels(5.), ScaledPixels(-7.)),
+                point(ScaledPixels(115.), ScaledPixels(203.)),
+                angle,
+            );
+            let (x, y) = apply(moved, 115., 203.);
+            assert!((x - 115.).abs() < 1e-3 && (y - 203.).abs() < 1e-3, "moved scaled one showed at ({x}, {y})");
         }
     }
 
