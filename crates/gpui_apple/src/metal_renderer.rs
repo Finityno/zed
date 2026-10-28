@@ -1421,6 +1421,7 @@ impl MetalRenderer {
             None,
         );
         command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         command_encoder.set_depth_stencil_state(&self.depth_test_state);
         set_viewport(command_encoder, viewport_size, depth, depth);
 
@@ -1568,6 +1569,7 @@ impl MetalRenderer {
         let command_encoder =
             self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
         command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
@@ -2424,6 +2426,7 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
         command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
 
         // Damage rectangles never overlap, so each one's depth prepass
         // writes only depth that its own draws test against.
@@ -2586,6 +2589,7 @@ impl MetalRenderer {
                             None,
                         );
                         command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
+                        command_encoder.set_vertex_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
                         command_encoder.set_depth_stencil_state(&self.depth_test_state);
                         set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
 
@@ -2700,6 +2704,7 @@ impl MetalRenderer {
         let command_encoder =
             self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
         command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         let slot_offset = [0f32, 0f32];
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::SlotOffset as u64,
@@ -6704,6 +6709,21 @@ mod quad_shader_tests {
         patterned.corner_radii = Corners::all(ScaledPixels(10.));
         scene.insert_primitive(patterned);
         scene.insert_primitive(quad(rect(980.2, 420.6, 200., 120.), gpui::checkerboard(gpui::hsla(0.5, 0.8, 0.5, 0.6), 7.)));
+        let mut striped = quad(rect(980.2, 560.6, 200., 100.), gpui::pattern_stripe(gpui::hsla(0.9, 0.8, 0.5, 0.7), 5., 11.));
+        striped.corner_radii = Corners::all(ScaledPixels(14.));
+        scene.insert_primitive(striped);
+        let oklab = gpui::linear_gradient(
+            120.,
+            gpui::linear_color_stop(gpui::hsla(0.15, 0.9, 0.5, 1.), 0.),
+            gpui::linear_color_stop(gpui::hsla(0.55, 0.9, 0.5, 0.5), 1.),
+        )
+        .color_space(gpui::ColorSpace::Oklab);
+        scene.insert_primitive(quad(rect(980.2, 680.6, 200., 100.), oklab));
+        // A quad far out along x, as a very wide scrolled strip is, whose
+        // edges are too coarse for the shortcuts' margins.
+        let mut far = quad(rect(-67_108_864., 700., 67_109_064.5, 60.), solid(0.33, 0.6));
+        far.corner_radii = Corners::all(ScaledPixels(0.25));
+        scene.insert_primitive(far);
         // Cards inside two nested rounded clips, as a rounded card's content is.
         scene.rounded_clips.push(RoundedClipNode {
             bounds: rect(60.5, 540.25, 600., 240.),
