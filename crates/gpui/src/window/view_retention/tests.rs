@@ -1110,6 +1110,38 @@ fn a_view_is_built_again_at_the_time_it_asked_for() {
     assert!(after.view_rebuilds.deadline >= 1, "{after:?}");
 }
 
+/// A view spliced around a gap built at its deadline asks for its next frame
+/// at the gap's next deadline, not again at the one that just passed, which
+/// would draw the window on every frame.
+#[test]
+fn a_spliced_view_does_not_ask_again_for_a_passed_deadline() {
+    let mut cx = TestAppContext::single();
+    let (window, _) = shell_window(&mut cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    draw(&mut cx, window);
+    let work = work_after(&mut cx, window, |cx| {
+        cx.executor().advance_clock(Duration::from_millis(1100));
+    });
+    assert!(work.view_rebuilds.deadline >= 1, "{work:?}");
+    assert!(work.views_spliced >= 1, "{work:?}");
+    assert_eq!(work.frames, 1, "{work:?}");
+    let next_frame_in_future = cx
+        .update_window(window.into(), |_, window, cx| {
+            let now = cx.background_executor().now();
+            window
+                .view_retention
+                .deadline_frame
+                .as_ref()
+                .map(|(deadline, _)| *deadline > now)
+        })
+        .unwrap();
+    assert_eq!(next_frame_in_future, Some(true));
+}
+
 /// Views recorded before fonts were added shaped their text without them,
 /// so the first frame after is built whole, and the one after that draws
 /// views again.

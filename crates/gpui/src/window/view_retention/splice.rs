@@ -47,7 +47,7 @@ use crate::{
     key_dispatch::DispatchNodeId, view::ViewName,
 };
 use smallvec::SmallVec;
-use std::{mem, ops::Range};
+use std::{mem, ops::Range, time::Instant};
 
 /// A view laid out as it was last frame, to be drawn again around the nested
 /// views at `gaps`, all records of the last frame.
@@ -621,9 +621,26 @@ impl Window {
             gaps,
             checked,
         } = splice;
-        let (prepaint_range, last, dependencies, own_hovers) = {
+        let (prepaint_range, last, dependencies, own_hovers, deadline) = {
             let source = &self.rendered_frame.retained_views;
             let record = &source.records[previous];
+            // The earliest deadline of the views copied, not the record's,
+            // which counts the gaps': a gap built because its deadline
+            // passed says when it changes next as it is built, and the one it
+            // replaced, already past, would ask for a frame at once, and so
+            // on every frame for as long as the view is spliced.
+            let mut deadline: Option<Instant> = None;
+            let mut index = previous;
+            while index <= previous + record.nested {
+                if gaps.contains(&index) {
+                    index += source.records[index].nested + 1;
+                    continue;
+                }
+                if let Some(at) = source.records[index].own_dependencies.rebuild_at {
+                    deadline = Some(deadline.map_or(at, |earliest| earliest.min(at)));
+                }
+                index += 1;
+            }
             // The nodes the copied views laid out as they prepainted, and
             // their layouts' nodes; the gaps claim theirs as they are built.
             if let Some(engine) = self.layout_engine.as_mut() {
@@ -652,9 +669,10 @@ impl Window {
                 previous + record.nested,
                 record.dependencies.clone(),
                 record.own_hovers.clone(),
+                deadline,
             )
         };
-        if let Some(deadline) = dependencies.rebuild_at {
+        if let Some(deadline) = deadline {
             self.rebuild_at(deadline);
         }
         // What the view and the views copied with it read is read again; the
