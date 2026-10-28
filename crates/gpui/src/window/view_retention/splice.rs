@@ -632,9 +632,12 @@ impl Window {
             // around it read the same deadline, or they would be built at
             // the next frame for one nothing in them still has.
             let mut deadline: Option<Instant> = None;
+            // The gaps were found in record order, so the walk meets them in
+            // turn.
+            let mut next_gaps = gaps.iter().peekable();
             let mut index = previous;
             while index <= previous + record.nested {
-                if gaps.contains(&index) {
+                if next_gaps.next_if_eq(&&index).is_some() {
                     index += source.records[index].nested + 1;
                     continue;
                 }
