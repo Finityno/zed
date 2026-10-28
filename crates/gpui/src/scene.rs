@@ -145,6 +145,13 @@ pub struct Scene {
     pub opaque_quad_indices: Vec<u32>,
     /// Sweeps referenced by `SpriteEffect::animation`.
     shimmer_animations: Vec<ShimmerAnimation>,
+    /// Turns referenced by `SpriteEffect::animation` with
+    /// [`ROTATION_ANIMATION`] set.
+    rotation_animations: Vec<RotationAnimation>,
+    /// The monochrome sprites that turn, by draw-order index, with the
+    /// transformation each was painted with, gathered by `finish`: every
+    /// present rotates that one, so turning never compounds.
+    rotating_monochrome_sprites: Vec<(u32, TransformationMatrix)>,
     /// Indices of the sprites whose effect animates, gathered by `finish`
     /// (sorting moves sprites, so they cannot be recorded on insertion).
     animated_monochrome_sprites: Vec<u32>,
@@ -219,6 +226,8 @@ impl Scene {
         painted_subpixel_sprites.clear_vec(&mut self.painted_subpixel_sprites);
         self.backdrop_blurs.clear();
         self.shimmer_animations.clear();
+        self.rotation_animations.clear();
+        self.rotating_monochrome_sprites.clear();
         self.animated_monochrome_sprites.clear();
         self.animated_subpixel_sprites.clear();
         self.quad_animations.clear();
@@ -684,6 +693,13 @@ impl Scene {
         });
     }
 
+    /// Registers a continuous turn for one sprite, returning the value its
+    /// [`SpriteEffect::animation`] should carry.
+    pub(crate) fn push_rotation_animation(&mut self, animation: RotationAnimation) -> u32 {
+        self.rotation_animations.push(animation);
+        self.rotation_animations.len() as u32 | ROTATION_ANIMATION
+    }
+
     /// Registers a sweep for sprites painted after this call, returning the
     /// value their [`SpriteEffect::animation`] should carry.
     pub(crate) fn push_shimmer_animation(&mut self, animation: ShimmerAnimation) -> u32 {
@@ -926,10 +942,17 @@ impl Scene {
                         && effect.animation != 0
                     {
                         if remapped_animation.0 != effect.animation {
-                            let animation =
-                                prev_scene.shimmer_animations[effect.animation as usize - 1];
-                            remapped_animation =
-                                (effect.animation, self.push_shimmer_animation(animation));
+                            let remapped = if effect.animation & ROTATION_ANIMATION != 0 {
+                                self.push_rotation_animation(
+                                    prev_scene.rotation_animations
+                                        [(effect.animation & !ROTATION_ANIMATION) as usize - 1],
+                                )
+                            } else {
+                                self.push_shimmer_animation(
+                                    prev_scene.shimmer_animations[effect.animation as usize - 1],
+                                )
+                            };
+                            remapped_animation = (effect.animation, remapped);
                         }
                         effect.animation = remapped_animation.1;
                     }
@@ -1009,10 +1032,15 @@ impl Scene {
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
         self.partition_quads();
         self.animated_monochrome_sprites.clear();
-        self.animated_monochrome_sprites.extend(
-            (0..self.monochrome_sprites.len() as u32)
-                .filter(|&index| self.monochrome_sprites[index as usize].effect.animation != 0),
-        );
+        self.rotating_monochrome_sprites.clear();
+        for (index, sprite) in self.monochrome_sprites.iter().enumerate() {
+            if sprite.effect.animation & ROTATION_ANIMATION != 0 {
+                self.rotating_monochrome_sprites
+                    .push((index as u32, sprite.transformation));
+            } else if sprite.effect.animation != 0 {
+                self.animated_monochrome_sprites.push(index as u32);
+            }
+        }
         self.animated_subpixel_sprites.clear();
         self.animated_subpixel_sprites.extend(
             (0..self.subpixel_sprites.len() as u32)
@@ -1106,6 +1134,7 @@ impl Scene {
     /// presenting it again later shows something new.
     pub fn has_time_animations(&self) -> bool {
         !self.animated_monochrome_sprites.is_empty()
+            || !self.rotating_monochrome_sprites.is_empty()
             || !self.animated_subpixel_sprites.is_empty()
             || !self.animated_quads.is_empty()
             || self.transitions_in_flight()
@@ -1153,6 +1182,21 @@ impl Scene {
             quad.border_color = animation.border_color.opacity(opacity);
         }
         self.advance_transitions(now);
+        // After the transitions, which move a sprite's bounds and with them
+        // the centre it turns about.
+        for &(index, painted) in &self.rotating_monochrome_sprites {
+            let sprite = &mut self.monochrome_sprites[index as usize];
+            let animation_id = (sprite.effect.animation & !ROTATION_ANIMATION) as usize;
+            let Some(animation) = self.rotation_animations.get(animation_id.wrapping_sub(1)) else {
+                continue;
+            };
+            let center = sprite.bounds.center();
+            sprite.transformation = TransformationMatrix::unit()
+                .translate(center)
+                .rotate(Radians(animation.current_angle()))
+                .translate(Point::new(ScaledPixels(-center.x.0), ScaledPixels(-center.y.0)))
+                .compose(painted);
+        }
     }
 
     /// Which finished frame this scene holds; see [`Self::content_id`]'s
@@ -1204,6 +1248,26 @@ impl Scene {
                 return false;
             }
             rects.extend(DamageRect::covering(&sprite.bounds, &sprite.content_mask, viewport));
+        }
+        for &(index, painted) in &self.rotating_monochrome_sprites {
+            // Turning about its centre, the sprite stays inside the square
+            // its corners sweep.
+            if painted != TransformationMatrix::unit() {
+                return false;
+            }
+            let sprite = &self.monochrome_sprites[index as usize];
+            let center = sprite.bounds.center();
+            let reach = ScaledPixels(
+                (sprite.bounds.size.width.0.powi(2) + sprite.bounds.size.height.0.powi(2)).sqrt() / 2.0,
+            );
+            let swept = Bounds {
+                origin: Point::new(center.x - reach, center.y - reach),
+                size: Size {
+                    width: reach * 2.0,
+                    height: reach * 2.0,
+                },
+            };
+            rects.extend(DamageRect::covering(&swept, &sprite.content_mask, viewport));
         }
         for quad in self.animated_quads.iter().map(|&index| &self.quads[index as usize]) {
             rects.extend(DamageRect::covering(&quad.bounds, &quad.content_mask, viewport));
@@ -2894,6 +2958,110 @@ mod tests {
         assert_eq!(damage, vec![device_rect(99, 99, 111, 111)]);
     }
 
+    fn turning_sprite(scene: &mut Scene, period_ms: u64) -> MonochromeSprite {
+        let animation = scene.push_rotation_animation(RotationAnimation {
+            period: std::time::Duration::from_millis(period_ms),
+        });
+        let bounds = Bounds {
+            origin: point(ScaledPixels(100.), ScaledPixels(200.)),
+            size: Size {
+                width: ScaledPixels(20.),
+                height: ScaledPixels(20.),
+            },
+        };
+        MonochromeSprite {
+            bounds,
+            content_mask: ContentMask { bounds },
+            effect: SpriteEffect {
+                kind: SpriteEffect::MASK_KIND,
+                animation,
+                ..SpriteEffect::default()
+            },
+            ..shimmering_glyph(0)
+        }
+    }
+
+    fn turned_point(sprite: &MonochromeSprite, x: f32, y: f32) -> (f32, f32) {
+        let matrix = sprite.transformation;
+        (
+            matrix.rotation_scale[0][0] * x + matrix.rotation_scale[0][1] * y + matrix.translation[0],
+            matrix.rotation_scale[1][0] * x + matrix.rotation_scale[1][1] * y + matrix.translation[1],
+        )
+    }
+
+    /// A turning sprite is rotated about its own centre from the
+    /// transformation it was painted with on every advance, so the turn
+    /// never compounds, and a replay of the frame keeps it turning.
+    #[test]
+    fn a_turning_sprite_rotates_about_its_centre_on_every_advance() {
+        let mut scene = Scene::default();
+        let sprite = turning_sprite(&mut scene, 1000);
+        scene.insert_primitive(sprite);
+        scene.finish();
+        assert!(scene.has_time_animations());
+        assert!(scene.animated_monochrome_sprites.is_empty(), "a turn is not a shimmer");
+
+        for _ in 0..3 {
+            scene.advance_time_animations();
+            let sprite = &scene.monochrome_sprites[0];
+            let (x, y) = turned_point(sprite, 110., 210.);
+            assert!((x - 110.).abs() < 1e-3 && (y - 210.).abs() < 1e-3, "the centre stays put");
+            let (x, y) = turned_point(sprite, 120., 210.);
+            let radius = ((x - 110.).powi(2) + (y - 210.).powi(2)).sqrt();
+            assert!((radius - 10.).abs() < 1e-3, "a turn keeps distances from the centre: {radius}");
+            let determinant = sprite.transformation.rotation_scale[0][0]
+                * sprite.transformation.rotation_scale[1][1]
+                - sprite.transformation.rotation_scale[0][1]
+                    * sprite.transformation.rotation_scale[1][0];
+            assert!((determinant - 1.).abs() < 1e-4, "turns never compound into a scale");
+        }
+        assert_eq!(
+            scene.painted_monochrome_sprites[0].transformation,
+            TransformationMatrix::unit(),
+            "the painted copy keeps the transformation it was painted with"
+        );
+
+        let mut replayed = Scene::default();
+        replayed.push_shimmer_animation(ShimmerAnimation {
+            band_start: 0.0,
+            travel: 0.0,
+            period: std::time::Duration::from_millis(1),
+            hold: 0.0,
+        });
+        replayed.replay(0..scene.len(), &scene);
+        replayed.finish();
+        assert_eq!(replayed.rotating_monochrome_sprites.len(), 1);
+        assert_eq!(replayed.rotation_animations.len(), 1);
+        assert_eq!(replayed.shimmer_animations.len(), 1, "the turn is not copied as a sweep");
+        replayed.advance_time_animations();
+        assert_ne!(replayed.monochrome_sprites[0].transformation, TransformationMatrix::unit());
+    }
+
+    /// A present that only turns a spinner damages the square its corners
+    /// sweep, and nothing else.
+    #[test]
+    fn a_turning_sprite_damages_the_square_it_sweeps() {
+        let mut scene = Scene::default();
+        let mut sprite = turning_sprite(&mut scene, 800);
+        sprite.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                size: Size {
+                    width: ScaledPixels(1000.),
+                    height: ScaledPixels(1000.),
+                },
+            },
+        };
+        scene.insert_primitive(sprite);
+        scene.insert_primitive(opaque_quad());
+        scene.finish();
+        scene.advance_time_animations();
+        let mut damage = Vec::new();
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        // Centre (110, 210), half-diagonal 14.14, a pixel of slack.
+        assert_eq!(damage, vec![device_rect(94, 194, 126, 226)]);
+    }
+
     /// The glyph sprite inserts build the same scene `insert_primitive` builds
     /// from the same sprites: culling, draw order, transition tagging and paint
     /// operations alike.
@@ -3841,6 +4009,25 @@ pub(crate) struct ShimmerAnimation {
     pub travel: f32,
     pub period: std::time::Duration,
     pub hold: f32,
+}
+
+/// Set in a [`SpriteEffect::animation`] that names a [`RotationAnimation`]
+/// rather than a [`ShimmerAnimation`]. The shaders never read the field.
+pub(crate) const ROTATION_ANIMATION: u32 = 1 << 31;
+
+/// A continuous clockwise turn of one sprite about its centre, evaluated by
+/// the scene before every present so a spinner turns without its view
+/// drawing again. Painted inside [`crate::Window::with_rotation_animation`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RotationAnimation {
+    /// How long one full turn takes.
+    pub period: std::time::Duration,
+}
+
+impl RotationAnimation {
+    fn current_angle(&self) -> f32 {
+        time_animation_phase(self.period) * std::f32::consts::TAU
+    }
 }
 
 /// A repeating opacity curve for quads, evaluated by the scene before every
