@@ -43,6 +43,7 @@ float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
+float4 quad_solid_interior(Quad quad);
 
 struct GradientColor {
   float4 solid;
@@ -59,6 +60,7 @@ struct QuadVertexOutput {
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
+  float4 solid_interior [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -70,6 +72,7 @@ struct QuadFragmentInput {
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
+  float4 solid_interior [[flat]];
 };
 
 vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
@@ -108,13 +111,41 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       gradient.solid,
       gradient.color0,
       gradient.color1,
+      quad_solid_interior(quad),
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// The rectangle, as (left, top, right, bottom) in device pixels, in which
+// every pixel of a solid-filled quad is its plain background: farther from
+// each edge than any corner radius and any border reaches, with a pixel to
+// spare for antialiasing. Empty for every other fill, whose colour depends
+// on the position. The fragment shader returns the background there without
+// loading the quad or evaluating its outline, which for a large translucent
+// panel is nearly every pixel it covers.
+float4 quad_solid_interior(Quad quad) {
+  if (quad.background.tag != 0) {
+    return float4(1.0, 1.0, 0.0, 0.0);
+  }
+  float radius = max(max(quad.corner_radii.top_left, quad.corner_radii.top_right),
+                     max(quad.corner_radii.bottom_right, quad.corner_radii.bottom_left));
+  float border = max(max(quad.border_widths.top, quad.border_widths.right),
+                     max(quad.border_widths.bottom, quad.border_widths.left));
+  float inset = max(radius, border) + 1.0;
+  return float4(quad.bounds.origin.x + inset,
+                quad.bounds.origin.y + inset,
+                quad.bounds.origin.x + quad.bounds.size.width - inset,
+                quad.bounds.origin.y + quad.bounds.size.height - inset);
 }
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]],
     constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
+  float2 position = input.position.xy;
+  if (position.x > input.solid_interior.x && position.y > input.solid_interior.y &&
+      position.x < input.solid_interior.z && position.y < input.solid_interior.w) {
+    return input.background_solid * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, position, rounded_masks));
+  }
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -1668,7 +1699,19 @@ float rounded_clip_coverage(uint index, float2 position, constant RoundedClipNod
   float coverage = 1.0;
   while (index != 0) {
     RoundedClipNode mask = masks[index - 1];
-    coverage = min(coverage, saturate(0.5 - quad_sdf(position, mask.bounds, mask.corner_radii)));
+    // A point farther inside every edge than any corner reaches, and than
+    // the antialiasing ramp, is fully covered: its distance field is at most
+    // -0.5. Most of a clipped card's pixels are, so they skip the field.
+    float radius = max(max(mask.corner_radii.top_left, mask.corner_radii.top_right),
+                       max(mask.corner_radii.bottom_right, mask.corner_radii.bottom_left));
+    float inset = max(radius, 0.5) + 0.25;
+    bool interior = position.x > mask.bounds.origin.x + inset &&
+                    position.y > mask.bounds.origin.y + inset &&
+                    position.x < mask.bounds.origin.x + mask.bounds.size.width - inset &&
+                    position.y < mask.bounds.origin.y + mask.bounds.size.height - inset;
+    if (!interior) {
+      coverage = min(coverage, saturate(0.5 - quad_sdf(position, mask.bounds, mask.corner_radii)));
+    }
     index = mask.parent;
   }
   return coverage;
