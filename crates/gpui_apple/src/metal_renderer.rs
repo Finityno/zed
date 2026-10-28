@@ -1844,6 +1844,7 @@ impl MetalRenderer {
         self.presented_frame = Some(PresentedFrame {
             texture: drawable.texture().to_owned(),
             content_id: scene.content_id(),
+            advanced_at: scene.last_advanced_at(),
             viewport_size,
         });
 
@@ -1895,7 +1896,7 @@ impl MetalRenderer {
             && presented.texture.as_ptr() != texture.as_ptr()
             // A surface's pixel buffer can change without the scene changing.
             && scene.surfaces.is_empty()
-            && scene.time_animation_damage(viewport_size, &mut self.damage_rects);
+            && scene.time_animation_damage(viewport_size, presented.advanced_at, &mut self.damage_rects);
         usable.then_some(presented.texture)
     }
 
@@ -3222,6 +3223,9 @@ fn new_command_encoder_for_texture<'a>(
 struct PresentedFrame {
     texture: metal::Texture,
     content_id: u64,
+    /// When the scene's time animations were advanced for it, which says
+    /// where its transitions drew what they carry.
+    advanced_at: Option<std::time::Instant>,
     viewport_size: Size<DevicePixels>,
 }
 
@@ -6343,8 +6347,9 @@ mod partial_present_tests {
         let previous = target(&renderer);
         draw(&mut renderer, &scene, &previous, None);
 
+        let presented_at = scene.last_advanced_at();
         scene.advance_time_animations();
-        assert!(scene.time_animation_damage(SIZE, &mut renderer.damage_rects));
+        assert!(scene.time_animation_damage(SIZE, presented_at, &mut renderer.damage_rects));
         assert_eq!(
             renderer.damage_rects.len(),
             3,
@@ -6379,6 +6384,63 @@ mod partial_present_tests {
         let full = draw(&mut renderer, &scene, &full_target, None);
 
         assert_eq!((renderer.partial_presents, renderer.full_presents), (1, 2));
+        let mismatch = full
+            .enumerate_pixels()
+            .find(|(x, y, pixel)| partial.get_pixel(*x, *y) != *pixel);
+        assert!(
+            mismatch.is_none(),
+            "partial present differs at {:?}: partial {:?}",
+            mismatch,
+            mismatch.map(|(x, y, _)| partial.get_pixel(x, y)),
+        );
+    }
+
+    /// A card easing in over striped content between two presents draws
+    /// the same frame partially as fully: where it was is drawn again
+    /// beneath it, and where it is now.
+    #[test]
+    fn a_partial_present_of_a_moving_transition_draws_what_a_full_one_does() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        renderer.update_transparency(true);
+        renderer.update_intermediate_textures(SIZE);
+        let mut scene = Scene::default();
+        for index in 0..8 {
+            scene.insert_primitive(quad(
+                rect(index as f32 * 12., 0., 12., 64.),
+                gpui::hsla(index as f32 / 8., 0.7, 0.5, 1.),
+            ));
+        }
+        let started_at = std::time::Instant::now();
+        scene.insert_transitioned_quad(
+            Quad {
+                content_mask: ContentMask { bounds: rect(0., 0., 96., 64.) },
+                ..quad(rect(20., 30., 24., 10.), gpui::hsla(0., 0., 0.95, 0.8))
+            },
+            gpui::TimeTransition::new(started_at, std::time::Duration::from_secs(2))
+                .offset(Point { x: gpui::px(0.), y: gpui::px(12.) }, Point::default())
+                .opacity(0.2, 1.0),
+            1.0,
+        );
+        scene.finish();
+
+        scene.advance_time_animations();
+        let previous = target(&renderer);
+        draw(&mut renderer, &scene, &previous, None);
+        let presented_at = scene.last_advanced_at();
+        // Long enough for the card to travel several of its 12 pixels, more
+        // than the slack a damage rectangle has.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(SIZE, presented_at, &mut renderer.damage_rects));
+        assert!(!renderer.damage_rects.is_empty());
+
+        let partial_target = target(&renderer);
+        let partial = draw(&mut renderer, &scene, &partial_target, Some(&previous));
+        let full_target = target(&renderer);
+        let full = draw(&mut renderer, &scene, &full_target, None);
+        assert_eq!(renderer.partial_presents, 1);
         let mismatch = full
             .enumerate_pixels()
             .find(|(x, y, pixel)| partial.get_pixel(*x, *y) != *pixel);
@@ -6618,9 +6680,10 @@ mod partial_present_timing_tests {
         frame_gpu_milliseconds(&mut renderer, &scene, &targets[0], None);
         for frame in 0..frames {
             let (previous, next) = (&targets[frame % 2], &targets[(frame + 1) % 2]);
+            let presented_at = scene.last_advanced_at();
             scene.advance_time_animations();
             full.push(frame_gpu_milliseconds(&mut renderer, &scene, next, None));
-            assert!(scene.time_animation_damage(TARGET, &mut renderer.damage_rects));
+            assert!(scene.time_animation_damage(TARGET, presented_at, &mut renderer.damage_rects));
             partial.push(frame_gpu_milliseconds(&mut renderer, &scene, next, Some(previous)));
         }
         full.sort_by(f64::total_cmp);
