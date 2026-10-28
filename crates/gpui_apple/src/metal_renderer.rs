@@ -1724,6 +1724,12 @@ impl MetalRenderer {
     /// a compositor holding the layer's drawables, main-thread CPU (or page
     /// faults) while encoding, or a GPU backlog.
     fn draw_in_pool(&mut self, scene: &Scene) -> PresentReport {
+        // Taken before anything can defer or drop this present: the window
+        // advanced the scene's time animations for it, so a later present
+        // cannot tell what changed since the frame on screen from the
+        // scene's latest advance alone (a transition may have landed in
+        // between). It goes back only once this present is encoded.
+        let presented_frame = self.presented_frame.take();
         let mut breakdown = PresentBreakdown {
             layers: 1,
             ..PresentBreakdown::default()
@@ -1809,7 +1815,8 @@ impl MetalRenderer {
         }
 
         let encode_start = Instant::now();
-        let previous_frame = self.previous_frame_to_copy(scene, drawable.texture(), viewport_size);
+        let previous_frame =
+            self.previous_frame_to_copy(presented_frame, scene, drawable.texture(), viewport_size);
         let command_buffer = self.render_frame(
             scene, drawable.texture(), viewport_size, Some(submission), previous_frame.as_deref(),
         );
@@ -1845,8 +1852,8 @@ impl MetalRenderer {
         }
     }
 
-    /// The drawable presented last, when `scene` is what it shows with only
-    /// its time animations advanced since; `damage_rects` then holds what
+    /// `presented`'s drawable, when `scene` is what it shows with only its
+    /// time animations advanced once since; `damage_rects` then holds what
     /// changed, and the present copies the rest from it instead of drawing
     /// the whole window again for a shimmer or a spinner.
     ///
@@ -1856,12 +1863,13 @@ impl MetalRenderer {
     /// out. `GPUI_DISABLE_PARTIAL_PRESENTS=1` draws every present in full.
     fn previous_frame_to_copy(
         &mut self,
+        presented: Option<PresentedFrame>,
         scene: &Scene,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Option<metal::Texture> {
         static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let presented = self.presented_frame.take()?;
+        let presented = presented?;
         let disabled = *DISABLED.get_or_init(|| {
             std::env::var("GPUI_DISABLE_PARTIAL_PRESENTS").is_ok_and(|value| value == "1")
         });
@@ -2328,6 +2336,9 @@ impl MetalRenderer {
                 .peekable();
             let mut planned_slots = path_plan.as_deref().map(|slots| slots.iter());
             let mut quad_cursor: u32 = 0;
+            // The previous rectangle may have ended on a batch that collapsed
+            // the depth range; the prepass gives each quad its own depth.
+            set_viewport(command_encoder, viewport_size, 0., 1.);
             command_encoder.set_depth_stencil_state(&self.depth_write_state);
             let opaque_quad_indices = scene.blended_quad_indices.len()
                 ..scene.blended_quad_indices.len() + scene.opaque_quad_indices.len();
@@ -5804,7 +5815,7 @@ mod partial_present_tests {
     use super::{InstanceBufferPool, MetalRenderer, read_texture_to_image, undamaged_rects};
     use gpui::{
         BackdropBlur, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
-        OpacityCycle, Point, Quad, ScaledPixels, Scene,
+        OpacityCycle, Point, Quad, ScaledPixels, Scene, Underline,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -5881,6 +5892,10 @@ mod partial_present_tests {
                 gpui::hsla(index as f32 / 8., 0.7, 0.5, alpha),
             ));
         }
+        // Opaque cards over opaque stripes under the lone pulses: the depth
+        // prepass of each damaged rectangle has to keep them apart.
+        scene.insert_primitive(quad(rect(2., 2., 16., 14.), gpui::hsla(0., 0., 0.4, 1.)));
+        scene.insert_primitive(quad(rect(26., 36., 14., 14.), gpui::hsla(0., 0., 0.7, 1.)));
         let cycle = OpacityCycle::new(
             std::time::Duration::from_millis(900),
             [(0.0, 0.2), (0.5, 1.0), (0.75, 0.6), (1.0, 0.2)],
@@ -5911,6 +5926,20 @@ mod partial_present_tests {
             quad(rect(30., 40., 8., 8.), gpui::hsla(0.1, 0.8, 0.6, 1.)),
             cycle.phase(0.5),
         );
+        // A batch that collapses the depth range, ordered last because it
+        // crosses the pulse and the frosted surface, ends every rectangle.
+        let underlined = rect(0., 44., 96., 2.);
+        scene.insert_primitive(Underline {
+            order: 0,
+            pad: 0,
+            bounds: underlined,
+            content_mask: ContentMask { bounds: underlined },
+            color: gpui::hsla(0.5, 0.5, 0.5, 1.),
+            thickness: ScaledPixels(2.),
+            wavy: false.into(),
+            rounded_clip: 0,
+            clip_padding: 0,
+        });
         scene.finish();
         scene
     }
