@@ -149,9 +149,10 @@ pub struct Scene {
     /// [`ROTATION_ANIMATION`] set.
     rotation_animations: Vec<RotationAnimation>,
     /// The monochrome sprites that turn, by draw-order index, with the
-    /// transformation each was painted with, gathered by `finish`: every
-    /// present rotates that one, so turning never compounds.
-    rotating_monochrome_sprites: Vec<(u32, TransformationMatrix)>,
+    /// transformation each was painted with and where it was painted,
+    /// gathered by `finish`: every present rotates that transformation, so
+    /// turning never compounds.
+    rotating_monochrome_sprites: Vec<(u32, TransformationMatrix, Point<ScaledPixels>)>,
     /// Indices of the sprites whose effect animates, gathered by `finish`
     /// (sorting moves sprites, so they cannot be recorded on insertion).
     animated_monochrome_sprites: Vec<u32>,
@@ -579,8 +580,7 @@ impl Scene {
         if primitive.rounded_clip() == 0 {
             primitive.set_rounded_clip(self.current_rounded_clip);
         }
-        let clipped_bounds = primitive
-            .bounds()
+        let clipped_bounds = primitive_extent(&primitive)
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -1036,7 +1036,7 @@ impl Scene {
         for (index, sprite) in self.monochrome_sprites.iter().enumerate() {
             if sprite.effect.animation & ROTATION_ANIMATION != 0 {
                 self.rotating_monochrome_sprites
-                    .push((index as u32, sprite.transformation));
+                    .push((index as u32, sprite.transformation, sprite.bounds.origin));
             } else if sprite.effect.animation != 0 {
                 self.animated_monochrome_sprites.push(index as u32);
             }
@@ -1184,18 +1184,18 @@ impl Scene {
         self.advance_transitions(now);
         // After the transitions, which move a sprite's bounds and with them
         // the centre it turns about.
-        for &(index, painted) in &self.rotating_monochrome_sprites {
+        for &(index, painted, painted_origin) in &self.rotating_monochrome_sprites {
             let sprite = &mut self.monochrome_sprites[index as usize];
             let animation_id = (sprite.effect.animation & !ROTATION_ANIMATION) as usize;
             let Some(animation) = self.rotation_animations.get(animation_id.wrapping_sub(1)) else {
                 continue;
             };
-            let center = sprite.bounds.center();
-            sprite.transformation = TransformationMatrix::unit()
-                .translate(center)
-                .rotate(Radians(animation.current_angle()))
-                .translate(Point::new(ScaledPixels(-center.x.0), ScaledPixels(-center.y.0)))
-                .compose(painted);
+            sprite.transformation = turned(
+                painted,
+                sprite.bounds.origin - painted_origin,
+                sprite.bounds.center(),
+                animation.current_angle(),
+            );
         }
     }
 
@@ -1249,25 +1249,18 @@ impl Scene {
             }
             rects.extend(DamageRect::covering(&sprite.bounds, &sprite.content_mask, viewport));
         }
-        for &(index, painted) in &self.rotating_monochrome_sprites {
+        for &(index, painted, _) in &self.rotating_monochrome_sprites {
             // Turning about its centre, the sprite stays inside the square
             // its corners sweep.
             if painted != TransformationMatrix::unit() {
                 return false;
             }
             let sprite = &self.monochrome_sprites[index as usize];
-            let center = sprite.bounds.center();
-            let reach = ScaledPixels(
-                (sprite.bounds.size.width.0.powi(2) + sprite.bounds.size.height.0.powi(2)).sqrt() / 2.0,
-            );
-            let swept = Bounds {
-                origin: Point::new(center.x - reach, center.y - reach),
-                size: Size {
-                    width: reach * 2.0,
-                    height: reach * 2.0,
-                },
-            };
-            rects.extend(DamageRect::covering(&swept, &sprite.content_mask, viewport));
+            rects.extend(DamageRect::covering(
+                &swept_by_turning(&sprite.bounds),
+                &sprite.content_mask,
+                viewport,
+            ));
         }
         for quad in self.animated_quads.iter().map(|&index| &self.quads[index as usize]) {
             rects.extend(DamageRect::covering(&quad.bounds, &quad.content_mask, viewport));
@@ -3037,6 +3030,82 @@ mod tests {
         assert_ne!(replayed.monochrome_sprites[0].transformation, TransformationMatrix::unit());
     }
 
+    /// A sprite painted translated, or moved by a transition, turns in place
+    /// where it is shown rather than orbiting the spot it was laid out at.
+    #[test]
+    fn a_turning_sprite_turns_where_it_is_shown() {
+        let painted = TransformationMatrix::unit().translate(point(ScaledPixels(10.), ScaledPixels(0.)));
+        let apply = |matrix: TransformationMatrix, x: f32, y: f32| {
+            (
+                matrix.rotation_scale[0][0] * x + matrix.rotation_scale[0][1] * y + matrix.translation[0],
+                matrix.rotation_scale[1][0] * x + matrix.rotation_scale[1][1] * y + matrix.translation[1],
+            )
+        };
+        for angle in [0.0, 1.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 4.0] {
+            let still = turned(painted, Point::default(), point(ScaledPixels(110.), ScaledPixels(210.)), angle);
+            let (x, y) = apply(still, 110., 210.);
+            assert!((x - 120.).abs() < 1e-3 && (y - 210.).abs() < 1e-3, "orbited to ({x}, {y}) at {angle}");
+            let moved = turned(
+                painted,
+                point(ScaledPixels(5.), ScaledPixels(-7.)),
+                point(ScaledPixels(115.), ScaledPixels(203.)),
+                angle,
+            );
+            let (x, y) = apply(moved, 115., 203.);
+            assert!((x - 125.).abs() < 1e-3 && (y - 203.).abs() < 1e-3, "moved one orbited to ({x}, {y})");
+        }
+    }
+
+    /// A turning sprite is culled and ordered by the square it sweeps: a quad
+    /// it only reaches while turned still draws over it, and one whose own
+    /// rectangle misses its mask is kept for the corners that do not.
+    #[test]
+    fn a_turning_sprite_is_ordered_by_the_square_it_sweeps() {
+        let mut scene = Scene::default();
+        let sprite = turning_sprite(&mut scene, 800);
+        scene.insert_primitive(MonochromeSprite {
+            content_mask: ContentMask {
+                bounds: Bounds {
+                    origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size: Size {
+                        width: ScaledPixels(1000.),
+                        height: ScaledPixels(1000.),
+                    },
+                },
+            },
+            ..sprite
+        });
+        let reached = Bounds {
+            origin: point(ScaledPixels(122.), ScaledPixels(208.)),
+            size: Size {
+                width: ScaledPixels(4.),
+                height: ScaledPixels(4.),
+            },
+        };
+        scene.insert_primitive(Quad {
+            bounds: reached,
+            content_mask: ContentMask { bounds: reached },
+            ..opaque_quad()
+        });
+        let mut corner_only = turning_sprite(&mut scene, 800);
+        corner_only.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(121.), ScaledPixels(200.)),
+                size: Size {
+                    width: ScaledPixels(10.),
+                    height: ScaledPixels(20.),
+                },
+            },
+        };
+        scene.insert_primitive(corner_only);
+        scene.finish();
+        assert_eq!(scene.monochrome_sprites.len(), 2, "the sprite reaching its mask only turned was kept");
+        assert!(
+            scene.quads[0].order > scene.monochrome_sprites[0].order,
+            "the quad the turning sprite reaches must draw over it"
+        );
+    }
+
     /// A present that only turns a spinner damages the square its corners
     /// sweep, and nothing else.
     #[test]
@@ -3282,7 +3351,52 @@ pub(crate) fn primitive_extent(primitive: &Primitive) -> Bounds<ScaledPixels> {
             let margin = shadow.blur_radius * 3.;
             shadow.bounds.dilate(margin)
         }
+        Primitive::MonochromeSprite(sprite) if sprite.effect.animation & ROTATION_ANIMATION != 0 => {
+            swept_by_turning(&sprite.bounds)
+        }
         primitive => *primitive.bounds(),
+    }
+}
+
+/// `painted` carried along with a sprite a transition moved by `moved`, then
+/// turned by `angle` about where that puts the sprite's `center`: the sprite
+/// turns in place, wherever its painted transformation and the transition
+/// put it, rather than orbiting the spot it was laid out at.
+fn turned(
+    painted: TransformationMatrix,
+    moved: Point<ScaledPixels>,
+    center: Point<ScaledPixels>,
+    angle: f32,
+) -> TransformationMatrix {
+    let negate = |point: Point<ScaledPixels>| Point::new(ScaledPixels(-point.x.0), ScaledPixels(-point.y.0));
+    let carried = TransformationMatrix::unit()
+        .translate(moved)
+        .compose(painted)
+        .translate(negate(moved));
+    let [[a, b], [c, d]] = carried.rotation_scale;
+    let shown = Point::new(
+        ScaledPixels(a * center.x.0 + b * center.y.0 + carried.translation[0]),
+        ScaledPixels(c * center.x.0 + d * center.y.0 + carried.translation[1]),
+    );
+    TransformationMatrix::unit()
+        .translate(shown)
+        .rotate(Radians(angle))
+        .translate(negate(shown))
+        .compose(carried)
+}
+
+/// The square `bounds` stays inside while turning about its centre.
+pub(crate) fn swept_by_turning(bounds: &Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+    let center = bounds.center();
+    let reach = ScaledPixels(
+        (bounds.size.width.0.powi(2) + bounds.size.height.0.powi(2)).sqrt() / 2.0,
+    );
+    Bounds {
+        origin: Point::new(center.x - reach, center.y - reach),
+        size: Size {
+            width: reach * 2.0,
+            height: reach * 2.0,
+        },
     }
 }
 

@@ -346,11 +346,13 @@ struct ViewContext {
 
 /// What a view's paint inherited that turns into what its primitives hold:
 /// the text effect glyphs are stamped with, the opacity cycle and glass mode
-/// quads are stamped with, and the time transition everything is moved with.
+/// quads are stamped with, the turn SVGs are stamped with, and the time
+/// transition everything is moved with.
 #[derive(Clone, Default)]
 struct PaintContext {
     shimmer: Option<TextShimmerStyle>,
     opacity_cycle: Option<OpacityCycle>,
+    rotation: Option<crate::scene::RotationAnimation>,
     glass_content: bool,
     transition: u32,
 }
@@ -359,6 +361,7 @@ impl PaintContext {
     fn effects_match(&self, other: &Self) -> bool {
         self.shimmer == other.shimmer
             && self.opacity_cycle == other.opacity_cycle
+            && self.rotation == other.rotation
             && self.glass_content == other.glass_content
     }
 }
@@ -1550,6 +1553,7 @@ impl Window {
         PaintContext {
             shimmer: self.text_shimmer_stack.last().copied(),
             opacity_cycle: self.opacity_cycle_stack.last().copied(),
+            rotation: self.rotation_animation_stack.last().copied(),
             glass_content: self.glass_content,
             transition: self.next_frame.scene.current_transition(),
         }
