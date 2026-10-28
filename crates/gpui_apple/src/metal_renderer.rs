@@ -6759,6 +6759,37 @@ mod quad_shader_tests {
             clipped.corner_radii = Corners::all(ScaledPixels(index as f32 * 6.));
             scene.insert_primitive(clipped);
         }
+        // The live window's shape: one opaque card painted again inside
+        // three nested rounded clips of its own rectangle, an unrounded
+        // opaque quad flush with the clip's corner and one well inside it,
+        // and translucent content over them.
+        let card = rect(640.5, 20.25, 320., 300.);
+        let base = scene.rounded_clips.len() as u32;
+        for nesting in 0..3u32 {
+            scene.rounded_clips.push(RoundedClipNode {
+                bounds: card,
+                corner_radii: Corners::all(ScaledPixels(24.)),
+                parent: if nesting == 0 { 0 } else { base + nesting },
+                transition: 0,
+                base_origin: Default::default(),
+            });
+        }
+        for clip in [0, base + 1, base + 2, base + 3] {
+            let mut opaque_card = quad(card, solid(0.95, 1.));
+            opaque_card.corner_radii = Corners::all(ScaledPixels(24.));
+            opaque_card.rounded_clip = clip;
+            scene.insert_primitive(opaque_card);
+        }
+        let mut flush = quad(rect(640.5, 20.25, 90., 300.), solid(0.45, 1.));
+        flush.rounded_clip = base + 3;
+        scene.insert_primitive(flush);
+        let mut inner = quad(rect(760., 100., 120., 120.), solid(0.25, 1.));
+        inner.rounded_clip = base + 3;
+        scene.insert_primitive(inner);
+        let mut over = quad(rect(700., 60., 220., 220.), solid(0.7, 0.45));
+        over.corner_radii = Corners::all(ScaledPixels(10.));
+        over.rounded_clip = base + 3;
+        scene.insert_primitive(over);
         scene.finish();
         scene
     }
@@ -6830,6 +6861,113 @@ mod quad_shader_tests {
         }
         scene.finish();
         scene
+    }
+
+    /// The layering a live window's attribution reported: the main card
+    /// (opaque, 24 px corners) painted five times over, four of them inside
+    /// nested rounded clips of its own rectangle; the sidebar card three
+    /// times, two inside a clip; translucent cards over the main card.
+    fn nested_cards_window() -> Scene {
+        let mut scene = Scene::default();
+        let solid = |l: f32, a: f32| Background::from(gpui::hsla(0.6, 0.05, l, a));
+        scene.insert_primitive(quad(rect(0., 0., 3456., 2168.), solid(0.08, 0.72)));
+        let main_card = rect(741., 88., 2707., 2072.);
+        let sidebar = rect(104., 88., 637., 2072.);
+        let clip = |scene: &mut Scene, bounds, radius: f32, parent: u32| {
+            scene.rounded_clips.push(RoundedClipNode {
+                bounds,
+                corner_radii: Corners::all(ScaledPixels(radius)),
+                parent,
+                transition: 0,
+                base_origin: Default::default(),
+            });
+            scene.rounded_clips.len() as u32
+        };
+        let sidebar_clip = clip(&mut scene, sidebar, 24., 0);
+        let mut sidebar_card = quad(sidebar, solid(0.12, 1.));
+        sidebar_card.corner_radii = Corners::all(ScaledPixels(24.));
+        scene.insert_primitive(sidebar_card);
+        for _ in 0..2 {
+            let mut inner = quad(rect(104., 88., 635., 2072.), solid(0.12, 1.));
+            inner.rounded_clip = sidebar_clip;
+            scene.insert_primitive(inner);
+        }
+        let mut parent = 0;
+        let mut main_clips = Vec::new();
+        for _ in 0..4 {
+            parent = clip(&mut scene, main_card, 24., parent);
+            main_clips.push(parent);
+        }
+        for clip in std::iter::once(0).chain(main_clips.iter().copied()) {
+            let mut card = quad(main_card, solid(0.1, 1.));
+            card.corner_radii = Corners::all(ScaledPixels(24.));
+            card.rounded_clip = clip;
+            scene.insert_primitive(card);
+        }
+        for index in 0..30 {
+            let mut card = quad(rect(820., 200. + index as f32 * 64., 2400., 56.), solid(0.2, 0.35));
+            card.corner_radii = Corners::all(ScaledPixels(16.));
+            card.rounded_clip = parent;
+            scene.insert_primitive(card);
+        }
+        scene.finish();
+        scene
+    }
+
+    fn median_gpu_milliseconds(renderer: &mut MetalRenderer, scene: &Scene, size: Size<DevicePixels>) -> (f64, f64, f64) {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let target = renderer.device.new_texture(&descriptor);
+        let end_time = |buffer: &metal::CommandBufferRef| -> f64 {
+            let buffer = buffer.as_ptr().cast::<AnyObject>();
+            // SAFETY: `GPUEndTime` is a `CFTimeInterval` property of every
+            // completed `MTLCommandBuffer`.
+            unsafe { msg_send![buffer, GPUEndTime] }
+        };
+        let mut costs = Vec::new();
+        for _ in 0..12 {
+            objc2::rc::autoreleasepool(|_| {
+                let fence = renderer.command_queue.new_command_buffer().to_owned();
+                let frames: Vec<_> = (0..10)
+                    .map(|_| renderer.render_frame(scene, &target, size, None, None).expect("frame encodes"))
+                    .collect();
+                fence.commit();
+                for frame in &frames {
+                    frame.commit();
+                }
+                if let Some(last) = frames.last() {
+                    last.wait_until_completed();
+                }
+                let mut previous = end_time(&fence);
+                for frame in &frames {
+                    let end = end_time(frame);
+                    costs.push((end - previous) * 1000.);
+                    previous = end;
+                }
+            });
+        }
+        costs.sort_by(f64::total_cmp);
+        (costs[costs.len() / 2], costs[costs.len() / 10], costs[costs.len() * 9 / 10])
+    }
+
+    /// Run with `--ignored --nocapture`: median GPU milliseconds of the
+    /// nested opaque cards a live window paints, at 3456x2168.
+    #[test]
+    #[ignore = "measurement, prints the GPU time of nested opaque cards"]
+    fn measure_nested_cards_window_gpu_time() {
+        let size = gpui::size(DevicePixels(3456), DevicePixels(2168));
+        let mut renderer = headless(size);
+        let scene = nested_cards_window();
+        let (median, p10, p90) = median_gpu_milliseconds(&mut renderer, &scene, size);
+        println!(
+            "nested cards window: {median:.3} ms per frame, p10 {p10:.3} p90 {p90:.3}, {} of {} quads in the prepass",
+            scene.opaque_quad_indices.len(),
+            scene.quads.len(),
+        );
     }
 
     /// Run with `--ignored --nocapture`: median GPU milliseconds of the

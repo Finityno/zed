@@ -1487,7 +1487,8 @@ impl Scene {
                 && quad.order < prepass_below
                 && quad.background.time_animation() == 0
                 && quad.background.time_transition() == 0
-                && quad.has_opaque_core();
+                && quad.has_opaque_core()
+                && core_is_fully_covered(quad, &self.rounded_clips);
             if has_opaque_core {
                 self.opaque_quad_indices.push(quad_id as u32);
             }
@@ -1754,6 +1755,117 @@ pub const MAX_DEPTH_PARTITIONED_QUADS: usize = 65534;
 /// test, it is above quads before the cursor and ties with the quad after it.
 /// Depth-based renderers must use this mapping in both CPU and shader code.
 ///
+/// Whether the opaque prepass may draw `quad`'s core without its rounded
+/// clips: every clip it is drawn in covers all of the core fully, so the
+/// coverage it would multiply the core by is exactly 1 there.
+///
+/// The prepass draws the core unclipped, so before this a quad inside any
+/// rounded clip never took it, and an opaque card painted in nested rounded
+/// containers (each its own clip, all the same rectangle) was shaded in full
+/// once per container: five full-window layers in a live window. A rounded
+/// rectangle's distance field is convex, so a core whose four corners are at
+/// least the antialiasing ramp inside a clip, with a margin for the float
+/// steps between this and the shaders' arithmetic, is inside it throughout.
+/// Both bands a backend may draw as the core are checked, so it does not
+/// matter which one it picks; past 2^18 device pixels, where float steps
+/// outgrow the margin, a clipped quad keeps the blended pass.
+fn core_is_fully_covered(quad: &Quad, rounded_clips: &[RoundedClipNode]) -> bool {
+    const PRECISE: f32 = 262144.0;
+    const REQUIRED_SDF: f32 = -0.75;
+    if quad.rounded_clip == 0 {
+        return true;
+    }
+    let precise = |bounds: &Bounds<ScaledPixels>| {
+        [bounds.left().0, bounds.top().0, bounds.right().0, bounds.bottom().0]
+            .into_iter()
+            .all(|edge| edge.abs() < PRECISE)
+    };
+    if !precise(&quad.bounds) {
+        return false;
+    }
+    let cores = opaque_core_bands(quad);
+    let mut clip = quad.rounded_clip;
+    while clip != 0 {
+        let Some(mask) = rounded_clips.get(clip as usize - 1) else {
+            return false;
+        };
+        if !precise(&mask.bounds) {
+            return false;
+        }
+        for core in &cores {
+            let corners = [
+                (core.left().0, core.top().0),
+                (core.right().0, core.top().0),
+                (core.left().0, core.bottom().0),
+                (core.right().0, core.bottom().0),
+            ];
+            if corners
+                .into_iter()
+                .any(|(x, y)| rounded_rect_sdf(x, y, &mask.bounds, &mask.corner_radii) > REQUIRED_SDF)
+            {
+                return false;
+            }
+        }
+        clip = mask.parent;
+    }
+    true
+}
+
+/// The rectangles the backends' `opaque_quad_core` may draw for `quad`: its
+/// bounds when unrounded, otherwise the band clear of the top and bottom
+/// corner arcs and the band clear of the left and right ones (a backend
+/// draws the larger). Empty bands are left out.
+fn opaque_core_bands(quad: &Quad) -> Vec<Bounds<ScaledPixels>> {
+    if !quad.has_rounded_corners() {
+        return vec![quad.bounds];
+    }
+    const ANTIALIAS_INSET: f32 = 1.0;
+    let radii = &quad.corner_radii;
+    let left = radii.top_left.0.max(radii.bottom_left.0) + ANTIALIAS_INSET;
+    let right = radii.top_right.0.max(radii.bottom_right.0) + ANTIALIAS_INSET;
+    let top = radii.top_left.0.max(radii.top_right.0) + ANTIALIAS_INSET;
+    let bottom = radii.bottom_left.0.max(radii.bottom_right.0) + ANTIALIAS_INSET;
+    let (width, height) = (quad.bounds.size.width.0, quad.bounds.size.height.0);
+    let origin = quad.bounds.origin;
+    let band = |x: f32, y: f32, width: f32, height: f32| Bounds {
+        origin: point(ScaledPixels(origin.x.0 + x), ScaledPixels(origin.y.0 + y)),
+        size: Size {
+            width: ScaledPixels(width.max(0.0)),
+            height: ScaledPixels(height.max(0.0)),
+        },
+    };
+    [
+        band(ANTIALIAS_INSET, top, width - 2.0 * ANTIALIAS_INSET, height - top - bottom),
+        band(left, ANTIALIAS_INSET, width - left - right, height - 2.0 * ANTIALIAS_INSET),
+    ]
+    .into_iter()
+    .filter(|band| band.size.width.0 > 0.0 && band.size.height.0 > 0.0)
+    .collect()
+}
+
+/// The shaders' `quad_sdf`: the signed distance from a point to a rounded
+/// rectangle, negative inside.
+fn rounded_rect_sdf(x: f32, y: f32, bounds: &Bounds<ScaledPixels>, radii: &Corners<ScaledPixels>) -> f32 {
+    let half_width = bounds.size.width.0 / 2.0;
+    let half_height = bounds.size.height.0 / 2.0;
+    let to_point_x = x - (bounds.origin.x.0 + half_width);
+    let to_point_y = y - (bounds.origin.y.0 + half_height);
+    let radius = match (to_point_x < 0.0, to_point_y < 0.0) {
+        (true, true) => radii.top_left.0,
+        (false, true) => radii.top_right.0,
+        (true, false) => radii.bottom_left.0,
+        (false, false) => radii.bottom_right.0,
+    };
+    let corner_x = to_point_x.abs() - half_width + radius;
+    let corner_y = to_point_y.abs() - half_height + radius;
+    if radius == 0.0 {
+        return corner_x.max(corner_y);
+    }
+    let outside = (corner_x.max(0.0).powi(2) + corner_y.max(0.0).powi(2)).sqrt();
+    let inside = corner_x.max(corner_y).min(0.0);
+    outside + inside - radius
+}
+
 /// Steps are 1/65535 so that every partitioned quad (see
 /// [`MAX_DEPTH_PARTITIONED_QUADS`]) lands on its own value of a 16-bit
 /// unorm depth attachment as well as a 32-bit float one.
@@ -3416,6 +3528,59 @@ mod tests {
         assert!(order(183.) > order(200.), "the later quad must draw over the bounce's peak");
     }
 
+    fn card_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(width),
+                height: ScaledPixels(height),
+            },
+        }
+    }
+
+    /// An opaque card painted again inside nested rounded clips of its own
+    /// rectangle takes the opaque prepass for each copy, so the copies
+    /// beneath are rejected by the depth test instead of shaded in full; a
+    /// quad reaching into a clip's antialiased edge or corner keeps the
+    /// blended pass.
+    #[test]
+    fn opaque_quads_inside_rounded_clips_take_the_prepass_where_the_clips_cover_them() {
+        let card = card_bounds(100., 50., 900., 700.);
+        let mut scene = Scene::default();
+        for parent in 0..3u32 {
+            scene.rounded_clips.push(RoundedClipNode {
+                bounds: card,
+                corner_radii: Corners::all(ScaledPixels(24.)),
+                parent,
+                transition: 0,
+                base_origin: Default::default(),
+            });
+        }
+        let opaque = |bounds: Bounds<ScaledPixels>, radius: f32, clip: u32| Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(ScaledPixels(radius)),
+            rounded_clip: clip,
+            ..opaque_quad()
+        };
+        scene.insert_primitive(opaque(card, 24., 0));
+        scene.insert_primitive(opaque(card, 24., 1));
+        scene.insert_primitive(opaque(card, 24., 3));
+        // Unrounded, flush with the clip's top-left corner: the arc cuts it.
+        scene.insert_primitive(opaque(card_bounds(100., 50., 200., 700.), 0., 3));
+        // Unrounded, well inside: covered throughout.
+        scene.insert_primitive(opaque(card_bounds(200., 150., 300., 300.), 0., 3));
+        scene.finish();
+
+        let prepass: Vec<_> = scene.opaque_quad_indices.iter().copied().collect();
+        let opaque_bounds = |index: u32| scene.quads[index as usize].bounds;
+        assert_eq!(prepass.len(), 4, "the card thrice and the inner quad: {prepass:?}");
+        assert!(prepass.iter().all(|&index| opaque_bounds(index).origin.x.0 != 100. || opaque_bounds(index).size.width.0 != 200.),
+            "a quad the clip's corner arc cuts keeps the blended pass");
+        let inner = scene.quads.iter().position(|quad| quad.bounds.size.width.0 == 300.).unwrap_or(usize::MAX) as u32;
+        assert!(!scene.blended_quad_indices.contains(&inner), "a covered unrounded quad needs no blended edge");
+    }
+
     /// The glyph sprite inserts build the same scene `insert_primitive` builds
     /// from the same sprites: culling, draw order, transition tagging and paint
     /// operations alike.
@@ -4149,9 +4314,9 @@ impl Quad {
         // Glass content deliberately leaves the destination alpha of the
         // translucent surface beneath it untouched. The opaque pass blends
         // nothing and so would write alpha 1 over that surface, so glass quads
-        // never take it, however solid their color is.
-        self.rounded_clip == 0
-            && !self.background.is_glass_content()
+        // never take it, however solid their color is. A rounded clip is
+        // checked by the scene (see `core_is_fully_covered`).
+        !self.background.is_glass_content()
             && self
                 .background
                 .as_solid()
