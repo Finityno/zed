@@ -821,17 +821,14 @@ impl DirectXRenderer {
         overlay_start: usize,
         clear_color: [f32; 4],
     ) -> Result<()> {
-        let split = overlay_start.min(scene.len());
         // Taken out of the scratch for the draw, since drawing needs the
         // renderer mutably, and put back afterwards whatever happened.
         let mut base_scene = std::mem::take(&mut self.frame_scratch.base_scene);
         let mut overlay_scene = std::mem::take(&mut self.frame_scratch.overlay_scene);
-        base_scene.clear();
-        base_scene.replay(0..split, scene);
-        base_scene.finish();
-        overlay_scene.clear();
-        overlay_scene.replay(split..scene.len(), scene);
-        overlay_scene.finish();
+        // Replaying copies primitives as they were painted, so each plane is
+        // also moved to now: a shimmer, a pulse or a turning spinner drawn
+        // through the split would otherwise stand still.
+        scene.split_planes_into(overlay_start, &mut base_scene, &mut overlay_scene);
         let result = self.draw_layered_scenes(scene, &base_scene, &overlay_scene, clear_color);
         self.frame_scratch.base_scene = base_scene;
         self.frame_scratch.overlay_scene = overlay_scene;
