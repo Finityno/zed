@@ -1722,6 +1722,16 @@ impl InputRateTracker {
         Instant::now() < self.sustain_until
     }
 
+    /// Ends a sustain started by input the window received before it lost
+    /// focus. That input is over, and keeping its window presenting at the
+    /// display's rate for the rest of the second spent GPU on an app the
+    /// user had just left; input that reaches the window while it is
+    /// unfocused (a scroll over it) starts a sustain of its own.
+    pub fn end_sustain(&mut self) {
+        self.timestamps.clear();
+        self.sustain_until = Instant::now();
+    }
+
     fn prune_old_timestamps(&mut self, now: Instant) {
         self.timestamps
             .retain(|&t| now.duration_since(t) <= self.window);
@@ -2504,6 +2514,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        if !active {
+                            window.input_rate_tracker.borrow_mut().end_sustain();
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -11006,6 +11019,34 @@ mod tests {
     /// windows (macOS, Windows, X11) stop presenting while GPUI still wants
     /// presentation: high-rate input sustains presentation for a while after
     /// it stops.
+    /// Input before the window lost focus no longer keeps it presenting at
+    /// the display's rate once it is unfocused; input after does.
+    #[gpui::test]
+    fn losing_focus_ends_a_high_rate_input_sustain(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        let burst = |window: &mut Window| {
+            let mut tracker = window.input_rate_tracker.borrow_mut();
+            for _ in 0..64 {
+                tracker.record_input();
+            }
+            tracker.is_high_rate()
+        };
+        assert!(window.update(cx, |_, window, _| burst(window)).unwrap());
+        test_window.simulate_active_status_change(false);
+        cx.run_until_parked();
+        assert!(
+            !window
+                .update(cx, |_, window, _| window.input_rate_tracker.borrow().is_high_rate())
+                .unwrap(),
+            "the sustain from before the window lost focus should have ended"
+        );
+        assert!(
+            window.update(cx, |_, window, _| burst(window)).unwrap(),
+            "input to the unfocused window sustains presentation again"
+        );
+    }
+
     #[gpui::test]
     fn test_frame_waker_rearms_for_non_dirty_demand(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
