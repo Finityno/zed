@@ -158,7 +158,11 @@ pub struct Scene {
     animated_monochrome_sprites: Vec<u32>,
     animated_subpixel_sprites: Vec<u32>,
     /// Opacity cycles referenced by `Background::time_animation`.
-    quad_animations: Vec<QuadOpacityAnimation>,
+    quad_animations: Vec<QuadAnimation>,
+    /// The animated quads that move with an [`OffsetCycle`], by draw-order
+    /// index, with the origin each was painted at, gathered by `finish`:
+    /// every present offsets that origin, so moving never compounds.
+    offset_quads: Vec<(u32, Point<ScaledPixels>)>,
     animated_quads: Vec<u32>,
     /// Moves referenced by each primitive's transition id (`pad`, or the
     /// background's transition bits for quads).
@@ -232,6 +236,7 @@ impl Scene {
         self.animated_monochrome_sprites.clear();
         self.animated_subpixel_sprites.clear();
         self.quad_animations.clear();
+        self.offset_quads.clear();
         self.animated_quads.clear();
         self.transitions.clear();
         self.current_transition = 0;
@@ -584,6 +589,7 @@ impl Scene {
         // rectangle, so that is what it is culled and ordered by.
         let reach = match &primitive {
             Primitive::MonochromeSprite(sprite) => monochrome_sprite_extent(sprite),
+            Primitive::Quad(quad) => self.quad_extent(quad),
             primitive => *primitive.bounds(),
         };
         let clipped_bounds = reach.intersect(&primitive.content_mask().bounds);
@@ -677,9 +683,9 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
-    /// Registers an opacity cycle for one quad, returning the value its
-    /// background's time animation should carry.
-    pub(crate) fn push_quad_animation(&mut self, animation: QuadOpacityAnimation) -> u32 {
+    /// Registers an opacity cycle or an offset cycle for one quad, returning
+    /// the value its background's time animation should carry.
+    pub(crate) fn push_quad_animation(&mut self, animation: QuadAnimation) -> u32 {
         self.quad_animations.push(animation);
         self.quad_animations.len() as u32
     }
@@ -687,8 +693,9 @@ impl Scene {
     /// Inserts `quad` with its opacity driven by `cycle`, as a quad painted
     /// inside [`crate::Window::with_opacity_cycle`] is.
     pub fn insert_opacity_cycled_quad(&mut self, quad: Quad, cycle: OpacityCycle) {
-        let animation = self.push_quad_animation(QuadOpacityAnimation {
-            cycle,
+        let animation = self.push_quad_animation(QuadAnimation {
+            opacity: Some(cycle),
+            offset: None,
             background: quad.background,
             border_color: quad.border_color,
         });
@@ -845,6 +852,9 @@ impl Scene {
             clipped_only_inside(scaled_edges(extent), scaled_edges(&mask.bounds), outer)
         };
         self.paint_operations[range].iter().all(|operation| match operation {
+            PaintOperation::Primitive(Primitive::Quad(quad)) => {
+                clipped(&self.quad_extent(quad), &quad.content_mask)
+            }
             PaintOperation::Primitive(primitive) => {
                 clipped(&primitive_extent(primitive), primitive.content_mask())
             }
@@ -1052,10 +1062,21 @@ impl Scene {
                 .filter(|&index| self.subpixel_sprites[index as usize].effect.animation != 0),
         );
         self.animated_quads.clear();
-        self.animated_quads.extend(
-            (0..self.quads.len() as u32)
-                .filter(|&index| self.quads[index as usize].background.time_animation() != 0),
-        );
+        self.offset_quads.clear();
+        for (index, quad) in self.quads.iter().enumerate() {
+            let animation = quad.background.time_animation();
+            if animation == 0 {
+                continue;
+            }
+            self.animated_quads.push(index as u32);
+            if self
+                .quad_animations
+                .get(animation as usize - 1)
+                .is_some_and(|animation| animation.offset.is_some())
+            {
+                self.offset_quads.push((index as u32, quad.bounds.origin));
+            }
+        }
         self.gather_transitioned();
         self.content_id = NEXT_SCENE_CONTENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.last_advanced_at = None;
@@ -1179,14 +1200,34 @@ impl Scene {
             let quad = &mut self.quads[index as usize];
             let animation_id = quad.background.time_animation();
             let animation = &self.quad_animations[animation_id as usize - 1];
-            let opacity = animation.cycle.current_opacity();
+            let Some(cycle) = animation.opacity else {
+                continue;
+            };
+            let opacity = cycle.current_opacity();
             quad.background = animation
                 .background
                 .opacity(opacity)
                 .with_time_animation(animation_id);
             quad.border_color = animation.border_color.opacity(opacity);
         }
+        // Back to where they were painted before any transition moves them,
+        // so the cycle's offset below lands on top of the transition's.
+        for &(index, painted_origin) in &self.offset_quads {
+            self.quads[index as usize].bounds.origin = painted_origin;
+        }
         self.advance_transitions(now);
+        for &(index, _) in &self.offset_quads {
+            let quad = &mut self.quads[index as usize];
+            let animation_id = quad.background.time_animation() as usize;
+            let Some(offset) = self
+                .quad_animations
+                .get(animation_id.wrapping_sub(1))
+                .and_then(|animation| animation.offset)
+            else {
+                continue;
+            };
+            quad.bounds.origin = quad.bounds.origin + offset.current_displacement();
+        }
         // After the transitions, which move a sprite's bounds and with them
         // the centre it turns about.
         for &(index, painted, painted_origin) in &self.rotating_monochrome_sprites {
@@ -1267,8 +1308,13 @@ impl Scene {
                 viewport,
             ));
         }
-        for quad in self.animated_quads.iter().map(|&index| &self.quads[index as usize]) {
-            rects.extend(DamageRect::covering(&quad.bounds, &quad.content_mask, viewport));
+        for &index in &self.animated_quads {
+            let quad = &self.quads[index as usize];
+            let reach = match self.quad_offset(quad) {
+                Some(offset) => offset.swept(&quad.bounds, self.painted_quad_origin(index)),
+                None => quad.bounds,
+            };
+            rects.extend(DamageRect::covering(&reach, &quad.content_mask, viewport));
         }
         let mut merged = DamageRect::merge(rects);
         // A blur frosts what is beneath it within its bounds, so damage that
@@ -1305,6 +1351,31 @@ impl Scene {
         }
         damage.extend(merged.iter().map(DamageRect::to_bounds));
         true
+    }
+
+    /// The offset cycle `quad` moves with, if any.
+    fn quad_offset(&self, quad: &Quad) -> Option<ScaledOffsetCycle> {
+        let animation = quad.background.time_animation() as usize;
+        self.quad_animations
+            .get(animation.wrapping_sub(1))
+            .and_then(|animation| animation.offset)
+    }
+
+    /// Where the draw-order quad at `index` was painted, before any offset.
+    fn painted_quad_origin(&self, index: u32) -> Option<Point<ScaledPixels>> {
+        self.offset_quads
+            .iter()
+            .find(|(offset_index, _)| *offset_index == index)
+            .map(|(_, origin)| *origin)
+    }
+
+    /// Where `quad`, as painted, can draw: its rectangle, or for one that an
+    /// offset cycle moves, every rectangle it passes through.
+    fn quad_extent(&self, quad: &Quad) -> Bounds<ScaledPixels> {
+        match self.quad_offset(quad) {
+            Some(offset) => offset.swept(&quad.bounds, Some(quad.bounds.origin)),
+            None => quad.bounds,
+        }
     }
 
     fn advance_transitions(&mut self, now: std::time::Instant) {
@@ -2393,11 +2464,12 @@ mod tests {
         glyph.effect.band_origin = -1000.0;
         source.insert_primitive(glyph);
         let quad = opaque_quad();
-        let pulse = source.push_quad_animation(QuadOpacityAnimation {
-            cycle: OpacityCycle::new(
+        let pulse = source.push_quad_animation(QuadAnimation {
+            opacity: Some(OpacityCycle::new(
                 std::time::Duration::from_millis(750),
                 [(0.0, 0.5), (0.5, 0.5), (0.75, 0.5), (1.0, 0.5)],
-            ),
+            )),
+            offset: None,
             background: quad.background,
             border_color: quad.border_color,
         });
@@ -2780,11 +2852,12 @@ mod tests {
     fn opacity_cycled_quads_take_the_blended_pass() {
         let mut scene = Scene::default();
         let quad = opaque_quad();
-        let animation = scene.push_quad_animation(QuadOpacityAnimation {
-            cycle: OpacityCycle::new(
+        let animation = scene.push_quad_animation(QuadAnimation {
+            opacity: Some(OpacityCycle::new(
                 std::time::Duration::from_millis(750),
                 [(0.0, 0.5), (0.5, 0.5), (0.75, 0.5), (1.0, 0.5)],
-            ),
+            )),
+            offset: None,
             background: quad.background,
             border_color: quad.border_color,
         });
@@ -3196,6 +3269,108 @@ mod tests {
         assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
         // Centre (110, 210), half-diagonal 14.14, a pixel of slack.
         assert_eq!(damage, vec![device_rect(94, 194, 126, 226)]);
+    }
+
+    fn bouncing_quad(scene: &mut Scene, phase: f32) -> Quad {
+        let animation = scene.push_quad_animation(QuadAnimation {
+            opacity: None,
+            offset: Some(
+                OffsetCycle::bounce(
+                    std::time::Duration::from_millis(1000),
+                    0.55,
+                    point(crate::px(0.), crate::px(-9.)),
+                )
+                .phase(phase)
+                .scaled(2.0),
+            ),
+            background: opaque_quad().background,
+            border_color: opaque_quad().border_color,
+        });
+        let bounds = Bounds {
+            origin: point(ScaledPixels(100.), ScaledPixels(200.)),
+            size: Size {
+                width: ScaledPixels(8.),
+                height: ScaledPixels(8.),
+            },
+        };
+        Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds: Bounds {
+                    origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size: Size {
+                        width: ScaledPixels(1000.),
+                        height: ScaledPixels(1000.),
+                    },
+                },
+            },
+            background: opaque_quad().background.with_time_animation(animation),
+            ..opaque_quad()
+        }
+    }
+
+    #[test]
+    fn an_offset_cycle_rests_outside_its_active_window_and_peaks_inside_it() {
+        let cycle = OffsetCycle::bounce(std::time::Duration::from_secs(1), 0.5, point(crate::px(0.), crate::px(-4.)));
+        assert!(cycle.rise_at(0.0).abs() < 1e-6);
+        assert!((cycle.rise_at(0.25) - 1.0).abs() < 1e-6);
+        assert!(cycle.rise_at(0.5).abs() < 1e-6);
+        assert!(cycle.rise_at(0.8).abs() < 1e-6, "at rest for the rest of the period");
+        let late = cycle.phase(-0.25);
+        assert!((late.rise_at(0.5) - 1.0).abs() < 1e-6, "a negative phase starts later");
+    }
+
+    /// A bouncing quad is moved from where it was painted on every advance,
+    /// by whole device pixels, never compounding, and only ever between its
+    /// rest and its peak; its damage covers that whole span.
+    #[test]
+    fn an_offset_quad_moves_from_where_it_was_painted() {
+        let mut scene = Scene::default();
+        let quad = bouncing_quad(&mut scene, 0.0);
+        scene.insert_primitive(quad);
+        scene.finish();
+        assert!(scene.has_time_animations());
+        for _ in 0..5 {
+            scene.advance_time_animations();
+            let origin = scene.quads[0].bounds.origin;
+            assert_eq!(origin.x, ScaledPixels(100.));
+            assert!(origin.y.0 <= 200. && origin.y.0 >= 182., "out of its span: {origin:?}");
+            assert_eq!(origin.y.0.fract(), 0., "moves by whole device pixels");
+        }
+        let mut damage = Vec::new();
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert_eq!(damage, vec![device_rect(99, 181, 109, 209)]);
+    }
+
+    /// A bouncing quad is ordered by every rectangle it passes through: a
+    /// quad painted after it, which it only reaches at its peak, draws over
+    /// it.
+    #[test]
+    fn an_offset_quad_is_ordered_by_the_span_it_moves_through() {
+        let mut scene = Scene::default();
+        let quad = bouncing_quad(&mut scene, 0.0);
+        scene.insert_primitive(quad);
+        let above = Bounds {
+            origin: point(ScaledPixels(100.), ScaledPixels(183.)),
+            size: Size {
+                width: ScaledPixels(8.),
+                height: ScaledPixels(4.),
+            },
+        };
+        scene.insert_primitive(Quad {
+            bounds: above,
+            content_mask: ContentMask { bounds: above },
+            ..opaque_quad()
+        });
+        scene.finish();
+        let order = |y: f32| {
+            scene
+                .quads
+                .iter()
+                .find(|quad| quad.bounds.origin.y.0 == y)
+                .map(|quad| quad.order)
+        };
+        assert!(order(183.) > order(200.), "the later quad must draw over the bounce's peak");
     }
 
     /// The glyph sprite inserts build the same scene `insert_primitive` builds
@@ -4492,13 +4667,106 @@ enum TransitionTarget {
     },
 }
 
-/// A quad whose background and border fade with an [`OpacityCycle`]; the
-/// colors are the ones it was painted with at full cycle opacity.
+/// A quad whose background and border fade with an [`OpacityCycle`], whose
+/// position moves with an [`OffsetCycle`], or both; the colors are the ones
+/// it was painted with at full cycle opacity.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct QuadOpacityAnimation {
-    pub cycle: OpacityCycle,
+pub(crate) struct QuadAnimation {
+    pub opacity: Option<OpacityCycle>,
+    pub offset: Option<ScaledOffsetCycle>,
     pub background: Background,
     pub border_color: Hsla,
+}
+
+/// A repeating move out to a peak offset and back: a raised cosine over the
+/// first `active` fraction of each `period`, at rest for the remainder. A
+/// bouncing loader's dots are each one, out of step by their `phase`.
+/// Painted inside [`crate::Window::with_offset_cycle`], it moves quads
+/// without their view drawing again.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct OffsetCycle {
+    period: std::time::Duration,
+    phase: f32,
+    active: f32,
+    peak: Point<Pixels>,
+}
+
+impl OffsetCycle {
+    /// Out to `peak` and back over the first `active` fraction (clamped to
+    /// `0..=1`) of every `period`.
+    pub fn bounce(period: std::time::Duration, active: f32, peak: Point<Pixels>) -> Self {
+        Self {
+            period,
+            phase: 0.0,
+            active: active.clamp(0.0, 1.0),
+            peak,
+        }
+    }
+
+    /// Offsets this cycle by a fraction of its period: with a negative
+    /// phase it starts that much later.
+    pub fn phase(mut self, phase: f32) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// How far out the cycle is at `phase` of its period, from `0.0` at rest
+    /// to `1.0` at the peak.
+    pub fn rise_at(&self, phase: f32) -> f32 {
+        let phase = (phase + self.phase).rem_euclid(1.0);
+        if self.active <= 0.0 || phase >= self.active {
+            return 0.0;
+        }
+        (1.0 - (phase / self.active * std::f32::consts::TAU).cos()) * 0.5
+    }
+
+    pub(crate) fn scaled(self, scale_factor: f32) -> ScaledOffsetCycle {
+        ScaledOffsetCycle {
+            cycle: self,
+            peak: self.peak.scale(scale_factor),
+        }
+    }
+}
+
+/// An [`OffsetCycle`] with its peak in device pixels, as a scene keeps it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct ScaledOffsetCycle {
+    cycle: OffsetCycle,
+    peak: Point<ScaledPixels>,
+}
+
+impl ScaledOffsetCycle {
+    /// Where the cycle has moved its quads now, snapped to whole device
+    /// pixels so a moving quad keeps the size it rasterizes at.
+    fn current_displacement(&self) -> Point<ScaledPixels> {
+        let rise = self.cycle.rise_at(time_animation_phase(self.cycle.period));
+        Point::new(
+            ScaledPixels((self.peak.x.0 * rise).round()),
+            ScaledPixels((self.peak.y.0 * rise).round()),
+        )
+    }
+
+    /// Every rectangle `bounds` passes through, moved from `painted_origin`
+    /// (or where `bounds` is, when that is not known) out to the peak.
+    fn swept(
+        &self,
+        bounds: &Bounds<ScaledPixels>,
+        painted_origin: Option<Point<ScaledPixels>>,
+    ) -> Bounds<ScaledPixels> {
+        let rest = Bounds {
+            origin: painted_origin.unwrap_or(bounds.origin),
+            size: bounds.size,
+        };
+        let peak = Bounds {
+            origin: rest.origin
+                + Point::new(
+                    ScaledPixels(self.peak.x.0.round()),
+                    ScaledPixels(self.peak.y.0.round()),
+                ),
+            size: rest.size,
+        };
+        rest.union(&peak)
+    }
 }
 
 impl ShimmerAnimation {

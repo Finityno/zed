@@ -921,11 +921,13 @@ impl Window {
     ) {
         let gap = &mut rebuilt.0;
         let inherited = self.enter_gap(gap.previous, true);
-        let (glass, opacity_cycles) = {
+        let (glass, opacity_cycles, rotations, offset_cycles) = {
             let record = &self.rendered_frame.retained_views.records[gap.previous];
             (
                 record.paint_context.glass_content,
                 record.paint_context.opacity_cycle,
+                record.paint_context.rotation,
+                record.paint_context.offset_cycle,
             )
         };
         let glass_before = mem::replace(&mut self.glass_content, glass);
@@ -933,11 +935,21 @@ impl Window {
             &mut self.opacity_cycle_stack,
             opacity_cycles.into_iter().collect(),
         );
+        let rotations_before = mem::replace(
+            &mut self.rotation_animation_stack,
+            rotations.into_iter().collect(),
+        );
+        let offsets_before = mem::replace(
+            &mut self.offset_cycle_stack,
+            offset_cycles.into_iter().collect(),
+        );
         let shimmers_before = mem::take(&mut self.text_shimmer_stack);
         self.next_frame.dispatch_tree.set_active_node(gap.node);
         self.paint_retained_view(gap.entity, ViewName::default(), &gap.id, &mut gap.prepaint, cx);
         self.text_shimmer_stack = shimmers_before;
         self.opacity_cycle_stack = cycles_before;
+        self.rotation_animation_stack = rotations_before;
+        self.offset_cycle_stack = offsets_before;
         self.glass_content = glass_before;
         self.leave_gap(inherited, true);
     }
@@ -988,17 +1000,27 @@ impl Window {
                 None,
             );
             let inherited = self.enter_gap(gap.previous, true);
-            let (glass, opacity_cycles) = {
+            let (glass, opacity_cycles, rotations, offset_cycles) = {
                 let record = &self.rendered_frame.retained_views.records[gap.previous];
                 (
                     record.paint_context.glass_content,
                     record.paint_context.opacity_cycle,
+                    record.paint_context.rotation,
+                    record.paint_context.offset_cycle,
                 )
             };
             let glass_before = mem::replace(&mut self.glass_content, glass);
             let cycles_before = mem::replace(
                 &mut self.opacity_cycle_stack,
                 opacity_cycles.into_iter().collect(),
+            );
+            let rotations_before = mem::replace(
+                &mut self.rotation_animation_stack,
+                rotations.into_iter().collect(),
+            );
+            let offsets_before = mem::replace(
+                &mut self.offset_cycle_stack,
+                offset_cycles.into_iter().collect(),
             );
             let shimmers_before = mem::take(&mut self.text_shimmer_stack);
             self.next_frame.dispatch_tree.set_active_node(gap.node);
@@ -1011,6 +1033,8 @@ impl Window {
             );
             self.text_shimmer_stack = shimmers_before;
             self.opacity_cycle_stack = cycles_before;
+            self.rotation_animation_stack = rotations_before;
+            self.offset_cycle_stack = offsets_before;
             self.glass_content = glass_before;
             self.leave_gap(inherited, true);
             cursor = gap_range.end.clone();

@@ -18,7 +18,7 @@ use crate::{
     PolychromeSprite, PresentOutcome, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, Rgba, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubscriberSet, Subscription,
+    OffsetCycle, OpacityCycle, SpriteEffect, StrikethroughStyle, Style, SubscriberSet, Subscription,
     TimeTransition,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
@@ -1581,6 +1581,7 @@ pub struct Window {
     pub(crate) frame_work: frame_work::FrameWorkCounters,
     pub(crate) opacity_cycle_stack: Vec<OpacityCycle>,
     pub(crate) rotation_animation_stack: Vec<crate::scene::RotationAnimation>,
+    pub(crate) offset_cycle_stack: Vec<OffsetCycle>,
     pub(crate) view_retention: view_retention::ViewRetention,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2671,6 +2672,7 @@ impl Window {
             frame_work: frame_work::FrameWorkCounters::default(),
             opacity_cycle_stack: Vec::new(),
             rotation_animation_stack: Vec::new(),
+            offset_cycle_stack: Vec::new(),
             view_retention: view_retention::ViewRetention::new(cx),
             element_opacity: 1.0,
             glass_content: false,
@@ -5530,6 +5532,20 @@ impl Window {
         result
     }
 
+    /// Moves every quad painted inside `f` with `cycle`, driven by the
+    /// window rather than by drawing again: the scene offsets each quad from
+    /// where it was painted before every present, and keeps presenting while
+    /// one is on screen. For a looping decorative motion (a bouncing loader)
+    /// that would otherwise redraw its whole window at its frame rate. The
+    /// quads are painted at rest; nested cycles do not compose.
+    pub fn with_offset_cycle<R>(&mut self, cycle: OffsetCycle, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint();
+        self.offset_cycle_stack.push(cycle);
+        let result = f(self);
+        self.offset_cycle_stack.pop();
+        result
+    }
+
     /// Turns every SVG painted inside `f` clockwise about its centre, one
     /// full turn per `period`, driven by the window rather than by drawing
     /// again: the scene sets each one's rotation before every present, and
@@ -6246,16 +6262,20 @@ impl Window {
             border_style: quad.border_style,
         };
 
-        if let Some(cycle) = self.opacity_cycle_stack.last().copied() {
+        let opacity_cycle = self.opacity_cycle_stack.last().copied();
+        let offset_cycle = self.offset_cycle_stack.last().copied();
+        if opacity_cycle.is_some() || offset_cycle.is_some() {
+            let scale_factor = self.scale_factor();
             let animation =
                 self.next_frame
                     .scene
-                    .push_quad_animation(crate::scene::QuadOpacityAnimation {
-                        cycle,
+                    .push_quad_animation(crate::scene::QuadAnimation {
+                        opacity: opacity_cycle,
+                        offset: offset_cycle.map(|cycle| cycle.scaled(scale_factor)),
                         background: quad.background,
                         border_color: quad.border_color,
                     });
-            let opacity = cycle.current_opacity();
+            let opacity = opacity_cycle.map_or(1.0, |cycle| cycle.current_opacity());
             self.next_frame.scene.insert_primitive(Quad {
                 background: quad
                     .background
