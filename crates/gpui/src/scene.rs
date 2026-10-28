@@ -1166,6 +1166,12 @@ impl Scene {
             || self.transitions_in_flight()
     }
 
+    /// Whether a time animation of this finished scene moves something (an
+    /// offset cycle), which a window presents at its faster motion rate.
+    pub fn has_motion_animations(&self) -> bool {
+        !self.offset_quads.is_empty()
+    }
+
     /// Moves every time-driven primitive of this finished scene to where it is
     /// now. Called before each present, so a frame replayed from a cached view
     /// shows the current phase rather than the one it was painted at.

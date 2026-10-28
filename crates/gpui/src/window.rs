@@ -1625,6 +1625,10 @@ pub struct Window {
     /// Whether the rendered scene moves with time on its own, so the window
     /// keeps presenting it while nothing redraws it.
     scene_animates: Rc<Cell<bool>>,
+    /// Whether that animation moves something (see
+    /// [`Scene::has_motion_animations`]), which presents at the faster
+    /// motion rate.
+    scene_moves: Rc<Cell<bool>>,
     /// Whether a transition in the rendered scene has yet to land, so the
     /// window presents it on every frame rather than at the time-animation
     /// rate.
@@ -2038,6 +2042,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let scene_animates = Rc::new(Cell::new(false));
+        let scene_moves = Rc::new(Cell::new(false));
         let scene_transitioning = Rc::new(Cell::new(false));
         let last_present_at = Rc::new(Cell::new(None));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -2159,6 +2164,7 @@ impl Window {
             let active = active.clone();
             let needs_present = needs_present.clone();
             let scene_animates = scene_animates.clone();
+            let scene_moves = scene_moves.clone();
             let scene_transitioning = scene_transitioning.clone();
             let last_present_at = last_present_at.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
@@ -2317,8 +2323,11 @@ impl Window {
                         && presented_within(time_transition_frame_interval()))
                     || (scene_animates.get()
                         && last_present_at.get().is_none_or(|last_present| {
-                            let interval =
-                                scene_animation_interval(active.get(), inactive_frame_interval);
+                            let interval = scene_animation_interval(
+                                active.get(),
+                                scene_moves.get(),
+                                inactive_frame_interval,
+                            );
                             // Frame requests arrive on vsync, so an interval
                             // that is a whole number of refreshes lands a hair
                             // early or late; without the slack, 30 fps on a
@@ -2423,6 +2432,7 @@ impl Window {
                     let next_step_scheduled = next_time_animation_present_at(
                         last_present_at.get(),
                         scene_animates.get(),
+                        scene_moves.get(),
                         scene_transitioning.get(),
                         active.get(),
                         inactive_frame_interval,
@@ -2707,6 +2717,7 @@ impl Window {
             hovered,
             needs_present,
             scene_animates,
+            scene_moves,
             scene_transitioning,
             last_present_at,
             input_rate_tracker,
@@ -2871,12 +2882,41 @@ fn time_animation_frame_interval() -> Duration {
 
 /// How often a scene that animates on its own presents: an inactive window
 /// never faster than its inactive frame interval.
-fn scene_animation_interval(active: bool, inactive_frame_interval: Option<Duration>) -> Duration {
-    if active {
-        time_animation_frame_interval()
+fn scene_animation_interval(
+    active: bool,
+    moves: bool,
+    inactive_frame_interval: Option<Duration>,
+) -> Duration {
+    let interval = if moves {
+        time_motion_frame_interval().min(time_animation_frame_interval())
     } else {
-        time_animation_frame_interval().max(inactive_frame_interval.unwrap_or_default())
+        time_animation_frame_interval()
+    };
+    if active {
+        interval
+    } else {
+        interval.max(inactive_frame_interval.unwrap_or_default())
     }
+}
+
+/// Sets how often a window whose scene moves something on its own (a
+/// bouncing loader's dots, see [`crate::OffsetCycle`]) presents it again
+/// while nothing redraws it. Defaults to 60 fps: a short repeating move steps
+/// visibly at the 30 fps a sweep or a pulse is presented at. Never slower
+/// than [`set_time_animation_frame_interval`]'s interval, and an inactive
+/// window never faster than its [`WindowOptions::inactive_frame_interval`].
+pub fn set_time_motion_frame_interval(interval: Duration) {
+    TIME_MOTION_FRAME_NANOS.store(
+        u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+static TIME_MOTION_FRAME_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(16_666_667);
+
+fn time_motion_frame_interval() -> Duration {
+    Duration::from_nanos(TIME_MOTION_FRAME_NANOS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// When the frame loop's next present of a scene that animates or
@@ -2886,6 +2926,7 @@ fn scene_animation_interval(active: bool, inactive_frame_interval: Option<Durati
 fn next_time_animation_present_at(
     last_present: Option<Instant>,
     animates: bool,
+    moves: bool,
     transitioning: bool,
     active: bool,
     inactive_frame_interval: Option<Duration>,
@@ -2895,7 +2936,7 @@ fn next_time_animation_present_at(
         last_present + interval.saturating_sub(TIME_ANIMATION_FRAME_SLACK)
     };
     let animation = animates
-        .then(|| due_after(scene_animation_interval(active, inactive_frame_interval)));
+        .then(|| due_after(scene_animation_interval(active, moves, inactive_frame_interval)));
     let transition = transitioning.then(|| due_after(time_transition_frame_interval()));
     match (animation, transition) {
         (Some(animation), Some(transition)) => Some(animation.min(transition)),
@@ -4441,6 +4482,8 @@ impl Window {
         }
         self.scene_animates
             .set(self.rendered_frame.scene.has_time_animations());
+        self.scene_moves
+            .set(self.rendered_frame.scene.has_motion_animations());
         self.scene_transitioning
             .set(self.rendered_frame.scene.transitions_in_flight());
         #[cfg(feature = "profiler")]
@@ -4624,6 +4667,8 @@ impl Window {
             .set(self.rendered_frame.scene.transitions_in_flight());
         self.scene_animates
             .set(self.rendered_frame.scene.has_time_animations());
+        self.scene_moves
+            .set(self.rendered_frame.scene.has_motion_animations());
         let previous_present_at = self.last_present_at.replace(Some(Instant::now()));
         let report = self.platform_window.draw_layered(
             &self.rendered_frame.scene,
@@ -11065,6 +11110,19 @@ mod tests {
     /// windows (macOS, Windows, X11) stop presenting while GPUI still wants
     /// presentation: high-rate input sustains presentation for a while after
     /// it stops.
+    /// A scene that moves something presents at the motion rate while the
+    /// window is active, never slower than a sweep, and an inactive window
+    /// keeps its cap.
+    #[test]
+    fn moving_scenes_present_at_the_motion_rate() {
+        let inactive = Some(Duration::from_millis(250));
+        let still = super::scene_animation_interval(true, false, inactive);
+        let moving = super::scene_animation_interval(true, true, inactive);
+        assert!(moving <= still);
+        assert_eq!(moving, super::time_motion_frame_interval().min(super::time_animation_frame_interval()));
+        assert_eq!(super::scene_animation_interval(false, true, inactive), Duration::from_millis(250));
+    }
+
     /// Input before the window lost focus no longer keeps it presenting at
     /// the display's rate once it is unfocused; input after does.
     #[gpui::test]
@@ -11308,7 +11366,7 @@ mod tests {
             test_window.frame_deadlines(),
             vec![
                 presented_at
-                    + super::scene_animation_interval(false, inactive_frame_interval)
+                    + super::scene_animation_interval(false, false, inactive_frame_interval)
                     - super::TIME_ANIMATION_FRAME_SLACK
             ],
             "the next step is asked for when its present falls due"
