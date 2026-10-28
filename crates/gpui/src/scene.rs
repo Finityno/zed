@@ -184,9 +184,6 @@ pub struct Scene {
     content_id: u64,
     /// When [`Self::advance_time_animations`] last ran on this content.
     last_advanced_at: Option<std::time::Instant>,
-    /// Whether the transitions this scene carries had already landed when
-    /// the advance before the latest one ran, so the latest moved nothing.
-    transitions_unmoved: bool,
     /// One tracker per vector above, in the order `clear` destructures them.
     shrink: [CapacityShrink; 15],
     /// Room `finish` sorts in, kept across frames.
@@ -244,7 +241,6 @@ impl Scene {
         self.transitioned.clear();
         self.transitions_end_at = None;
         self.last_advanced_at = None;
-        self.transitions_unmoved = false;
     }
 
     /// Shrinks this scene's vectors to twice the fill of `rendered`, the
@@ -706,6 +702,23 @@ impl Scene {
         });
     }
 
+    /// Inserts `quad` moving and fading with `transition` at `scale_factor`,
+    /// as a quad painted inside [`crate::Window::with_time_transition`] is, for a
+    /// renderer's tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_transitioned_quad(&mut self, quad: Quad, transition: TimeTransition, scale_factor: f32) {
+        let Some(id) = self.push_transition(SceneTransition {
+            transition,
+            scale_factor,
+            parent: 0,
+        }) else {
+            return;
+        };
+        let outer = self.set_current_transition(id);
+        self.insert_primitive(quad);
+        self.set_current_transition(outer);
+    }
+
     /// Registers a continuous turn for one sprite, returning the value its
     /// [`SpriteEffect::animation`] should carry.
     pub(crate) fn push_rotation_animation(&mut self, animation: RotationAnimation) -> u32 {
@@ -1085,7 +1098,6 @@ impl Scene {
         self.gather_transitioned();
         self.content_id = NEXT_SCENE_CONTENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.last_advanced_at = None;
-        self.transitions_unmoved = false;
     }
 
     fn gather_transitioned(&mut self) {
@@ -1182,11 +1194,6 @@ impl Scene {
     /// shows the current phase rather than the one it was painted at.
     pub fn advance_time_animations(&mut self) {
         let now = std::time::Instant::now();
-        self.transitions_unmoved = self.transitions.is_empty()
-            || self
-                .transitions_end_at
-                .zip(self.last_advanced_at)
-                .is_some_and(|(end, last_advanced_at)| last_advanced_at >= end);
         self.last_advanced_at = Some(now);
         if !self.has_time_animations() && self.transitioned.is_empty() {
             return;
@@ -1263,30 +1270,52 @@ impl Scene {
         self.content_id
     }
 
+    /// When [`Self::advance_time_animations`] last ran on this content, which
+    /// a renderer keeps with what it presents to pass back to
+    /// [`Self::time_animation_damage`].
+    pub fn last_advanced_at(&self) -> Option<std::time::Instant> {
+        self.last_advanced_at
+    }
+
     /// Where the latest [`Self::advance_time_animations`] can have changed
-    /// what this scene draws, as device-pixel rectangles inside `viewport`
-    /// that do not overlap. A renderer still showing this content from its
-    /// previous present needs to draw only those and can copy the rest of
-    /// the frame over, which for a shimmering label or a pulsing spinner is a
-    /// sliver of the window instead of all of it.
+    /// what this scene draws since this content was presented as advanced
+    /// at `presented_at`, as device-pixel rectangles inside `viewport` that
+    /// do not overlap. A renderer still showing that present needs to draw
+    /// only those and can copy the rest of the frame over, which for a
+    /// shimmering label or a pulsing spinner is a sliver of the window
+    /// instead of all of it.
+    ///
+    /// A transition still moving damages what it carries where the present
+    /// showed it and where it is now, so a row easing in moves a row's
+    /// worth of the window rather than all of it.
     ///
     /// A rectangle that reaches a backdrop blur covers all of it, so the blur
     /// can frost it again from what the rectangle redraws beneath it.
     ///
     /// `false` when the change cannot be bounded that way: no advance has
-    /// run on this content yet, a transition was still moving, a moving
-    /// sprite is transformed, or the rectangles cover so much of the viewport
-    /// that drawing everything costs about the same.
+    /// run on this content yet or the present's is unknown, a moving sprite
+    /// is transformed, or the rectangles cover so much of the viewport that
+    /// drawing everything costs about the same.
     pub fn time_animation_damage(
         &self,
         viewport: Size<DevicePixels>,
+        presented_at: Option<std::time::Instant>,
         damage: &mut Vec<Bounds<DevicePixels>>,
     ) -> bool {
         damage.clear();
-        if self.last_advanced_at.is_none() || !self.transitions_unmoved {
+        if self.last_advanced_at.is_none() {
             return false;
         }
+        let Some(presented_at) = presented_at else {
+            return false;
+        };
         let mut rects = Vec::new();
+        if !self.transitions.is_empty()
+            && !self.transitions_end_at.is_some_and(|end| presented_at >= end)
+            && !self.transition_damage(presented_at, viewport, &mut rects)
+        {
+            return false;
+        }
         for sprite in self
             .animated_monochrome_sprites
             .iter()
@@ -1370,6 +1399,132 @@ impl Scene {
         }
         damage.extend(merged.iter().map(DamageRect::to_bounds));
         true
+    }
+
+    /// Adds to `rects` where each transition that moved or faded since
+    /// `presented_at` drew what it carries then and at the latest advance.
+    /// `false` if the transitions were not advanced with this content.
+    fn transition_damage(
+        &self,
+        presented_at: std::time::Instant,
+        viewport: Size<DevicePixels>,
+        rects: &mut Vec<DamageRect>,
+    ) -> bool {
+        // The states of the latest advance, which also put every primitive
+        // where it is now.
+        let now = &self.transition_states;
+        if now.len() != self.transitions.len() {
+            return false;
+        }
+        let then = self.composed_transition_states(presented_at);
+        // How far back to where the present showed it, if it changed.
+        let back = |transition: u32| -> Option<Point<ScaledPixels>> {
+            let index = transition as usize - 1;
+            (then[index] != now[index]).then(|| then[index].0 - now[index].0)
+        };
+        let mut push_both = |extent: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>, back: Point<ScaledPixels>| {
+            rects.extend(DamageRect::covering(&extent, mask, viewport));
+            if back != Point::default() {
+                let extent = Bounds { origin: extent.origin + back, size: extent.size };
+                rects.extend(DamageRect::covering(&extent, mask, viewport));
+            }
+        };
+        let unmasked = ContentMask {
+            bounds: Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: ScaledPixels(viewport.width.0 as f32),
+                    height: ScaledPixels(viewport.height.0 as f32),
+                },
+            },
+        };
+        // A clip that moves shows and hides what it holds along its edges,
+        // whether or not that moves with it.
+        for clip in &self.rounded_clips {
+            if clip.transition != 0
+                && let Some(back) = back(clip.transition)
+            {
+                push_both(clip.bounds, &unmasked, back);
+            }
+        }
+        for primitive in &self.transitioned {
+            let Some(back) = back(primitive.transition) else {
+                continue;
+            };
+            let (extent, mask) = match primitive.target {
+                TransitionTarget::MonochromeSprite { index, .. } => {
+                    let sprite = &self.monochrome_sprites[index as usize];
+                    if sprite.transformation != TransformationMatrix::unit() {
+                        return false;
+                    }
+                    (sprite.bounds, &sprite.content_mask)
+                }
+                TransitionTarget::SubpixelSprite { index, .. } => {
+                    let sprite = &self.subpixel_sprites[index as usize];
+                    if sprite.transformation != TransformationMatrix::unit() {
+                        return false;
+                    }
+                    (sprite.bounds, &sprite.content_mask)
+                }
+                TransitionTarget::PolychromeSprite { index, .. } => {
+                    let sprite = &self.polychrome_sprites[index as usize];
+                    (sprite.bounds, &sprite.content_mask)
+                }
+                TransitionTarget::Underline { index, .. } => {
+                    let underline = &self.underlines[index as usize];
+                    (underline.bounds.dilate(underline.thickness), &underline.content_mask)
+                }
+                // A drop shadow is blurred out to three radii past its
+                // bounds by the shader; an inset one, whose bounds are the
+                // hole it leaves, draws across the element.
+                TransitionTarget::Shadow { index, .. } => {
+                    let shadow = &self.shadows[index as usize];
+                    let extent = if shadow.inset != 0 {
+                        shadow.element_bounds
+                    } else {
+                        shadow.bounds.dilate(shadow.blur_radius * 3.)
+                    };
+                    (extent, &shadow.content_mask)
+                }
+                // A bouncing quad sweeps its whole cycle from where the
+                // transition rests it, at either time; its bounds hold
+                // this present's phase on top.
+                TransitionTarget::Quad { index, .. } => {
+                    let quad = &self.quads[index as usize];
+                    // `finish` lists the bouncing quads in quad order.
+                    let swept = self.quad_offset(quad).and_then(|offset| {
+                        let position = self
+                            .offset_quads
+                            .binary_search_by_key(&index, |offset_quad| offset_quad.index)
+                            .ok()?;
+                        Some(offset.swept(&quad.bounds, Some(self.offset_quads[position].rest_origin)))
+                    });
+                    let extent = swept.unwrap_or(quad.bounds);
+                    (extent, &quad.content_mask)
+                }
+            };
+            push_both(extent, mask, back);
+        }
+        true
+    }
+
+    /// Each transition's offset and opacity at `at`, composed with the
+    /// transitions it is inside, as [`Self::advance_transitions`] composes
+    /// them.
+    fn composed_transition_states(&self, at: std::time::Instant) -> Vec<(Point<ScaledPixels>, f32)> {
+        let mut states: Vec<(Point<ScaledPixels>, f32)> = Vec::with_capacity(self.transitions.len());
+        for transition in &self.transitions {
+            let own = (transition.offset_at(at), transition.transition.opacity_at(at));
+            let composed = match transition.parent {
+                0 => own,
+                parent => {
+                    let (offset, opacity) = states[parent as usize - 1];
+                    (own.0 + offset, own.1 * opacity)
+                }
+            };
+            states.push(composed);
+        }
+        states
     }
 
     /// The offset cycle `quad` moves with, if any.
@@ -3046,12 +3201,12 @@ mod tests {
         let viewport = device_viewport(1000, 1000);
         let mut damage = Vec::new();
         assert!(
-            !scene.time_animation_damage(viewport, &mut damage),
+            !scene.time_animation_damage(viewport, scene.last_advanced_at(), &mut damage),
             "nothing to compare against before the first advance"
         );
 
         scene.advance_time_animations();
-        assert!(scene.time_animation_damage(viewport, &mut damage));
+        assert!(scene.time_animation_damage(viewport, scene.last_advanced_at(), &mut damage));
         damage.sort_by_key(|rect| rect.origin.y.0);
         assert_eq!(
             damage,
@@ -3071,7 +3226,7 @@ mod tests {
         scene.finish();
         scene.advance_time_animations();
         let mut damage = Vec::new();
-        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), scene.last_advanced_at(), &mut damage));
         assert_eq!(damage, vec![device_rect(0, 0, 47, 31)]);
     }
 
@@ -3097,7 +3252,7 @@ mod tests {
         scene.finish();
         scene.advance_time_animations();
         let mut damage = Vec::new();
-        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), scene.last_advanced_at(), &mut damage));
         assert_eq!(
             damage,
             vec![device_rect(399, 399, 446, 426)],
@@ -3111,45 +3266,185 @@ mod tests {
         scene.finish();
         scene.advance_time_animations();
         let mut damage = Vec::new();
-        assert!(scene.time_animation_damage(device_viewport(100, 100), &mut damage));
-        assert!(!scene.time_animation_damage(device_viewport(14, 14), &mut damage));
+        assert!(scene.time_animation_damage(device_viewport(100, 100), scene.last_advanced_at(), &mut damage));
+        assert!(!scene.time_animation_damage(device_viewport(14, 14), scene.last_advanced_at(), &mut damage));
     }
 
-    /// A moving transition shifts whatever it covers, so its present cannot
-    /// be bounded; once it has landed before an advance, the next one moves
-    /// nothing and the shimmer alone is damaged again.
+    /// A transition still moving between a present and the next damages
+    /// what it carries where the present showed it and where it is now; one
+    /// that landed before the present damages nothing.
     #[test]
-    fn damage_is_unbounded_until_transitions_have_landed() {
+    fn a_moving_transition_damages_where_it_was_and_where_it_is() {
         let viewport = device_viewport(1000, 1000);
         let mut damage = Vec::new();
-
-        let mut moving = shimmer_scene_with_glyphs_at(&[(100., 100.)]);
-        let Some(transition) = moving.push_transition(rolling_in(std::time::Instant::now())) else {
-            panic!("a first transition always fits");
+        let whole_window = ContentMask {
+            bounds: Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: ScaledPixels(1000.),
+                    height: ScaledPixels(1000.),
+                },
+            },
         };
-        moving.set_current_transition(transition);
-        moving.insert_primitive(shimmering_glyph(0));
-        moving.finish();
-        moving.advance_time_animations();
-        moving.advance_time_animations();
-        assert!(!moving.time_animation_damage(viewport, &mut damage));
+        let rolling_glyph = |scene: &mut Scene, started_at| {
+            let Some(transition) = scene.push_transition(rolling_in(started_at)) else {
+                panic!("a first transition always fits");
+            };
+            scene.set_current_transition(transition);
+            scene.insert_primitive(MonochromeSprite {
+                bounds: Bounds {
+                    origin: point(ScaledPixels(500.), ScaledPixels(500.)),
+                    size: unit_bounds().size,
+                },
+                content_mask: whole_window,
+                ..shimmering_glyph(0)
+            });
+        };
 
         let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let mut landed = shimmer_scene_with_glyphs_at(&[(100., 100.)]);
-        let Some(transition) = landed.push_transition(rolling_in(landed_at)) else {
+        let mut scene = shimmer_scene_with_glyphs_at(&[(100., 100.)]);
+        rolling_glyph(&mut scene, landed_at);
+        scene.finish();
+        scene.advance_time_animations();
+        assert!(
+            !scene.time_animation_damage(viewport, None, &mut damage),
+            "nothing to compare against without the present's advance"
+        );
+        assert!(scene.time_animation_damage(viewport, scene.last_advanced_at(), &mut damage));
+        assert_eq!(damage, vec![device_rect(99, 99, 111, 111)], "landed before the present");
+
+        // Presented as the transition began, 10 px (20 device pixels) below
+        // where it rests and fully faded.
+        assert!(scene.time_animation_damage(viewport, Some(landed_at), &mut damage));
+        damage.sort_by_key(|rect| rect.origin.y.0);
+        assert_eq!(
+            damage,
+            vec![device_rect(99, 99, 111, 111), device_rect(499, 499, 511, 531)],
+            "the glyph where it rests now and where the present drew it"
+        );
+    }
+
+    /// A transition inside another moves with it, so what it carries is
+    /// damaged where the two together put it.
+    #[test]
+    fn a_nested_transition_is_damaged_where_its_parents_put_it() {
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+        let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut scene = Scene::default();
+        let Some(parent) = scene.push_transition(rolling_in(landed_at)) else {
             panic!("a first transition always fits");
         };
-        landed.set_current_transition(transition);
-        landed.insert_primitive(shimmering_glyph(0));
-        landed.finish();
-        landed.advance_time_animations();
+        let Some(child) = scene.push_transition(sliding(landed_at, parent)) else {
+            panic!("a second transition fits");
+        };
+        scene.set_current_transition(child);
+        let bounds = Bounds {
+            origin: point(ScaledPixels(500.), ScaledPixels(500.)),
+            size: unit_bounds().size,
+        };
+        scene.insert_primitive(MonochromeSprite {
+            bounds,
+            content_mask: ContentMask {
+                bounds: bounds.dilate(ScaledPixels(200.)),
+            },
+            ..shimmering_glyph(0)
+        });
+        scene.finish();
+        scene.advance_time_animations();
+        let then = scene.composed_transition_states(landed_at)[child as usize - 1].0;
+        assert!(then.x != ScaledPixels(0.) && then.y != ScaledPixels(0.), "{then:?}");
+        assert!(scene.time_animation_damage(viewport, Some(landed_at), &mut damage));
+        let at = |offset: Point<ScaledPixels>| {
+            DamageRect::from_scaled(&Bounds { origin: bounds.origin + offset, size: bounds.size }).to_bounds()
+        };
+        for expected in [at(Point::default()), at(then)] {
+            assert!(
+                damage.iter().any(|rect| rect.intersect(&expected) == expected),
+                "{expected:?} not inside {damage:?}"
+            );
+        }
+    }
+
+    fn assert_damage_covers(damage: &[Bounds<DevicePixels>], expected: Bounds<ScaledPixels>) {
+        let expected = DamageRect::from_scaled(&expected).to_bounds();
         assert!(
-            !landed.time_animation_damage(viewport, &mut damage),
-            "the first advance after a draw may still have moved it"
+            damage.iter().any(|rect| rect.intersect(&expected) == expected),
+            "{expected:?} not inside {damage:?}"
         );
-        landed.advance_time_animations();
-        assert!(landed.time_animation_damage(viewport, &mut damage));
-        assert_eq!(damage, vec![device_rect(99, 99, 111, 111)]);
+    }
+
+    /// An inset shadow draws across its element, not inside the hole its
+    /// bounds leave, so a fade of it damages the whole element.
+    #[test]
+    fn a_fading_inset_shadow_damages_its_element() {
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+        let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut scene = Scene::default();
+        let Some(transition) = scene.push_transition(rolling_in(landed_at)) else {
+            panic!("a first transition always fits");
+        };
+        scene.set_current_transition(transition);
+        let element = Bounds {
+            origin: point(ScaledPixels(400.), ScaledPixels(400.)),
+            size: Size {
+                width: ScaledPixels(100.),
+                height: ScaledPixels(60.),
+            },
+        };
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: element.dilate(ScaledPixels(-20.)),
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: element.dilate(ScaledPixels(100.)),
+            },
+            color: crate::black(),
+            element_bounds: element,
+            element_corner_radii: Corners::default(),
+            inset: 1,
+            pad: 0,
+            rounded_clip: 0,
+            clip_padding: 0,
+        });
+        scene.finish();
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(viewport, Some(landed_at), &mut damage));
+        assert_damage_covers(&damage, element);
+    }
+
+    /// A bouncing quad inside a moving transition sweeps its whole cycle
+    /// from where the transition rested it at the present and now, whatever
+    /// phase each present caught it in.
+    #[test]
+    fn a_bouncing_quad_in_a_moving_transition_damages_both_sweeps() {
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+        let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut scene = Scene::default();
+        let Some(transition) = scene.push_transition(rolling_in(landed_at)) else {
+            panic!("a first transition always fits");
+        };
+        scene.set_current_transition(transition);
+        let quad = bouncing_quad(&mut scene, 0.25);
+        let bounds = quad.bounds;
+        scene.insert_primitive(quad);
+        scene.finish();
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(viewport, Some(landed_at), &mut damage));
+        // Rests at y 200 now and 20 device pixels lower at the present;
+        // bounces up to 18 above either.
+        let sweep_from = |y: f32| Bounds {
+            origin: point(bounds.origin.x, ScaledPixels(y - 18.)),
+            size: Size {
+                width: bounds.size.width,
+                height: bounds.size.height + ScaledPixels(18.),
+            },
+        };
+        assert_damage_covers(&damage, sweep_from(200.));
+        assert_damage_covers(&damage, sweep_from(220.));
     }
 
     fn turning_sprite(scene: &mut Scene, period_ms: u64) -> MonochromeSprite {
@@ -3389,7 +3684,7 @@ mod tests {
         scene.finish();
         scene.advance_time_animations();
         let mut damage = Vec::new();
-        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), scene.last_advanced_at(), &mut damage));
         // Centre (110, 210), half-diagonal 14.14, a pixel of slack.
         assert_eq!(damage, vec![device_rect(94, 194, 126, 226)]);
     }
@@ -3461,7 +3756,7 @@ mod tests {
             assert_eq!(origin.y.0.fract(), 0., "moves by whole device pixels");
         }
         let mut damage = Vec::new();
-        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), scene.last_advanced_at(), &mut damage));
         assert_eq!(damage, vec![device_rect(99, 181, 109, 209)]);
     }
 
@@ -3493,7 +3788,7 @@ mod tests {
             assert!(scene.quads[0].bounds.origin.x.0 >= 199.9, "moved with the transition");
         }
         let mut damage = Vec::new();
-        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), scene.last_advanced_at(), &mut damage));
         assert_eq!(damage, vec![device_rect(199, 181, 209, 209)]);
     }
 
