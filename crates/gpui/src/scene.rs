@@ -1491,15 +1491,15 @@ impl Scene {
                 // this present's phase on top.
                 TransitionTarget::Quad { index, .. } => {
                     let quad = &self.quads[index as usize];
-                    let extent = match (
-                        self.quad_offset(quad),
-                        self.offset_quads.iter().find(|offset_quad| offset_quad.index == index),
-                    ) {
-                        (Some(offset), Some(offset_quad)) => {
-                            offset.swept(&quad.bounds, Some(offset_quad.rest_origin))
-                        }
-                        _ => quad.bounds,
-                    };
+                    // `finish` lists the bouncing quads in quad order.
+                    let swept = self.quad_offset(quad).and_then(|offset| {
+                        let position = self
+                            .offset_quads
+                            .binary_search_by_key(&index, |offset_quad| offset_quad.index)
+                            .ok()?;
+                        Some(offset.swept(&quad.bounds, Some(self.offset_quads[position].rest_origin)))
+                    });
+                    let extent = swept.unwrap_or(quad.bounds);
                     (extent, &quad.content_mask)
                 }
             };
