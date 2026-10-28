@@ -559,6 +559,38 @@ struct QuadVarying {
     @location(4) @interpolate(flat) background_color0: vec4<f32>,
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
     @location(6) @interpolate(flat) rounded_clip: u32,
+    @location(7) @interpolate(flat) solid_interior: vec4<f32>,
+}
+
+// Whether `bounds` lies where a float resolves well under the margins the
+// shortcuts below keep: below 2^18 a coordinate's step is 1/32 of a pixel,
+// so computing an edge directly and computing it through a centre and half
+// size, as the distance fields do, cannot disagree across them.
+fn coordinates_are_precise(bounds: Bounds) -> bool {
+    let limit = 262144.0;
+    let far = bounds.origin + bounds.size;
+    let reach = max(max(abs(bounds.origin.x), abs(bounds.origin.y)), max(abs(far.x), abs(far.y)));
+    return reach < limit;
+}
+
+// The rectangle, as (left, top, right, bottom) in device pixels, in which
+// every pixel of a solid-filled quad is its plain background: farther from
+// each edge than any corner radius and any border reaches, with a pixel to
+// spare for antialiasing (an unrounded, borderless quad has neither, so all
+// of it). Empty for every other fill, whose colour depends on the position.
+// The fragment shader returns the background there without loading the
+// quad or evaluating its outline.
+fn quad_solid_interior(quad: Quad) -> vec4<f32> {
+    if (quad.background.tag != 0u || !coordinates_are_precise(quad.bounds)) {
+        return vec4<f32>(1.0, 1.0, 0.0, 0.0);
+    }
+    let radius = max(max(quad.corner_radii.top_left, quad.corner_radii.top_right),
+                     max(quad.corner_radii.bottom_right, quad.corner_radii.bottom_left));
+    let border = max(max(quad.border_widths.top, quad.border_widths.right),
+                     max(quad.border_widths.bottom, quad.border_widths.left));
+    let inset = select(max(radius, border) + 1.0, 0.0, radius == 0.0 && border == 0.0);
+    let far = quad.bounds.origin + quad.bounds.size;
+    return vec4<f32>(quad.bounds.origin + vec2<f32>(inset), far - vec2<f32>(inset));
 }
 
 @vertex
@@ -584,6 +616,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.quad_id = quad_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     out.rounded_clip = quad.rounded_clip;
+    out.solid_interior = quad_solid_interior(quad);
     return out;
 }
 
@@ -592,6 +625,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return rounded_clip_color(vec4<f32>(0.0), rounded_clip_coverage(input.rounded_clip, input.position.xy));
+    }
+
+    let position = input.position.xy;
+    if (position.x > input.solid_interior.x && position.y > input.solid_interior.y &&
+            position.x < input.solid_interior.z && position.y < input.solid_interior.w) {
+        return rounded_clip_color(blend_color(input.background_solid, 1.0), rounded_clip_coverage(input.rounded_clip, position));
     }
 
     let quad = load_quad(input.quad_id);
@@ -1710,9 +1749,18 @@ fn rounded_clip_coverage(first: u32, position: vec2<f32>) -> f32 {
         let offset = (index - 1u) * 3u;
         let rectangle = bitcast<vec4<f32>>(rounded_clip_texel(offset));
         let radii = bitcast<vec4<f32>>(rounded_clip_texel(offset + 1u));
-        let distance = quad_sdf(position, Bounds(rectangle.xy, rectangle.zw),
-            Corners(radii.x, radii.y, radii.z, radii.w));
-        coverage = min(coverage, saturate(0.5 - distance));
+        let bounds = Bounds(rectangle.xy, rectangle.zw);
+        // A point farther inside every edge than any corner reaches, and than
+        // the antialiasing ramp, is fully covered: its distance field is at
+        // most -0.5. Most of a clipped card's pixels are, so they skip it.
+        let inset = max(max(max(radii.x, radii.y), max(radii.z, radii.w)), 0.5) + 0.25;
+        let interior = coordinates_are_precise(bounds) &&
+            all(position > bounds.origin + vec2<f32>(inset)) &&
+            all(position < bounds.origin + bounds.size - vec2<f32>(inset));
+        if (!interior) {
+            let distance = quad_sdf(position, bounds, Corners(radii.x, radii.y, radii.z, radii.w));
+            coverage = min(coverage, saturate(0.5 - distance));
+        }
         index = rounded_clip_texel(offset + 2u).x;
     }
     return coverage;
