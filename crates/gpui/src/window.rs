@@ -2866,9 +2866,10 @@ static TIME_ANIMATION_FRAME_NANOS: std::sync::atomic::AtomicU64 =
 /// 30 fps. An inactive window never goes faster than its
 /// [`WindowOptions::inactive_frame_interval`].
 ///
-/// These frames render, lay out and paint nothing, but each one still encodes
-/// and rasterizes the whole scene on the GPU, so an app in the background may
-/// want to slow them down.
+/// These frames render, lay out and paint nothing, but each one still uploads
+/// and encodes the whole scene, and rasterizes whatever its animations reach
+/// (all of it on renderers without partial presents), so an app in the
+/// background may want to slow them down.
 pub fn set_time_animation_frame_interval(interval: Duration) {
     TIME_ANIMATION_FRAME_NANOS.store(
         u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
