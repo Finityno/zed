@@ -3370,8 +3370,19 @@ fn gpu_attribution_line(
     let (Some(full), Some(clear)) = (median(0), median(ATTRIBUTED_ALL)) else {
         return None;
     };
+    let window = Bounds {
+        origin: Point::default(),
+        size: gpui::size(
+            ScaledPixels(viewport_size.width.0 as f32),
+            ScaledPixels(viewport_size.height.0 as f32),
+        ),
+    };
+    // What reaches the window: content masks are not clipped to it.
+    let visible = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+        bounds.intersect(&mask.bounds).intersect(&window)
+    };
     let area = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
-        let visible = bounds.intersect(&mask.bounds);
+        let visible = visible(bounds, mask);
         (visible.size.width.0.max(0.) * visible.size.height.0.max(0.)) as f64
     };
     let quads = |indices: &[u32]| {
@@ -3431,7 +3442,7 @@ fn gpu_attribution_line(
     largest.sort_by(|a, b| b.0.total_cmp(&a.0));
     line.push_str(" | largest blended quads:");
     for (covered, quad) in largest.iter().take(ATTRIBUTION_LARGEST_QUADS) {
-        let visible = quad.bounds.intersect(&quad.content_mask.bounds);
+        let visible = visible(&quad.bounds, &quad.content_mask);
         let fill = match quad.background.as_solid() {
             Some(solid) => format!("a{:.2}", solid.a),
             None => "gradient/pattern".to_string(),
@@ -6775,9 +6786,10 @@ mod quad_shader_tests {
         }
     }
 
-    /// A translucent window: a frosted-glass backdrop, a sidebar and a main
-    /// card over it, a header band, and the cards of a transcript, rounded
-    /// and bordered, several of them inside a rounded clip.
+    /// A translucent window's quads: a translucent backdrop, a sidebar and a
+    /// main card over it, a header band, and the cards of a transcript,
+    /// rounded and bordered, several of them inside a rounded clip. No
+    /// backdrop blur: this times the quad stack alone.
     fn translucent_window(size: Size<DevicePixels>) -> Scene {
         let (width, height) = (size.width.0 as f32, size.height.0 as f32);
         let mut scene = Scene::default();
