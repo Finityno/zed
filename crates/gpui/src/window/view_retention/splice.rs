@@ -47,7 +47,7 @@ use crate::{
     key_dispatch::DispatchNodeId, view::ViewName,
 };
 use smallvec::SmallVec;
-use std::{mem, ops::Range};
+use std::{mem, ops::Range, time::Instant};
 
 /// A view laid out as it was last frame, to be drawn again around the nested
 /// views at `gaps`, all records of the last frame.
@@ -621,9 +621,31 @@ impl Window {
             gaps,
             checked,
         } = splice;
-        let (prepaint_range, last, dependencies, own_hovers) = {
+        let (prepaint_range, last, dependencies, own_hovers, deadline) = {
             let source = &self.rendered_frame.retained_views;
             let record = &source.records[previous];
+            // The earliest deadline of the views copied, not the record's,
+            // which counts the gaps': a gap built because its deadline
+            // passed says when it changes next as it is built, and the one it
+            // replaced, already past, would ask for a frame at once, and so
+            // on every frame for as long as the view is spliced. The views
+            // around it read the same deadline, or they would be built at
+            // the next frame for one nothing in them still has.
+            let mut deadline: Option<Instant> = None;
+            // The gaps were found in record order, so the walk meets them in
+            // turn.
+            let mut next_gaps = gaps.iter().peekable();
+            let mut index = previous;
+            while index <= previous + record.nested {
+                if next_gaps.next_if_eq(&&index).is_some() {
+                    index += source.records[index].nested + 1;
+                    continue;
+                }
+                if let Some(at) = source.records[index].own_dependencies.rebuild_at {
+                    deadline = Some(deadline.map_or(at, |earliest| earliest.min(at)));
+                }
+                index += 1;
+            }
             // The nodes the copied views laid out as they prepainted, and
             // their layouts' nodes; the gaps claim theirs as they are built.
             if let Some(engine) = self.layout_engine.as_mut() {
@@ -647,14 +669,17 @@ impl Window {
                     retention.nested_keys.push(keys_before..keys_after);
                 }
             }
+            let mut dependencies = record.dependencies.clone();
+            dependencies.rebuild_at = deadline;
             (
                 record.prepaint_range.clone(),
                 previous + record.nested,
-                record.dependencies.clone(),
+                dependencies,
                 record.own_hovers.clone(),
+                deadline,
             )
         };
-        if let Some(deadline) = dependencies.rebuild_at {
+        if let Some(deadline) = deadline {
             self.rebuild_at(deadline);
         }
         // What the view and the views copied with it read is read again; the

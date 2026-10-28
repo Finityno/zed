@@ -1110,6 +1110,135 @@ fn a_view_is_built_again_at_the_time_it_asked_for() {
     assert!(after.view_rebuilds.deadline >= 1, "{after:?}");
 }
 
+/// A view spliced around a gap built at its deadline asks for its next frame
+/// at the gap's next deadline, not again at the one that just passed, which
+/// would draw the window on every frame.
+#[test]
+fn a_spliced_view_does_not_ask_again_for_a_passed_deadline() {
+    let mut cx = TestAppContext::single();
+    let (window, _) = shell_window(&mut cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    draw(&mut cx, window);
+    let work = work_after(&mut cx, window, |cx| {
+        cx.executor().advance_clock(Duration::from_millis(1100));
+    });
+    assert!(work.view_rebuilds.deadline >= 1, "{work:?}");
+    assert!(work.views_spliced >= 1, "{work:?}");
+    assert_eq!(work.frames, 1, "{work:?}");
+    let next_frame_in_future = cx
+        .update_window(window.into(), |_, window, cx| {
+            let now = cx.background_executor().now();
+            window
+                .view_retention
+                .deadline_frame
+                .as_ref()
+                .map(|(deadline, _)| *deadline > now)
+        })
+        .unwrap();
+    assert_eq!(next_frame_in_future, Some(true));
+}
+
+/// A clock nested two views down, beside a view that changes on its own.
+struct ClockHost {
+    outer: Entity<ClockOuter>,
+    other: Entity<Panel>,
+}
+
+struct ClockOuter {
+    middle: Entity<ClockMiddle>,
+    value: usize,
+}
+
+struct ClockMiddle {
+    clock: Entity<Clock>,
+    leaf: Entity<Panel>,
+}
+
+struct Clock {
+    started_at: Instant,
+}
+
+impl Render for ClockHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().flex().child(self.outer.clone()).child(self.other.clone())
+    }
+}
+
+impl Render for ClockOuter {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_col()
+            .child(SharedString::from(format!("outer {}", self.value)))
+            .child(self.middle.clone())
+    }
+}
+
+impl Render for ClockMiddle {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().flex_col().child(self.clock.clone()).child(self.leaf.clone())
+    }
+}
+
+impl Render for Clock {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let elapsed = cx
+            .background_executor()
+            .now()
+            .saturating_duration_since(self.started_at)
+            .as_secs();
+        window.rebuild_at(self.started_at + Duration::from_secs(elapsed + 1));
+        div().child(SharedString::from(format!("{elapsed}s ago")))
+    }
+}
+
+/// A view built in the frame a view inside it is spliced around a clock
+/// built at its deadline reads the clock's next deadline, not the one that
+/// passed: a frame drawn for something else before the next deadline draws
+/// it again rather than building it for a deadline nothing in it has.
+#[test]
+fn a_view_around_a_splice_reads_the_clocks_next_deadline() {
+    let mut cx = TestAppContext::single();
+    cx.update(|cx| cx.set_view_retention(true));
+    let started_at = cx.executor().now();
+    let window = cx.add_window(|_, cx| {
+        let clock = cx.new(|_| Clock { started_at });
+        let leaf = cx.new(|_| Panel { ix: 0, value: 0 });
+        let middle = cx.new(|_| ClockMiddle { clock, leaf });
+        ClockHost {
+            outer: cx.new(|_| ClockOuter { middle, value: 0 }),
+            other: cx.new(|_| Panel { ix: 1, value: 0 }),
+        }
+    });
+    for _ in 0..2 {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+    let (outer, other) = window
+        .read_with(&cx, |host, _| (host.outer.clone(), host.other.clone()))
+        .unwrap();
+    let work = work_after(&mut cx, window, |cx| {
+        outer.update(cx, |outer, cx| {
+            outer.value += 1;
+            cx.notify();
+        });
+        cx.executor().advance_clock(Duration::from_millis(1100));
+    });
+    assert!(work.view_rebuilds.deadline >= 1, "{work:?}");
+    assert!(work.views_spliced >= 1, "{work:?}");
+    cx.executor().advance_clock(Duration::from_millis(100));
+    let work = work_after(&mut cx, window, |cx| {
+        other.update(cx, |other, cx| {
+            other.value += 1;
+            cx.notify();
+        });
+    });
+    assert_eq!(work.view_rebuilds.deadline, 0, "{work:?}");
+}
+
 /// Views recorded before fonts were added shaped their text without them,
 /// so the first frame after is built whole, and the one after that draws
 /// views again.
