@@ -628,7 +628,9 @@ impl Window {
             // which counts the gaps': a gap built because its deadline
             // passed says when it changes next as it is built, and the one it
             // replaced, already past, would ask for a frame at once, and so
-            // on every frame for as long as the view is spliced.
+            // on every frame for as long as the view is spliced. The views
+            // around it read the same deadline, or they would be built at
+            // the next frame for one nothing in them still has.
             let mut deadline: Option<Instant> = None;
             let mut index = previous;
             while index <= previous + record.nested {
@@ -664,10 +666,12 @@ impl Window {
                     retention.nested_keys.push(keys_before..keys_after);
                 }
             }
+            let mut dependencies = record.dependencies.clone();
+            dependencies.rebuild_at = deadline;
             (
                 record.prepaint_range.clone(),
                 previous + record.nested,
-                record.dependencies.clone(),
+                dependencies,
                 record.own_hovers.clone(),
                 deadline,
             )
