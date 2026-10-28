@@ -580,8 +580,15 @@ impl Scene {
         if primitive.rounded_clip() == 0 {
             primitive.set_rounded_clip(self.current_rounded_clip);
         }
-        let clipped_bounds = primitive_extent(&primitive)
-            .intersect(&primitive.content_mask().bounds);
+        // A turning sprite reaches the square it sweeps, not just its own
+        // rectangle, so that is what it is culled and ordered by.
+        let reach = match &primitive {
+            Primitive::MonochromeSprite(sprite) if sprite.effect.animation & ROTATION_ANIMATION != 0 => {
+                swept_by_turning(&sprite.bounds)
+            }
+            primitive => *primitive.bounds(),
+        };
+        let clipped_bounds = reach.intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
             // The second place a single glyph can vanish with nothing logged (the first is the
