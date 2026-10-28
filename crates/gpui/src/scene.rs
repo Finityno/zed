@@ -1474,14 +1474,33 @@ impl Scene {
                     let underline = &self.underlines[index as usize];
                     (underline.bounds.dilate(underline.thickness), &underline.content_mask)
                 }
-                // Blurred out to three radii past its bounds by the shader.
+                // A drop shadow is blurred out to three radii past its
+                // bounds by the shader; an inset one, whose bounds are the
+                // hole it leaves, draws across the element.
                 TransitionTarget::Shadow { index, .. } => {
                     let shadow = &self.shadows[index as usize];
-                    (shadow.bounds.dilate(shadow.blur_radius * 3.), &shadow.content_mask)
+                    let extent = if shadow.inset != 0 {
+                        shadow.element_bounds
+                    } else {
+                        shadow.bounds.dilate(shadow.blur_radius * 3.)
+                    };
+                    (extent, &shadow.content_mask)
                 }
+                // A bouncing quad sweeps its whole cycle from where the
+                // transition rests it, at either time; its bounds hold
+                // this present's phase on top.
                 TransitionTarget::Quad { index, .. } => {
                     let quad = &self.quads[index as usize];
-                    (self.quad_extent(quad), &quad.content_mask)
+                    let extent = match (
+                        self.quad_offset(quad),
+                        self.offset_quads.iter().find(|offset_quad| offset_quad.index == index),
+                    ) {
+                        (Some(offset), Some(offset_quad)) => {
+                            offset.swept(&quad.bounds, Some(offset_quad.rest_origin))
+                        }
+                        _ => quad.bounds,
+                    };
+                    (extent, &quad.content_mask)
                 }
             };
             push_both(extent, mask, back);
@@ -3345,6 +3364,87 @@ mod tests {
                 "{expected:?} not inside {damage:?}"
             );
         }
+    }
+
+    fn assert_damage_covers(damage: &[Bounds<DevicePixels>], expected: Bounds<ScaledPixels>) {
+        let expected = DamageRect::from_scaled(&expected).to_bounds();
+        assert!(
+            damage.iter().any(|rect| rect.intersect(&expected) == expected),
+            "{expected:?} not inside {damage:?}"
+        );
+    }
+
+    /// An inset shadow draws across its element, not inside the hole its
+    /// bounds leave, so a fade of it damages the whole element.
+    #[test]
+    fn a_fading_inset_shadow_damages_its_element() {
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+        let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut scene = Scene::default();
+        let Some(transition) = scene.push_transition(rolling_in(landed_at)) else {
+            panic!("a first transition always fits");
+        };
+        scene.set_current_transition(transition);
+        let element = Bounds {
+            origin: point(ScaledPixels(400.), ScaledPixels(400.)),
+            size: Size {
+                width: ScaledPixels(100.),
+                height: ScaledPixels(60.),
+            },
+        };
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: element.dilate(ScaledPixels(-20.)),
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: element.dilate(ScaledPixels(100.)),
+            },
+            color: crate::black(),
+            element_bounds: element,
+            element_corner_radii: Corners::default(),
+            inset: 1,
+            pad: 0,
+            rounded_clip: 0,
+            clip_padding: 0,
+        });
+        scene.finish();
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(viewport, Some(landed_at), &mut damage));
+        assert_damage_covers(&damage, element);
+    }
+
+    /// A bouncing quad inside a moving transition sweeps its whole cycle
+    /// from where the transition rested it at the present and now, whatever
+    /// phase each present caught it in.
+    #[test]
+    fn a_bouncing_quad_in_a_moving_transition_damages_both_sweeps() {
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+        let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut scene = Scene::default();
+        let Some(transition) = scene.push_transition(rolling_in(landed_at)) else {
+            panic!("a first transition always fits");
+        };
+        scene.set_current_transition(transition);
+        let quad = bouncing_quad(&mut scene, 0.25);
+        let bounds = quad.bounds;
+        scene.insert_primitive(quad);
+        scene.finish();
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(viewport, Some(landed_at), &mut damage));
+        // Rests at y 200 now and 20 device pixels lower at the present;
+        // bounces up to 18 above either.
+        let sweep_from = |y: f32| Bounds {
+            origin: point(bounds.origin.x, ScaledPixels(y - 18.)),
+            size: Size {
+                width: bounds.size.width,
+                height: bounds.size.height + ScaledPixels(18.),
+            },
+        };
+        assert_damage_covers(&damage, sweep_from(200.));
+        assert_damage_covers(&damage, sweep_from(220.));
     }
 
     fn turning_sprite(scene: &mut Scene, period_ms: u64) -> MonochromeSprite {
