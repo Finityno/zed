@@ -370,6 +370,14 @@ pub struct MetalRenderer {
     /// line.
     full_presents: u32,
     partial_presents: u32,
+    /// The primitive kinds the render being encoded leaves out, as
+    /// `ATTRIBUTED_*` bits; zero outside an attribution render.
+    attribution_skips: u16,
+    /// Set while an attribution render encodes, so it neither counts as a
+    /// present nor ages the atlas.
+    attributing: bool,
+    /// `FINCODE_GPU_ATTRIBUTION=1`; see [`Self::maybe_attribute_gpu_time`].
+    gpu_attribution: Option<GpuAttribution>,
     /// What this renderer has reported into the process-wide render memory
     /// gauges: the depth attachments it holds, refreshed by
     /// [`Self::publish_depth_memory`].
@@ -1012,6 +1020,9 @@ impl MetalRenderer {
             damage_rects: Vec::new(),
             full_presents: 0,
             partial_presents: 0,
+            attribution_skips: 0,
+            attributing: false,
+            gpu_attribution: GpuAttribution::from_env(),
             render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
             drawables_in_flight: Arc::new(AtomicU32::new(0)),
@@ -1846,6 +1857,7 @@ impl MetalRenderer {
         }
         breakdown.commit = commit_start.elapsed();
         self.maybe_log_gpu_stats();
+        self.maybe_attribute_gpu_time(scene, viewport_size);
         PresentReport {
             outcome: PresentOutcome::Presented,
             breakdown,
@@ -1883,6 +1895,96 @@ impl MetalRenderer {
             && scene.surfaces.is_empty()
             && scene.time_animation_damage(viewport_size, &mut self.damage_rects);
         usable.then_some(presented.texture)
+    }
+
+    /// While `FINCODE_GPU_ATTRIBUTION=1`, every [`ATTRIBUTION_PRESENT_STRIDE`]th
+    /// present draws its scene again into an offscreen target, once whole,
+    /// once with nothing but the clear, and once without each primitive kind,
+    /// timing each on the GPU. Every [`ATTRIBUTION_ROUNDS`] rounds it logs the
+    /// medians: what a kind saves when left out is what it costs in this
+    /// window's real scene, overdraw and early depth rejection included,
+    /// which a Metal trace of the window cannot split out of one pass.
+    fn maybe_attribute_gpu_time(&mut self, scene: &Scene, viewport_size: Size<DevicePixels>) {
+        let Some(attribution) = self.gpu_attribution.as_mut() else {
+            return;
+        };
+        attribution.presents_since_round += 1;
+        if attribution.presents_since_round < ATTRIBUTION_PRESENT_STRIDE {
+            return;
+        }
+        attribution.presents_since_round = 0;
+        let (width, height) = (viewport_size.width.0 as u64, viewport_size.height.0 as u64);
+        let target = match &attribution.target {
+            Some(target) if target.width() == width && target.height() == height => target.clone(),
+            _ => {
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(width);
+                descriptor.set_height(height);
+                descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                let target = self.device.new_texture(&descriptor);
+                attribution.target = Some(target.clone());
+                attribution.samples.lock().clear();
+                attribution.rounds = 0;
+                target
+            }
+        };
+        attribution.rounds += 1;
+        let log_now = attribution.rounds >= ATTRIBUTION_ROUNDS;
+        let round = attribution.rounds;
+        let samples = attribution.samples.clone();
+        let mut variants = [0; 2 + ATTRIBUTED_KINDS.len()];
+        variants[1] = ATTRIBUTED_ALL;
+        for (variant, (bit, _)) in variants[2..].iter_mut().zip(ATTRIBUTED_KINDS) {
+            *variant = bit;
+        }
+        // The GPU clocks up through a round, so no variant always goes first.
+        let count = variants.len();
+        variants.rotate_left(attribution.rounds as usize % count);
+        // Every render is encoded before any is committed, so the GPU runs
+        // them back to back: each one's cost is then how much later it ends
+        // than the one before, beginning with an empty fence. Their own
+        // start-to-end spans overlap their neighbours' and overstate it.
+        self.attributing = true;
+        let mut renders = Vec::with_capacity(variants.len());
+        for skips in variants {
+            self.attribution_skips = skips;
+            match self.render_frame(scene, &target, viewport_size, None, None) {
+                Ok(command_buffer) => renders.push((skips, command_buffer)),
+                Err(error) => {
+                    log::warn!("[gpu-attribution] render failed: {error:#}");
+                    break;
+                }
+            }
+        }
+        let fence = self.command_queue.new_command_buffer().to_owned();
+        for (slot, (skips, command_buffer)) in
+            std::iter::once((ATTRIBUTION_FENCE, &fence)).chain(renders.iter().map(|(skips, buffer)| (*skips, buffer))).enumerate()
+        {
+            let samples = samples.clone();
+            let block = RcBlock::new(move |buffer: ptr::NonNull<AnyObject>| {
+                let buffer = buffer.as_ptr();
+                // SAFETY: `GPUEndTime` is a `CFTimeInterval` property of every
+                // completed `MTLCommandBuffer`.
+                let end: f64 = unsafe { objc2::msg_send![buffer, GPUEndTime] };
+                samples.lock().push(AttributionSample { round, slot, skips, end });
+            });
+            // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+            unsafe {
+                command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
+            }
+            command_buffer.commit();
+        }
+        self.attribution_skips = 0;
+        self.attributing = false;
+        if log_now && let Some(attribution) = self.gpu_attribution.as_mut() {
+            attribution.rounds = 0;
+            let samples = mem::take(&mut *attribution.samples.lock());
+            if let Some(line) = gpu_attribution_line(&samples, scene, viewport_size) {
+                log::info!("{line}");
+            }
+        }
     }
 
     /// What a present that got no drawable reports. The frame stays owed
@@ -2126,7 +2228,9 @@ impl MetalRenderer {
         // drew nothing, so it must not age the atlas. An overlay renderer's
         // scene was marked by its window's base draw and belongs to the same
         // present, so it neither marks nor advances (see `note_scene_tiles`).
-        if !self.shares_atlas_frame {
+        // An attribution render draws the frame on screen again; counting it
+        // would age the atlas faster than the window presents.
+        if !self.shares_atlas_frame && !self.attributing {
             self.sprite_atlas.on_frame_drawn(scene);
         }
         self.publish_depth_memory();
@@ -2287,17 +2391,21 @@ impl MetalRenderer {
         let store_depth = depth_texture.storage_mode() != metal::MTLStorageMode::Memoryless;
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
-        if let Some(slots) = &path_plan {
+        if let Some(slots) = &path_plan
+            && self.attribution_skips & ATTRIBUTED_PATHS == 0
+        {
             self.rasterize_path_batches(scene, &instances.rounded_clips, slots, writer, viewport_size, command_buffer)?;
         }
         // A present drawn in part draws path batches only from the packed
         // slots: the split pass ends the encoder at each batch.
         let previous_frame = previous_frame.filter(|_| path_plan.is_some());
         let damage = previous_frame.map(|_| mem::take(&mut self.damage_rects));
-        if damage.is_some() {
-            self.partial_presents = self.partial_presents.saturating_add(1);
-        } else {
-            self.full_presents = self.full_presents.saturating_add(1);
+        if !self.attributing {
+            if damage.is_some() {
+                self.partial_presents = self.partial_presents.saturating_add(1);
+            } else {
+                self.full_presents = self.full_presents.saturating_add(1);
+            }
         }
         let alpha = if self.opaque { 1. } else { 0. };
 
@@ -2342,18 +2450,23 @@ impl MetalRenderer {
             command_encoder.set_depth_stencil_state(&self.depth_write_state);
             let opaque_quad_indices = scene.blended_quad_indices.len()
                 ..scene.blended_quad_indices.len() + scene.opaque_quad_indices.len();
-            self.draw_quads(
-                &self.opaque_quads_pipeline_state,
-                opaque_quad_indices,
-                instances,
-                viewport_size,
-                command_encoder,
-            );
+            if self.attribution_skips & ATTRIBUTED_OPAQUE_QUADS == 0 {
+                self.draw_quads(
+                    &self.opaque_quads_pipeline_state,
+                    opaque_quad_indices,
+                    instances,
+                    viewport_size,
+                    command_encoder,
+                );
+            }
             command_encoder.set_depth_stencil_state(&self.depth_test_state);
 
             for batch in scene.batches() {
                 let batch_order = scene.batch_order(&batch);
                 while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+                    if self.attribution_skips & ATTRIBUTED_BACKDROP_BLURS != 0 {
+                        continue;
+                    }
                     command_encoder = self.draw_backdrop_blur(
                         blur,
                         command_buffer,
@@ -2378,6 +2491,18 @@ impl MetalRenderer {
                     set_viewport(command_encoder, viewport_size, 0., 1.);
                 } else {
                     set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
+                }
+                if self.attribution_skips & attributed_kind(&batch) != 0 {
+                    match &batch {
+                        PrimitiveBatch::Quads { range, .. } => quad_cursor += range.len() as u32,
+                        PrimitiveBatch::Paths(_) => {
+                            if let Some(slots) = planned_slots.as_mut() {
+                                slots.next();
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
                 }
 
                 match batch {
@@ -2504,7 +2629,8 @@ impl MetalRenderer {
                 }
             }
             // A blur above everything else still frosts what is beneath it.
-            for blur in pending_blurs {
+            let skip_blurs = self.attribution_skips & ATTRIBUTED_BACKDROP_BLURS != 0;
+            for blur in pending_blurs.filter(|_| !skip_blurs) {
                 command_encoder = self.draw_backdrop_blur(
                     blur,
                     command_buffer,
@@ -3089,6 +3215,165 @@ struct PresentedFrame {
     texture: metal::Texture,
     content_id: u64,
     viewport_size: Size<DevicePixels>,
+}
+
+const ATTRIBUTED_OPAQUE_QUADS: u16 = 1 << 0;
+const ATTRIBUTED_BLENDED_QUADS: u16 = 1 << 1;
+const ATTRIBUTED_SHADOWS: u16 = 1 << 2;
+const ATTRIBUTED_PATHS: u16 = 1 << 3;
+const ATTRIBUTED_UNDERLINES: u16 = 1 << 4;
+const ATTRIBUTED_GLYPHS: u16 = 1 << 5;
+const ATTRIBUTED_IMAGES: u16 = 1 << 6;
+const ATTRIBUTED_SURFACES: u16 = 1 << 7;
+const ATTRIBUTED_BACKDROP_BLURS: u16 = 1 << 8;
+const ATTRIBUTED_ALL: u16 = (1 << 9) - 1;
+const ATTRIBUTED_KINDS: [(u16, &str); 9] = [
+    (ATTRIBUTED_OPAQUE_QUADS, "opaque quads"),
+    (ATTRIBUTED_BLENDED_QUADS, "blended quads"),
+    (ATTRIBUTED_SHADOWS, "shadows"),
+    (ATTRIBUTED_PATHS, "paths"),
+    (ATTRIBUTED_UNDERLINES, "underlines"),
+    (ATTRIBUTED_GLYPHS, "glyphs"),
+    (ATTRIBUTED_IMAGES, "images"),
+    (ATTRIBUTED_SURFACES, "surfaces"),
+    (ATTRIBUTED_BACKDROP_BLURS, "backdrop blurs"),
+];
+/// Presents between attribution rounds: a round is eleven extra frames of
+/// GPU work, so this keeps the app usable while it measures.
+const ATTRIBUTION_PRESENT_STRIDE: u32 = 15;
+/// Rounds per logged line.
+const ATTRIBUTION_ROUNDS: u32 = 20;
+
+/// What `FINCODE_GPU_ATTRIBUTION=1` keeps between rounds.
+struct GpuAttribution {
+    presents_since_round: u32,
+    rounds: u32,
+    target: Option<metal::Texture>,
+    /// When each render of a round ended, pushed by completion handlers on
+    /// a Metal thread.
+    samples: Arc<Mutex<Vec<AttributionSample>>>,
+}
+
+/// The empty command buffer each round starts with, in place of a variant.
+const ATTRIBUTION_FENCE: u16 = u16::MAX;
+
+#[derive(Clone, Copy, Debug)]
+struct AttributionSample {
+    round: u32,
+    /// Submission order within the round; the fence is slot 0.
+    slot: usize,
+    /// The `ATTRIBUTED_*` bits the render left out.
+    skips: u16,
+    /// `GPUEndTime`, in seconds.
+    end: f64,
+}
+
+impl GpuAttribution {
+    fn from_env() -> Option<Self> {
+        std::env::var("FINCODE_GPU_ATTRIBUTION")
+            .is_ok_and(|value| value == "1")
+            .then(|| Self {
+                presents_since_round: 0,
+                rounds: 0,
+                target: None,
+                samples: Arc::default(),
+            })
+    }
+}
+
+fn attributed_kind(batch: &PrimitiveBatch) -> u16 {
+    match batch {
+        PrimitiveBatch::Shadows(_) => ATTRIBUTED_SHADOWS,
+        PrimitiveBatch::Quads { .. } => ATTRIBUTED_BLENDED_QUADS,
+        PrimitiveBatch::Paths(_) => ATTRIBUTED_PATHS,
+        PrimitiveBatch::Underlines(_) => ATTRIBUTED_UNDERLINES,
+        PrimitiveBatch::MonochromeSprites { .. } | PrimitiveBatch::SubpixelSprites { .. } => {
+            ATTRIBUTED_GLYPHS
+        }
+        PrimitiveBatch::PolychromeSprites { .. } => ATTRIBUTED_IMAGES,
+        PrimitiveBatch::Surfaces(_) => ATTRIBUTED_SURFACES,
+    }
+}
+
+/// The `[gpu-attribution]` line: the median GPU time of the whole frame and
+/// of the clear alone, then per kind what leaving it out saved, how many it
+/// drew and how many window areas they cover between them.
+fn gpu_attribution_line(
+    samples: &[AttributionSample],
+    scene: &Scene,
+    viewport_size: Size<DevicePixels>,
+) -> Option<String> {
+    let mut ordered = samples.to_vec();
+    ordered.sort_by_key(|sample| (sample.round, sample.slot));
+    // A render's cost is how much later it ended than the one submitted
+    // before it in its round.
+    let costs: Vec<(u16, f64)> = ordered
+        .windows(2)
+        .filter(|pair| pair[0].round == pair[1].round && pair[0].slot + 1 == pair[1].slot)
+        .map(|pair| (pair[1].skips, (pair[1].end - pair[0].end) * 1000.))
+        .collect();
+    let median = |skips: u16| {
+        let mut times: Vec<f64> = costs
+            .iter()
+            .filter(|(sample_skips, _)| *sample_skips == skips)
+            .map(|(_, milliseconds)| *milliseconds)
+            .collect();
+        times.sort_by(f64::total_cmp);
+        times.get(times.len() / 2).copied()
+    };
+    let (Some(full), Some(clear)) = (median(0), median(ATTRIBUTED_ALL)) else {
+        return None;
+    };
+    let area = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+        let visible = bounds.intersect(&mask.bounds);
+        (visible.size.width.0.max(0.) * visible.size.height.0.max(0.)) as f64
+    };
+    let quads = |indices: &[u32]| {
+        indices
+            .iter()
+            .filter_map(|&index| scene.quads.get(index as usize))
+            .map(|quad| area(&quad.bounds, &quad.content_mask))
+            .collect::<Vec<_>>()
+    };
+    let coverage = |bit: u16| -> Vec<f64> {
+        match bit {
+            ATTRIBUTED_OPAQUE_QUADS => quads(&scene.opaque_quad_indices),
+            ATTRIBUTED_BLENDED_QUADS => quads(&scene.blended_quad_indices),
+            ATTRIBUTED_SHADOWS => scene.shadows.iter().map(|shadow| area(&shadow.bounds, &shadow.content_mask)).collect(),
+            ATTRIBUTED_PATHS => scene.paths.iter().map(|path| area(&path.bounds, &path.content_mask)).collect(),
+            ATTRIBUTED_UNDERLINES => scene.underlines.iter().map(|underline| area(&underline.bounds, &underline.content_mask)).collect(),
+            ATTRIBUTED_GLYPHS => scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| area(&sprite.bounds, &sprite.content_mask))
+                .chain(scene.subpixel_sprites.iter().map(|sprite| area(&sprite.bounds, &sprite.content_mask)))
+                .collect(),
+            ATTRIBUTED_IMAGES => scene.polychrome_sprites.iter().map(|sprite| area(&sprite.bounds, &sprite.content_mask)).collect(),
+            ATTRIBUTED_SURFACES => scene.surfaces.iter().map(|surface| area(&surface.bounds, &surface.content_mask)).collect(),
+            _ => scene.backdrop_blurs.iter().map(|blur| area(&blur.bounds, &blur.content_mask)).collect(),
+        }
+    };
+    let window_area = (viewport_size.width.0.max(1) as f64) * (viewport_size.height.0.max(1) as f64);
+    let mut line = format!(
+        "[gpu-attribution] {}x{}: frame {full:.2} ms, clear alone {clear:.2} ms",
+        viewport_size.width.0, viewport_size.height.0,
+    );
+    for (bit, name) in ATTRIBUTED_KINDS {
+        let Some(without) = median(bit) else {
+            continue;
+        };
+        let areas = coverage(bit);
+        if areas.is_empty() {
+            continue;
+        }
+        line.push_str(&format!(
+            " | {name} {:.2} ms ({} over {:.1}x the window)",
+            full - without,
+            areas.len(),
+            areas.iter().sum::<f64>() / window_area,
+        ));
+    }
+    Some(line)
 }
 
 fn scissor_rect(rect: &Bounds<DevicePixels>) -> metal::MTLScissorRect {
@@ -6154,6 +6439,44 @@ mod partial_present_timing_tests {
                 unsafe { (msg_send![buffer, GPUStartTime], msg_send![buffer, GPUEndTime]) };
             (end - start) * 1000.
         })
+    }
+
+    /// One attribution round renders the frame whole, cleared and without
+    /// each kind, and its line names what this scene draws.
+    #[test]
+    fn an_attribution_round_times_every_kind() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        renderer.update_transparency(true);
+        renderer.update_intermediate_textures(TARGET);
+        renderer.gpu_attribution = Some(super::GpuAttribution {
+            presents_since_round: 0,
+            rounds: 0,
+            target: None,
+            samples: Arc::default(),
+        });
+        let mut scene = window_scene();
+        scene.advance_time_animations();
+        let rounds = 5;
+        for _ in 0..super::ATTRIBUTION_PRESENT_STRIDE * rounds {
+            renderer.maybe_attribute_gpu_time(&scene, TARGET);
+        }
+        // Command buffers complete in queue order.
+        let fence = renderer.command_queue.new_command_buffer();
+        fence.commit();
+        fence.wait_until_completed();
+        let samples = renderer
+            .gpu_attribution
+            .as_ref()
+            .map(|attribution| attribution.samples.lock().clone())
+            .unwrap_or_default();
+        assert_eq!(samples.len(), (3 + super::ATTRIBUTED_KINDS.len()) * rounds as usize);
+        assert_eq!((renderer.full_presents, renderer.attribution_skips, renderer.attributing), (0, 0, false));
+        let line = super::gpu_attribution_line(&samples, &scene, TARGET).expect("a full and a clear render");
+        println!("{line}");
+        assert!(line.contains("blended quads") && line.contains("backdrop blurs"), "{line}");
+        assert!(!line.contains("glyphs"), "a scene without text has no glyph entry: {line}");
     }
 
     #[test]
