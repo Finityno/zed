@@ -1925,14 +1925,16 @@ impl MetalRenderer {
                 descriptor.set_storage_mode(metal::MTLStorageMode::Private);
                 let target = self.device.new_texture(&descriptor);
                 attribution.target = Some(target.clone());
-                attribution.samples.lock().clear();
+                // Rounds still in flight at the old size are left out.
+                attribution.first_round_at_size = attribution.next_round;
                 attribution.rounds = 0;
                 target
             }
         };
         attribution.rounds += 1;
         let log_now = attribution.rounds >= ATTRIBUTION_ROUNDS;
-        let round = attribution.rounds;
+        let round = attribution.next_round;
+        attribution.next_round += 1;
         let samples = attribution.samples.clone();
         let mut variants = [0; 2 + ATTRIBUTED_KINDS.len()];
         variants[1] = ATTRIBUTED_ALL;
@@ -1941,7 +1943,7 @@ impl MetalRenderer {
         }
         // The GPU clocks up through a round, so no variant always goes first.
         let count = variants.len();
-        variants.rotate_left(attribution.rounds as usize % count);
+        variants.rotate_left(round as usize % count);
         // Every render is encoded before any is committed, so the GPU runs
         // them back to back: each one's cost is then how much later it ends
         // than the one before, beginning with an empty fence. Their own
@@ -1980,8 +1982,9 @@ impl MetalRenderer {
         self.attributing = false;
         if log_now && let Some(attribution) = self.gpu_attribution.as_mut() {
             attribution.rounds = 0;
-            let samples = mem::take(&mut *attribution.samples.lock());
-            if let Some(line) = gpu_attribution_line(&samples, scene, viewport_size) {
+            let first_round = attribution.first_round_at_size;
+            let complete = take_complete_rounds(&mut attribution.samples.lock(), ATTRIBUTION_SLOTS, first_round, round);
+            if let Some(line) = gpu_attribution_line(&complete, scene, viewport_size) {
                 log::info!("{line}");
             }
         }
@@ -3247,7 +3250,13 @@ const ATTRIBUTION_ROUNDS: u32 = 20;
 /// What `FINCODE_GPU_ATTRIBUTION=1` keeps between rounds.
 struct GpuAttribution {
     presents_since_round: u32,
+    /// Rounds since the last line.
     rounds: u32,
+    /// Never reused, so a round's samples cannot mix with a later one's
+    /// whatever order their completion handlers run in.
+    next_round: u64,
+    /// The first round drawn at the target's current size.
+    first_round_at_size: u64,
     target: Option<metal::Texture>,
     /// When each render of a round ended, pushed by completion handlers on
     /// a Metal thread.
@@ -3259,7 +3268,7 @@ const ATTRIBUTION_FENCE: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct AttributionSample {
-    round: u32,
+    round: u64,
     /// Submission order within the round; the fence is slot 0.
     slot: usize,
     /// The `ATTRIBUTED_*` bits the render left out.
@@ -3275,10 +3284,40 @@ impl GpuAttribution {
             .then(|| Self {
                 presents_since_round: 0,
                 rounds: 0,
+                next_round: 0,
+                first_round_at_size: 0,
                 target: None,
                 samples: Arc::default(),
             })
     }
+}
+
+/// The fence, the whole frame, the clear alone and one render per kind.
+const ATTRIBUTION_SLOTS: usize = 3 + ATTRIBUTED_KINDS.len();
+
+/// Removes from `samples` the rounds every render of which has reported, of
+/// `slots` renders each, fence included, and returns those drawn at the
+/// current size. A round still on the GPU stays for the next line, unless
+/// it is a reporting period older than `latest_round` (one that failed to
+/// encode never completes).
+fn take_complete_rounds(
+    samples: &mut Vec<AttributionSample>,
+    slots: usize,
+    first_round: u64,
+    latest_round: u64,
+) -> Vec<AttributionSample> {
+    let mut reported = collections::HashMap::<u64, usize>::default();
+    for sample in samples.iter() {
+        *reported.entry(sample.round).or_default() += 1;
+    }
+    let (complete, pending): (Vec<_>, Vec<_>) = samples
+        .drain(..)
+        .partition(|sample| reported.get(&sample.round).is_some_and(|count| *count >= slots));
+    *samples = pending
+        .into_iter()
+        .filter(|sample| sample.round + u64::from(ATTRIBUTION_ROUNDS) > latest_round)
+        .collect();
+    complete.into_iter().filter(|sample| sample.round >= first_round).collect()
 }
 
 fn attributed_kind(batch: &PrimitiveBatch) -> u16 {
@@ -6453,6 +6492,8 @@ mod partial_present_timing_tests {
         renderer.gpu_attribution = Some(super::GpuAttribution {
             presents_since_round: 0,
             rounds: 0,
+            next_round: 0,
+            first_round_at_size: 0,
             target: None,
             samples: Arc::default(),
         });
@@ -6471,12 +6512,32 @@ mod partial_present_timing_tests {
             .as_ref()
             .map(|attribution| attribution.samples.lock().clone())
             .unwrap_or_default();
-        assert_eq!(samples.len(), (3 + super::ATTRIBUTED_KINDS.len()) * rounds as usize);
+        assert_eq!(samples.len(), super::ATTRIBUTION_SLOTS * rounds as usize);
         assert_eq!((renderer.full_presents, renderer.attribution_skips, renderer.attributing), (0, 0, false));
         let line = super::gpu_attribution_line(&samples, &scene, TARGET).expect("a full and a clear render");
         println!("{line}");
         assert!(line.contains("blended quads") && line.contains("backdrop blurs"), "{line}");
         assert!(!line.contains("glyphs"), "a scene without text has no glyph entry: {line}");
+    }
+
+    /// Only rounds every render of which has reported reach a line; a round
+    /// still on the GPU waits for the next one, and rounds from before a
+    /// resize or long abandoned are dropped.
+    #[test]
+    fn attribution_lines_take_only_complete_rounds() {
+        let sample = |round: u64, slot: usize| super::AttributionSample {
+            round,
+            slot,
+            skips: 0,
+            end: slot as f64,
+        };
+        let mut samples = vec![sample(3, 0), sample(3, 1), sample(4, 0), sample(5, 0), sample(5, 1), sample(30, 0)];
+        let complete = super::take_complete_rounds(&mut samples, 2, 4, 30);
+        let rounds = |samples: &[super::AttributionSample]| {
+            samples.iter().map(|sample| (sample.round, sample.slot)).collect::<Vec<_>>()
+        };
+        assert_eq!(rounds(&complete), vec![(5, 0), (5, 1)], "round 3 is from before the resize");
+        assert_eq!(rounds(&samples), vec![(30, 0)], "round 4 never completed and is too old to");
     }
 
     #[test]
