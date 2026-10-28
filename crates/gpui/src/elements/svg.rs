@@ -20,6 +20,7 @@ pub struct Svg {
     external_path: Option<SharedString>,
     data: Option<Arc<[u8]>>,
     data_path: Option<SharedString>,
+    rotation_period: Option<std::time::Duration>,
 }
 
 /// Create a new SVG element.
@@ -32,6 +33,7 @@ pub fn svg() -> Svg {
         external_path: None,
         data: None,
         data_path: None,
+        rotation_period: None,
     }
 }
 
@@ -65,6 +67,16 @@ impl Svg {
     /// Note that this won't effect the hitbox or layout of the element, only the rendering.
     pub fn with_transformation(mut self, transformation: Transformation) -> Self {
         self.transformation = Some(transformation);
+        self
+    }
+
+    /// Turn the SVG clockwise about its centre, one full turn per `period`,
+    /// for as long as it is on screen. The window turns it before every
+    /// present (see [`Window::with_rotation_animation`]), so a spinner turns
+    /// without its view drawing again. Like a transformation, this changes
+    /// only the rendering.
+    pub fn with_rotation_animation(mut self, period: std::time::Duration) -> Self {
+        self.rotation_period = Some(period);
         self
     }
 }
@@ -138,6 +150,8 @@ impl Element for Svg {
             window,
             cx,
             |style, window, cx| {
+                let rotation_period = self.rotation_period;
+                let mut paint_contents = |window: &mut Window| {
                 let transformation = self
                     .transformation
                     .as_ref()
@@ -183,6 +197,11 @@ impl Element for Svg {
                     window
                         .paint_svg(bounds, path.clone(), None, transformation, color, cx)
                         .log_err();
+                }
+                };
+                match rotation_period {
+                    Some(period) => window.with_rotation_animation(period, paint_contents),
+                    None => paint_contents(window),
                 }
             },
         )

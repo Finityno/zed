@@ -1580,6 +1580,7 @@ pub struct Window {
     pub(crate) line_glyph_cache: glyph_painting::LineGlyphCache,
     pub(crate) frame_work: frame_work::FrameWorkCounters,
     pub(crate) opacity_cycle_stack: Vec<OpacityCycle>,
+    pub(crate) rotation_animation_stack: Vec<crate::scene::RotationAnimation>,
     pub(crate) view_retention: view_retention::ViewRetention,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2669,6 +2670,7 @@ impl Window {
             line_glyph_cache: glyph_painting::LineGlyphCache::default(),
             frame_work: frame_work::FrameWorkCounters::default(),
             opacity_cycle_stack: Vec::new(),
+            rotation_animation_stack: Vec::new(),
             view_retention: view_retention::ViewRetention::new(cx),
             element_opacity: 1.0,
             glass_content: false,
@@ -5528,6 +5530,25 @@ impl Window {
         result
     }
 
+    /// Turns every SVG painted inside `f` clockwise about its centre, one
+    /// full turn per `period`, driven by the window rather than by drawing
+    /// again: the scene sets each one's rotation before every present, and
+    /// keeps presenting while one is on screen. For a spinner that would
+    /// otherwise redraw its whole window at its frame rate. The rotation
+    /// applies on top of the transformation the SVG is painted with.
+    pub fn with_rotation_animation<R>(
+        &mut self,
+        period: std::time::Duration,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        self.rotation_animation_stack
+            .push(crate::scene::RotationAnimation { period });
+        let result = f(self);
+        self.rotation_animation_stack.pop();
+        result
+    }
+
     /// Moves and fades everything painted inside `f` with `transition`,
     /// driven by the window rather than by drawing again: the scene sets each
     /// primitive's position and opacity before every present, and the window
@@ -6502,6 +6523,10 @@ impl Window {
             final_bounds.center(),
         );
 
+        let animation = match self.rotation_animation_stack.last().copied() {
+            Some(rotation) => self.next_frame.scene.push_rotation_animation(rotation),
+            None => 0,
+        };
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             rounded_clip: 0,
             clip_padding: 0,
@@ -6514,6 +6539,7 @@ impl Window {
             // without DirectWrite's text contrast and gamma ramp.
             effect: SpriteEffect {
                 kind: SpriteEffect::MASK_KIND,
+                animation,
                 ..SpriteEffect::default()
             },
             tile,
