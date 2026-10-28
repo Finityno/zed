@@ -20,6 +20,7 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
                           constant Size_DevicePixels *input_viewport_size);
 float quad_depth(uint quad_id);
 float rounded_clip_coverage(uint index, float2 position, constant RoundedClipNode *masks);
+float rounded_clip_interior_inset(RoundedClipNode mask);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
@@ -43,6 +44,8 @@ float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
+float4 quad_solid_interior(Quad quad, constant RoundedClipNode *masks);
+bool coordinates_are_precise(Bounds_ScaledPixels bounds);
 
 struct GradientColor {
   float4 solid;
@@ -59,6 +62,7 @@ struct QuadVertexOutput {
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
+  float4 solid_interior [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -70,6 +74,7 @@ struct QuadFragmentInput {
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
+  float4 solid_interior [[flat]];
 };
 
 vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
@@ -81,7 +86,8 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     constant uint *quad_indices
                                     [[buffer(QuadInputIndex_QuadIndices)]],
                                     constant Size_DevicePixels *viewport_size
-                                    [[buffer(QuadInputIndex_ViewportSize)]]) {
+                                    [[buffer(QuadInputIndex_ViewportSize)]],
+                                    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   uint quad_id = quad_indices[instance_id];
   Quad quad = quads[quad_id];
@@ -108,13 +114,71 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       gradient.solid,
       gradient.color0,
       gradient.color1,
+      quad_solid_interior(quad, rounded_masks),
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Whether `bounds` lies where a float resolves well under the margins the
+// shortcuts below keep: below 2^18 a coordinate's step is 1/32 of a pixel,
+// so computing an edge directly and computing it through a centre and half
+// size, as the distance fields do, cannot disagree across them.
+bool coordinates_are_precise(Bounds_ScaledPixels bounds) {
+  const float limit = 262144.0;
+  float reach = max(max(fabs(bounds.origin.x), fabs(bounds.origin.y)),
+                    max(fabs(bounds.origin.x + bounds.size.width),
+                        fabs(bounds.origin.y + bounds.size.height)));
+  return reach < limit;
+}
+
+// The rectangle, as (left, top, right, bottom) in device pixels, in which
+// every pixel of a solid-filled quad is its plain background at full clip
+// coverage: farther from each edge than any corner radius and any border
+// reaches, with a pixel to spare for antialiasing (an unrounded, borderless
+// quad has neither, so all of it), and inside every rounded clip it draws in
+// by more than that clip's corners and antialiasing reach. Empty for every
+// other fill, whose colour depends on the position. The fragment shader
+// returns the background there without loading the quad, evaluating its
+// outline or walking its clips, which for a large translucent panel is
+// nearly every pixel it covers.
+float4 quad_solid_interior(Quad quad, constant RoundedClipNode *masks) {
+  const float4 empty = float4(1.0, 1.0, 0.0, 0.0);
+  if (quad.background.tag != 0 || !coordinates_are_precise(quad.bounds)) {
+    return empty;
+  }
+  float radius = max(max(quad.corner_radii.top_left, quad.corner_radii.top_right),
+                     max(quad.corner_radii.bottom_right, quad.corner_radii.bottom_left));
+  float border = max(max(quad.border_widths.top, quad.border_widths.right),
+                     max(quad.border_widths.bottom, quad.border_widths.left));
+  float inset = (radius == 0.0 && border == 0.0) ? 0.0 : max(radius, border) + 1.0;
+  float4 interior = float4(quad.bounds.origin.x + inset,
+                           quad.bounds.origin.y + inset,
+                           quad.bounds.origin.x + quad.bounds.size.width - inset,
+                           quad.bounds.origin.y + quad.bounds.size.height - inset);
+  uint clip = quad.rounded_clip;
+  while (clip != 0) {
+    RoundedClipNode mask = masks[clip - 1];
+    if (!coordinates_are_precise(mask.bounds)) {
+      return empty;
+    }
+    float mask_inset = rounded_clip_interior_inset(mask);
+    interior = float4(max(interior.x, mask.bounds.origin.x + mask_inset),
+                      max(interior.y, mask.bounds.origin.y + mask_inset),
+                      min(interior.z, mask.bounds.origin.x + mask.bounds.size.width - mask_inset),
+                      min(interior.w, mask.bounds.origin.y + mask.bounds.size.height - mask_inset));
+    clip = mask.parent;
+  }
+  return interior;
 }
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]],
     constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
+  float2 position = input.position.xy;
+  if (position.x > input.solid_interior.x && position.y > input.solid_interior.y &&
+      position.x < input.solid_interior.z && position.y < input.solid_interior.w) {
+    return input.background_solid;
+  }
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -1664,11 +1728,30 @@ float4 fill_color(Background background,
   return color;
 }
 
+// How far inside a rounded clip's bounds a point must be for the clip to
+// cover it fully: past its largest corner and the antialiasing ramp.
+float rounded_clip_interior_inset(RoundedClipNode mask) {
+  float radius = max(max(mask.corner_radii.top_left, mask.corner_radii.top_right),
+                     max(mask.corner_radii.bottom_right, mask.corner_radii.bottom_left));
+  return max(radius, 0.5) + 0.25;
+}
+
 float rounded_clip_coverage(uint index, float2 position, constant RoundedClipNode *masks) {
   float coverage = 1.0;
   while (index != 0) {
     RoundedClipNode mask = masks[index - 1];
-    coverage = min(coverage, saturate(0.5 - quad_sdf(position, mask.bounds, mask.corner_radii)));
+    // A point farther inside every edge than any corner reaches, and than
+    // the antialiasing ramp, is fully covered: its distance field is at most
+    // -0.5. Most of a clipped card's pixels are, so they skip the field.
+    float inset = rounded_clip_interior_inset(mask);
+    bool interior = coordinates_are_precise(mask.bounds) &&
+                    position.x > mask.bounds.origin.x + inset &&
+                    position.y > mask.bounds.origin.y + inset &&
+                    position.x < mask.bounds.origin.x + mask.bounds.size.width - inset &&
+                    position.y < mask.bounds.origin.y + mask.bounds.size.height - inset;
+    if (!interior) {
+      coverage = min(coverage, saturate(0.5 - quad_sdf(position, mask.bounds, mask.corner_radii)));
+    }
     index = mask.parent;
   }
   return coverage;

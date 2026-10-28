@@ -1421,6 +1421,7 @@ impl MetalRenderer {
             None,
         );
         command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         command_encoder.set_depth_stencil_state(&self.depth_test_state);
         set_viewport(command_encoder, viewport_size, depth, depth);
 
@@ -1568,6 +1569,7 @@ impl MetalRenderer {
         let command_encoder =
             self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
         command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
@@ -2424,6 +2426,7 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
         command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
 
         // Damage rectangles never overlap, so each one's depth prepass
         // writes only depth that its own draws test against.
@@ -2586,6 +2589,7 @@ impl MetalRenderer {
                             None,
                         );
                         command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
+                        command_encoder.set_vertex_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
                         command_encoder.set_depth_stencil_state(&self.depth_test_state);
                         set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
 
@@ -2700,6 +2704,7 @@ impl MetalRenderer {
         let command_encoder =
             self.new_path_rasterization_encoder(command_buffer, &intermediate_texture);
         command_encoder.set_fragment_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        command_encoder.set_vertex_buffer(15, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         let slot_offset = [0f32, 0f32];
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::SlotOffset as u64,
@@ -3244,6 +3249,8 @@ const ATTRIBUTED_KINDS: [(u16, &str); 9] = [
 /// Presents between attribution rounds: a round is eleven extra frames of
 /// GPU work, so this keeps the app usable while it measures.
 const ATTRIBUTION_PRESENT_STRIDE: u32 = 15;
+/// How many of the largest blended quads a line names.
+const ATTRIBUTION_LARGEST_QUADS: usize = 8;
 /// Rounds per logged line.
 const ATTRIBUTION_ROUNDS: u32 = 20;
 
@@ -3363,8 +3370,19 @@ fn gpu_attribution_line(
     let (Some(full), Some(clear)) = (median(0), median(ATTRIBUTED_ALL)) else {
         return None;
     };
+    let window = Bounds {
+        origin: Point::default(),
+        size: gpui::size(
+            ScaledPixels(viewport_size.width.0 as f32),
+            ScaledPixels(viewport_size.height.0 as f32),
+        ),
+    };
+    // What reaches the window: content masks are not clipped to it.
+    let visible = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+        bounds.intersect(&mask.bounds).intersect(&window)
+    };
     let area = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
-        let visible = bounds.intersect(&mask.bounds);
+        let visible = visible(bounds, mask);
         (visible.size.width.0.max(0.) * visible.size.height.0.max(0.)) as f64
     };
     let quads = |indices: &[u32]| {
@@ -3410,6 +3428,50 @@ fn gpu_attribution_line(
             full - without,
             areas.len(),
             areas.iter().sum::<f64>() / window_area,
+        ));
+    }
+    // What the overdraw is made of: the blended quads covering the most of
+    // the window, in draw order's terms (position, size, fill alpha, the
+    // largest corner radius and border, the rounded clip they draw inside).
+    let mut largest: Vec<_> = scene
+        .blended_quad_indices
+        .iter()
+        .filter_map(|&index| scene.quads.get(index as usize))
+        .map(|quad| (area(&quad.bounds, &quad.content_mask), quad))
+        .collect();
+    largest.sort_by(|a, b| b.0.total_cmp(&a.0));
+    line.push_str(" | largest blended quads:");
+    for (covered, quad) in largest.iter().take(ATTRIBUTION_LARGEST_QUADS) {
+        let visible = visible(&quad.bounds, &quad.content_mask);
+        let fill = match quad.background.as_solid() {
+            Some(solid) => format!("a{:.2}", solid.a),
+            None => "gradient/pattern".to_string(),
+        };
+        let radius = [
+            quad.corner_radii.top_left,
+            quad.corner_radii.top_right,
+            quad.corner_radii.bottom_right,
+            quad.corner_radii.bottom_left,
+        ]
+        .into_iter()
+        .fold(0f32, |largest, radius| largest.max(radius.0));
+        let border = [
+            quad.border_widths.top,
+            quad.border_widths.right,
+            quad.border_widths.bottom,
+            quad.border_widths.left,
+        ]
+        .into_iter()
+        .fold(0f32, |largest, width| largest.max(width.0));
+        line.push_str(&format!(
+            " {:.0}x{:.0}@{:.0},{:.0} {:.2}w {fill} r{radius:.0} b{border:.1} clip{}{}",
+            visible.size.width.0,
+            visible.size.height.0,
+            visible.origin.x.0,
+            visible.origin.y.0,
+            covered / window_area,
+            quad.rounded_clip,
+            if quad.background.is_glass_content() { " glass" } else { "" },
         ));
     }
     Some(line)
@@ -6569,6 +6631,264 @@ mod partial_present_timing_tests {
             TARGET.height.0,
             full[frames / 2],
             partial[frames / 2],
+        );
+    }
+}
+
+/// Scenes for the quad and clip shaders: one that exercises every quad
+/// branch for exact before/after comparisons, and one shaped like a
+/// translucent window for timing them.
+#[cfg(test)]
+mod quad_shader_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use foreign_types::ForeignTypeRef;
+    use gpui::{
+        Background, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Point, Quad,
+        RoundedClipNode, ScaledPixels, Scene, Size,
+    };
+    use objc2::{msg_send, runtime::AnyObject};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, background: Background) -> Quad {
+        Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background,
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    /// Every quad branch the fragment shader has, over fractional bounds and
+    /// through nested rounded clips, on a translucent target.
+    fn branch_scene() -> Scene {
+        let mut scene = Scene::default();
+        let solid = |h: f32, a: f32| Background::from(gpui::hsla(h, 0.6, 0.5, a));
+        scene.insert_primitive(quad(rect(0., 0., 1200., 800.), solid(0.6, 0.55)));
+        let mut x = 7.3;
+        for (index, radius) in [0., 0.5, 3., 12.5, 40., 200.].into_iter().enumerate() {
+            for (row, border) in [0., 1., 2.5, 9.].into_iter().enumerate() {
+                let mut card = quad(
+                    rect(x, 11.7 + row as f32 * 130., 150.4, 117.9),
+                    solid(index as f32 / 6., if row % 2 == 0 { 0.4 } else { 1. }),
+                );
+                card.corner_radii = Corners {
+                    top_left: ScaledPixels(radius),
+                    top_right: ScaledPixels(radius * 0.5),
+                    bottom_right: ScaledPixels(radius),
+                    bottom_left: ScaledPixels(radius * 0.25),
+                };
+                card.border_widths = Edges {
+                    top: ScaledPixels(border),
+                    right: ScaledPixels(border * 0.5),
+                    bottom: ScaledPixels(border),
+                    left: ScaledPixels(border * 2.),
+                };
+                card.border_color = gpui::hsla(0.1, 0.9, 0.5, 0.8);
+                if row == 3 && index % 2 == 0 {
+                    card.border_style = BorderStyle::Dashed;
+                }
+                scene.insert_primitive(card);
+            }
+            x += 160.;
+        }
+        let gradient = gpui::linear_gradient(
+            35.,
+            gpui::linear_color_stop(gpui::hsla(0.0, 0.8, 0.5, 0.9), 0.1),
+            gpui::linear_color_stop(gpui::hsla(0.7, 0.8, 0.5, 0.3), 0.9),
+        );
+        let mut gradient_card = quad(rect(980.2, 20.6, 200., 240.), gradient);
+        gradient_card.corner_radii = Corners::all(ScaledPixels(18.));
+        scene.insert_primitive(gradient_card);
+        let mut patterned = quad(rect(980.2, 280.6, 200., 120.), gpui::pattern_slash(gpui::hsla(0.3, 0.8, 0.5, 0.7), 4., 9.));
+        patterned.corner_radii = Corners::all(ScaledPixels(10.));
+        scene.insert_primitive(patterned);
+        scene.insert_primitive(quad(rect(980.2, 420.6, 200., 120.), gpui::checkerboard(gpui::hsla(0.5, 0.8, 0.5, 0.6), 7.)));
+        let mut striped = quad(rect(980.2, 560.6, 200., 100.), gpui::pattern_stripe(gpui::hsla(0.9, 0.8, 0.5, 0.7), 5., 11.));
+        striped.corner_radii = Corners::all(ScaledPixels(14.));
+        scene.insert_primitive(striped);
+        let oklab = gpui::linear_gradient(
+            120.,
+            gpui::linear_color_stop(gpui::hsla(0.15, 0.9, 0.5, 1.), 0.),
+            gpui::linear_color_stop(gpui::hsla(0.55, 0.9, 0.5, 0.5), 1.),
+        )
+        .color_space(gpui::ColorSpace::Oklab);
+        scene.insert_primitive(quad(rect(980.2, 680.6, 200., 100.), oklab));
+        // A quad far out along x, as a very wide scrolled strip is, whose
+        // edges are too coarse for the shortcuts' margins.
+        let mut far = quad(rect(-67_108_864., 700., 67_109_064.5, 60.), solid(0.33, 0.6));
+        far.corner_radii = Corners::all(ScaledPixels(0.25));
+        scene.insert_primitive(far);
+        // Cards inside two nested rounded clips, as a rounded card's content is.
+        scene.rounded_clips.push(RoundedClipNode {
+            bounds: rect(60.5, 540.25, 600., 240.),
+            corner_radii: Corners::all(ScaledPixels(24.)),
+            parent: 0,
+            transition: 0,
+            base_origin: Default::default(),
+        });
+        scene.rounded_clips.push(RoundedClipNode {
+            bounds: rect(300.5, 560.25, 300., 200.),
+            corner_radii: Corners::all(ScaledPixels(60.)),
+            parent: 1,
+            transition: 0,
+            base_origin: Default::default(),
+        });
+        for (index, clip) in [1u32, 2, 2].into_iter().enumerate() {
+            let mut clipped = quad(
+                rect(40. + index as f32 * 210., 520., 260., 280.),
+                solid(0.8 - index as f32 * 0.2, if index == 1 { 1. } else { 0.5 }),
+            );
+            clipped.rounded_clip = clip;
+            clipped.corner_radii = Corners::all(ScaledPixels(index as f32 * 6.));
+            scene.insert_primitive(clipped);
+        }
+        scene.finish();
+        scene
+    }
+
+    fn headless(size: Size<DevicePixels>) -> MetalRenderer {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        renderer.update_transparency(true);
+        renderer.update_intermediate_textures(size);
+        renderer
+    }
+
+    /// Set `GPUI_QUAD_REFERENCE_OUT` to a path to write the scene's pixels
+    /// there, once before and once after a shader change, and compare the
+    /// two files: the fast paths must not move a single byte.
+    #[test]
+    fn branch_scene_renders() {
+        let size = gpui::size(DevicePixels(1200), DevicePixels(800));
+        let mut renderer = headless(size);
+        let image = renderer
+            .render_scene_to_image(&branch_scene(), size)
+            .expect("headless render succeeds");
+        assert!(image.pixels().any(|pixel| pixel[3] > 0));
+        if let Ok(path) = std::env::var("GPUI_QUAD_REFERENCE_OUT") {
+            std::fs::write(path, image.as_raw()).expect("reference written");
+        }
+    }
+
+    /// A translucent window's quads: a translucent backdrop, a sidebar and a
+    /// main card over it, a header band, and the cards of a transcript,
+    /// rounded and bordered, several of them inside a rounded clip. No
+    /// backdrop blur: this times the quad stack alone.
+    fn translucent_window(size: Size<DevicePixels>) -> Scene {
+        let (width, height) = (size.width.0 as f32, size.height.0 as f32);
+        let mut scene = Scene::default();
+        let translucent = |l: f32, a: f32| Background::from(gpui::hsla(0.6, 0.05, l, a));
+        scene.insert_primitive(quad(rect(0., 0., width, height), translucent(0.1, 0.72)));
+        let mut sidebar = quad(rect(0., 0., 620., height), translucent(0.14, 0.55));
+        sidebar.border_widths.right = ScaledPixels(2.);
+        sidebar.border_color = gpui::hsla(0., 0., 1., 0.08);
+        scene.insert_primitive(sidebar);
+        let mut main = quad(rect(632., 16., width - 648., height - 32.), translucent(0.12, 0.8));
+        main.corner_radii = Corners::all(ScaledPixels(24.));
+        main.border_widths = Edges::all(ScaledPixels(2.));
+        main.border_color = gpui::hsla(0., 0., 1., 0.1);
+        scene.insert_primitive(main);
+        scene.insert_primitive(quad(rect(632., 16., width - 648., 96.), translucent(0.16, 0.5)));
+        scene.rounded_clips.push(RoundedClipNode {
+            bounds: rect(632., 16., width - 648., height - 32.),
+            corner_radii: Corners::all(ScaledPixels(24.)),
+            parent: 0,
+            transition: 0,
+            base_origin: Default::default(),
+        });
+        for index in 0..30 {
+            let mut card = quad(
+                rect(700. + (index % 3) as f32 * 30., 140. + index as f32 * 64., width - 900., 56.),
+                translucent(0.2, 0.35),
+            );
+            card.corner_radii = Corners::all(ScaledPixels(16.));
+            card.border_widths = Edges::all(ScaledPixels(2.));
+            card.border_color = gpui::hsla(0., 0., 1., 0.12);
+            card.rounded_clip = 1;
+            scene.insert_primitive(card);
+        }
+        for index in 0..18 {
+            let mut row = quad(rect(24., 120. + index as f32 * 72., 572., 60.), translucent(0.22, 0.3));
+            row.corner_radii = Corners::all(ScaledPixels(12.));
+            scene.insert_primitive(row);
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Run with `--ignored --nocapture`: median GPU milliseconds of the
+    /// translucent window at 3456x2168, drawn back to back so the GPU runs at
+    /// the clock a busy frame gets.
+    #[test]
+    #[ignore = "measurement, prints the GPU time of a translucent window"]
+    fn measure_translucent_window_gpu_time() {
+        let size = gpui::size(DevicePixels(3456), DevicePixels(2168));
+        let mut renderer = headless(size);
+        let scene = translucent_window(size);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let target = renderer.device.new_texture(&descriptor);
+        let end_time = |buffer: &metal::CommandBufferRef| -> f64 {
+            let buffer = buffer.as_ptr().cast::<AnyObject>();
+            // SAFETY: `GPUEndTime` is a `CFTimeInterval` property of every
+            // completed `MTLCommandBuffer`.
+            unsafe { msg_send![buffer, GPUEndTime] }
+        };
+        let mut costs = Vec::new();
+        for _ in 0..12 {
+            objc2::rc::autoreleasepool(|_| {
+                let fence = renderer.command_queue.new_command_buffer().to_owned();
+                let frames: Vec<_> = (0..10)
+                    .map(|_| {
+                        renderer
+                            .render_frame(&scene, &target, size, None, None)
+                            .expect("frame encodes")
+                    })
+                    .collect();
+                fence.commit();
+                for frame in &frames {
+                    frame.commit();
+                }
+                if let Some(last) = frames.last() {
+                    last.wait_until_completed();
+                }
+                let mut previous = end_time(&fence);
+                for frame in &frames {
+                    let end = end_time(frame);
+                    costs.push((end - previous) * 1000.);
+                    previous = end;
+                }
+            });
+        }
+        costs.sort_by(f64::total_cmp);
+        println!(
+            "translucent window {}x{}: {:.3} ms per frame (median of {}), p10 {:.3} p90 {:.3}",
+            size.width.0,
+            size.height.0,
+            costs[costs.len() / 2],
+            costs.len(),
+            costs[costs.len() / 10],
+            costs[costs.len() * 9 / 10],
         );
     }
 }
