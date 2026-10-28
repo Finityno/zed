@@ -360,6 +360,16 @@ pub struct MetalRenderer {
     /// memoryless on Apple GPUs and cannot survive an encoder boundary.
     fallback_depth_texture: Option<metal::Texture>,
     fallback_depth_idle_frames: u32,
+    /// The drawable presented last and the scene content it shows, so a
+    /// present that only advances time animations can copy it and draw just
+    /// what moved (see [`Scene::time_animation_damage`]).
+    presented_frame: Option<PresentedFrame>,
+    /// What the present being encoded redraws, reused across presents.
+    damage_rects: Vec<Bounds<DevicePixels>>,
+    /// Presents drawn whole and in part since the last `FINCODE_GPU_STATS`
+    /// line.
+    full_presents: u32,
+    partial_presents: u32,
     /// What this renderer has reported into the process-wide render memory
     /// gauges: the depth attachments it holds, refreshed by
     /// [`Self::publish_depth_memory`].
@@ -998,6 +1008,10 @@ impl MetalRenderer {
             shares_atlas_frame: false,
             fallback_depth_texture: None,
             fallback_depth_idle_frames: 0,
+            presented_frame: None,
+            damage_rects: Vec::new(),
+            full_presents: 0,
+            partial_presents: 0,
             render_memory: RenderMemoryLedger::default(),
             gpu_stats_last_log: None,
             drawables_in_flight: Arc::new(AtomicU32::new(0)),
@@ -1035,6 +1049,7 @@ impl MetalRenderer {
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         self.drawable_size = size;
+        self.presented_frame = None;
         if let Some(layer) = &self.layer
             && !self.drawables_released
         {
@@ -1054,6 +1069,7 @@ impl MetalRenderer {
     /// [`Self::restore_drawables`] brings the size back before the next
     /// frame.
     pub fn release_drawables(&mut self) {
+        self.presented_frame = None;
         if let Some(layer) = &self.layer {
             self.drawables_released = true;
             layer.set_drawable_size(CGSize::new(1., 1.));
@@ -1084,6 +1100,9 @@ impl MetalRenderer {
     /// The instance buffer pool is process-wide and shared with visible
     /// windows, so it is deliberately left alone.
     pub fn release_intermediate_textures(&mut self) {
+        // A window the compositor is not showing may not keep what it last
+        // showed, so the next present must not copy from it.
+        self.presented_frame = None;
         if self.borrows_intermediates {
             return;
         }
@@ -1659,6 +1678,7 @@ impl MetalRenderer {
 
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
+        self.presented_frame = None;
         if let Some(layer) = &self.layer {
             layer.set_opaque(!transparent);
         }
@@ -1704,6 +1724,12 @@ impl MetalRenderer {
     /// a compositor holding the layer's drawables, main-thread CPU (or page
     /// faults) while encoding, or a GPU backlog.
     fn draw_in_pool(&mut self, scene: &Scene) -> PresentReport {
+        // Taken before anything can defer or drop this present: the window
+        // advanced the scene's time animations for it, so a later present
+        // cannot tell what changed since the frame on screen from the
+        // scene's latest advance alone (a transition may have landed in
+        // between). It goes back only once this present is encoded.
+        let presented_frame = self.presented_frame.take();
         let mut breakdown = PresentBreakdown {
             layers: 1,
             ..PresentBreakdown::default()
@@ -1789,8 +1815,10 @@ impl MetalRenderer {
         }
 
         let encode_start = Instant::now();
+        let previous_frame =
+            self.previous_frame_to_copy(presented_frame, scene, drawable.texture(), viewport_size);
         let command_buffer = self.render_frame(
-            scene, drawable.texture(), viewport_size, Some(submission),
+            scene, drawable.texture(), viewport_size, Some(submission), previous_frame.as_deref(),
         );
         breakdown.encode = encode_start.elapsed();
         let command_buffer = match command_buffer {
@@ -1800,6 +1828,11 @@ impl MetalRenderer {
                 return dropped(breakdown);
             }
         };
+        self.presented_frame = Some(PresentedFrame {
+            texture: drawable.texture().to_owned(),
+            content_id: scene.content_id(),
+            viewport_size,
+        });
 
         let commit_start = Instant::now();
         self.note_drawable_in_flight(drawable);
@@ -1817,6 +1850,39 @@ impl MetalRenderer {
             outcome: PresentOutcome::Presented,
             breakdown,
         }
+    }
+
+    /// `presented`'s drawable, when `scene` is what it shows with only its
+    /// time animations advanced once since; `damage_rects` then holds what
+    /// changed, and the present copies the rest from it instead of drawing
+    /// the whole window again for a shimmer or a spinner.
+    ///
+    /// Only the drawable last presented is taken: it is the one on screen or
+    /// queued for it, so the compositor holds it and nothing writes to it.
+    /// Earlier ones are back in the layer's pool for `nextDrawable` to hand
+    /// out. `GPUI_DISABLE_PARTIAL_PRESENTS=1` draws every present in full.
+    fn previous_frame_to_copy(
+        &mut self,
+        presented: Option<PresentedFrame>,
+        scene: &Scene,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<metal::Texture> {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let presented = presented?;
+        let disabled = *DISABLED.get_or_init(|| {
+            std::env::var("GPUI_DISABLE_PARTIAL_PRESENTS").is_ok_and(|value| value == "1")
+        });
+        // A drawable handed back again was released by the compositor, and a
+        // copy onto itself is undefined.
+        let usable = !disabled
+            && presented.content_id == scene.content_id()
+            && presented.viewport_size == viewport_size
+            && presented.texture.as_ptr() != texture.as_ptr()
+            // A surface's pixel buffer can change without the scene changing.
+            && scene.surfaces.is_empty()
+            && scene.time_animation_damage(viewport_size, &mut self.damage_rects);
+        usable.then_some(presented.texture)
     }
 
     /// What a present that got no drawable reports. The frame stays owed
@@ -1869,6 +1935,7 @@ impl MetalRenderer {
     /// holds from before the window was hidden therefore go uncounted once it
     /// is visible again, until it has presented past them.
     pub fn forget_drawables_in_flight(&mut self) {
+        self.presented_frame = None;
         self.drawables_in_flight = Arc::new(AtomicU32::new(0));
         self.drawables_in_flight_overstated = false;
     }
@@ -1943,7 +2010,8 @@ impl MetalRenderer {
         const MB: u64 = 1024 * 1024;
         log::info!(
             "[gpu-stats] device_allocated={}MB atlas_monochrome={}MB atlas_polychrome={}MB \
-             instance_pool={}x{}KB depth={}MB path_intermediates={}MB backdrop_scratch={}KB",
+             instance_pool={}x{}KB depth={}MB path_intermediates={}MB backdrop_scratch={}KB \
+             presents_full={} presents_partial={}",
             self.device.current_allocated_size() / MB,
             monochrome_bytes / MB,
             polychrome_bytes / MB,
@@ -1952,6 +2020,8 @@ impl MetalRenderer {
             depth_bytes / MB,
             path_intermediate_bytes / MB,
             backdrop_bytes / 1024,
+            mem::take(&mut self.full_presents),
+            mem::take(&mut self.partial_presents),
         );
     }
 
@@ -1961,6 +2031,7 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
         submission: Option<InFlightSubmission>,
+        previous_frame: Option<&metal::TextureRef>,
     ) -> Result<metal::CommandBuffer> {
         // A window that lives through display, backing-scale, or backing-view
         // changes can be left with renderer textures sized for a stale
@@ -2030,6 +2101,7 @@ impl MetalRenderer {
             &mut writer,
             texture,
             viewport_size,
+            previous_frame,
         )?;
         self.retire_idle_path_intermediate();
         self.retire_idle_backdrop_scratch();
@@ -2083,7 +2155,7 @@ impl MetalRenderer {
             .next_drawable()
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
 
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size, None)?;
+        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size, None, None)?;
 
         // Commit and wait for completion without presenting
         command_buffer.commit();
@@ -2130,7 +2202,7 @@ impl MetalRenderer {
             });
             let target_texture = self.device.new_texture(&texture_descriptor);
 
-            let command_buffer = self.render_frame(scene, &target_texture, size, None)?;
+            let command_buffer = self.render_frame(scene, &target_texture, size, None, None)?;
 
             // Managed textures require an explicit blit synchronize before the CPU
             // can read back the rendered data. Without this, get_bytes returns
@@ -2184,7 +2256,7 @@ impl MetalRenderer {
                 .clone()
                 .expect("just ensured the render target exists");
 
-            let command_buffer = self.render_frame(scene, &target_texture, size, None)?;
+            let command_buffer = self.render_frame(scene, &target_texture, size, None, None)?;
 
             // Commit without waiting, mirroring presentation to a real window where
             // the CPU doesn't block on the GPU.
@@ -2200,6 +2272,7 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        previous_frame: Option<&metal::TextureRef>,
     ) -> Result<metal::CommandBuffer> {
         let path_plan = Self::plan_path_batches(scene, viewport_size);
         let depth_texture = if path_plan.is_some() || !self.is_apple_gpu {
@@ -2217,9 +2290,20 @@ impl MetalRenderer {
         if let Some(slots) = &path_plan {
             self.rasterize_path_batches(scene, &instances.rounded_clips, slots, writer, viewport_size, command_buffer)?;
         }
-        let mut planned_slots = path_plan.as_deref().map(|slots| slots.iter());
+        // A present drawn in part draws path batches only from the packed
+        // slots: the split pass ends the encoder at each batch.
+        let previous_frame = previous_frame.filter(|_| path_plan.is_some());
+        let damage = previous_frame.map(|_| mem::take(&mut self.damage_rects));
+        if damage.is_some() {
+            self.partial_presents = self.partial_presents.saturating_add(1);
+        } else {
+            self.full_presents = self.full_presents.saturating_add(1);
+        }
         let alpha = if self.opaque { 1. } else { 0. };
 
+        // The clear covers the whole target, so each damaged rectangle is
+        // drawn from the clear colour up, as in a full frame, and the copy
+        // that follows replaces everything outside them.
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
@@ -2230,23 +2314,197 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
 
-        command_encoder.set_depth_stencil_state(&self.depth_write_state);
-        let opaque_quad_indices = scene.blended_quad_indices.len()
-            ..scene.blended_quad_indices.len() + scene.opaque_quad_indices.len();
-        self.draw_quads(
-            &self.opaque_quads_pipeline_state,
-            opaque_quad_indices,
-            instances,
-            viewport_size,
-            command_encoder,
-        );
-        command_encoder.set_depth_stencil_state(&self.depth_test_state);
+        // Damage rectangles never overlap, so each one's depth prepass
+        // writes only depth that its own draws test against.
+        let regions = damage.as_ref().map_or(1, Vec::len);
+        for region in 0..regions {
+            let scissor = damage
+                .as_ref()
+                .and_then(|rects| rects.get(region))
+                .map(scissor_rect);
+            if let Some(scissor) = scissor {
+                command_encoder.set_scissor_rect(scissor);
+            }
+            // A rectangle that reaches a blur holds all of it (see
+            // `Scene::time_animation_damage`), so the blur runs again there
+            // from what the rectangle redrew beneath it; the copy brings the
+            // frosting of every other blur.
+            let mut pending_blurs = scene
+                .backdrop_blurs
+                .iter()
+                .filter(|blur| scissor.is_none_or(|scissor| scissor_reaches_blur(&scissor, blur)))
+                .peekable();
+            let mut planned_slots = path_plan.as_deref().map(|slots| slots.iter());
+            let mut quad_cursor: u32 = 0;
+            // The previous rectangle may have ended on a batch that collapsed
+            // the depth range; the prepass gives each quad its own depth.
+            set_viewport(command_encoder, viewport_size, 0., 1.);
+            command_encoder.set_depth_stencil_state(&self.depth_write_state);
+            let opaque_quad_indices = scene.blended_quad_indices.len()
+                ..scene.blended_quad_indices.len() + scene.opaque_quad_indices.len();
+            self.draw_quads(
+                &self.opaque_quads_pipeline_state,
+                opaque_quad_indices,
+                instances,
+                viewport_size,
+                command_encoder,
+            );
+            command_encoder.set_depth_stencil_state(&self.depth_test_state);
 
-        let mut quad_cursor: u32 = 0;
-        let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
-        for batch in scene.batches() {
-            let batch_order = scene.batch_order(&batch);
-            while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+            for batch in scene.batches() {
+                let batch_order = scene.batch_order(&batch);
+                while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+                    command_encoder = self.draw_backdrop_blur(
+                        blur,
+                        command_buffer,
+                        command_encoder,
+                        texture,
+                        &depth_texture,
+                        store_depth,
+                        &instances.rounded_clips,
+                        writer,
+                        viewport_size,
+                        quad_depth(quad_cursor) as f64,
+                    )?;
+                    if let Some(scissor) = scissor {
+                        command_encoder.set_scissor_rect(scissor);
+                    }
+                }
+                // Quads carry their own depth. Every other batch is flattened onto
+                // the depth of the quad cursor by collapsing the viewport's depth
+                // range onto a single value.
+                let batch_depth = quad_depth(quad_cursor) as f64;
+                if matches!(batch, PrimitiveBatch::Quads { .. }) {
+                    set_viewport(command_encoder, viewport_size, 0., 1.);
+                } else {
+                    set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
+                }
+
+                match batch {
+                    PrimitiveBatch::Shadows(range) => {
+                        self.draw_shadows(range, instances, viewport_size, command_encoder)
+                    }
+                    PrimitiveBatch::Quads {
+                        range,
+                        blended_range,
+                    } => {
+                        quad_cursor += range.len() as u32;
+                        // Paint runs of consecutive quads that share the same glass
+                        // flag, so glass-content quads use the alpha-preserving
+                        // pipeline while ordinary quads use the standard one.
+                        // Splitting by run keeps draw order intact.
+                        let mut start = blended_range.start;
+                        while start < blended_range.end {
+                            let is_glass = blended_quad_is_glass(scene, start);
+                            let mut end = start + 1;
+                            while end < blended_range.end
+                                && blended_quad_is_glass(scene, end) == is_glass
+                            {
+                                end += 1;
+                            }
+
+                            let pipeline = if is_glass {
+                                &self.quads_glass_pipeline_state
+                            } else {
+                                &self.quads_pipeline_state
+                            };
+                            self.draw_quads(
+                                pipeline,
+                                start..end,
+                                instances,
+                                viewport_size,
+                                command_encoder,
+                            );
+                            start = end;
+                        }
+                    }
+                    PrimitiveBatch::Paths(range) => {
+                        let paths = &scene.paths[range];
+                        if let Some(slots) = planned_slots.as_mut() {
+                            let Some(slot) = slots.next() else {
+                                command_encoder.end_encoding();
+                                anyhow::bail!("path plan has fewer slots than the scene has path batches");
+                            };
+                            if !slot.empty
+                                && let Err(error) = self.draw_paths_from_intermediate(
+                                    paths,
+                                    slot.offset,
+                                    writer,
+                                    viewport_size,
+                                    command_encoder,
+                                )
+                            {
+                                command_encoder.end_encoding();
+                                return Err(error);
+                            }
+                            continue;
+                        }
+                        command_encoder.end_encoding();
+
+                        let did_draw = self.draw_paths_to_intermediate(
+                            paths,
+                            &instances.rounded_clips,
+                            writer,
+                            viewport_size,
+                            command_buffer,
+                        )?;
+
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            &depth_texture,
+                            store_depth,
+                            viewport_size,
+                            None,
+                        );
+                        command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
+                        command_encoder.set_depth_stencil_state(&self.depth_test_state);
+                        set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
+
+                        if did_draw {
+                            if let Err(error) = self.draw_paths_from_intermediate(
+                                paths,
+                                point(ScaledPixels(0.), ScaledPixels(0.)),
+                                writer,
+                                viewport_size,
+                                command_encoder,
+                            ) {
+                                command_encoder.end_encoding();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    PrimitiveBatch::Underlines(range) => {
+                        self.draw_underlines(range, instances, viewport_size, command_encoder)
+                    }
+                    PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                        .draw_monochrome_sprites(
+                            texture_id,
+                            range,
+                            instances,
+                            viewport_size,
+                            command_encoder,
+                        ),
+                    PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                        .draw_polychrome_sprites(
+                            texture_id,
+                            range,
+                            instances,
+                            viewport_size,
+                            command_encoder,
+                        ),
+                    PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                        &scene.surfaces[range.clone()],
+                        range.start,
+                        instances,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                }
+            }
+            // A blur above everything else still frosts what is beneath it.
+            for blur in pending_blurs {
                 command_encoder = self.draw_backdrop_blur(
                     blur,
                     command_buffer,
@@ -2259,157 +2517,41 @@ impl MetalRenderer {
                     viewport_size,
                     quad_depth(quad_cursor) as f64,
                 )?;
+                if let Some(scissor) = scissor {
+                    command_encoder.set_scissor_rect(scissor);
+                }
             }
-            // Quads carry their own depth. Every other batch is flattened onto
-            // the depth of the quad cursor by collapsing the viewport's depth
-            // range onto a single value.
-            let batch_depth = quad_depth(quad_cursor) as f64;
-            if matches!(batch, PrimitiveBatch::Quads { .. }) {
-                set_viewport(command_encoder, viewport_size, 0., 1.);
-            } else {
-                set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
-            }
-
-            match batch {
-                PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instances, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::Quads {
-                    range,
-                    blended_range,
-                } => {
-                    quad_cursor += range.len() as u32;
-                    // Paint runs of consecutive quads that share the same glass
-                    // flag, so glass-content quads use the alpha-preserving
-                    // pipeline while ordinary quads use the standard one.
-                    // Splitting by run keeps draw order intact.
-                    let mut start = blended_range.start;
-                    while start < blended_range.end {
-                        let is_glass = blended_quad_is_glass(scene, start);
-                        let mut end = start + 1;
-                        while end < blended_range.end
-                            && blended_quad_is_glass(scene, end) == is_glass
-                        {
-                            end += 1;
-                        }
-
-                        let pipeline = if is_glass {
-                            &self.quads_glass_pipeline_state
-                        } else {
-                            &self.quads_pipeline_state
-                        };
-                        self.draw_quads(
-                            pipeline,
-                            start..end,
-                            instances,
-                            viewport_size,
-                            command_encoder,
-                        );
-                        start = end;
-                    }
-                }
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    if let Some(slots) = planned_slots.as_mut() {
-                        let Some(slot) = slots.next() else {
-                            command_encoder.end_encoding();
-                            anyhow::bail!("path plan has fewer slots than the scene has path batches");
-                        };
-                        if !slot.empty
-                            && let Err(error) = self.draw_paths_from_intermediate(
-                                paths,
-                                slot.offset,
-                                writer,
-                                viewport_size,
-                                command_encoder,
-                            )
-                        {
-                            command_encoder.end_encoding();
-                            return Err(error);
-                        }
-                        continue;
-                    }
-                    command_encoder.end_encoding();
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        &instances.rounded_clips,
-                        writer,
-                        viewport_size,
-                        command_buffer,
-                    )?;
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        &depth_texture,
-                        store_depth,
-                        viewport_size,
-                        None,
-                    );
-                    command_encoder.set_fragment_buffer(15, Some(&instances.rounded_clips.buffer), instances.rounded_clips.offset as u64);
-                    command_encoder.set_depth_stencil_state(&self.depth_test_state);
-                    set_viewport(command_encoder, viewport_size, batch_depth, batch_depth);
-
-                    if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
-                            paths,
-                            point(ScaledPixels(0.), ScaledPixels(0.)),
-                            writer,
-                            viewport_size,
-                            command_encoder,
-                        ) {
-                            command_encoder.end_encoding();
-                            return Err(error);
-                        }
-                    }
-                }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instances, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
-                        texture_id,
-                        range,
-                        instances,
-                        viewport_size,
-                        command_encoder,
-                    ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
-                        texture_id,
-                        range,
-                        instances,
-                        viewport_size,
-                        command_encoder,
-                    ),
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
-                    &scene.surfaces[range.clone()],
-                    range.start,
-                    instances,
-                    viewport_size,
-                    command_encoder,
-                ),
-                PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
-            }
-        }
-        // A blur above everything else still frosts what is beneath it.
-        for blur in pending_blurs {
-            command_encoder = self.draw_backdrop_blur(
-                blur,
-                command_buffer,
-                command_encoder,
-                texture,
-                &depth_texture,
-                store_depth,
-                &instances.rounded_clips,
-                writer,
-                viewport_size,
-                quad_depth(quad_cursor) as f64,
-            )?;
         }
 
         command_encoder.end_encoding();
+
+        if let (Some(previous_frame), Some(damage)) = (previous_frame, damage) {
+            let blit = command_buffer.new_blit_command_encoder();
+            for rect in undamaged_rects(&damage, viewport_size) {
+                let origin = metal::MTLOrigin {
+                    x: rect.origin.x.0 as u64,
+                    y: rect.origin.y.0 as u64,
+                    z: 0,
+                };
+                blit.copy_from_texture(
+                    previous_frame,
+                    0,
+                    0,
+                    origin,
+                    metal::MTLSize {
+                        width: rect.size.width.0 as u64,
+                        height: rect.size.height.0 as u64,
+                        depth: 1,
+                    },
+                    texture,
+                    0,
+                    0,
+                    origin,
+                );
+            }
+            blit.end_encoding();
+            self.damage_rects = damage;
+        }
 
         Ok(command_buffer.to_owned())
     }
@@ -2940,6 +3082,81 @@ fn new_command_encoder_for_texture<'a>(
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     set_viewport(command_encoder, viewport_size, 0.0, 1.0);
     command_encoder
+}
+
+/// The drawable a renderer presented last, for [`MetalRenderer::previous_frame_to_copy`].
+struct PresentedFrame {
+    texture: metal::Texture,
+    content_id: u64,
+    viewport_size: Size<DevicePixels>,
+}
+
+fn scissor_rect(rect: &Bounds<DevicePixels>) -> metal::MTLScissorRect {
+    metal::MTLScissorRect {
+        x: rect.origin.x.0.max(0) as u64,
+        y: rect.origin.y.0.max(0) as u64,
+        width: rect.size.width.0.max(0) as u64,
+        height: rect.size.height.0.max(0) as u64,
+    }
+}
+
+fn scissor_reaches_blur(scissor: &metal::MTLScissorRect, blur: &BackdropBlur) -> bool {
+    let visible = blur.bounds.intersect(&blur.content_mask.bounds);
+    let (left, top) = (scissor.x as f32, scissor.y as f32);
+    let (right, bottom) = (left + scissor.width as f32, top + scissor.height as f32);
+    visible.size.width.0 > 0.
+        && visible.size.height.0 > 0.
+        && visible.origin.x.0 < right
+        && left < visible.origin.x.0 + visible.size.width.0
+        && visible.origin.y.0 < bottom
+        && top < visible.origin.y.0 + visible.size.height.0
+}
+
+/// The viewport outside `damage`, whose rectangles lie inside it and do not
+/// overlap, as rectangles for a blit to copy: the rows between consecutive
+/// damage edges, split around the damage those rows cross.
+fn undamaged_rects(
+    damage: &[Bounds<DevicePixels>],
+    viewport: Size<DevicePixels>,
+) -> Vec<Bounds<DevicePixels>> {
+    let (width, height) = (viewport.width.0, viewport.height.0);
+    let mut edges = Vec::with_capacity(damage.len() * 2 + 2);
+    edges.extend([0, height]);
+    for rect in damage {
+        edges.extend([rect.top().0.clamp(0, height), rect.bottom().0.clamp(0, height)]);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut undamaged = Vec::new();
+    let mut crossed = Vec::with_capacity(damage.len());
+    for rows in edges.windows(2) {
+        let (top, bottom) = (rows[0], rows[1]);
+        crossed.clear();
+        crossed.extend(
+            damage
+                .iter()
+                .filter(|rect| rect.top().0 <= top && rect.bottom().0 >= bottom)
+                .map(|rect| (rect.left().0.clamp(0, width), rect.right().0.clamp(0, width))),
+        );
+        crossed.sort_unstable();
+        let mut left = 0;
+        let mut push = |left: i32, right: i32| {
+            undamaged.push(Bounds {
+                origin: point(DevicePixels(left), DevicePixels(top)),
+                size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
+            });
+        };
+        for &(damage_left, damage_right) in &crossed {
+            if damage_left > left {
+                push(left, damage_left);
+            }
+            left = left.max(damage_right);
+        }
+        if left < width {
+            push(left, width);
+        }
+    }
+    undamaged
 }
 
 fn set_viewport(
@@ -4012,7 +4229,7 @@ mod stale_texture_healing_tests {
         let target = renderer.device.new_texture(&descriptor);
 
         let command_buffer = renderer
-            .render_frame(&scene, &target, large, None)
+            .render_frame(&scene, &target, large, None, None)
             .expect("stale-texture render heals and succeeds");
         if !renderer.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
@@ -5403,7 +5620,7 @@ mod backdrop_blur_timing_tests {
         objc2::rc::autoreleasepool(|_| {
             renderer.update_intermediate_textures(TARGET);
             let command_buffer = renderer
-                .render_frame(scene, target, TARGET, None)
+                .render_frame(scene, target, TARGET, None, None)
                 .expect("frame encodes");
             command_buffer.commit();
             command_buffer.wait_until_completed();
@@ -5585,5 +5802,389 @@ mod hidden_drawable_tests {
         assert_eq!(layer_size(&renderer), (1728., 1084.));
         renderer.restore_drawables();
         assert_eq!(layer_size(&renderer), (1728., 1084.), "restoring twice is harmless");
+    }
+}
+
+/// A present that only advances time animations copies the frame presented
+/// last and draws just what moved over the clear colour. Whatever the copy
+/// brings, the result must be the frame a full draw gives: through a
+/// translucent target, around a backdrop blur elsewhere in the window, and
+/// with nothing of the previous frame left where the damage is.
+#[cfg(test)]
+mod partial_present_tests {
+    use super::{InstanceBufferPool, MetalRenderer, read_texture_to_image, undamaged_rects};
+    use gpui::{
+        BackdropBlur, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+        OpacityCycle, Point, Quad, ScaledPixels, Scene, Underline,
+    };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    const SIZE: gpui::Size<DevicePixels> = gpui::Size {
+        width: DevicePixels(96),
+        height: DevicePixels(64),
+    };
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(color),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::all(ScaledPixels(3.)),
+            border_widths: Edges::default(),
+        }
+    }
+
+    fn target(renderer: &MetalRenderer) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(SIZE.width.0 as u64);
+        descriptor.set_height(SIZE.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(if renderer.is_apple_gpu {
+            metal::MTLStorageMode::Shared
+        } else {
+            metal::MTLStorageMode::Managed
+        });
+        renderer.device.new_texture(&descriptor)
+    }
+
+    fn draw(
+        renderer: &mut MetalRenderer,
+        scene: &Scene,
+        texture: &metal::TextureRef,
+        previous_frame: Option<&metal::TextureRef>,
+    ) -> image::RgbaImage {
+        let command_buffer = renderer
+            .render_frame(scene, texture, SIZE, None, previous_frame)
+            .expect("headless render succeeds");
+        if !renderer.is_apple_gpu {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.synchronize_resource(texture);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        read_texture_to_image(texture).expect("readback succeeds")
+    }
+
+    fn pulsing_scene() -> Scene {
+        let mut scene = Scene::default();
+        for index in 0..8 {
+            let alpha = if index % 2 == 0 { 1. } else { 0.6 };
+            scene.insert_primitive(quad(
+                rect(index as f32 * 12., 0., 12., 64.),
+                gpui::hsla(index as f32 / 8., 0.7, 0.5, alpha),
+            ));
+        }
+        // Opaque cards over opaque stripes under the lone pulses: the depth
+        // prepass of each damaged rectangle has to keep them apart.
+        scene.insert_primitive(quad(rect(2., 2., 16., 14.), gpui::hsla(0., 0., 0.4, 1.)));
+        scene.insert_primitive(quad(rect(26., 36., 14., 14.), gpui::hsla(0., 0., 0.7, 1.)));
+        let cycle = OpacityCycle::new(
+            std::time::Duration::from_millis(900),
+            [(0.0, 0.2), (0.5, 1.0), (0.75, 0.6), (1.0, 0.2)],
+        );
+        // Beneath the frosted surface, so the frosting changes as it pulses.
+        scene.insert_opacity_cycled_quad(
+            quad(rect(78., 48., 6., 6.), gpui::hsla(0.3, 0.9, 0.5, 1.)),
+            cycle.phase(0.25),
+        );
+        let frosted = rect(60., 28., 32., 32.);
+        scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(3.),
+            saturation: 1.4,
+            opacity: 1.,
+            bounds: frosted,
+            content_mask: ContentMask { bounds: frosted },
+            corner_radii: Corners::all(ScaledPixels(6.)),
+        });
+        scene.insert_primitive(quad(frosted, gpui::hsla(0., 0., 0.1, 0.5)));
+        // On the frosted surface, as a spinner in a frosted composer is.
+        scene.insert_opacity_cycled_quad(
+            quad(rect(66., 34., 8., 8.), gpui::hsla(0.8, 0.8, 0.6, 1.)),
+            cycle.phase(0.75),
+        );
+        scene.insert_opacity_cycled_quad(quad(rect(6., 6., 10., 8.), gpui::hsla(0.6, 0.8, 0.6, 1.)), cycle);
+        scene.insert_opacity_cycled_quad(
+            quad(rect(30., 40., 8., 8.), gpui::hsla(0.1, 0.8, 0.6, 1.)),
+            cycle.phase(0.5),
+        );
+        // A batch that collapses the depth range, ordered last because it
+        // crosses the pulse and the frosted surface, ends every rectangle.
+        let underlined = rect(0., 44., 96., 2.);
+        scene.insert_primitive(Underline {
+            order: 0,
+            pad: 0,
+            bounds: underlined,
+            content_mask: ContentMask { bounds: underlined },
+            color: gpui::hsla(0.5, 0.5, 0.5, 1.),
+            thickness: ScaledPixels(2.),
+            wavy: false.into(),
+            rounded_clip: 0,
+            clip_padding: 0,
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn a_partial_present_draws_what_a_full_one_does() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        renderer.update_transparency(true);
+        renderer.update_intermediate_textures(SIZE);
+        let mut scene = pulsing_scene();
+
+        scene.advance_time_animations();
+        let previous = target(&renderer);
+        draw(&mut renderer, &scene, &previous, None);
+
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(SIZE, &mut renderer.damage_rects));
+        assert_eq!(
+            renderer.damage_rects.len(),
+            3,
+            "one rectangle per lone pulse, and one holding the frosted surface and both pulses on it"
+        );
+        let magenta = [255u8, 0, 255, 255];
+        for rect in &renderer.damage_rects {
+            let width = rect.size.width.0 as usize;
+            let height = rect.size.height.0 as usize;
+            let pixels = magenta.repeat(width * height);
+            previous.replace_region(
+                metal::MTLRegion {
+                    origin: metal::MTLOrigin {
+                        x: rect.origin.x.0 as u64,
+                        y: rect.origin.y.0 as u64,
+                        z: 0,
+                    },
+                    size: metal::MTLSize {
+                        width: width as u64,
+                        height: height as u64,
+                        depth: 1,
+                    },
+                },
+                0,
+                pixels.as_ptr().cast(),
+                (width * 4) as u64,
+            );
+        }
+        let partial_target = target(&renderer);
+        let partial = draw(&mut renderer, &scene, &partial_target, Some(&previous));
+        let full_target = target(&renderer);
+        let full = draw(&mut renderer, &scene, &full_target, None);
+
+        assert_eq!((renderer.partial_presents, renderer.full_presents), (1, 2));
+        let mismatch = full
+            .enumerate_pixels()
+            .find(|(x, y, pixel)| partial.get_pixel(*x, *y) != *pixel);
+        assert!(
+            mismatch.is_none(),
+            "partial present differs at {:?}: partial {:?}",
+            mismatch,
+            mismatch.map(|(x, y, _)| partial.get_pixel(x, y)),
+        );
+    }
+
+    #[test]
+    fn undamaged_rects_tile_the_rest_of_the_viewport() {
+        let device_rect = |left: i32, top: i32, right: i32, bottom: i32| Bounds {
+            origin: gpui::point(DevicePixels(left), DevicePixels(top)),
+            size: gpui::size(DevicePixels(right - left), DevicePixels(bottom - top)),
+        };
+        for damage in [
+            vec![],
+            vec![device_rect(0, 0, 96, 64)],
+            vec![device_rect(10, 10, 30, 30)],
+            vec![device_rect(10, 10, 30, 30), device_rect(40, 5, 50, 55), device_rect(0, 50, 8, 64)],
+        ] {
+            let undamaged = undamaged_rects(&damage, SIZE);
+            for y in 0..SIZE.height.0 {
+                for x in 0..SIZE.width.0 {
+                    let covers = |rect: &&Bounds<DevicePixels>| {
+                        rect.origin.x.0 <= x
+                            && x < rect.origin.x.0 + rect.size.width.0
+                            && rect.origin.y.0 <= y
+                            && y < rect.origin.y.0 + rect.size.height.0
+                    };
+                    let covered = damage.iter().filter(covers).count()
+                        + undamaged.iter().filter(covers).count();
+                    assert_eq!(covered, 1, "pixel ({x}, {y}) of {damage:?} covered {covered} times");
+                }
+            }
+        }
+    }
+}
+
+/// Run with `--ignored --nocapture`; prints the GPU time of a full-screen
+/// frame drawn whole and of the same frame presented again for a pulse.
+#[cfg(test)]
+mod partial_present_timing_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{
+        BackdropBlur, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+        OpacityCycle, Point, Quad, ScaledPixels, Scene, Size,
+    };
+    use foreign_types::ForeignType;
+    use objc2::{msg_send, runtime::AnyObject};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    const TARGET: Size<DevicePixels> = Size {
+        width: DevicePixels(3456),
+        height: DevicePixels(2168),
+    };
+
+    fn quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
+        let bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        };
+        Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(color),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::all(ScaledPixels(16.)),
+            border_widths: Edges::default(),
+        }
+    }
+
+    /// A translucent window's worth of stacked translucent panels, a frosted
+    /// composer, and the two things that keep a turn's window presenting: a
+    /// spinner pulse in the sidebar and one in the transcript.
+    fn window_scene() -> Scene {
+        let mut scene = Scene::default();
+        let (width, height) = (TARGET.width.0 as f32, TARGET.height.0 as f32);
+        scene.insert_primitive(quad(0., 0., width, height, gpui::hsla(0.6, 0.1, 0.12, 0.85)));
+        for index in 0..12 {
+            let inset = index as f32 * 40.;
+            scene.insert_primitive(quad(
+                inset,
+                inset,
+                width - inset * 2.,
+                height - inset * 2.,
+                gpui::hsla(index as f32 / 12., 0.3, 0.3, 0.4),
+            ));
+        }
+        let composer = (900., 1800., 1700., 300.);
+        let composer_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(composer.0),
+                y: ScaledPixels(composer.1),
+            },
+            size: gpui::size(ScaledPixels(composer.2), ScaledPixels(composer.3)),
+        };
+        scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(24.),
+            saturation: 1.4,
+            opacity: 1.,
+            bounds: composer_bounds,
+            content_mask: ContentMask {
+                bounds: composer_bounds,
+            },
+            corner_radii: Corners::all(ScaledPixels(24.)),
+        });
+        scene.insert_primitive(quad(composer.0, composer.1, composer.2, composer.3, gpui::hsla(0., 0., 0.1, 0.8)));
+        let cycle = OpacityCycle::new(
+            std::time::Duration::from_millis(900),
+            [(0.0, 0.2), (0.5, 1.0), (0.75, 0.6), (1.0, 0.2)],
+        );
+        scene.insert_opacity_cycled_quad(quad(60., 400., 24., 24., gpui::hsla(0.6, 0.8, 0.6, 1.)), cycle);
+        scene.insert_opacity_cycled_quad(
+            quad(1200., 1200., 36., 36., gpui::hsla(0.1, 0.8, 0.6, 1.)),
+            cycle.phase(0.5),
+        );
+        scene.finish();
+        scene
+    }
+
+    fn target(renderer: &MetalRenderer) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(TARGET.width.0 as u64);
+        descriptor.set_height(TARGET.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        renderer.device.new_texture(&descriptor)
+    }
+
+    fn frame_gpu_milliseconds(
+        renderer: &mut MetalRenderer,
+        scene: &Scene,
+        target: &metal::TextureRef,
+        previous_frame: Option<&metal::TextureRef>,
+    ) -> f64 {
+        objc2::rc::autoreleasepool(|_| {
+            let command_buffer = renderer
+                .render_frame(scene, target, TARGET, None, previous_frame)
+                .expect("frame encodes");
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            let buffer = command_buffer.as_ptr().cast::<AnyObject>();
+            // SAFETY: `GPUStartTime` and `GPUEndTime` are `CFTimeInterval`
+            // properties of every completed `MTLCommandBuffer`.
+            let (start, end): (f64, f64) =
+                unsafe { (msg_send![buffer, GPUStartTime], msg_send![buffer, GPUEndTime]) };
+            (end - start) * 1000.
+        })
+    }
+
+    #[test]
+    #[ignore = "measurement, prints GPU time of full and partial presents"]
+    fn measure_partial_present_gpu_time() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )));
+        renderer.update_transparency(true);
+        renderer.update_intermediate_textures(TARGET);
+        let mut scene = window_scene();
+        let targets = [target(&renderer), target(&renderer)];
+        let frames = 60;
+        let (mut full, mut partial) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
+        scene.advance_time_animations();
+        frame_gpu_milliseconds(&mut renderer, &scene, &targets[0], None);
+        for frame in 0..frames {
+            let (previous, next) = (&targets[frame % 2], &targets[(frame + 1) % 2]);
+            scene.advance_time_animations();
+            full.push(frame_gpu_milliseconds(&mut renderer, &scene, next, None));
+            assert!(scene.time_animation_damage(TARGET, &mut renderer.damage_rects));
+            partial.push(frame_gpu_milliseconds(&mut renderer, &scene, next, Some(previous)));
+        }
+        full.sort_by(f64::total_cmp);
+        partial.sort_by(f64::total_cmp);
+        println!(
+            "{}x{}: full present {:.3} ms, partial present {:.3} ms (median of {frames})",
+            TARGET.width.0,
+            TARGET.height.0,
+            full[frames / 2],
+            partial[frames / 2],
+        );
     }
 }

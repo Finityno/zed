@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, util::CapacityShrink,
 };
 use std::{
@@ -165,6 +165,15 @@ pub struct Scene {
     /// Each transition's composed offset and opacity for the present being
     /// prepared, reused across presents.
     transition_states: Vec<(Point<ScaledPixels>, f32)>,
+    /// Which `finish` produced what this scene holds, unique across scenes,
+    /// so a renderer can tell a present of the frame it drew last from a
+    /// present of a new one. Zero until the first `finish`.
+    content_id: u64,
+    /// When [`Self::advance_time_animations`] last ran on this content.
+    last_advanced_at: Option<std::time::Instant>,
+    /// Whether the transitions this scene carries had already landed when
+    /// the advance before the latest one ran, so the latest moved nothing.
+    transitions_unmoved: bool,
     /// One tracker per vector above, in the order `clear` destructures them.
     shrink: [CapacityShrink; 15],
     /// Room `finish` sorts in, kept across frames.
@@ -218,6 +227,8 @@ impl Scene {
         self.current_transition = 0;
         self.transitioned.clear();
         self.transitions_end_at = None;
+        self.last_advanced_at = None;
+        self.transitions_unmoved = false;
     }
 
     /// Shrinks this scene's vectors to twice the fill of `rendered`, the
@@ -659,6 +670,20 @@ impl Scene {
         self.quad_animations.len() as u32
     }
 
+    /// Inserts `quad` with its opacity driven by `cycle`, as a quad painted
+    /// inside [`crate::Window::with_opacity_cycle`] is.
+    pub fn insert_opacity_cycled_quad(&mut self, quad: Quad, cycle: OpacityCycle) {
+        let animation = self.push_quad_animation(QuadOpacityAnimation {
+            cycle,
+            background: quad.background,
+            border_color: quad.border_color,
+        });
+        self.insert_primitive(Quad {
+            background: quad.background.with_time_animation(animation),
+            ..quad
+        });
+    }
+
     /// Registers a sweep for sprites painted after this call, returning the
     /// value their [`SpriteEffect::animation`] should carry.
     pub(crate) fn push_shimmer_animation(&mut self, animation: ShimmerAnimation) -> u32 {
@@ -999,6 +1024,9 @@ impl Scene {
                 .filter(|&index| self.quads[index as usize].background.time_animation() != 0),
         );
         self.gather_transitioned();
+        self.content_id = NEXT_SCENE_CONTENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_advanced_at = None;
+        self.transitions_unmoved = false;
     }
 
     fn gather_transitioned(&mut self) {
@@ -1086,7 +1114,14 @@ impl Scene {
     /// Moves every time-driven primitive of this finished scene to where it is
     /// now. Called before each present, so a frame replayed from a cached view
     /// shows the current phase rather than the one it was painted at.
-    pub(crate) fn advance_time_animations(&mut self) {
+    pub fn advance_time_animations(&mut self) {
+        let now = std::time::Instant::now();
+        self.transitions_unmoved = self.transitions.is_empty()
+            || self
+                .transitions_end_at
+                .zip(self.last_advanced_at)
+                .is_some_and(|(end, last_advanced_at)| last_advanced_at >= end);
+        self.last_advanced_at = Some(now);
         if !self.has_time_animations() && self.transitioned.is_empty() {
             return;
         }
@@ -1117,7 +1152,97 @@ impl Scene {
                 .with_time_animation(animation_id);
             quad.border_color = animation.border_color.opacity(opacity);
         }
-        self.advance_transitions(std::time::Instant::now());
+        self.advance_transitions(now);
+    }
+
+    /// Which finished frame this scene holds; see [`Self::content_id`]'s
+    /// field. Advancing time animations keeps it.
+    pub fn content_id(&self) -> u64 {
+        self.content_id
+    }
+
+    /// Where the latest [`Self::advance_time_animations`] can have changed
+    /// what this scene draws, as device-pixel rectangles inside `viewport`
+    /// that do not overlap. A renderer still showing this content from its
+    /// previous present needs to draw only those and can copy the rest of
+    /// the frame over, which for a shimmering label or a pulsing spinner is a
+    /// sliver of the window instead of all of it.
+    ///
+    /// A rectangle that reaches a backdrop blur covers all of it, so the blur
+    /// can frost it again from what the rectangle redraws beneath it.
+    ///
+    /// `false` when the change cannot be bounded that way: no advance has
+    /// run on this content yet, a transition was still moving, a moving
+    /// sprite is transformed, or the rectangles cover so much of the viewport
+    /// that drawing everything costs about the same.
+    pub fn time_animation_damage(
+        &self,
+        viewport: Size<DevicePixels>,
+        damage: &mut Vec<Bounds<DevicePixels>>,
+    ) -> bool {
+        damage.clear();
+        if self.last_advanced_at.is_none() || !self.transitions_unmoved {
+            return false;
+        }
+        let mut rects = Vec::new();
+        for sprite in self
+            .animated_monochrome_sprites
+            .iter()
+            .map(|&index| &self.monochrome_sprites[index as usize])
+        {
+            if sprite.transformation != TransformationMatrix::unit() {
+                return false;
+            }
+            rects.extend(DamageRect::covering(&sprite.bounds, &sprite.content_mask, viewport));
+        }
+        for sprite in self
+            .animated_subpixel_sprites
+            .iter()
+            .map(|&index| &self.subpixel_sprites[index as usize])
+        {
+            if sprite.transformation != TransformationMatrix::unit() {
+                return false;
+            }
+            rects.extend(DamageRect::covering(&sprite.bounds, &sprite.content_mask, viewport));
+        }
+        for quad in self.animated_quads.iter().map(|&index| &self.quads[index as usize]) {
+            rects.extend(DamageRect::covering(&quad.bounds, &quad.content_mask, viewport));
+        }
+        let mut merged = DamageRect::merge(rects);
+        // A blur frosts what is beneath it within its bounds, so damage that
+        // reaches one takes all of it in: the rectangle then holds everything
+        // the blur samples, and the blur can run again inside it.
+        let frosted: Vec<DamageRect> = self
+            .backdrop_blurs
+            .iter()
+            .map(|blur| DamageRect::from_scaled(&blur.bounds.intersect(&blur.content_mask.bounds)))
+            .collect();
+        loop {
+            let mut grown = false;
+            for rect in &mut merged {
+                for blur in &frosted {
+                    let covering = rect.union(blur);
+                    if rect.intersects(blur) && covering != *rect {
+                        *rect = covering;
+                        grown = true;
+                    }
+                }
+            }
+            if !grown {
+                break;
+            }
+            merged = DamageRect::merge(merged);
+        }
+        for rect in &mut merged {
+            *rect = rect.clamped_to(viewport);
+        }
+        let viewport_area = viewport.width.0.max(0) as i64 * viewport.height.0.max(0) as i64;
+        let damaged_area: i64 = merged.iter().map(DamageRect::area).sum();
+        if damaged_area * MAX_DAMAGE_SHARE_DENOMINATOR > viewport_area {
+            return false;
+        }
+        damage.extend(merged.iter().map(DamageRect::to_bounds));
+        true
     }
 
     fn advance_transitions(&mut self, now: std::time::Instant) {
@@ -1490,6 +1615,117 @@ pub const MAX_DEPTH_PARTITIONED_QUADS: usize = 65534;
 /// unorm depth attachment as well as a 32-bit float one.
 pub fn quad_depth(quad_id: u32) -> f32 {
     ((quad_id + 1) as f32 * (1.0 / 65535.0)).min(1.0)
+}
+
+static NEXT_SCENE_CONTENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Past this many rectangles, [`Scene::time_animation_damage`] draws the one
+/// bounding them all: every rectangle repeats the frame's draw calls.
+const MAX_DAMAGE_RECTS: usize = 8;
+/// Rectangles nearer than this, in device pixels, are drawn as one, so a line
+/// of shimmering glyphs is one rectangle rather than one per glyph.
+const DAMAGE_MERGE_GAP: i32 = 16;
+/// Damage over more than one part in this many of the viewport draws the
+/// whole frame: the copy of the rest is no longer the cheaper half.
+const MAX_DAMAGE_SHARE_DENOMINATOR: i64 = 2;
+
+/// A device-pixel rectangle of [`Scene::time_animation_damage`], half-open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DamageRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl DamageRect {
+    fn from_scaled(bounds: &Bounds<ScaledPixels>) -> Self {
+        // A pixel of slack on each side covers antialiasing that a
+        // primitive's coverage spreads past its bounds.
+        Self {
+            left: bounds.left().0.floor() as i32 - 1,
+            top: bounds.top().0.floor() as i32 - 1,
+            right: bounds.right().0.ceil() as i32 + 1,
+            bottom: bounds.bottom().0.ceil() as i32 + 1,
+        }
+    }
+
+    /// What of `bounds` its content mask lets onto the viewport, if any.
+    fn covering(
+        bounds: &Bounds<ScaledPixels>,
+        mask: &ContentMask<ScaledPixels>,
+        viewport: Size<DevicePixels>,
+    ) -> Option<Self> {
+        let rect = Self::from_scaled(&bounds.intersect(&mask.bounds)).clamped_to(viewport);
+        (rect.left < rect.right && rect.top < rect.bottom).then_some(rect)
+    }
+
+    fn clamped_to(&self, viewport: Size<DevicePixels>) -> Self {
+        Self {
+            left: self.left.max(0),
+            top: self.top.max(0),
+            right: self.right.min(viewport.width.0),
+            bottom: self.bottom.min(viewport.height.0),
+        }
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        self.left < other.right
+            && other.left < self.right
+            && self.top < other.bottom
+            && other.top < self.bottom
+    }
+
+    fn near(&self, other: &Self) -> bool {
+        self.left - DAMAGE_MERGE_GAP < other.right
+            && other.left - DAMAGE_MERGE_GAP < self.right
+            && self.top - DAMAGE_MERGE_GAP < other.bottom
+            && other.top - DAMAGE_MERGE_GAP < self.bottom
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    fn area(&self) -> i64 {
+        (self.right - self.left) as i64 * (self.bottom - self.top) as i64
+    }
+
+    fn to_bounds(&self) -> Bounds<DevicePixels> {
+        Bounds {
+            origin: point(DevicePixels(self.left), DevicePixels(self.top)),
+            size: Size {
+                width: DevicePixels(self.right - self.left),
+                height: DevicePixels(self.bottom - self.top),
+            },
+        }
+    }
+
+    /// Folds `rects` into rectangles no two of which are near each other,
+    /// and so never overlap, at most [`MAX_DAMAGE_RECTS`] of them.
+    fn merge(rects: Vec<Self>) -> Vec<Self> {
+        let mut merged: Vec<Self> = Vec::with_capacity(rects.len().min(MAX_DAMAGE_RECTS + 1));
+        for mut rect in rects {
+            // A union can reach rectangles neither half was near, so keep
+            // folding until it stands alone.
+            while let Some(index) = merged.iter().position(|other| other.near(&rect)) {
+                rect = rect.union(&merged.swap_remove(index));
+            }
+            merged.push(rect);
+        }
+        if merged.len() > MAX_DAMAGE_RECTS
+            && let Some(bounding) = merged.iter().copied().reduce(|bounding, rect| bounding.union(&rect))
+        {
+            merged.clear();
+            merged.push(bounding);
+        }
+        merged
+    }
 }
 
 static OPAQUE_QUAD_PARTITIONING_DISABLED: std::sync::atomic::AtomicBool =
@@ -2502,6 +2738,160 @@ mod tests {
         let background = scene.quads[0].background;
         assert_eq!(background.time_animation(), animation);
         assert!((background.solid.a - quad.background.solid.a * 0.5).abs() < 1e-6);
+    }
+
+    fn shimmer_scene_with_glyphs_at(origins: &[(f32, f32)]) -> Scene {
+        let mut scene = Scene::default();
+        let animation = scene.push_shimmer_animation(ShimmerAnimation {
+            band_start: -40.0,
+            travel: 1000.0,
+            period: std::time::Duration::from_millis(1000),
+            hold: 0.0,
+        });
+        for &(x, y) in origins {
+            let bounds = Bounds {
+                origin: point(ScaledPixels(x), ScaledPixels(y)),
+                size: unit_bounds().size,
+            };
+            scene.insert_primitive(MonochromeSprite {
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..shimmering_glyph(animation)
+            });
+        }
+        scene
+    }
+
+    fn device_viewport(width: i32, height: i32) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(width),
+            height: DevicePixels(height),
+        }
+    }
+
+    fn device_rect(left: i32, top: i32, right: i32, bottom: i32) -> Bounds<DevicePixels> {
+        Bounds {
+            origin: point(DevicePixels(left), DevicePixels(top)),
+            size: device_viewport(right - left, bottom - top),
+        }
+    }
+
+    /// Presenting a shimmer again changes only its glyphs, so only they are
+    /// damaged, each with a pixel of slack, while the scene keeps the content
+    /// id a renderer recognizes its previous present by.
+    #[test]
+    fn a_shimmer_present_damages_only_its_glyphs() {
+        let mut scene = shimmer_scene_with_glyphs_at(&[(100., 100.), (500., 600.)]);
+        scene.insert_primitive(opaque_quad());
+        scene.finish();
+        let content_id = scene.content_id();
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+        assert!(
+            !scene.time_animation_damage(viewport, &mut damage),
+            "nothing to compare against before the first advance"
+        );
+
+        scene.advance_time_animations();
+        assert!(scene.time_animation_damage(viewport, &mut damage));
+        damage.sort_by_key(|rect| rect.origin.y.0);
+        assert_eq!(
+            damage,
+            vec![device_rect(99, 99, 111, 111), device_rect(499, 599, 511, 611)]
+        );
+        assert_eq!(scene.content_id(), content_id);
+
+        scene.finish();
+        assert_ne!(scene.content_id(), content_id);
+    }
+
+    /// A line of shimmering glyphs is damaged as one rectangle, not one per
+    /// glyph.
+    #[test]
+    fn neighbouring_glyphs_share_one_damage_rect() {
+        let mut scene = shimmer_scene_with_glyphs_at(&[(0., 0.), (12., 0.), (24., 0.), (36., 20.)]);
+        scene.finish();
+        scene.advance_time_animations();
+        let mut damage = Vec::new();
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert_eq!(damage, vec![device_rect(0, 0, 47, 31)]);
+    }
+
+    #[test]
+    fn damage_reaching_a_backdrop_blur_takes_all_of_it() {
+        let blur_at = |x: f32, y: f32| {
+            let bounds = Bounds {
+                origin: point(ScaledPixels(x), ScaledPixels(y)),
+                size: Size {
+                    width: ScaledPixels(40.),
+                    height: ScaledPixels(20.),
+                },
+            };
+            BackdropBlur {
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..unit_backdrop_blur()
+            }
+        };
+        let mut scene = shimmer_scene_with_glyphs_at(&[(400., 400.)]);
+        scene.insert_backdrop_blur(blur_at(405., 405.));
+        scene.insert_backdrop_blur(blur_at(700., 700.));
+        scene.finish();
+        scene.advance_time_animations();
+        let mut damage = Vec::new();
+        assert!(scene.time_animation_damage(device_viewport(1000, 1000), &mut damage));
+        assert_eq!(
+            damage,
+            vec![device_rect(399, 399, 446, 426)],
+            "the blur the glyph reaches is redrawn whole, the other one not at all"
+        );
+    }
+
+    #[test]
+    fn damage_over_half_the_viewport_is_not_worth_bounding() {
+        let mut scene = shimmer_scene_with_glyphs_at(&[(0., 0.)]);
+        scene.finish();
+        scene.advance_time_animations();
+        let mut damage = Vec::new();
+        assert!(scene.time_animation_damage(device_viewport(100, 100), &mut damage));
+        assert!(!scene.time_animation_damage(device_viewport(14, 14), &mut damage));
+    }
+
+    /// A moving transition shifts whatever it covers, so its present cannot
+    /// be bounded; once it has landed before an advance, the next one moves
+    /// nothing and the shimmer alone is damaged again.
+    #[test]
+    fn damage_is_unbounded_until_transitions_have_landed() {
+        let viewport = device_viewport(1000, 1000);
+        let mut damage = Vec::new();
+
+        let mut moving = shimmer_scene_with_glyphs_at(&[(100., 100.)]);
+        let Some(transition) = moving.push_transition(rolling_in(std::time::Instant::now())) else {
+            panic!("a first transition always fits");
+        };
+        moving.set_current_transition(transition);
+        moving.insert_primitive(shimmering_glyph(0));
+        moving.finish();
+        moving.advance_time_animations();
+        moving.advance_time_animations();
+        assert!(!moving.time_animation_damage(viewport, &mut damage));
+
+        let landed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut landed = shimmer_scene_with_glyphs_at(&[(100., 100.)]);
+        let Some(transition) = landed.push_transition(rolling_in(landed_at)) else {
+            panic!("a first transition always fits");
+        };
+        landed.set_current_transition(transition);
+        landed.insert_primitive(shimmering_glyph(0));
+        landed.finish();
+        landed.advance_time_animations();
+        assert!(
+            !landed.time_animation_damage(viewport, &mut damage),
+            "the first advance after a draw may still have moved it"
+        );
+        landed.advance_time_animations();
+        assert!(landed.time_animation_damage(viewport, &mut damage));
+        assert_eq!(damage, vec![device_rect(99, 99, 111, 111)]);
     }
 
     /// The glyph sprite inserts build the same scene `insert_primitive` builds
