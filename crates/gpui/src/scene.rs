@@ -1762,13 +1762,15 @@ pub const MAX_DEPTH_PARTITIONED_QUADS: usize = 65534;
 /// The prepass draws the core unclipped, so before this a quad inside any
 /// rounded clip never took it, and an opaque card painted in nested rounded
 /// containers (each its own clip, all the same rectangle) was shaded in full
-/// once per container: five full-window layers in a live window. A rounded
-/// rectangle's distance field is convex, so a core whose four corners are at
-/// least the antialiasing ramp inside a clip, with a margin for the float
-/// steps between this and the shaders' arithmetic, is inside it throughout.
-/// Both bands a backend may draw as the core are checked, so it does not
-/// matter which one it picks; past 2^18 device pixels, where float steps
-/// outgrow the margin, a clipped quad keeps the blended pass.
+/// once per container: five full-window layers in a live window. Within each
+/// quadrant of a clip, its distance field only grows away from the centre,
+/// so a core whose four corners are at least the antialiasing ramp inside a
+/// clip, with a margin for the float steps between this and the shaders'
+/// arithmetic, is inside it throughout. Both bands a backend may draw as the
+/// core are checked, so it does not matter which one it picks; past 2^18
+/// device pixels, where float steps outgrow the margin, and under a clip a
+/// transition moves after the scene is partitioned, a clipped quad keeps the
+/// blended pass.
 fn core_is_fully_covered(quad: &Quad, rounded_clips: &[RoundedClipNode]) -> bool {
     const PRECISE: f32 = 262144.0;
     const REQUIRED_SDF: f32 = -0.75;
@@ -1789,10 +1791,10 @@ fn core_is_fully_covered(quad: &Quad, rounded_clips: &[RoundedClipNode]) -> bool
         let Some(mask) = rounded_clips.get(clip as usize - 1) else {
             return false;
         };
-        if !precise(&mask.bounds) {
+        if !precise(&mask.bounds) || mask.transition != 0 {
             return false;
         }
-        for core in &cores {
+        for core in cores.iter().flatten() {
             let corners = [
                 (core.left().0, core.top().0),
                 (core.right().0, core.top().0),
@@ -1815,9 +1817,9 @@ fn core_is_fully_covered(quad: &Quad, rounded_clips: &[RoundedClipNode]) -> bool
 /// bounds when unrounded, otherwise the band clear of the top and bottom
 /// corner arcs and the band clear of the left and right ones (a backend
 /// draws the larger). Empty bands are left out.
-fn opaque_core_bands(quad: &Quad) -> Vec<Bounds<ScaledPixels>> {
+fn opaque_core_bands(quad: &Quad) -> [Option<Bounds<ScaledPixels>>; 2] {
     if !quad.has_rounded_corners() {
-        return vec![quad.bounds];
+        return [Some(quad.bounds), None];
     }
     const ANTIALIAS_INSET: f32 = 1.0;
     let radii = &quad.corner_radii;
@@ -1838,9 +1840,7 @@ fn opaque_core_bands(quad: &Quad) -> Vec<Bounds<ScaledPixels>> {
         band(ANTIALIAS_INSET, top, width - 2.0 * ANTIALIAS_INSET, height - top - bottom),
         band(left, ANTIALIAS_INSET, width - left - right, height - 2.0 * ANTIALIAS_INSET),
     ]
-    .into_iter()
-    .filter(|band| band.size.width.0 > 0.0 && band.size.height.0 > 0.0)
-    .collect()
+    .map(|band| (band.size.width.0 > 0.0 && band.size.height.0 > 0.0).then_some(band))
 }
 
 /// The shaders' `quad_sdf`: the signed distance from a point to a rounded
@@ -3579,6 +3579,31 @@ mod tests {
             "a quad the clip's corner arc cuts keeps the blended pass");
         let inner = scene.quads.iter().position(|quad| quad.bounds.size.width.0 == 300.).unwrap_or(usize::MAX) as u32;
         assert!(!scene.blended_quad_indices.contains(&inner), "a covered unrounded quad needs no blended edge");
+    }
+
+    /// A clip a transition moves can stop covering a quad that stands
+    /// still, after the scene was partitioned; the quad keeps the blended
+    /// pass.
+    #[test]
+    fn a_quad_under_a_moving_clip_keeps_the_blended_pass() {
+        let mut scene = Scene::default();
+        scene.rounded_clips.push(RoundedClipNode {
+            bounds: card_bounds(0., 0., 100., 100.),
+            corner_radii: Corners::all(ScaledPixels(20.)),
+            parent: 0,
+            transition: 1,
+            base_origin: Default::default(),
+        });
+        let bounds = card_bounds(10., 10., 80., 80.);
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            rounded_clip: 1,
+            ..opaque_quad()
+        });
+        scene.finish();
+        assert!(scene.opaque_quad_indices.is_empty());
+        assert_eq!(scene.blended_quad_indices, vec![0]);
     }
 
     /// The glyph sprite inserts build the same scene `insert_primitive` builds
