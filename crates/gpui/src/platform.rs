@@ -1164,7 +1164,8 @@ pub enum PresentOutcome {
     #[default]
     Presented,
     /// The platform had no surface to render into (on macOS, `nextDrawable`
-    /// returned none) and submitted nothing. The frame is still owed: the
+    /// returned none, or had not handed one back within the present's wait)
+    /// and submitted nothing. The frame is still owed: the
     /// window keeps it pending and re-arms its frame source, and the next
     /// frame request presents it. Retries run at the rate the platform
     /// delivers frame requests (macOS: once per display refresh), so an
