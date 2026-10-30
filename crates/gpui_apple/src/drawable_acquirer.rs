@@ -38,6 +38,37 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    gate: Arc<AcquireGate>,
+}
+
+/// Holds the thread back before it asks for a drawable, standing in for a
+/// compositor that holds every drawable: a layer in no window allocates a new
+/// one for every request and never runs out.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AcquireGate {
+    closed: Mutex<bool>,
+    opened: Condvar,
+}
+
+#[cfg(test)]
+impl AcquireGate {
+    pub(crate) fn close(&self) {
+        *self.closed.lock() = true;
+    }
+
+    pub(crate) fn open(&self) {
+        *self.closed.lock() = false;
+        self.opened.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut closed = self.closed.lock();
+        while *closed {
+            self.opened.wait(&mut closed);
+        }
+    }
 }
 
 pub(crate) struct DrawableAcquirer {
@@ -52,6 +83,8 @@ impl DrawableAcquirer {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                gate: Arc::default(),
             }),
             layer,
             thread_started: false,
@@ -112,6 +145,11 @@ impl DrawableAcquirer {
         drop(discarded);
     }
 
+    #[cfg(test)]
+    pub(crate) fn gate(&self) -> Arc<AcquireGate> {
+        Arc::clone(&self.shared.gate)
+    }
+
     fn start_thread(&mut self) {
         if self.thread_started {
             return;
@@ -165,6 +203,8 @@ fn serve_requests(shared: &Shared, layer: &MetalLayer) {
             continue;
         };
         let drawable = MutexGuard::unlocked(&mut state, || {
+            #[cfg(test)]
+            shared.gate.pass();
             // The drawable comes back autoreleased; it is retained before
             // this thread's pool drains, and released wherever it is dropped.
             objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))

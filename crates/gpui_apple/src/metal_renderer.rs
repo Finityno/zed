@@ -280,6 +280,11 @@ pub struct MetalRenderer {
     /// for had not come back began, and how many there have been; logged
     /// once the drawable comes back.
     awaiting_drawable: Option<(Instant, u32)>,
+    /// [`DRAWABLE_WAIT`], except in tests: a layer in no window allocates a
+    /// new drawable for every request, which a machine busy running tests in
+    /// parallel can take longer than a refresh to do, so tests wait for it
+    /// unless they are about deferring.
+    drawable_wait: Duration,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -1003,6 +1008,7 @@ impl MetalRenderer {
             device,
             drawable_acquirer: layer.clone().map(DrawableAcquirer::new),
             awaiting_drawable: None,
+            drawable_wait: if cfg!(test) { Duration::from_secs(10) } else { DRAWABLE_WAIT },
             layer,
             presents_with_transaction: false,
             use_display_p3: false,
@@ -1827,7 +1833,7 @@ impl MetalRenderer {
         breakdown.drawables_in_flight = drawables_in_flight;
         breakdown.drawables_in_flight_clamped = drawables_in_flight_clamped;
         let acquire_start = Instant::now();
-        let drawable = self.acquire_drawable(viewport_size, acquire_start + DRAWABLE_WAIT);
+        let drawable = self.acquire_drawable(viewport_size, acquire_start + self.drawable_wait);
         breakdown.acquire = acquire_start.elapsed();
         let drawable = match drawable {
             Acquired::Ready(drawable) => drawable,
@@ -2118,7 +2124,7 @@ impl MetalRenderer {
     /// overlap. Returns whether both came back; a drawable that did is kept
     /// for the retry when the other did not.
     pub fn ready_layered_drawables(base: &mut Self, overlay: &mut Self) -> bool {
-        let deadline = Instant::now() + DRAWABLE_WAIT;
+        let deadline = Instant::now() + base.drawable_wait;
         let base_asked = base.request_drawable();
         let overlay_asked = overlay.request_drawable();
         base.wait_for_drawable(base_asked, deadline)
@@ -5157,6 +5163,7 @@ mod present_report_tests {
         Acquired, DRAWABLE_WAIT, InstanceBufferPool, MetalRenderer,
         stale_texture_healing_tests::solid_quad_scene,
     };
+    use crate::drawable_acquirer::AcquireGate;
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
     use std::{
@@ -5250,31 +5257,26 @@ mod present_report_tests {
         );
     }
 
-    fn hold_every_drawable(layer: &metal::MetalLayerRef) -> Vec<metal::MetalDrawable> {
-        objc2::rc::autoreleasepool(|_| {
-            (0..layer.maximum_drawable_count())
-                .map(|_| {
-                    layer
-                        .next_drawable()
-                        .expect("a layer in no window has a drawable while one is free")
-                        .to_owned()
-                })
-                .collect()
-        })
+    fn gate(renderer: &MetalRenderer) -> Arc<AcquireGate> {
+        renderer
+            .drawable_acquirer
+            .as_ref()
+            .expect("a layer-backed renderer")
+            .gate()
     }
 
-    /// While every drawable is held, as a compositor holds them for a window
-    /// it is not compositing, a present waits out [`DRAWABLE_WAIT`] and
-    /// defers instead of blocking until one comes back; a retry while the
-    /// request is still out defers without waiting again, and the first
-    /// retry after a drawable comes back presents.
+    /// While no drawable comes back, as when a compositor holds every one
+    /// for a window it is not compositing, a present waits out
+    /// [`DRAWABLE_WAIT`] and defers instead of blocking until one does; a
+    /// retry while the request is still out defers without waiting again,
+    /// and the first retry after the drawable comes back presents.
     #[test]
-    fn a_present_whose_drawables_are_all_held_defers_instead_of_blocking() {
+    fn a_present_whose_drawable_does_not_come_back_defers_instead_of_blocking() {
         let mut renderer =
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
-        let layer = renderer.layer.clone().expect("a window renderer has a layer");
-        let held = hold_every_drawable(&layer);
+        renderer.drawable_wait = DRAWABLE_WAIT;
+        gate(&renderer).close();
 
         let report = renderer.draw(&solid_quad_scene(32.));
         assert_eq!(report.outcome, PresentOutcome::Deferred);
@@ -5293,7 +5295,7 @@ mod present_report_tests {
             report.breakdown
         );
 
-        drop(held);
+        gate(&renderer).open();
         let deadline = Instant::now() + Duration::from_secs(5);
         let report = loop {
             let report = renderer.draw(&solid_quad_scene(32.));
@@ -5305,7 +5307,7 @@ mod present_report_tests {
         assert_eq!(
             report.outcome,
             PresentOutcome::Presented,
-            "the drawable asked for came back once the held ones were released"
+            "the drawable asked for came back once the layer let it go"
         );
         assert!(renderer.awaiting_drawable.is_none());
     }
@@ -5317,7 +5319,7 @@ mod present_report_tests {
         let mut renderer =
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
-        let deadline = Instant::now() + DRAWABLE_WAIT;
+        let deadline = Instant::now() + renderer.drawable_wait;
         assert_eq!(renderer.request_drawable(), Some(true));
         assert!(renderer.wait_for_drawable(Some(true), deadline));
 
@@ -5335,28 +5337,31 @@ mod present_report_tests {
         let mut renderer =
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        renderer.drawable_wait = DRAWABLE_WAIT;
         renderer.set_presents_with_transaction(true);
-        let held = hold_every_drawable(&renderer.layer.clone().expect("a window renderer has a layer"));
+        gate(&renderer).close();
         assert_eq!(renderer.request_drawable(), Some(true));
         renderer
             .drawable_acquirer
             .as_ref()
             .expect("a layer-backed renderer")
             .discard();
-        let releaser = std::thread::spawn(move || {
+
+        let gate = gate(&renderer);
+        let opener = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            drop(held);
+            gate.open();
         });
 
         let report = renderer.draw(&solid_quad_scene(32.));
 
-        releaser.join().expect("the releasing thread finished");
+        opener.join().expect("the opening thread finished");
         assert_eq!(report.outcome, PresentOutcome::Presented);
     }
 
-    /// A layered window's planes defer together: when one plane's drawables
-    /// are all held, neither presents, and the other's drawable is kept for
-    /// the retry rather than asked for again.
+    /// A layered window's planes defer together: when one plane's drawable
+    /// does not come back, neither presents, and the other's drawable is kept
+    /// for the retry rather than asked for again.
     #[test]
     fn layered_drawables_are_ready_only_when_both_planes_have_one() {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
@@ -5365,12 +5370,13 @@ mod present_report_tests {
         for renderer in [&mut base, &mut overlay] {
             renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         }
-        let held = hold_every_drawable(&overlay.layer.clone().expect("an overlay has a layer"));
+        base.drawable_wait = DRAWABLE_WAIT;
+        gate(&overlay).close();
 
         assert!(!MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
         assert_eq!(base.request_drawable(), Some(false), "the base's drawable is kept");
 
-        drop(held);
+        gate(&overlay).open();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay) {
             assert!(Instant::now() < deadline, "the overlay's drawable came back");
