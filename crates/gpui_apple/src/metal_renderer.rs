@@ -1,3 +1,4 @@
+use crate::drawable_acquirer::{Acquired, DrawableAcquirer};
 use crate::metal_atlas::MetalAtlas;
 use etagere::BucketedAtlasAllocator;
 use anyhow::{Context as _, Result};
@@ -37,12 +38,20 @@ use std::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// How many presents in a row may defer for want of a drawable before the
 /// frame is dropped instead: about a second of display refreshes.
 const MAX_CONSECUTIVE_DEFERRED_PRESENTS: u32 = 120;
+
+/// The longest a present waits for the layer to hand back a drawable before
+/// it defers instead, leaving the frame owed for the next display refresh.
+/// A drawable held back by an ordinary GPU or compositor backlog comes back
+/// within a refresh at 60 Hz, so those presents land as they did when the
+/// wait was unbounded; only a compositor holding the drawables for longer
+/// turns into deferred presents, with the main thread free in between.
+const DRAWABLE_WAIT: Duration = Duration::from_millis(16);
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -114,6 +123,11 @@ impl Drop for InFlightSubmission {
     fn drop(&mut self) {
         self.unfinished.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+fn drawable_matches(drawable: &metal::MetalDrawableRef, viewport_size: Size<DevicePixels>) -> bool {
+    let texture = drawable.texture();
+    texture.width() == viewport_size.width.0 as u64 && texture.height() == viewport_size.height.0 as u64
 }
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -258,6 +272,13 @@ impl InstanceBufferPool {
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
+    /// Asks `layer` for drawables off the main thread; see
+    /// [`Self::acquire_drawable`].
+    drawable_acquirer: Option<DrawableAcquirer>,
+    /// When the presents deferred in a row because the drawable they asked
+    /// for had not come back began, and how many there have been; logged
+    /// once the drawable comes back.
+    awaiting_drawable: Option<(Instant, u32)>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -973,6 +994,8 @@ impl MetalRenderer {
 
         Self {
             device,
+            drawable_acquirer: layer.clone().map(DrawableAcquirer::new),
+            awaiting_drawable: None,
             layer,
             presents_with_transaction: false,
             use_display_p3: false,
@@ -1081,6 +1104,9 @@ impl MetalRenderer {
     /// frame.
     pub fn release_drawables(&mut self) {
         self.presented_frame = None;
+        if let Some(acquirer) = &self.drawable_acquirer {
+            acquirer.discard();
+        }
         if let Some(layer) = &self.layer {
             self.drawables_released = true;
             layer.set_drawable_size(CGSize::new(1., 1.));
@@ -1794,8 +1820,27 @@ impl MetalRenderer {
         breakdown.drawables_in_flight = drawables_in_flight;
         breakdown.drawables_in_flight_clamped = drawables_in_flight_clamped;
         let acquire_start = Instant::now();
-        let drawable = layer.next_drawable();
+        let drawable = self.acquire_drawable(viewport_size, acquire_start + DRAWABLE_WAIT);
         breakdown.acquire = acquire_start.elapsed();
+        let drawable = match drawable {
+            Acquired::Ready(drawable) => drawable,
+            Acquired::Pending => {
+                let (_, deferred) = self.awaiting_drawable.get_or_insert((acquire_start, 0));
+                *deferred += 1;
+                return PresentReport {
+                    outcome: PresentOutcome::Deferred,
+                    breakdown,
+                };
+            }
+        };
+        if let Some((since, deferred)) = self.awaiting_drawable.take() {
+            log::info!(
+                "drawable came back after {:?} and {deferred} deferred presents \
+                 ({} in flight now)",
+                since.elapsed(),
+                breakdown.drawables_in_flight
+            );
+        }
         let Some(drawable) = drawable else {
             let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
             let allows_timeout = objc2_layer.allowsNextDrawableTimeout();
@@ -1849,13 +1894,13 @@ impl MetalRenderer {
         });
 
         let commit_start = Instant::now();
-        self.note_drawable_in_flight(drawable);
+        self.note_drawable_in_flight(&drawable);
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
-            command_buffer.present_drawable(drawable);
+            command_buffer.present_drawable(&drawable);
             command_buffer.commit();
         }
         breakdown.commit = commit_start.elapsed();
@@ -1991,6 +2036,80 @@ impl MetalRenderer {
                 log::info!("{line}");
             }
         }
+    }
+
+    /// The layer's next drawable, waited for until `deadline` by the present
+    /// that asks for it. A present retried while an earlier one's request is
+    /// still out does not wait again: it takes the drawable if it has come
+    /// back and otherwise defers at once, so a compositor that holds the
+    /// drawables for seconds costs the main thread one wait, not one per
+    /// display refresh. Inside a transaction (a live resize) the present
+    /// waits for as long as it takes, as `nextDrawable` itself would, since a
+    /// deferred retry would land outside the transaction and show the window
+    /// stretched.
+    ///
+    /// A drawable that came back at a size the layer no longer has (the
+    /// window was resized while a present was deferred) is released and asked
+    /// for again once.
+    fn acquire_drawable(&mut self, viewport_size: Size<DevicePixels>, deadline: Instant) -> Acquired {
+        let mut retried = false;
+        loop {
+            let asked = self.request_drawable();
+            self.wait_for_drawable(asked, deadline);
+            let Some(acquirer) = &self.drawable_acquirer else {
+                return Acquired::Ready(None);
+            };
+            match acquirer.take() {
+                Acquired::Ready(Some(drawable))
+                    if !retried && !drawable_matches(&drawable, viewport_size) =>
+                {
+                    retried = true;
+                }
+                acquired => return acquired,
+            }
+        }
+    }
+
+    /// Asks for the layer's next drawable when a present would ask for one
+    /// (see the early returns in `draw_in_pool`). `Some(true)` when this made
+    /// a new request, `Some(false)` when one was already out or its drawable
+    /// is waiting, `None` when nothing was asked for.
+    fn request_drawable(&mut self) -> Option<bool> {
+        let layer = self.layer.as_ref()?;
+        let size = layer.drawable_size();
+        if self.drawables_released || size.width <= 0. || size.height <= 0. {
+            return None;
+        }
+        self.drawable_acquirer.as_mut().map(DrawableAcquirer::request)
+    }
+
+    /// Whether the drawable [`Self::request_drawable`] asked for is ready,
+    /// waiting for it as [`Self::acquire_drawable`] describes.
+    fn wait_for_drawable(&self, asked: Option<bool>, deadline: Instant) -> bool {
+        let (Some(asked), Some(acquirer)) = (asked, &self.drawable_acquirer) else {
+            return true;
+        };
+        acquirer.wait(if self.presents_with_transaction {
+            None
+        } else if asked {
+            Some(deadline)
+        } else {
+            Some(Instant::now())
+        })
+    }
+
+    /// Gets both of a layered window's drawables ready before either layer
+    /// presents, so the two planes never land on different frames: an
+    /// overlay that deferred after its base landed would not be retried.
+    /// Both are asked for before either is waited on, so the two waits
+    /// overlap. Returns whether both came back; a drawable that did is kept
+    /// for the retry when the other did not.
+    pub fn ready_layered_drawables(base: &mut Self, overlay: &mut Self) -> bool {
+        let deadline = Instant::now() + DRAWABLE_WAIT;
+        let base_asked = base.request_drawable();
+        let overlay_asked = overlay.request_drawable();
+        base.wait_for_drawable(base_asked, deadline)
+            && overlay.wait_for_drawable(overlay_asked, deadline)
     }
 
     /// What a present that got no drawable reports. The frame stays owed
@@ -5021,12 +5140,15 @@ mod stale_texture_healing_tests {
 /// but `nextDrawable`, encoding and commit all run for real.
 #[cfg(test)]
 mod present_report_tests {
-    use super::{InstanceBufferPool, MetalRenderer, stale_texture_healing_tests::solid_quad_scene};
+    use super::{
+        Acquired, DRAWABLE_WAIT, InstanceBufferPool, MetalRenderer,
+        stale_texture_healing_tests::solid_quad_scene,
+    };
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
     use std::{
         sync::{Arc, atomic::Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -5113,6 +5235,109 @@ mod present_report_tests {
             renderer.consecutive_deferred_presents, 0,
             "a dropped present ends the run of deferrals before it"
         );
+    }
+
+    fn hold_every_drawable(layer: &metal::MetalLayerRef) -> Vec<metal::MetalDrawable> {
+        objc2::rc::autoreleasepool(|_| {
+            (0..layer.maximum_drawable_count())
+                .map(|_| {
+                    layer
+                        .next_drawable()
+                        .expect("a layer in no window has a drawable while one is free")
+                        .to_owned()
+                })
+                .collect()
+        })
+    }
+
+    /// While every drawable is held, as a compositor holds them for a window
+    /// it is not compositing, a present waits out [`DRAWABLE_WAIT`] and
+    /// defers instead of blocking until one comes back; a retry while the
+    /// request is still out defers without waiting again, and the first
+    /// retry after a drawable comes back presents.
+    #[test]
+    fn a_present_whose_drawables_are_all_held_defers_instead_of_blocking() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        let layer = renderer.layer.clone().expect("a window renderer has a layer");
+        let held = hold_every_drawable(&layer);
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+        assert_eq!(report.outcome, PresentOutcome::Deferred);
+        assert!(
+            report.breakdown.acquire >= DRAWABLE_WAIT
+                && report.breakdown.acquire < DRAWABLE_WAIT * 10,
+            "the present waited about DRAWABLE_WAIT for a drawable: {:?}",
+            report.breakdown
+        );
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+        assert_eq!(report.outcome, PresentOutcome::Deferred);
+        assert!(
+            report.breakdown.acquire < DRAWABLE_WAIT,
+            "a retry does not wait on the request again: {:?}",
+            report.breakdown
+        );
+
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            let report = renderer.draw(&solid_quad_scene(32.));
+            if report.outcome != PresentOutcome::Deferred || Instant::now() > deadline {
+                break report;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(
+            report.outcome,
+            PresentOutcome::Presented,
+            "the drawable asked for came back once the held ones were released"
+        );
+        assert!(renderer.awaiting_drawable.is_none());
+    }
+
+    /// Hiding a window releases a drawable that came back for a deferred
+    /// present instead of holding it, unpresented, out of the layer's pool.
+    #[test]
+    fn releasing_the_drawables_releases_one_waiting_to_be_presented() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        let deadline = Instant::now() + DRAWABLE_WAIT;
+        assert_eq!(renderer.request_drawable(), Some(true));
+        assert!(renderer.wait_for_drawable(Some(true), deadline));
+
+        renderer.release_drawables();
+
+        let acquirer = renderer.drawable_acquirer.as_ref().expect("a layer-backed renderer");
+        assert!(matches!(acquirer.take(), Acquired::Pending));
+    }
+
+    /// A layered window's planes defer together: when one plane's drawables
+    /// are all held, neither presents, and the other's drawable is kept for
+    /// the retry rather than asked for again.
+    #[test]
+    fn layered_drawables_are_ready_only_when_both_planes_have_one() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut base = MetalRenderer::new(pool.clone(), false, false);
+        let mut overlay = base.new_sharing_atlas(pool, true);
+        for renderer in [&mut base, &mut overlay] {
+            renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        }
+        let held = hold_every_drawable(&overlay.layer.clone().expect("an overlay has a layer"));
+
+        assert!(!MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
+        assert_eq!(base.request_drawable(), Some(false), "the base's drawable is kept");
+
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay) {
+            assert!(Instant::now() < deadline, "the overlay's drawable came back");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(base.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
+        assert_eq!(overlay.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
     }
 
     #[test]

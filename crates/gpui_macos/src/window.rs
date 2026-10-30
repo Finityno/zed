@@ -2749,6 +2749,24 @@ impl PlatformWindow for MacWindow {
             };
         }
         let this = &mut *this;
+        // Both planes must have a drawable before either is presented too,
+        // for the same reason; neither is waited on for longer than one
+        // plane alone would be.
+        let acquire_start = Instant::now();
+        if let Some(overlay_renderer) = this.overlay_renderer.as_mut()
+            && !renderer::Renderer::ready_layered_drawables(&mut this.renderer, overlay_renderer)
+        {
+            this.release_intermediates_if_occluded();
+            return PresentReport {
+                outcome: PresentOutcome::Deferred,
+                breakdown: gpui::PresentBreakdown {
+                    acquire: acquire_start.elapsed(),
+                    layers: 2,
+                    ..Default::default()
+                },
+            };
+        }
+        let acquire_duration = acquire_start.elapsed();
         let split_start = Instant::now();
         // The two halves are kept across presents so their vectors hold
         // their capacity, instead of being allocated and freed per frame for
@@ -2758,6 +2776,7 @@ impl PlatformWindow for MacWindow {
         this.renderer.note_scene_tiles(&this.overlay_scene);
         let split_duration = split_start.elapsed();
         let mut report = this.renderer.draw(&this.base_scene);
+        report.breakdown.acquire += acquire_duration;
         report.breakdown.encode += split_duration;
         if report.outcome != PresentOutcome::Presented {
             // Presenting the overlay over a base that did not land would put
@@ -2791,8 +2810,9 @@ impl PlatformWindow for MacWindow {
         // outcome would count every frame as lost while the content was
         // reaching the screen. An overlay that defers after the base landed
         // is not retried: its plane keeps the previous frame until the window
-        // next presents. It cannot defer while its layer waits for drawables
-        // rather than timing out.
+        // next presents. Its drawable was ready before the base drew, so it
+        // defers only when that drawable came back at a size the layer no
+        // longer has and the one asked for in its place did not come in time.
         report.breakdown.overlay_outcome = Some(overlay_report.outcome);
         report
     }
