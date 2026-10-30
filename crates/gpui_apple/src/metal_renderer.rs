@@ -1833,10 +1833,20 @@ impl MetalRenderer {
         breakdown.drawables_in_flight = drawables_in_flight;
         breakdown.drawables_in_flight_clamped = drawables_in_flight_clamped;
         let acquire_start = Instant::now();
-        let drawable = self.acquire_drawable(viewport_size, acquire_start + self.drawable_wait);
+        let drawable = self.acquire_drawable(
+            viewport_size,
+            drawables_in_flight > 0 || drawables_in_flight_clamped,
+            acquire_start + self.drawable_wait,
+        );
         breakdown.acquire = acquire_start.elapsed();
         let drawable = match drawable {
             Acquired::Ready(drawable) => drawable,
+            // Not counted against MAX_CONSECUTIVE_DEFERRED_PRESENTS: that cut-off
+            // is for a layer that answers with no drawable at all, while this
+            // one's request is still out and its drawable comes back once the
+            // compositor lets one go. Dropping the frame instead would leave the
+            // window on a stale frame until something invalidates it, and a
+            // retry costs no wait; an occluded window stops its frame source.
             Acquired::Pending => {
                 let (_, deferred) = self.awaiting_drawable.get_or_insert((acquire_start, 0));
                 *deferred += 1;
@@ -1915,11 +1925,6 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(&drawable);
             command_buffer.commit();
-            // Not inside a transaction: a live resize changes the size before
-            // the next present, and the drawable fetched now would be stale.
-            if let Some(acquirer) = &mut self.drawable_acquirer {
-                acquirer.prefetch();
-            }
         }
         breakdown.commit = commit_start.elapsed();
         self.maybe_log_gpu_stats();
@@ -2069,16 +2074,37 @@ impl MetalRenderer {
     /// A drawable that came back at a size the layer no longer has (the
     /// window was resized while a present was deferred) is released and asked
     /// for again once.
-    fn acquire_drawable(&mut self, viewport_size: Size<DevicePixels>, deadline: Instant) -> Acquired {
+    ///
+    /// A present the layer cannot make wait (`may_wait` false, see
+    /// [`Self::drawable_may_wait`]) asks on the presenting thread instead,
+    /// unless an earlier request is still out: handing the request to the
+    /// acquire thread and sleeping until it answers costs a steady window
+    /// about 100 µs of main-thread time and 70 µs of CPU per present, and
+    /// asking for the next frame's drawable ahead of time instead would hold
+    /// one while the compositor still holds the other two, making the layer
+    /// allocate its third.
+    fn acquire_drawable(
+        &mut self,
+        viewport_size: Size<DevicePixels>,
+        may_wait: bool,
+        deadline: Instant,
+    ) -> Acquired {
+        let synchronous = self
+            .drawable_acquirer
+            .as_ref()
+            .is_none_or(|acquirer| !may_wait && acquirer.is_idle());
+        if synchronous {
+            let layer = self.layer.as_ref();
+            return Acquired::Ready(
+                layer.and_then(|layer| layer.next_drawable()).map(ToOwned::to_owned),
+            );
+        }
         let mut retried = false;
         loop {
             let asked = self.request_drawable();
             self.wait_for_drawable(asked, deadline);
             let Some(acquirer) = &self.drawable_acquirer else {
-                let layer = self.layer.as_ref();
-                return Acquired::Ready(
-                    layer.and_then(|layer| layer.next_drawable()).map(ToOwned::to_owned),
-                );
+                return Acquired::Ready(None);
             };
             match acquirer.take() {
                 Acquired::Ready(Some(drawable))
@@ -2102,6 +2128,31 @@ impl MetalRenderer {
             return None;
         }
         self.drawable_acquirer.as_mut().map(DrawableAcquirer::request)
+    }
+
+    /// Whether the layer may make a present wait for a drawable: false only
+    /// while no drawable it presented is still waiting to be displayed and
+    /// that count is known to be exact. The compositor then holds at most
+    /// the drawable on screen, so the layer has one to give at once.
+    /// Every present hang of a second or more in the field was made with a
+    /// drawable in flight or with the count overstated.
+    fn drawable_may_wait(&mut self) -> bool {
+        let Some(layer) = self.layer.clone() else {
+            return false;
+        };
+        let (in_flight, overstated) = self.read_drawables_in_flight(&layer);
+        in_flight > 0 || overstated
+    }
+
+    /// [`Self::request_drawable`] for a present the layer may make wait; one
+    /// it cannot asks on the presenting thread (see
+    /// [`Self::acquire_drawable`]), unless a request is already out.
+    fn request_drawable_if_it_may_wait(&mut self) -> Option<bool> {
+        let idle = self.drawable_acquirer.as_ref().is_none_or(DrawableAcquirer::is_idle);
+        if idle && !self.drawable_may_wait() {
+            return None;
+        }
+        self.request_drawable()
     }
 
     /// Whether the drawable [`Self::request_drawable`] asked for is ready,
@@ -2130,8 +2181,8 @@ impl MetalRenderer {
     /// for the retry when the other did not.
     pub fn ready_layered_drawables(base: &mut Self, overlay: &mut Self) -> bool {
         let deadline = Instant::now() + base.drawable_wait;
-        let base_asked = base.request_drawable();
-        let overlay_asked = overlay.request_drawable();
+        let base_asked = base.request_drawable_if_it_may_wait();
+        let overlay_asked = overlay.request_drawable_if_it_may_wait();
         base.wait_for_drawable(base_asked, deadline)
             && overlay.wait_for_drawable(overlay_asked, deadline)
     }
@@ -5168,7 +5219,7 @@ mod present_report_tests {
         Acquired, DRAWABLE_WAIT, InstanceBufferPool, MetalRenderer,
         stale_texture_healing_tests::solid_quad_scene,
     };
-    use crate::drawable_acquirer::{AcquireGate, UNCLAIMED_RELEASE};
+    use crate::drawable_acquirer::AcquireGate;
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
     use std::{
@@ -5262,6 +5313,12 @@ mod present_report_tests {
         );
     }
 
+    /// Counts a drawable as presented and not yet displayed, which is when a
+    /// present may have to wait for the next one and asks the acquire thread.
+    fn mark_drawable_in_flight(renderer: &MetalRenderer) {
+        renderer.drawables_in_flight.store(1, Ordering::Relaxed);
+    }
+
     fn gate(renderer: &MetalRenderer) -> Arc<AcquireGate> {
         renderer
             .drawable_acquirer
@@ -5281,6 +5338,7 @@ mod present_report_tests {
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         renderer.drawable_wait = DRAWABLE_WAIT;
+        mark_drawable_in_flight(&renderer);
         gate(&renderer).close();
 
         let report = renderer.draw(&solid_quad_scene(32.));
@@ -5317,26 +5375,19 @@ mod present_report_tests {
         assert!(renderer.awaiting_drawable.is_none());
     }
 
-    /// A present fetches the next frame's drawable ahead of time, and a
-    /// window that presents nothing more gives it back to the layer.
+    /// With nothing in flight the layer has a drawable to give at once, so
+    /// the present asks for it itself and never starts the acquire thread.
     #[test]
-    fn a_present_fetches_the_next_drawable_and_an_idle_window_gives_it_back() {
+    fn a_present_with_nothing_in_flight_asks_on_the_presenting_thread() {
         let mut renderer =
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
-        assert_eq!(renderer.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
-        let acquirer = renderer.drawable_acquirer.as_ref().expect("a layer-backed renderer");
+        gate(&renderer).close();
 
-        assert!(
-            acquirer.wait(Some(Instant::now() + Duration::from_secs(10))),
-            "the next drawable was fetched after the present"
-        );
-        std::thread::sleep(UNCLAIMED_RELEASE + Duration::from_millis(200));
+        let report = renderer.draw(&solid_quad_scene(32.));
 
-        assert!(
-            matches!(acquirer.take(), Acquired::Pending),
-            "a drawable no present asked for was given back"
-        );
+        assert_eq!(report.outcome, PresentOutcome::Presented, "the closed gate was never reached");
+        gate(&renderer).open();
     }
 
     /// Hiding a window releases a drawable that came back for a deferred
@@ -5398,6 +5449,8 @@ mod present_report_tests {
             renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         }
         base.drawable_wait = DRAWABLE_WAIT;
+        mark_drawable_in_flight(&base);
+        mark_drawable_in_flight(&overlay);
         gate(&overlay).close();
 
         assert!(!MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
@@ -7389,5 +7442,185 @@ mod quad_shader_tests {
             costs[costs.len() / 10],
             costs[costs.len() * 9 / 10],
         );
+    }
+}
+
+/// What waiting for drawables costs a window: the main-thread stall while the
+/// layer gives none back, and the cost of a steady present while it does.
+#[cfg(test)]
+mod present_wait_timing_tests {
+    use super::{
+        DRAWABLE_WAIT, InstanceBufferPool, MetalRenderer, stale_texture_healing_tests::solid_quad_scene,
+    };
+    use collections::HashSet;
+    use foreign_types::ForeignType;
+    use gpui::{DevicePixels, PresentOutcome};
+    use parking_lot::Mutex;
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::{Duration, Instant},
+    };
+
+    const REFRESH: Duration = Duration::from_micros(8333);
+
+    fn renderer() -> MetalRenderer {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        renderer
+    }
+
+    fn process_cpu() -> Duration {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage fills the struct it is handed.
+        let usage = unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+            usage.assume_init()
+        };
+        let time = |time: libc::timeval| {
+            Duration::new(time.tv_sec as u64, time.tv_usec as u32 * 1000)
+        };
+        time(usage.ru_utime) + time(usage.ru_stime)
+    }
+
+    fn median(mut values: Vec<Duration>) -> Duration {
+        values.sort();
+        values[values.len() / 2]
+    }
+
+    /// The layer gives no drawable back for `hold`, as a compositor holding
+    /// them does, while the window presents once per 120 Hz refresh until a
+    /// present lands. Returns the longest present and when one landed.
+    fn held_run(wait: Duration, hold: Duration) -> (Duration, Duration) {
+        let mut renderer = renderer();
+        assert_eq!(renderer.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
+        renderer.drawable_wait = wait;
+        renderer.drawables_in_flight.store(1, Ordering::Relaxed);
+        let gate = renderer.drawable_acquirer.as_ref().expect("a layer").gate();
+        gate.close();
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            gate.open();
+        });
+        let start = Instant::now();
+        let mut longest = Duration::ZERO;
+        loop {
+            let present_start = Instant::now();
+            let outcome = renderer.draw(&solid_quad_scene(32.)).outcome;
+            let took = present_start.elapsed();
+            longest = longest.max(took);
+            if outcome == PresentOutcome::Presented {
+                break;
+            }
+            assert!(start.elapsed() < hold * 10, "a present landed once the hold ended");
+            std::thread::sleep(REFRESH.saturating_sub(took));
+        }
+        let landed = start.elapsed();
+        opener.join().expect("the opener finished");
+        (longest, landed)
+    }
+
+    /// Run with `--ignored --nocapture`. "unbounded" waits for the drawable for
+    /// as long as it takes, which is what asking `nextDrawable` on the main
+    /// thread did.
+    #[test]
+    #[ignore = "measurement, prints the main-thread stall while the layer holds its drawables"]
+    fn measure_present_stall_while_the_layer_holds_its_drawables() {
+        let hold = Duration::from_secs(1);
+        for (label, wait) in [("unbounded", Duration::from_secs(30)), ("DRAWABLE_WAIT", DRAWABLE_WAIT)] {
+            held_run(wait, hold);
+            let runs: Vec<_> = (0..5).map(|_| held_run(wait, hold)).collect();
+            eprintln!(
+                "{label}: longest present {:?}, frame landed after {:?} (median of 5, hold {hold:?})",
+                median(runs.iter().map(|run| run.0).collect()),
+                median(runs.iter().map(|run| run.1).collect()),
+            );
+        }
+    }
+
+    struct SteadyRun {
+        p50: Duration,
+        p95: Duration,
+        cpu_per_present: Duration,
+        distinct_drawables: usize,
+        presents_with_drawables_in_flight: usize,
+    }
+
+    /// 600 presents at 120 Hz while the layer has drawables to give.
+    /// `synchronous` drops the acquirer, so every present asks `nextDrawable`
+    /// itself, as before the acquire thread.
+    fn steady_run(synchronous: bool) -> SteadyRun {
+        let mut renderer = renderer();
+        if synchronous {
+            renderer.drawable_acquirer = None;
+        }
+        let scene = solid_quad_scene(32.);
+        for _ in 0..30 {
+            renderer.draw(&scene);
+            std::thread::sleep(REFRESH);
+        }
+        let mut times = Vec::new();
+        let mut drawables = HashSet::default();
+        let mut presents_with_drawables_in_flight = 0;
+        let cpu_start = process_cpu();
+        for _ in 0..600 {
+            let start = Instant::now();
+            let report = renderer.draw(&scene);
+            let took = start.elapsed();
+            assert_eq!(report.outcome, PresentOutcome::Presented);
+            times.push(took);
+            if report.breakdown.drawables_in_flight > 0 || report.breakdown.drawables_in_flight_clamped
+            {
+                presents_with_drawables_in_flight += 1;
+            }
+            if let Some(frame) = &renderer.presented_frame {
+                drawables.insert(frame.texture.as_ptr() as usize);
+            }
+            std::thread::sleep(REFRESH.saturating_sub(took));
+        }
+        let cpu_per_present = (process_cpu() - cpu_start) / 600;
+        times.sort();
+        SteadyRun {
+            p50: times[300],
+            p95: times[570],
+            cpu_per_present,
+            distinct_drawables: drawables.len(),
+            presents_with_drawables_in_flight,
+        }
+    }
+
+    /// Run with `--ignored --nocapture`; six interleaved pairs, alternating
+    /// which goes first so drift in machine load splits evenly.
+    #[test]
+    #[ignore = "measurement, prints what a steady present costs with and without the acquire thread"]
+    fn measure_steady_present_cost_with_and_without_the_acquire_thread() {
+        steady_run(true);
+        steady_run(false);
+        let (mut synchronous, mut threaded) = (Vec::new(), Vec::new());
+        for pair in 0..6 {
+            if pair % 2 == 0 {
+                synchronous.push(steady_run(true));
+                threaded.push(steady_run(false));
+            } else {
+                threaded.push(steady_run(false));
+                synchronous.push(steady_run(true));
+            }
+        }
+        for (label, runs) in [("synchronous", &synchronous), ("acquire thread", &threaded)] {
+            for run in runs {
+                eprintln!(
+                    "{label} run: p50 {:?} p95 {:?} cpu/present {:?}, {} distinct drawables, \
+                     {} of 600 presents with drawables in flight",
+                    run.p50, run.p95, run.cpu_per_present, run.distinct_drawables,
+                    run.presents_with_drawables_in_flight
+                );
+            }
+            eprintln!(
+                "{label} median: p50 {:?} p95 {:?} cpu/present {:?}",
+                median(runs.iter().map(|run| run.p50).collect()),
+                median(runs.iter().map(|run| run.p95).collect()),
+                median(runs.iter().map(|run| run.cpu_per_present).collect()),
+            );
+        }
     }
 }

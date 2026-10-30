@@ -9,25 +9,10 @@
 //! the field's present hangs, and nearly all of those over a second, were
 //! spent there. Asked here, the main thread waits only as long as it chooses
 //! to and defers the present when no drawable came in time.
-//!
-//! Handing every request to the thread and sleeping until it answers cost a
-//! steady 120 Hz window about 100 µs of main-thread time and 70 µs of CPU per
-//! present, so a present also asks for the next one ahead of time
-//! ([`DrawableAcquirer::prefetch`]): by the next frame it is usually waiting.
 
 use metal::{MetalDrawable, MetalLayer};
 use parking_lot::{Condvar, Mutex, MutexGuard};
-use std::{
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
-
-/// How long a drawable fetched ahead of time is kept for a present that has
-/// not asked for it. Longer than the slowest cadence a painting window keeps
-/// (a background window presents a few times a second); a window that has
-/// gone idle gives it back, so the layer can hand it out or purge it.
-pub(crate) const UNCLAIMED_RELEASE: Duration = Duration::from_millis(250);
+use std::{sync::Arc, thread, time::Instant};
 
 /// What [`DrawableAcquirer::take`] found.
 pub(crate) enum Acquired {
@@ -44,9 +29,6 @@ struct State {
     requested: Option<u64>,
     /// The answer to the last request, until the renderer takes it.
     ready: Option<Option<MetalDrawable>>,
-    /// Whether a present has asked for the drawable `requested` or `ready`
-    /// stands for; one fetched ahead of time is unclaimed until then.
-    claimed: bool,
     /// Bumped by [`DrawableAcquirer::discard`], so a drawable that comes back
     /// for a request made before it is released instead of kept.
     generation: u64,
@@ -109,42 +91,20 @@ impl DrawableAcquirer {
         }
     }
 
-    /// Asks for the next drawable on behalf of a present, unless one is
-    /// already out or waiting to be taken. Returns whether the present should
-    /// wait for it: true for a new request and for one fetched ahead of time
-    /// that no present has asked for yet. A present that finds a request a
-    /// present already asked for was deferred before, and waiting on it again
-    /// would block the main thread for a share of every display refresh while
-    /// the compositor holds the drawables.
+    /// Asks for the next drawable, unless a request is already out or its
+    /// answer is waiting to be taken. Returns whether this made a new
+    /// request: a present that finds one already out was deferred before,
+    /// and waiting on it again would block the main thread for a share of
+    /// every display refresh while the compositor holds the drawables.
     pub(crate) fn request(&mut self) -> bool {
         self.start_thread();
         let mut state = self.shared.state.lock();
-        let first_claim = !state.claimed;
-        state.claimed = true;
-        if state.ready.is_some() {
+        if state.requested.is_some() || state.ready.is_some() {
             return false;
-        }
-        if state.requested.is_some() {
-            return first_claim;
         }
         state.requested = Some(state.generation);
         self.shared.changed.notify_all();
         true
-    }
-
-    /// Asks for the next drawable ahead of the present that will want it, so
-    /// that present takes one that is waiting instead of handing the request
-    /// over and sleeping until it is answered. Kept for
-    /// [`UNCLAIMED_RELEASE`] if no present asks for it.
-    pub(crate) fn prefetch(&mut self) {
-        self.start_thread();
-        let mut state = self.shared.state.lock();
-        if state.requested.is_some() || state.ready.is_some() {
-            return;
-        }
-        state.requested = Some(state.generation);
-        state.claimed = false;
-        self.shared.changed.notify_all();
     }
 
     /// Waits until the requested drawable has come back or `deadline` has
@@ -163,6 +123,12 @@ impl DrawableAcquirer {
             }
         }
         state.ready.is_some()
+    }
+
+    /// Whether no request is out and no drawable is waiting to be taken.
+    pub(crate) fn is_idle(&self) -> bool {
+        let state = self.shared.state.lock();
+        state.requested.is_none() && state.ready.is_none()
     }
 
     /// Takes the requested drawable if it has come back.
@@ -251,20 +217,10 @@ fn serve_requests(shared: &Shared, layer: &MetalLayer) {
         });
         state.requested = None;
         shared.changed.notify_all();
-        if state.generation != generation || state.shutdown {
+        if state.generation == generation && !state.shutdown {
+            state.ready = Some(drawable);
+        } else {
             MutexGuard::unlocked(&mut state, || drop(drawable));
-            continue;
-        }
-        state.ready = Some(drawable);
-        let release_at = Instant::now() + UNCLAIMED_RELEASE;
-        while state.ready.is_some() && !state.claimed && !state.shutdown {
-            if shared.changed.wait_until(&mut state, release_at).timed_out() {
-                if !state.claimed {
-                    let unclaimed = state.ready.take();
-                    MutexGuard::unlocked(&mut state, || drop(unclaimed));
-                }
-                break;
-            }
         }
     }
 }
