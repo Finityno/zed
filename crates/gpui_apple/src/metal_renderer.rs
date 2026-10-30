@@ -2085,17 +2085,20 @@ impl MetalRenderer {
 
     /// Whether the drawable [`Self::request_drawable`] asked for is ready,
     /// waiting for it as [`Self::acquire_drawable`] describes.
-    fn wait_for_drawable(&self, asked: Option<bool>, deadline: Instant) -> bool {
-        let (Some(asked), Some(acquirer)) = (asked, &self.drawable_acquirer) else {
+    fn wait_for_drawable(&mut self, asked: Option<bool>, deadline: Instant) -> bool {
+        let (Some(asked), Some(acquirer)) = (asked, self.drawable_acquirer.as_mut()) else {
             return true;
         };
-        acquirer.wait(if self.presents_with_transaction {
-            None
-        } else if asked {
-            Some(deadline)
-        } else {
-            Some(Instant::now())
-        })
+        if self.presents_with_transaction {
+            // A request discarded while it was out (the window was hidden)
+            // ends without a drawable; inside a transaction the present asks
+            // again rather than defer.
+            while !acquirer.wait(None) {
+                acquirer.request();
+            }
+            return true;
+        }
+        acquirer.wait(Some(if asked { deadline } else { Instant::now() }))
     }
 
     /// Gets both of a layered window's drawables ready before either layer
@@ -5312,6 +5315,33 @@ mod present_report_tests {
 
         let acquirer = renderer.drawable_acquirer.as_ref().expect("a layer-backed renderer");
         assert!(matches!(acquirer.take(), Acquired::Pending));
+    }
+
+    /// Inside a transaction a present never defers for want of a drawable,
+    /// not even when the one asked for was discarded on its way back: it
+    /// asks again and waits.
+    #[test]
+    fn a_present_in_a_transaction_asks_again_for_a_drawable_discarded_on_its_way() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        renderer.set_presents_with_transaction(true);
+        let held = hold_every_drawable(&renderer.layer.clone().expect("a window renderer has a layer"));
+        assert_eq!(renderer.request_drawable(), Some(true));
+        renderer
+            .drawable_acquirer
+            .as_ref()
+            .expect("a layer-backed renderer")
+            .discard();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+
+        let report = renderer.draw(&solid_quad_scene(32.));
+
+        releaser.join().expect("the releasing thread finished");
+        assert_eq!(report.outcome, PresentOutcome::Presented);
     }
 
     /// A layered window's planes defer together: when one plane's drawables
