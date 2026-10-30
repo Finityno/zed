@@ -1915,6 +1915,11 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(&drawable);
             command_buffer.commit();
+            // Not inside a transaction: a live resize changes the size before
+            // the next present, and the drawable fetched now would be stale.
+            if let Some(acquirer) = &mut self.drawable_acquirer {
+                acquirer.prefetch();
+            }
         }
         breakdown.commit = commit_start.elapsed();
         self.maybe_log_gpu_stats();
@@ -5163,7 +5168,7 @@ mod present_report_tests {
         Acquired, DRAWABLE_WAIT, InstanceBufferPool, MetalRenderer,
         stale_texture_healing_tests::solid_quad_scene,
     };
-    use crate::drawable_acquirer::AcquireGate;
+    use crate::drawable_acquirer::{AcquireGate, UNCLAIMED_RELEASE};
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
     use std::{
@@ -5310,6 +5315,28 @@ mod present_report_tests {
             "the drawable asked for came back once the layer let it go"
         );
         assert!(renderer.awaiting_drawable.is_none());
+    }
+
+    /// A present fetches the next frame's drawable ahead of time, and a
+    /// window that presents nothing more gives it back to the layer.
+    #[test]
+    fn a_present_fetches_the_next_drawable_and_an_idle_window_gives_it_back() {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
+        renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        assert_eq!(renderer.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
+        let acquirer = renderer.drawable_acquirer.as_ref().expect("a layer-backed renderer");
+
+        assert!(
+            acquirer.wait(Some(Instant::now() + Duration::from_secs(10))),
+            "the next drawable was fetched after the present"
+        );
+        std::thread::sleep(UNCLAIMED_RELEASE + Duration::from_millis(200));
+
+        assert!(
+            matches!(acquirer.take(), Acquired::Pending),
+            "a drawable no present asked for was given back"
+        );
     }
 
     /// Hiding a window releases a drawable that came back for a deferred
