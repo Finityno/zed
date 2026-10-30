@@ -273,7 +273,8 @@ pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     /// Asks `layer` for drawables off the main thread; see
-    /// [`Self::acquire_drawable`].
+    /// [`Self::acquire_drawable`]. `None` without a layer, and for a layer
+    /// from [`Self::from_layer`], which asks on the presenting thread.
     drawable_acquirer: Option<DrawableAcquirer>,
     /// When the presents deferred in a row because the drawable they asked
     /// for had not come back began, and how many there have been; logged
@@ -580,7 +581,13 @@ impl MetalRenderer {
             metal::MetalLayerRef::from_ptr(ptr::from_ref(layer).cast_mut().cast::<CAMetalLayer>())
         }.to_owned();
         Self::configure_layer(&layer, &device, transparent, false);
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool, None, None)
+        let mut renderer =
+            Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool, None, None);
+        // The UIKit window drops the present's outcome, so a deferred present
+        // would never be retried; it asks for drawables on the presenting
+        // thread and waits, as before.
+        renderer.drawable_acquirer = None;
+        renderer
     }
 
     fn new_layer(device: &metal::Device, transparent: bool, use_display_p3: bool) -> metal::MetalLayer {
@@ -2057,7 +2064,10 @@ impl MetalRenderer {
             let asked = self.request_drawable();
             self.wait_for_drawable(asked, deadline);
             let Some(acquirer) = &self.drawable_acquirer else {
-                return Acquired::Ready(None);
+                let layer = self.layer.as_ref();
+                return Acquired::Ready(
+                    layer.and_then(|layer| layer.next_drawable()).map(ToOwned::to_owned),
+                );
             };
             match acquirer.take() {
                 Acquired::Ready(Some(drawable))
