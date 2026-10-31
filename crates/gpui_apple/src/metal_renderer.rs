@@ -2121,13 +2121,39 @@ impl MetalRenderer {
     /// (see the early returns in `draw_in_pool`). `Some(true)` when this made
     /// a new request, `Some(false)` when one was already out or its drawable
     /// is waiting, `None` when nothing was asked for.
+    ///
+    /// A drawable that came back at a size the layer no longer has is
+    /// released first, so a new one at the current size is asked for.
     fn request_drawable(&mut self) -> Option<bool> {
-        let layer = self.layer.as_ref()?;
-        let size = layer.drawable_size();
-        if self.drawables_released || size.width <= 0. || size.height <= 0. {
+        let viewport_size = self.layer_viewport_size()?;
+        if self.drawables_released {
             return None;
         }
-        self.drawable_acquirer.as_mut().map(DrawableAcquirer::request)
+        let acquirer = self.drawable_acquirer.as_mut()?;
+        acquirer.release_ready_unless(|drawable| drawable_matches(drawable, viewport_size));
+        Some(acquirer.request())
+    }
+
+    /// The layer's drawable size as a present draws at it, `None` without a
+    /// layer or while that size is empty.
+    fn layer_viewport_size(&self) -> Option<Size<DevicePixels>> {
+        let size = self.layer.as_ref()?.drawable_size();
+        let size: Size<DevicePixels> = gpui::size(
+            (size.width.ceil() as i32).into(),
+            (size.height.ceil() as i32).into(),
+        );
+        (size.width.0 > 0 && size.height.0 > 0).then_some(size)
+    }
+
+    /// Whether this layer's drawable is ready at the size the layer has, or
+    /// the present would not ask the acquire thread for one at all.
+    fn drawable_ready_at_current_size(&self, asked: Option<bool>) -> bool {
+        let (Some(_), Some(acquirer), Some(viewport_size)) =
+            (asked, &self.drawable_acquirer, self.layer_viewport_size())
+        else {
+            return true;
+        };
+        acquirer.ready_fits(|drawable| drawable_matches(drawable, viewport_size))
     }
 
     /// Whether the layer may make a present wait for a drawable: false only
@@ -2177,14 +2203,35 @@ impl MetalRenderer {
     /// presents, so the two planes never land on different frames: an
     /// overlay that deferred after its base landed would not be retried.
     /// Both are asked for before either is waited on, so the two waits
-    /// overlap. Returns whether both came back; a drawable that did is kept
-    /// for the retry when the other did not.
+    /// overlap. Returns whether both came back at the size their layer has
+    /// now; a drawable that did is kept for the retry when the other did not.
+    ///
+    /// A drawable that came back at an earlier size (the window was resized
+    /// while a present was deferred) is released and asked for again once,
+    /// within the same wait: accepting it would let the base present and
+    /// leave the overlay to reject it and defer, and that deferral is never
+    /// retried, since the present reports the base's outcome.
     pub fn ready_layered_drawables(base: &mut Self, overlay: &mut Self) -> bool {
         let deadline = Instant::now() + base.drawable_wait;
-        let base_asked = base.request_drawable_if_it_may_wait();
-        let overlay_asked = overlay.request_drawable_if_it_may_wait();
-        base.wait_for_drawable(base_asked, deadline)
-            && overlay.wait_for_drawable(overlay_asked, deadline)
+        let mut retried = false;
+        loop {
+            let base_asked = base.request_drawable_if_it_may_wait();
+            let overlay_asked = overlay.request_drawable_if_it_may_wait();
+            let came_back = base.wait_for_drawable(base_asked, deadline)
+                && overlay.wait_for_drawable(overlay_asked, deadline);
+            if !came_back {
+                return false;
+            }
+            if base.drawable_ready_at_current_size(base_asked)
+                && overlay.drawable_ready_at_current_size(overlay_asked)
+            {
+                return true;
+            }
+            if retried {
+                return false;
+            }
+            retried = true;
+        }
     }
 
     /// What a present that got no drawable reports. The frame stays owed
@@ -5223,7 +5270,7 @@ mod present_report_tests {
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
     use std::{
-        sync::{Arc, atomic::Ordering},
+        sync::{Arc, atomic::{AtomicU32, Ordering}},
         time::{Duration, Instant},
     };
 
@@ -5315,8 +5362,10 @@ mod present_report_tests {
 
     /// Counts a drawable as presented and not yet displayed, which is when a
     /// present may have to wait for the next one and asks the acquire thread.
-    fn mark_drawable_in_flight(renderer: &MetalRenderer) {
-        renderer.drawables_in_flight.store(1, Ordering::Relaxed);
+    /// A fresh counter, so the presented handler of a drawable an earlier
+    /// present submitted cannot bring it back to zero.
+    fn mark_drawable_in_flight(renderer: &mut MetalRenderer) {
+        renderer.drawables_in_flight = Arc::new(AtomicU32::new(1));
     }
 
     fn gate(renderer: &MetalRenderer) -> Arc<AcquireGate> {
@@ -5338,7 +5387,7 @@ mod present_report_tests {
             MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false);
         renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         renderer.drawable_wait = DRAWABLE_WAIT;
-        mark_drawable_in_flight(&renderer);
+        mark_drawable_in_flight(&mut renderer);
         gate(&renderer).close();
 
         let report = renderer.draw(&solid_quad_scene(32.));
@@ -5449,8 +5498,8 @@ mod present_report_tests {
             renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         }
         base.drawable_wait = DRAWABLE_WAIT;
-        mark_drawable_in_flight(&base);
-        mark_drawable_in_flight(&overlay);
+        mark_drawable_in_flight(&mut base);
+        mark_drawable_in_flight(&mut overlay);
         gate(&overlay).close();
 
         assert!(!MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
@@ -5460,6 +5509,47 @@ mod present_report_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay) {
             assert!(Instant::now() < deadline, "the overlay's drawable came back");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(base.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
+        assert_eq!(overlay.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
+    }
+
+    /// An overlay drawable that came back at a size the window no longer has
+    /// is released and asked for again before either plane presents, so the
+    /// base cannot land while the overlay rejects its drawable and defers.
+    #[test]
+    fn layered_drawables_from_before_a_resize_are_asked_for_again() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut base = MetalRenderer::new(pool.clone(), false, false);
+        let mut overlay = base.new_sharing_atlas(pool, true);
+        for renderer in [&mut base, &mut overlay] {
+            renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
+        }
+        base.drawable_wait = DRAWABLE_WAIT;
+        mark_drawable_in_flight(&mut base);
+        mark_drawable_in_flight(&mut overlay);
+        assert!(MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
+
+        for renderer in [&mut base, &mut overlay] {
+            renderer.update_drawable_size(gpui::size(DevicePixels(96), DevicePixels(96)));
+        }
+        gate(&overlay).close();
+        assert!(
+            !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay),
+            "the overlay's 64-pixel drawable is not ready for a 96-pixel present"
+        );
+        let resized = gpui::size(DevicePixels(96), DevicePixels(96));
+        let overlay_acquirer = overlay.drawable_acquirer.as_ref().expect("an overlay acquirer");
+        assert!(
+            !overlay_acquirer.ready_fits(|drawable| super::drawable_matches(drawable, resized)),
+            "the stale drawable was released, not kept"
+        );
+
+        gate(&overlay).open();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay) {
+            assert!(Instant::now() < deadline, "the overlay's new drawable came back");
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(base.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
@@ -7457,7 +7547,7 @@ mod present_wait_timing_tests {
     use gpui::{DevicePixels, PresentOutcome};
     use parking_lot::Mutex;
     use std::{
-        sync::{Arc, atomic::Ordering},
+        sync::{Arc, atomic::AtomicU32},
         time::{Duration, Instant},
     };
 
@@ -7495,7 +7585,10 @@ mod present_wait_timing_tests {
         let mut renderer = renderer();
         assert_eq!(renderer.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
         renderer.drawable_wait = wait;
-        renderer.drawables_in_flight.store(1, Ordering::Relaxed);
+        // A fresh counter: the warm-up present's handler decrements the old
+        // one and would otherwise let the held stretch take the synchronous
+        // path past the closed gate.
+        renderer.drawables_in_flight = Arc::new(AtomicU32::new(1));
         let gate = renderer.drawable_acquirer.as_ref().expect("a layer").gate();
         gate.close();
         let opener = std::thread::spawn(move || {
@@ -7517,6 +7610,7 @@ mod present_wait_timing_tests {
         }
         let landed = start.elapsed();
         opener.join().expect("the opener finished");
+        assert!(landed >= hold, "a present landed before the hold ended: {landed:?}");
         (longest, landed)
     }
 

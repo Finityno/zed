@@ -10,7 +10,7 @@
 //! spent there. Asked here, the main thread waits only as long as it chooses
 //! to and defers the present when no drawable came in time.
 
-use metal::{MetalDrawable, MetalLayer};
+use metal::{MetalDrawable, MetalDrawableRef, MetalLayer};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::{sync::Arc, thread, time::Instant};
 
@@ -129,6 +129,29 @@ impl DrawableAcquirer {
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.shared.state.lock();
         state.requested.is_none() && state.ready.is_none()
+    }
+
+    /// Whether an answer is waiting that a present can take: a drawable that
+    /// `fits`, or none at all from a faulted layer, which the present reports
+    /// as it always has.
+    pub(crate) fn ready_fits(&self, fits: impl Fn(&MetalDrawableRef) -> bool) -> bool {
+        match &self.shared.state.lock().ready {
+            Some(Some(drawable)) => fits(drawable),
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    /// Releases a drawable that came back and is waiting, unless it `fits`.
+    pub(crate) fn release_ready_unless(&self, fits: impl Fn(&MetalDrawableRef) -> bool) {
+        let released = {
+            let mut state = self.shared.state.lock();
+            match &state.ready {
+                Some(Some(drawable)) if !fits(drawable) => state.ready.take(),
+                _ => None,
+            }
+        };
+        drop(released);
     }
 
     /// Takes the requested drawable if it has come back.
