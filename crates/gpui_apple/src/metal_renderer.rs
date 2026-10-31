@@ -5526,10 +5526,12 @@ mod present_report_tests {
         for renderer in [&mut base, &mut overlay] {
             renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
         }
-        base.drawable_wait = DRAWABLE_WAIT;
         mark_drawable_in_flight(&mut base);
         mark_drawable_in_flight(&mut overlay);
+        // Primed with the tests' long wait: allocating the first drawables on
+        // a busy machine can take longer than a refresh.
         assert!(MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
+        base.drawable_wait = DRAWABLE_WAIT;
 
         for renderer in [&mut base, &mut overlay] {
             renderer.update_drawable_size(gpui::size(DevicePixels(96), DevicePixels(96)));
@@ -7591,11 +7593,13 @@ mod present_wait_timing_tests {
         renderer.drawables_in_flight = Arc::new(AtomicU32::new(1));
         let gate = renderer.drawable_acquirer.as_ref().expect("a layer").gate();
         gate.close();
+        // Taken before the opener starts its hold, so a frame cannot land
+        // before `hold` has passed since `start`.
+        let start = Instant::now();
         let opener = std::thread::spawn(move || {
             std::thread::sleep(hold);
             gate.open();
         });
-        let start = Instant::now();
         let mut longest = Duration::ZERO;
         loop {
             let present_start = Instant::now();
