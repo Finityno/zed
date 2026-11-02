@@ -462,7 +462,12 @@ impl Window {
                     .entry(node)
                     .or_default()
                     .push(listener),
-                None => debug_assert!(false, "an action listener drawn again twice"),
+                None => {
+                    debug_assert!(false, "an action listener drawn again twice");
+                    // Its node would be left without the action: the next
+                    // frame builds every view, and the node with it.
+                    log.diverged = true;
+                }
             }
         }
     }
