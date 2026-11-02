@@ -6818,8 +6818,13 @@ impl Window {
     /// this variant takes a function that is invoked during layout so you can use arbitrary logic to
     /// determine the element's size. One place this is used internally is when measuring text.
     ///
-    /// The given closure is invoked at layout time with the known dimensions and available space and
-    /// returns a `Size`.
+    /// The given closure is invoked with the known dimensions and available space and returns a
+    /// `Size`. Taffy invokes it at layout time. A node kept from the last frame is not dirtied by
+    /// the new closure: before the next layout, the closure is invoked under every constraint
+    /// Taffy measured the node under since it was last dirtied, and only a node that measures
+    /// otherwise is dirtied and measured again at layout time. The closure may therefore not be
+    /// invoked at layout time at all, and should compute its size from its arguments rather than
+    /// rely on side effects of being called then.
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
     pub fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId

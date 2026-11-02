@@ -436,8 +436,8 @@ fn a_list_dragged_by_its_scrollbar_draws_its_rows_again() {
 }
 
 /// A view asking whether the list is at its end depends on the answer, not
-/// on the scroll position: it is built only once the answer changes, and the
-/// rows are drawn again meanwhile.
+/// on the scroll position: its rows are drawn again while the answer stays
+/// the same, and what it draws from the answer follows it when it changes.
 #[test]
 fn asking_whether_a_list_is_at_its_end_reads_only_the_answer() {
     let mut cx = super::super::layout_retention_tests::text_system_context_with_ink_in_font_bounds(0);
