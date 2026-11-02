@@ -11,12 +11,19 @@
 
 use super::{TextLayout, TextLayoutInner};
 use crate::{
-    App, AvailableSpace, DecorationRun, Hsla, LayoutId, Pixels, SharedString, Size, px,
+    App, AvailableSpace, Bounds, DecorationRun, Hsla, LayoutId, Pixels, SharedString, Size, px,
     StrikethroughStyle, TextOverflow, TextRun, TextStyle, TruncateFrom, UnderlineStyle,
     WhiteSpace, Window, WrappedLine, taffy::Adopted,
 };
 use gpui_util::ResultExt as _;
-use std::{any::Any, borrow::Cow, cell::RefCell, cmp, rc::Rc};
+use std::{
+    any::Any,
+    borrow::Cow,
+    cell::RefCell,
+    cmp,
+    rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 /// A weak handle on the inputs that measured a text layout, for its element
 /// to shape the text again at the width it was laid out at; see
@@ -192,6 +199,67 @@ pub(super) fn layout_text(
         measure_text,
         cx,
     )
+}
+
+/// Measures text that reaches prepaint without a measurement, as plain text
+/// in the text style in effect, at the size it is prepainted at.
+///
+/// Text is measured by the time it is prepainted: carried over from last
+/// frame as its layout is requested, or by Taffy as it lays the text's node
+/// out. A gap in retention can let a text node escape every layout computed
+/// this frame (a node marked for remeasuring that no computed tree reaches)
+/// while its element is still prepainted; measuring it here costs that text
+/// its runs' colors and fonts for a frame instead of aborting the app.
+pub(super) fn measure_unmeasured(
+    layout: &TextLayout,
+    text: &str,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if layout.0.borrow().is_some() {
+        return;
+    }
+    report_unmeasured("text reached prepaint unmeasured; measured there as plain text", text);
+    let inputs = Rc::new(TextMeasureInputs::new(
+        SharedString::from(text.to_owned()),
+        None,
+        layout,
+        window,
+    ));
+    // A node no layout reached can be placed with no size: laid out at a
+    // zero width, the text would wrap a glyph to a line.
+    let (known_dimensions, available_space) = if bounds.size.width > Pixels::ZERO {
+        (
+            bounds.size.map(Some),
+            bounds.size.map(AvailableSpace::Definite),
+        )
+    } else {
+        (
+            Size::default(),
+            Size::new(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+        )
+    };
+    measure_text(&inputs, known_dimensions, available_space, window, cx);
+}
+
+/// Whether [`report_unmeasured`] has reported anything in this process.
+static REPORTED_UNMEASURED: AtomicBool = AtomicBool::new(false);
+
+/// Logs text found unmeasured where it should not be: as an error the first
+/// time in the process, and at debug level after that, since a frame that
+/// finds it is likely to be followed by many that find it again.
+pub(super) fn report_unmeasured(what: &str, text: &str) {
+    const SHOWN_CHARS: usize = 32;
+    let mut shown: String = text.chars().take(SHOWN_CHARS).collect();
+    if text.chars().nth(SHOWN_CHARS).is_some() {
+        shown.push('…');
+    }
+    if REPORTED_UNMEASURED.swap(true, Ordering::Relaxed) {
+        log::debug!("{what}: {shown:?}");
+    } else {
+        log::error!("{what}: {shown:?}");
+    }
 }
 
 /// Takes over the measurement `previous` left, if it stands for `inputs`.

@@ -401,6 +401,7 @@ impl Element for &'static str {
         window: &mut Window,
         cx: &mut App,
     ) {
+        measurement::measure_unmeasured(text_layout, self, bounds, window, cx);
         measurement::fit_to_width(text_layout, bounds.size.width, window, cx);
         text_layout.prepaint(bounds, self, window.text_style().text_align);
         text_layout.note_position(window);
@@ -478,6 +479,7 @@ impl Element for SharedString {
         window: &mut Window,
         cx: &mut App,
     ) {
+        measurement::measure_unmeasured(text_layout, self, bounds, window, cx);
         measurement::fit_to_width(text_layout, bounds.size.width, window, cx);
         text_layout.prepaint(bounds, self.as_ref(), window.text_style().text_align);
         text_layout.note_position(window);
@@ -710,6 +712,7 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
+        measurement::measure_unmeasured(&self.layout, &self.text, bounds, window, cx);
         measurement::fit_to_width(&self.layout, bounds.size.width, window, cx);
         self.layout
             .prepaint(bounds, &self.text, window.text_style().text_align);
@@ -886,6 +889,7 @@ impl Element for ShimmerText {
         window: &mut Window,
         cx: &mut App,
     ) {
+        measurement::measure_unmeasured(&self.layout, &self.text, bounds, window, cx);
         measurement::fit_to_width(&self.layout, bounds.size.width, window, cx);
         self.layout
             .prepaint(bounds, &self.text, window.text_style().text_align);
@@ -1002,20 +1006,23 @@ impl TextLayout {
         window.note_positioned_state(|| self.0.clone());
     }
 
+    /// Notes where the text is painted. Text left unmeasured even by
+    /// [`measurement::measure_unmeasured`] is left without bounds, and
+    /// painting it paints nothing.
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, text_align: TextAlign) {
         let mut element_state = self.0.borrow_mut();
-        let element_state = element_state
-            .as_mut()
-            .with_context(|| format!("measurement has not been performed on {text}"))
-            .unwrap();
+        let Some(element_state) = element_state.as_mut() else {
+            measurement::report_unmeasured("text prepainted unmeasured", text);
+            return;
+        };
         element_state.bounds = Some(bounds);
         element_state.text_align = text_align;
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
-        self.paint_lines(TextPaintPass::All, window, cx)
-            .with_context(|| format!("failed to paint {text}"))
-            .unwrap();
+        if let Err(error) = self.paint_lines(TextPaintPass::All, window, cx) {
+            measurement::report_unmeasured(&format!("text not painted: {error}"), text);
+        }
     }
 
     /// Paints the backgrounds of the text runs without the glyphs, so that callers can paint
@@ -1105,14 +1112,14 @@ impl TextLayout {
         cx: &mut App,
     ) {
         let element_state = self.0.borrow();
-        let element_state = element_state
-            .as_ref()
-            .with_context(|| format!("measurement has not been performed on {text}"))
-            .unwrap();
-        let bounds = element_state
-            .bounds
-            .with_context(|| format!("prepaint has not been performed on {text}"))
-            .unwrap();
+        let Some(element_state) = element_state.as_ref() else {
+            measurement::report_unmeasured("text not painted: measurement has not been performed", text);
+            return;
+        };
+        let Some(bounds) = element_state.bounds else {
+            measurement::report_unmeasured("text not painted: prepaint has not been performed", text);
+            return;
+        };
 
         let text_size = element_state.size.unwrap_or(bounds.size);
         let line_height = element_state.line_height;
@@ -1829,6 +1836,122 @@ mod tests {
         );
         assert_eq!(wrap_width, Some(px(40.)), "text that does not fit is shaped at its width");
         assert!(wraps > 0);
+    }
+
+    const DETACHED_TEXT: &str = "laid out where no layout reaches it";
+
+    /// Requests the layout of its text without making the text's node a
+    /// child of its own, so that no layout computed this frame reaches the
+    /// text's node and Taffy never measures it, then prepaints and paints the
+    /// text in its own bounds all the same: text reaching prepaint
+    /// unmeasured, as a gap in retention can leave it.
+    struct Detached {
+        text: Option<StyledText>,
+        layout: Rc<RefCell<Option<TextLayout>>>,
+    }
+
+    impl IntoElement for Detached {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Detached {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            let mut text = StyledText::new(DETACHED_TEXT);
+            *self.layout.borrow_mut() = Some(text.layout().clone());
+            text.request_layout(None, None, window, cx);
+            self.text = Some(text);
+            let mut style = crate::Style::default();
+            style.size.width = px(120.).into();
+            style.size.height = px(40.).into();
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            if let Some(text) = self.text.as_mut() {
+                text.prepaint(None, None, bounds, &mut (), window, cx);
+            }
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            if let Some(text) = self.text.as_mut() {
+                text.paint(None, None, bounds, &mut (), &mut (), window, cx);
+            }
+        }
+    }
+
+    struct DetachedView {
+        layout: Rc<RefCell<Option<TextLayout>>>,
+    }
+
+    impl crate::Render for DetachedView {
+        fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl IntoElement {
+            use crate::{ParentElement as _, Styled as _, div};
+            div().size_full().child(Detached {
+                text: None,
+                layout: self.layout.clone(),
+            })
+        }
+    }
+
+    /// Text that reaches prepaint unmeasured is measured there, as plain
+    /// text at the width it is prepainted at, and painted, rather than
+    /// panicking.
+    #[test]
+    fn text_reaching_prepaint_unmeasured_is_measured_there_and_painted() {
+        use crate::AppContext as _;
+        let mut cx = crate::TestAppContext::single();
+        let layout = Rc::new(RefCell::new(None));
+        let window = cx.add_window({
+            let layout = layout.clone();
+            move |_, _| DetachedView { layout }
+        });
+        for _ in 0..3 {
+            window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            let layout = layout.borrow().clone().unwrap();
+            assert_eq!(layout.text(), DETACHED_TEXT);
+            assert_eq!(layout.0.borrow().as_ref().unwrap().wrap_width, Some(px(120.)));
+            assert_eq!(layout.bounds().size.width, px(120.));
+        }
     }
 
     #[test]
