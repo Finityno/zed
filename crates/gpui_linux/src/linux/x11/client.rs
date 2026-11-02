@@ -884,6 +884,16 @@ impl X11Client {
         if !state.has_xim() {
             return;
         }
+        // An input context belongs to an opened input method, and until the
+        // server's `OpenReply` assigns its id, `CreateIc` names input method
+        // 0. fcitx5 answers that with an `XIM_ERROR` the client cannot parse,
+        // and the client drops its XIM connection for the rest of the session.
+        // The handshake creates an input context of its own once it is done,
+        // for the window focus last went to, so a window focused before then
+        // is covered by it.
+        if !xim_handshake_complete(state.xim_handler.as_ref()) {
+            return;
+        }
 
         let Some((mut ximc, xim_handler)) = state.take_xim() else {
             return;
@@ -2851,6 +2861,12 @@ fn get_scale_factor(
     1.0
 }
 
+/// Whether the XIM handshake has created its input context, after which a
+/// focused window may create its own.
+fn xim_handshake_complete(xim_handler: Option<&XimHandler>) -> bool {
+    xim_handler.is_some_and(|xim_handler| xim_handler.connected)
+}
+
 /// GDK scales X11 windows by whole numbers only, so any other value is left
 /// to the next source rather than guessed at.
 fn parse_gdk_scale(value: &str) -> Option<f32> {
@@ -3067,6 +3083,15 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_waits_for_the_xim_handshake() {
+        assert!(!xim_handshake_complete(None));
+        assert!(!xim_handshake_complete(Some(&XimHandler::new())));
+        let mut xim_handler = XimHandler::new();
+        xim_handler.connected = true;
+        assert!(xim_handshake_complete(Some(&xim_handler)));
+    }
 
     #[test]
     fn a_whole_gdk_scale_is_the_scale_factor() {
