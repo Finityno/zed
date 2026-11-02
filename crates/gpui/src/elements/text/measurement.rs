@@ -241,6 +241,9 @@ pub(super) fn measure_unmeasured(
         )
     };
     measure_text(&inputs, known_dimensions, available_space, window, cx);
+    if let Some(inner) = layout.0.borrow_mut().as_mut() {
+        inner.unmeasured_fallback = true;
+    }
 }
 
 /// Whether [`report_unmeasured`] has reported anything in this process.
@@ -313,6 +316,14 @@ fn bind_measurement(inputs: &Rc<TextMeasureInputs>) {
 /// copied line by line. Something may still hold it (a caller's clone of a
 /// `StyledText`'s layout, say), and then it is copied, so it still answers.
 fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
+    if layout
+        .0
+        .borrow()
+        .as_ref()
+        .is_some_and(|inner| inner.unmeasured_fallback)
+    {
+        return None;
+    }
     if Rc::strong_count(&layout.0) == 1 {
         let mut inner = layout.0.borrow_mut().take()?;
         inner.bounds = None;
@@ -338,6 +349,7 @@ fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
             size: inner.size,
             bounds: None,
             carried: true,
+            unmeasured_fallback: false,
             measured_by: inner.measured_by.clone(),
         })
     }
@@ -457,6 +469,7 @@ fn measure_text(
     // text the width actually bites is shaped a second time.
     if let Some(text_layout) = element_state.0.borrow().as_ref()
         && let Some(size) = text_layout.size
+        && !text_layout.unmeasured_fallback
         && truncate_width == text_layout.truncate_width
         && (wrap_width == text_layout.wrap_width
             || (text_layout.wrap_width.is_none()
@@ -479,7 +492,9 @@ fn measure_text(
             .0
             .borrow()
             .as_ref()
-            .is_some_and(|cached| cached.wrap_width.is_some() && cached.size.is_some());
+            .is_some_and(|cached| {
+                cached.wrap_width.is_some() && cached.size.is_some() && !cached.unmeasured_fallback
+            });
 
     let runs = inputs.runs();
     let runs = &*runs;
@@ -550,6 +565,7 @@ fn measure_text(
                 size: Some(Size::default()),
                 bounds: None,
                 carried: false,
+                unmeasured_fallback: false,
                 measured_by: Rc::downgrade(inputs),
             });
         }
@@ -574,6 +590,7 @@ fn measure_text(
             size: Some(size),
             bounds: None,
             carried: false,
+            unmeasured_fallback: false,
             measured_by: Rc::downgrade(inputs),
         });
     }

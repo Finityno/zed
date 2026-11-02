@@ -958,6 +958,11 @@ struct TextLayoutInner {
     /// Whether the lines were carried over from last frame's element rather
     /// than asked of the line layout cache this frame.
     carried: bool,
+    /// Whether these are the plain lines [`measurement::measure_unmeasured`]
+    /// shaped for text that reached prepaint unmeasured. They stand for no
+    /// measurement of the text's own inputs, so they are neither carried to
+    /// the next frame nor taken as the answer to a measurement.
+    unmeasured_fallback: bool,
     measured_by: measurement::MeasuredBy,
 }
 
@@ -1767,6 +1772,7 @@ mod tests {
                 size: None,
                 bounds: None,
                 carried: false,
+                unmeasured_fallback: false,
                 measured_by: Default::default(),
             }))));
             layout.prepaint(Bounds::new(point(px(10.0), px(30.0)), size(px(100.0), px(40.0))), "aβcde", align);
