@@ -2828,6 +2828,20 @@ fn get_scale_factor(
         return scale;
     }
 
+    // A Wayland compositor that leaves XWayland clients unscaled (Hyprland's
+    // `xwayland:force_zero_scaling`) shows them in physical pixels and states
+    // the session's scale in `GDK_SCALE`, often with no `Xft.dpi`. The RandR
+    // guess from the monitor's physical DPI rarely matches it (17/12 for a
+    // 27" 4K monitor the session scales by 2), and GTK content embedded in
+    // the window, which obeys `GDK_SCALE`, would come out larger than ours.
+    if let Some(scale) = std::env::var("GDK_SCALE")
+        .ok()
+        .and_then(|value| parse_gdk_scale(&value))
+    {
+        log::info!("Using scale factor from GDK_SCALE: {}", scale);
+        return scale;
+    }
+
     if let Some(scale) = get_randr_scale_factor(connection, screen_index) {
         log::info!("Using RandR scale factor: {}", scale);
         return scale;
@@ -2835,6 +2849,15 @@ fn get_scale_factor(
 
     log::info!("Using default scale factor: 1.0");
     1.0
+}
+
+/// GDK scales X11 windows by whole numbers only, so any other value is left
+/// to the next source rather than guessed at.
+fn parse_gdk_scale(value: &str) -> Option<f32> {
+    match value.trim().parse::<u32>() {
+        Ok(scale) if scale > 0 => Some(scale as f32),
+        _ => None,
+    }
 }
 
 fn get_randr_scale_factor(connection: &XCBConnection, screen_index: usize) -> Option<f32> {
@@ -3044,6 +3067,19 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_whole_gdk_scale_is_the_scale_factor() {
+        assert_eq!(parse_gdk_scale("2"), Some(2.0));
+        assert_eq!(parse_gdk_scale(" 1 "), Some(1.0));
+    }
+
+    #[test]
+    fn a_gdk_scale_that_is_not_a_positive_whole_number_is_ignored() {
+        for value in ["", "0", "1.5", "-2", "auto"] {
+            assert_eq!(parse_gdk_scale(value), None, "GDK_SCALE={value:?}");
+        }
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")
