@@ -282,6 +282,10 @@ struct DirectCompositionPortal {
     visual: IDCompositionVisual,
     clip: IDCompositionRectangleClip,
     visible: Cell<bool>,
+    /// The bounds last committed. Prepaint places every portal each frame,
+    /// and a DirectComposition commit for bounds that did not change is work
+    /// the compositor does for nothing.
+    bounds: Cell<Option<Bounds<DevicePixels>>>,
 }
 
 impl DirectXRendererDevices {
@@ -2082,12 +2086,16 @@ impl DirectComposition {
             visual,
             clip,
             visible: Cell::new(true),
+            bounds: Cell::new(None),
         })
     }
 }
 
 impl PlatformNativeSurface for DirectCompositionPortal {
     fn set_bounds(&self, bounds: Bounds<DevicePixels>) -> Result<()> {
+        if self.bounds.get() == Some(bounds) {
+            return Ok(());
+        }
         let x = bounds.origin.x.0 as f32;
         let y = bounds.origin.y.0 as f32;
         let width = bounds.size.width.0.max(0) as f32;
@@ -2101,6 +2109,9 @@ impl PlatformNativeSurface for DirectCompositionPortal {
             self.clip.SetBottom2(height)?;
             self.comp_device.Commit()?;
         }
+        // Recorded only once committed, so bounds that failed to apply are
+        // tried again by the next frame.
+        self.bounds.set(Some(bounds));
         Ok(())
     }
 
