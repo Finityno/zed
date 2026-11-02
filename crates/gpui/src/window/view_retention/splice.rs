@@ -365,6 +365,10 @@ impl Window {
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.replay_a11y_prepaint(
+            range.start.a11y_ops_index..range.end.a11y_ops_index,
+            Point::default(),
+        );
         let nodes = range.start.dispatch_tree_index..range.end.dispatch_tree_index;
         let start = self.next_frame.dispatch_tree.len();
         dispatch.stretches.push((nodes.clone(), start));

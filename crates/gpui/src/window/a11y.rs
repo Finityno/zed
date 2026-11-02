@@ -96,11 +96,19 @@
 //!
 //! These are cleared at the start of a frame, and re-populated during painting.
 //!
+//! ### Views drawn again from the last frame
+//!
+//! A view drawn again from the last frame (a cached view, or any view with
+//! view retention on) is neither prepainted nor painted, so its elements push
+//! no nodes and register no listeners. Instead, the frame does again what
+//! building the tree did for it last frame; see [`replay`].
+//!
 //! [`NodeId`]: accesskit::NodeId
 
 use crate::*;
 
 pub(crate) mod debug;
+pub(crate) mod replay;
 
 use crate::{App, Bounds, FocusId, Pixels, SharedString, Window};
 use accesskit::{Action, NodeId, TreeUpdate};
@@ -221,7 +229,15 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Has the window build its tree from the next frame on as though
+    /// assistive technology had asked for it. See
+    /// [`crate::Window::force_a11y_active`].
+    pub(crate) fn force_active(&self) {
+        self.active_flag.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
+        self.nodes.log.focusable(node_id, focus_id);
         self.focus_ids.insert(node_id, focus_id);
     }
 
@@ -256,6 +272,7 @@ impl A11y {
     }
 
     pub(crate) fn set_active_descendant(&mut self, node_id: NodeId) {
+        self.nodes.log.active_descendant(node_id);
         // The active descendant must be a descendant of the focused container,
         // not the focused node itself.
         if self.nodes.node_is_focused(node_id) {
@@ -273,6 +290,7 @@ impl A11y {
 
     /// Clear per-frame state and push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
+        self.begin_replay_frame();
         self.focus_ids.clear();
         self.node_bounds.clear();
         self.action_listeners.clear();
@@ -281,6 +299,7 @@ impl A11y {
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
+        self.nodes.log.end_frame();
         let update = self.nodes.finalize();
         self.debug.capture(
             &update,
@@ -385,6 +404,9 @@ pub(crate) struct A11yNodeBuilder {
     active_descendant: Option<NodeId>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
+    /// What building the tree did, for views drawn again from this frame
+    /// on the next one to do again. See [`replay`].
+    pub(crate) log: replay::A11yLog,
 }
 
 impl A11yNodeBuilder {
@@ -398,6 +420,7 @@ impl A11yNodeBuilder {
             active_descendant: None,
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
+            log: replay::A11yLog::default(),
         }
     }
 
@@ -434,6 +457,7 @@ impl A11yNodeBuilder {
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
+        self.log.push(id);
         self.ids_stack.push(id);
         self.nodes_stack.push(node);
         true
@@ -452,6 +476,7 @@ impl A11yNodeBuilder {
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
+        self.log.leaf(self.all_nodes.len());
         self.all_nodes.push((id, node));
         true
     }
@@ -466,6 +491,7 @@ impl A11yNodeBuilder {
         debug_assert!(self.ids_stack.len() > 1, "pop would remove the root node");
 
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
+            self.log.pop(self.all_nodes.len());
             self.all_nodes.push((id, node));
         }
     }

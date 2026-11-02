@@ -96,6 +96,25 @@ impl A11yDebug {
         self.last_node_info = node_info.clone();
     }
 
+    /// The tree last built, which views drawn again from the frame that built
+    /// it read their finished nodes from (see [`super::replay`]).
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.last_tree_update.as_ref()
+    }
+
+    pub(crate) fn take_last_tree_update(&mut self) -> Option<TreeUpdate> {
+        self.last_tree_update.take()
+    }
+
+    pub(crate) fn restore_last_tree_update(&mut self, update: Option<TreeUpdate>) {
+        self.last_tree_update = update;
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn last_node_info(&self, id: NodeId) -> Option<NodeDebugInfo> {
+        self.last_node_info.get(&id).cloned()
+    }
+
     /// Serialize the last tree update to a readable JSON string. Node ids are
     /// replaced with short ephemeral ids (`a`, `b`, ..., `z`, `aa`, ...).
     pub(crate) fn to_json(&self) -> Option<String> {
