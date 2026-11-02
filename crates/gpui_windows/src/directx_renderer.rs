@@ -4452,3 +4452,34 @@ mod rendered_pixel_tests {
         );
     }
 }
+
+/// The shared rounded clipping pixel fixtures, drawn by Direct3D.
+#[cfg(all(test, feature = "test-support"))]
+mod rounded_clip_pixel_tests {
+    use crate::DirectXHeadlessRenderer;
+    use gpui::{
+        NoopTextSystem, PlatformHeadlessRenderer, TestAppContext, TestDispatcher,
+        test::rounded_clip_fixtures::check_rounded_clip_fixtures,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn rounded_clip_fixtures_render_on_direct3d() -> anyhow::Result<()> {
+        if DirectXHeadlessRenderer::new().is_none() {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return Ok(());
+        }
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(NoopTextSystem),
+            Some(Box::new(|| {
+                Ok(DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn PlatformHeadlessRenderer>))
+            })),
+        );
+        let failures = check_rounded_clip_fixtures(&mut cx)?;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    }
+}

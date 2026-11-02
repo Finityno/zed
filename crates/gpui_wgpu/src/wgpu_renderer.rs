@@ -5338,3 +5338,31 @@ mod tests {
         }
     }
 }
+
+/// The shared rounded clipping pixel fixtures, drawn by wgpu.
+#[cfg(all(test, target_os = "linux", feature = "test-support"))]
+mod rounded_clip_pixel_tests {
+    use super::WgpuHeadlessRenderer;
+    use gpui::{
+        NoopTextSystem, PlatformHeadlessRenderer, TestAppContext, TestDispatcher,
+        test::rounded_clip_fixtures::check_rounded_clip_fixtures,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn rounded_clip_fixtures_render_on_wgpu() -> anyhow::Result<()> {
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(NoopTextSystem),
+            Some(Box::new(|| {
+                Ok(Some(
+                    Box::new(WgpuHeadlessRenderer::new()?) as Box<dyn PlatformHeadlessRenderer>
+                ))
+            })),
+        );
+        let failures = check_rounded_clip_fixtures(&mut cx)?;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    }
+}

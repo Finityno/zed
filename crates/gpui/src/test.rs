@@ -25,6 +25,8 @@
 //!   assert!(true)
 //! }
 //! ```
+pub mod rounded_clip_fixtures;
+
 use crate::{Entity, Subscription, TestAppContext, TestDispatcher, calculate_seeds};
 use futures::StreamExt as _;
 use proptest::prelude::{Just, Strategy, any};

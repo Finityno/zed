@@ -7722,3 +7722,31 @@ mod present_wait_timing_tests {
         }
     }
 }
+
+/// The shared rounded clipping pixel fixtures, drawn by Metal.
+#[cfg(test)]
+mod rounded_clip_pixel_tests {
+    use super::MetalHeadlessRenderer;
+    use gpui::{
+        NoopTextSystem, PlatformHeadlessRenderer, TestAppContext, TestDispatcher,
+        test::rounded_clip_fixtures::check_rounded_clip_fixtures,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn rounded_clip_fixtures_render_on_metal() -> anyhow::Result<()> {
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(NoopTextSystem),
+            Some(Box::new(|| {
+                Ok(Some(
+                    Box::new(MetalHeadlessRenderer::new()) as Box<dyn PlatformHeadlessRenderer>
+                ))
+            })),
+        );
+        let failures = check_rounded_clip_fixtures(&mut cx)?;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    }
+}
