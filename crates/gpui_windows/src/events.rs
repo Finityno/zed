@@ -30,6 +30,8 @@ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+/// How long a window waits before trying a resize that failed twice again.
+const FAILED_RESIZE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -380,15 +382,11 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-        {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
-            self.state
-                .invalidate_devices
-                .store(true, std::sync::atomic::Ordering::Release);
-            // The compositor clock recreates the devices, and may be asleep.
-            self.state.frame_request.wake_device_owner();
+        if should_resize_renderer {
+            let result = self.state.renderer.borrow_mut().resize(device_size);
+            if let Err(error) = result {
+                self.handle_failed_resize(error, false);
+            }
         }
         // Same dedup as `handle_move_msg`: only a real change fans out to the
         // bounds observers. Keyed on (size, scale) because a DPI change can
@@ -404,6 +402,56 @@ impl WindowsWindowInner {
             self.state.last_reported_resize.set(reported);
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
+        }
+    }
+
+    /// A resize on a removed device is redone by the device recovery, which
+    /// rebuilds the swap chains at the size that was asked for. On a device
+    /// that is fine (out of memory for the new size, say) new devices would
+    /// allocate the same size and fail the same way, so the renderer skips
+    /// its draws and the window tries the resize again on a later frame.
+    fn handle_failed_resize(&self, error: anyhow::Error, retrying: bool) {
+        if self.state.renderer.borrow().is_device_lost() {
+            log::error!("Failed to resize renderer, invalidating devices: {error:#}");
+            self.state.resize_retry_at.set(None);
+            self.state.invalidate_devices.store(true, Ordering::Release);
+            // The compositor clock recreates the devices, and may be asleep.
+            self.state.frame_request.wake_device_owner();
+        } else if retrying {
+            log::debug!("Failed to resize renderer again, retrying later: {error:#}");
+            // Retried at every frame, a size that cannot be allocated yet
+            // would keep the clock painting a window that shows nothing.
+            let retry_at = std::time::Instant::now() + FAILED_RESIZE_RETRY_DELAY;
+            self.state.resize_retry_at.set(Some(retry_at));
+            self.state.frame_request.request_at(retry_at);
+        } else {
+            log::error!("Failed to resize renderer, retrying on the next frame: {error:#}");
+            self.state.resize_retry_at.set(None);
+            self.state.frame_request.request();
+        }
+    }
+
+    fn retry_failed_resize(&self) {
+        if !self.state.renderer.borrow().resize_failed() {
+            return;
+        }
+        if self
+            .state
+            .resize_retry_at
+            .get()
+            .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
+        {
+            return;
+        }
+        let result = self.state.renderer.borrow_mut().retry_resize();
+        match result {
+            Ok(()) => {
+                self.state.resize_retry_at.set(None);
+                if !self.state.renderer.borrow().resize_failed() {
+                    log::info!("Resized renderer after an earlier resize failed");
+                }
+            }
+            Err(error) => self.handle_failed_resize(error, true),
         }
     }
 
@@ -1529,14 +1577,34 @@ impl WindowsWindowInner {
         }
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
-        if let Err(err) = self
-            .state
-            .renderer
-            .borrow_mut()
-            .handle_device_lost(&devices)
-        {
-            panic!("Device lost: {err}");
+        let mut attempts = self.state.device_recovery.get();
+        // Tried even once the window has stopped asking for devices: these
+        // may come from a later recovery that the driver has finished.
+        let result = self.state.renderer.borrow_mut().handle_device_lost(devices);
+        if let Err(error) = result {
+            // The renderer is left without devices, so its draws stay skipped
+            // whatever happens next.
+            let retry = attempts.failed();
+            self.state.device_recovery.set(attempts);
+            if retry {
+                log::error!(
+                    "Failed to recover renderer from lost device (attempt {} of \
+                     {MAX_FAILED_RECOVERIES}), asking for new devices: {error:#}",
+                    attempts.failures(),
+                );
+                self.state.invalidate_devices.store(true, Ordering::Release);
+                self.state.frame_request.wake_device_owner();
+            } else if attempts.failures() == MAX_FAILED_RECOVERIES {
+                log::error!(
+                    "Failed to recover renderer from lost device after \
+                     {MAX_FAILED_RECOVERIES} attempts; the window draws nothing until the \
+                     devices are recreated again: {error:#}"
+                );
+            }
+            return Some(0);
         }
+        attempts.recovered();
+        self.state.device_recovery.set(attempts);
         #[cfg(test)]
         crate::native_tests::recovered();
         // Make sure the first `draw_window` after recovery (whether it comes
@@ -1610,6 +1678,9 @@ impl WindowsWindowInner {
             // will rebuild the scene with fresh atlas textures.
             self.state.renderer.borrow_mut().mark_drawable();
         }
+        // Before GPUI draws, so a frame that follows a failed resize is drawn
+        // at the size the window has now.
+        self.retry_failed_resize();
         let (signal_at, signal_source) = self.state.frame_signal.take().map_or(
             (None, FrameRequestSource::NativeCallback),
             |(at, source)| (Some(at), source),
