@@ -301,6 +301,7 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.check_remeasured_leaves(window, cx);
         let scale_factor = window.scale_factor();
 
         let transform = |v: AvailableSpace| match v {

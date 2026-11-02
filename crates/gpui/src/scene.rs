@@ -887,6 +887,34 @@ impl Scene {
         })
     }
 
+    /// Whether everything in `range` was drawn inside `bounds`: nothing it
+    /// culled where it reached past them can come into view once what drew
+    /// it moves where less of it shows.
+    pub(crate) fn drawn_inside(&self, range: Range<usize>, bounds: [f32; 4]) -> bool {
+        use crate::window::view_retention::moving::scaled_edges;
+        const EPSILON: f32 = 1e-3;
+        let inside = |extent: &Bounds<ScaledPixels>| {
+            let [left, top, right, bottom] = scaled_edges(extent);
+            left >= bounds[0] - EPSILON
+                && top >= bounds[1] - EPSILON
+                && right <= bounds[2] + EPSILON
+                && bottom <= bounds[3] + EPSILON
+        };
+        self.paint_operations[range].iter().all(|operation| match operation {
+            PaintOperation::Primitive(Primitive::Quad(quad)) => inside(&self.quad_extent(quad)),
+            PaintOperation::Primitive(primitive) => inside(&primitive_extent(primitive)),
+            PaintOperation::MonochromeSprite(index) => {
+                inside(&monochrome_sprite_extent(&self.painted_monochrome_sprites[*index as usize]))
+            }
+            PaintOperation::SubpixelSprite(index) => {
+                inside(&self.painted_subpixel_sprites[*index as usize].bounds)
+            }
+            PaintOperation::BackdropBlur(blur) => inside(&blur.bounds),
+            PaintOperation::StartLayer(layer) => inside(&layer.extent),
+            PaintOperation::EndLayer => true,
+        })
+    }
+
     /// Replays `range` of `prev_scene`, as [`Self::replay`] does, into a scene
     /// where what it was painted inside differs: `rebase` maps the transition
     /// the range was painted inside (`0` for none) to the one it is replayed

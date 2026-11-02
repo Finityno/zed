@@ -207,7 +207,7 @@ impl Window {
             &record.own_dependencies,
             self.inside_notified_view(),
             now,
-            &self.view_retention.every_frame,
+            &[&self.view_retention.every_frame],
         ) {
             Some(DependencyChange::Entity) => return Some(ViewRebuildReason::EntityChanged),
             Some(DependencyChange::Global) => return Some(ViewRebuildReason::GlobalChanged),
@@ -712,6 +712,7 @@ impl Window {
                 layout: record.layout.clone(),
                 unsettled: false,
                 stays_put: record.stays_put,
+                read_mask: record.read_mask,
                 moved: None,
                 paint_mask: record.paint_mask,
                 source: record.source.clone(),
@@ -812,6 +813,7 @@ impl Window {
         let mut all_hovers: Vec<HoverRead> = own_hovers.to_vec();
         let mut unsettled = false;
         let mut stays_put = views.records[index].stays_put;
+        let mut read_mask = views.records[index].read_mask;
         let mut nested_index = index + 1;
         while nested_index <= index + nested {
             let record = &views.records[nested_index];
@@ -827,6 +829,7 @@ impl Window {
             all_hovers.extend_from_slice(&record.hovers);
             unsettled |= record.unsettled;
             stays_put |= record.stays_put;
+            read_mask |= record.read_mask;
             nested_index += record.nested + 1;
         }
         let record = &mut views.records[index];
@@ -837,6 +840,7 @@ impl Window {
         record.hovers = all_hovers.into();
         record.unsettled = unsettled;
         record.stays_put = stays_put;
+        record.read_mask = read_mask;
         let retention = &mut self.view_retention;
         let hovers_end = retention.hovers.len();
         retention.hover_nested.push(hovers_start..hovers_end);
@@ -993,7 +997,7 @@ impl Window {
             (record.paint_range.clone(), record.paint_context.clone())
         };
         let current = self.paint_context();
-        let paint_mask = self.content_mask();
+        let paint_mask = self.current_content_mask();
         let id = self.next_frame.retained_views.records[*index].id.clone();
         self.take_hover_reads();
         self.view_retention.view_stack.push(id);

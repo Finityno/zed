@@ -916,6 +916,9 @@ pub struct App {
     /// Views that opted out of being drawn again moved. See
     /// [`Context::set_view_movable`].
     pub(crate) fixed_views: FxHashSet<EntityId>,
+    /// Whether lists draw rows again from the last frame on frames that only
+    /// scrolled them. See [`App::set_list_row_replay`].
+    pub(crate) list_row_replay: bool,
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
@@ -1018,6 +1021,8 @@ impl App {
                 non_retainable_views: FxHashSet::default(),
                 untracked_reads: FxHashMap::default(),
                 fixed_views: FxHashSet::default(),
+                list_row_replay:
+                    crate::window::view_retention::list_rows::list_row_replay_from_environment(),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),

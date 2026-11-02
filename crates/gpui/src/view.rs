@@ -676,7 +676,7 @@ fn prepaint_view(
         window.with_element_state::<ViewElementState, _>(
             global_id.unwrap(),
             |element_state, window| {
-                let content_mask = window.content_mask();
+                let content_mask = window.current_content_mask();
                 let text_style = window.text_style();
 
                 if let Some(mut element_state) = element_state

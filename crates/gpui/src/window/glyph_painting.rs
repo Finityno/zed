@@ -414,7 +414,7 @@ impl Window {
             align,
             align_width: align_width.map(|width| width.0.to_bits()),
             colors,
-            content_mask: self.content_mask(),
+            content_mask: self.current_content_mask(),
             element_opacity: self.element_opacity().to_bits(),
             scale_factor: self.scale_factor().to_bits(),
             rendering: (

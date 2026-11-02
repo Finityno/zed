@@ -4238,7 +4238,7 @@ impl Window {
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(self.current_content_mask().bounds),
         }
     }
 
@@ -4647,6 +4647,7 @@ impl Window {
         let mut views = self.invalidator.take_views();
         if cx.view_retention() {
             self.begin_retained_views_frame(&views);
+            self.view_retention.shrinking_moves = cx.records_list_rows();
         }
         for entity in views.drain() {
             self.mark_view_dirty(entity);
@@ -5521,7 +5522,7 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            let mask = mask.intersect(&self.current_content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -5821,7 +5822,21 @@ impl Window {
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
+    ///
+    /// With view retention on, a view whose elements read it as they
+    /// prepaint (to lay out only what shows, say) is taken to draw by it: it
+    /// is not drawn again moved while part of it is out of view.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
+        if !self.view_retention.view_stack_is_empty() && !self.invalidator.is_painting() {
+            let reads = &self.view_retention.mask_reads;
+            reads.set(reads.get() + 1);
+        }
+        self.current_content_mask()
+    }
+
+    /// The current content mask, as [`Self::content_mask`] answers, without
+    /// noting the read: for the window's own bookkeeping and culling.
+    pub(crate) fn current_content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.content_mask_stack
             .last()
@@ -6093,7 +6108,7 @@ impl Window {
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
 
-        let content_mask = self.content_mask();
+        let content_mask = self.current_content_mask();
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             let scale_factor = self.scale_factor();
@@ -6391,7 +6406,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.current_content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
         let color: Background = color.into();
@@ -6818,9 +6833,9 @@ impl Window {
         let scale_factor = self.scale_factor();
         self.frame_work.stats.layout_nodes += 1;
         let key = self.layout_keys.current();
-        self.layout_engine.as_mut().unwrap().request_keyed_measured_layout(
+        self.layout_engine.as_mut().unwrap().request_remeasured_layout(
             key,
-            Some(&style),
+            &style,
             rem_size,
             scale_factor,
             Box::new(measure),
@@ -7012,7 +7027,7 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        let content_mask = self.current_content_mask();
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {

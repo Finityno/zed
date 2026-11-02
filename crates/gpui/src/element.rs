@@ -352,6 +352,8 @@ trait ElementObject {
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels>;
+
+    fn layout_id(&self) -> Option<LayoutId>;
 }
 
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
@@ -703,6 +705,14 @@ where
     ) -> Size<Pixels> {
         Drawable::layout_as_root(self, available_space, window, cx)
     }
+
+    fn layout_id(&self) -> Option<LayoutId> {
+        match &self.phase {
+            ElementDrawPhase::RequestLayout { layout_id, .. }
+            | ElementDrawPhase::LayoutComputed { layout_id, .. } => Some(*layout_id),
+            _ => None,
+        }
+    }
 }
 
 /// A dynamically typed element that can be used to store any element type.
@@ -727,6 +737,12 @@ impl AnyElement {
     /// The id of the element stored in this `AnyElement`, if it has one.
     pub(crate) fn element_id(&self) -> Option<ElementId> {
         self.0.element_id()
+    }
+
+    /// The node the element was laid out at, between its layout and its
+    /// prepaint.
+    pub(crate) fn layout_id(&self) -> Option<LayoutId> {
+        self.0.layout_id()
     }
 
     /// Request the layout ID of the element stored in this `AnyElement`.

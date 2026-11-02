@@ -960,25 +960,27 @@ impl App {
         self.entities.mark_access_boundary();
     }
 
-    /// Whether anything in `dependencies` but `except` may have changed, as
-    /// [`Self::dependencies_changed`] answers.
+    /// Whether anything in `dependencies` but the states in `except` may have
+    /// changed, as [`Self::dependencies_changed`] answers.
     pub(crate) fn dependencies_changed_except(
         &self,
         dependencies: &RenderDependencies,
         inside_notified: bool,
         now: Instant,
-        except: &StateVersion,
+        except: &[&StateVersion],
     ) -> Option<DependencyChange> {
+        let excepted =
+            |version: &StateVersion| except.iter().any(|except| version.same_state(except));
         if dependencies
             .states
             .iter()
-            .any(|(version, _)| version.same_state(except))
+            .any(|(version, _)| excepted(version))
         {
             let mut without = dependencies.clone();
             without.states = without
                 .states
                 .iter()
-                .filter(|(version, _)| !version.same_state(except))
+                .filter(|(version, _)| !excepted(version))
                 .cloned()
                 .collect();
             return self.dependencies_changed(&without, inside_notified, now);

@@ -766,7 +766,7 @@ impl Element for Segments {
 
 /// The no-op text system, except that every glyph rasterizes to a small box,
 /// so text paints a sprite per glyph and what went where is compared.
-struct GlyphBoxTextSystem(NoopTextSystem);
+struct GlyphBoxTextSystem(NoopTextSystem, bool);
 
 impl PlatformTextSystem for GlyphBoxTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
@@ -782,7 +782,17 @@ impl PlatformTextSystem for GlyphBoxTextSystem {
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
-        self.0.font_metrics(font_id)
+        let mut metrics = self.0.font_metrics(font_id);
+        if self.1 {
+            // Two ems on every side of the baseline: more than any glyph's
+            // box at the sizes the tests draw text at.
+            let em = metrics.units_per_em as f32;
+            metrics.bounding_box = Bounds {
+                origin: point(-2. * em, -2. * em),
+                size: size(4. * em, 4. * em),
+            };
+        }
+        metrics
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
@@ -918,7 +928,18 @@ pub(crate) fn text_system_context(seed: u64) -> TestAppContext {
     TestAppContext::build_with_text_system(
         TestDispatcher::new(seed),
         None,
-        Arc::new(GlyphBoxTextSystem(NoopTextSystem)),
+        Arc::new(GlyphBoxTextSystem(NoopTextSystem, false)),
+    )
+}
+
+/// [`text_system_context`], with fonts whose bounding box covers every
+/// glyph's box, as a real font's covers every glyph's ink: what text culls
+/// out of view is then never what shows.
+pub(crate) fn text_system_context_with_ink_in_font_bounds(seed: u64) -> TestAppContext {
+    TestAppContext::build_with_text_system(
+        TestDispatcher::new(seed),
+        None,
+        Arc::new(GlyphBoxTextSystem(NoopTextSystem, true)),
     )
 }
 
