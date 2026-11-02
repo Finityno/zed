@@ -55,6 +55,8 @@ mod tests;
 #[cfg(test)]
 mod a11y_tests;
 #[cfg(test)]
+mod scenario_tests;
+#[cfg(test)]
 mod rounded_clip_tests;
 
 use super::{ArenaClearNeeded, PaintIndex, PrepaintStateIndex, Window};
