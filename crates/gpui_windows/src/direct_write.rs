@@ -607,8 +607,9 @@ impl DirectWriteState {
         last_error.map_or(Ok(None), Err)
     }
 
-    /// The best match for `family` by name, through the collection's font
-    /// families rather than its font set: `None` when it has no such family.
+    /// The first face of `family` that opens, best match first, through the
+    /// collection's font families rather than its font set: `None` when it
+    /// has no such family, an error when it has one and no face opened.
     unsafe fn font_face_from_family_name(
         collection: &IDWriteFontCollection1,
         family: &HSTRING,
@@ -622,22 +623,35 @@ impl DirectWriteState {
         if !exists.as_bool() {
             return Ok(None);
         }
-        let font = unsafe {
+        let fonts = unsafe {
             collection
                 .GetFontFamily(index)
                 .context("GetFontFamily")?
-                .GetFirstMatchingFont(
+                .GetMatchingFonts(
                     font_weight_to_dwrite(weight),
                     DWRITE_FONT_STRETCH_NORMAL,
                     font_style_to_dwrite(style),
                 )
-                .context("GetFirstMatchingFont")?
+                .context("GetMatchingFonts")?
         };
-        let font_face = unsafe { font.CreateFontFace() }.context("IDWriteFont::CreateFontFace")?;
-        font_face
-            .cast::<IDWriteFontFace3>()
-            .context("IDWriteFontFace3")
-            .map(Some)
+        let mut last_error = None;
+        for index in 0..unsafe { fonts.GetFontCount() } {
+            let font_face = unsafe { fonts.GetFont(index) }
+                .context("IDWriteFontList::GetFont")
+                .and_then(|font| {
+                    unsafe { font.CreateFontFace() }.context("IDWriteFont::CreateFontFace")
+                })
+                .and_then(|font_face| {
+                    font_face
+                        .cast::<IDWriteFontFace3>()
+                        .context("IDWriteFontFace3")
+                });
+            match font_face {
+                Ok(font_face) => return Ok(Some(font_face)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        last_error.map_or(Ok(None), Err)
     }
 
     fn layout_line(

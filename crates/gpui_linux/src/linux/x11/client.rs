@@ -334,7 +334,13 @@ impl X11ClientStatePtr {
             return;
         };
         let mut state = client.0.borrow_mut();
-        if state.composing || state.ximc.is_none() {
+        // Before the handshake the handler's input method and context ids
+        // are 0, which fcitx5 answers as it answers `CreateIc` then (see
+        // `enable_ime`).
+        if state.composing
+            || state.ximc.is_none()
+            || !xim_handshake_complete(state.xim_handler.as_ref())
+        {
             return;
         }
 

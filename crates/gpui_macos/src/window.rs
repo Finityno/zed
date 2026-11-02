@@ -2812,11 +2812,6 @@ impl PlatformWindow for MacWindow {
             this.release_intermediates_if_occluded();
             return report;
         }
-        {
-            let mut regions = this.overlay_input_regions.lock();
-            regions.clear();
-            regions.extend_from_slice(&this.pending_overlay_hit_regions);
-        }
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
@@ -2828,6 +2823,13 @@ impl PlatformWindow for MacWindow {
         let overlay_report = overlay_renderer.draw(&this.overlay_scene);
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
+        // Input follows the overlay on screen: an overlay that did not
+        // present leaves the previous frame's there, and its regions with it.
+        if overlay_report.outcome == PresentOutcome::Presented {
+            let mut regions = this.overlay_input_regions.lock();
+            regions.clear();
+            regions.extend_from_slice(&this.pending_overlay_hit_regions);
+        }
         this.release_intermediates_if_occluded();
         this.sync_overlay_backdrops();
 

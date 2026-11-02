@@ -89,6 +89,11 @@ pub(crate) struct DirectXRenderer {
     /// [`DirectXRenderer::resize`] to that size runs again instead of being
     /// skipped as unchanged.
     resize_failed: bool,
+    /// What a device-lost recovery in progress rebuilds: whether
+    /// DirectComposition was off and whether the overlay was on, taken by
+    /// its first attempt from the resources it then releases. An attempt
+    /// that fails has released them, so a retry reads them from here.
+    recovering_composition: Option<(bool, bool)>,
 
     /// Render into an owned offscreen texture rather than the swap chain, so frames can be
     /// read back. Preserved across device-lost recovery.
@@ -367,6 +372,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             resize_failed: false,
+            recovering_composition: None,
             headless: false,
             skip_draws: false,
             resize_count: 0,
@@ -427,6 +433,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             resize_failed: false,
+            recovering_composition: None,
             headless,
             skip_draws: false,
             resize_count: 0,
@@ -650,8 +657,9 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
-        let overlay_enabled = self.overlay_resources.is_some();
+        let (disable_direct_composition, overlay_enabled) = *self
+            .recovering_composition
+            .get_or_insert((self.direct_composition.is_none(), self.overlay_resources.is_some()));
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -731,6 +739,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.recovering_composition = None;
         self.skip_draws = true;
         // The rebuilt swap chains were created at the recorded size.
         self.resize_failed = false;
