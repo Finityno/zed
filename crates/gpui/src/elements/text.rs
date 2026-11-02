@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod clickable;
 mod measurement;
 
 static SHIMMER_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -1416,6 +1417,9 @@ pub struct InteractiveText {
     tooltip_builder: Option<Rc<dyn Fn(usize, &mut Window, &mut App) -> Option<AnyView>>>,
     tooltip_id: Option<TooltipId>,
     clickable_ranges: Vec<Range<usize>>,
+    /// Hitboxes over the clickable ranges, inserted as the text prepaints,
+    /// which the hand is set for as it paints; see [`clickable`].
+    clickable_hitboxes: Vec<Hitbox>,
 }
 
 struct InteractiveTextClickEvent {
@@ -1444,6 +1448,7 @@ impl InteractiveText {
             tooltip_builder: None,
             tooltip_id: None,
             clickable_ranges: Vec::new(),
+            clickable_hitboxes: Vec::new(),
         }
     }
 
@@ -1545,6 +1550,15 @@ impl Element for InteractiveText {
                 self.text
                     .prepaint(None, inspector_id, bounds, state, window, cx);
                 let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                let clickable_hitboxes = &mut self.clickable_hitboxes;
+                clickable::clickable_stretches(
+                    self.text.layout(),
+                    &self.clickable_ranges,
+                    |stretch| {
+                        clickable_hitboxes
+                            .push(window.insert_hitbox(stretch, HitboxBehavior::Normal));
+                    },
+                );
                 (hitbox, interactive_state)
             },
         )
@@ -1567,14 +1581,8 @@ impl Element for InteractiveText {
             |interactive_state, window| {
                 let mut interactive_state = interactive_state.unwrap_or_default();
                 if let Some(click_listener) = self.click_listener.take() {
-                    let mouse_position = window.mouse_position();
-                    if let Ok(ix) = text_layout.index_for_position(mouse_position)
-                        && self
-                            .clickable_ranges
-                            .iter()
-                            .any(|range| range.contains(&ix))
-                    {
-                        window.set_cursor_style(crate::CursorStyle::PointingHand, hitbox)
+                    for clickable_hitbox in &self.clickable_hitboxes {
+                        window.set_cursor_style(crate::CursorStyle::PointingHand, clickable_hitbox);
                     }
 
                     let text_layout = text_layout.clone();
@@ -1630,10 +1638,13 @@ impl Element for InteractiveText {
                             let updated = text_layout.index_for_position(event.position).ok();
                             if current != updated {
                                 hovered_index.set(updated);
+                                // Only what a hover listener did with the index can
+                                // change what the view renders: the hand is set by
+                                // the clickable hitboxes.
                                 if let Some(hover_listener) = hover_listener.as_ref() {
                                     hover_listener(updated, event.clone(), window, cx);
+                                    cx.notify(current_view);
                                 }
-                                cx.notify(current_view);
                             }
                         }
                     }

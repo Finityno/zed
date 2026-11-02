@@ -378,6 +378,12 @@ impl TestPlatform {
         oneshot::channel().1
     }
 
+    /// The cursor style last set on the platform.
+    #[cfg(test)]
+    pub(crate) fn active_cursor_style(&self) -> CursorStyle {
+        *self.active_cursor.lock()
+    }
+
     pub(crate) fn set_active_window(&self, window: Option<TestWindow>) {
         let executor = self.foreground_executor();
         let previous_window = self.active_window.borrow_mut().take();
