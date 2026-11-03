@@ -19,6 +19,8 @@ use taffy::{
 mod retained_nodes;
 
 pub(crate) use retained_nodes::{Adopted, RetentionCounts};
+#[cfg(test)]
+pub(crate) use retained_nodes::LINGERING_NODES;
 
 #[cfg(feature = "stacker")]
 type StackSafe<T> = stacksafe::StackSafe<T>;

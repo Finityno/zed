@@ -75,6 +75,9 @@ pub(crate) struct LayoutRetention {
     /// measured again with it before the next layout, under what their log
     /// holds. See [`TaffyLayoutEngine::request_remeasured_layout`].
     remeasured: Vec<(LayoutId, Rc<MeasureLog>)>,
+    /// When each lingering node stops lingering, gathered as a frame ends to
+    /// find the oldest when there are too many. See [`lingering_cutoff`].
+    lingering_scratch: Vec<u64>,
     pub(crate) counts: RetentionCounts,
 }
 
@@ -173,6 +176,46 @@ type MeasureLogEntry = (Size<Option<Pixels>>, Size<AvailableSpace>, Size<Pixels>
 
 /// Taffy caches up to ten results per node.
 const MEASURE_LOG_CAPACITY: usize = 16;
+
+/// The most nodes a frame keeps lingering: enough for the rows just
+/// scrolled past an edge, which a scroll back finds as they were measured.
+pub(crate) const LINGERING_NODES: usize = 512;
+
+/// The last frame a node lingering past this frame is released at the end
+/// of: `frame` itself when no more than [`LINGERING_NODES`] linger, and
+/// otherwise the frame the oldest of them stop lingering through, for as
+/// many to go as are too many.
+///
+/// A scroll through a long list lingers every row it passes, and Taffy's
+/// node table keeps the room its largest tree ever took: without a bound,
+/// one pass over a transcript kept the nodes of all its rows at once, the
+/// table grew to tens of megabytes, and stayed there. A bound in proportion
+/// to what a frame claims still doubled the nodes of a frame that opens a
+/// large part of a transcript at once. Rows linger in groups that stop
+/// lingering together, so the oldest go a group at a time.
+fn lingering_cutoff(
+    retained: &FxHashMap<u64, RetainedNode>,
+    scratch: &mut Vec<u64>,
+    frame: u64,
+    claimed: usize,
+) -> u64 {
+    let budget = LINGERING_NODES;
+    if retained.len().saturating_sub(claimed) <= budget {
+        return frame;
+    }
+    scratch.clear();
+    scratch.extend(
+        retained
+            .values()
+            .filter(|node| node.claimed_in_frame != frame && node.lingers_until > frame)
+            .map(|node| node.lingers_until),
+    );
+    let Some(excess) = scratch.len().checked_sub(budget).filter(|excess| *excess > 0) else {
+        return frame;
+    };
+    let (_, cutoff, _) = scratch.select_nth_unstable(excess - 1);
+    *cutoff
+}
 
 impl MeasureLog {
     /// Forgets every size logged, for a node dirtied: Taffy holds none of
@@ -1062,13 +1105,19 @@ impl TaffyLayoutEngine {
             }
             if retention.retained.len() != retention.claimed_this_frame {
                 let frame = retention.frame;
+                let cutoff = lingering_cutoff(
+                    &retention.retained,
+                    &mut retention.lingering_scratch,
+                    frame,
+                    retention.claimed_this_frame,
+                );
                 let taffy = &mut self.taffy;
                 let unstretched_styles = &mut retention.unstretched_styles;
                 let root_spaces = &mut retention.root_spaces;
                 let missing_children = &mut retention.missing_children;
                 let released = &mut retention.counts.nodes_released;
                 retention.retained.retain(|_, node| {
-                    if node.claimed_in_frame == frame || node.lingers_until > frame {
+                    if node.claimed_in_frame == frame || node.lingers_until > cutoff {
                         return true;
                     }
                     unstretched_styles.remove(&node.id);
