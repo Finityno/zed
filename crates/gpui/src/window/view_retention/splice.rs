@@ -233,6 +233,55 @@ impl Window {
             || self.rebuild_reason_besides_dirty(record, entity, cx).is_some()
     }
 
+    /// Whether a deferred draw the splice of `record` around `gaps` would
+    /// copy from the last frame drew a view that has to be built. Its records
+    /// come after the view's, not nested in it, so no gap builds it; a
+    /// deferred draw of that one view is built where it was (see
+    /// [`Window::rebuild_deferred_view`]), but one that drew more than the
+    /// view (a popover's frame around it) can only be copied as it was, and
+    /// would show the view as it was. The deferred draws a copied one
+    /// deferred in turn are copied with it, and are looked at too.
+    fn copies_a_deferred_view_to_build(
+        &self,
+        record: &ViewRecord,
+        gaps: &[usize],
+        cx: &App,
+    ) -> bool {
+        let records = &self.rendered_frame.retained_views.records;
+        let deferred_draws = &self.rendered_frame.deferred_draws;
+        let in_a_gap = |index: usize| {
+            gaps.iter().any(|gap| {
+                let range = &records[*gap].prepaint_range;
+                (range.start.deferred_draws_index..range.end.deferred_draws_index).contains(&index)
+            })
+        };
+        let range = &record.prepaint_range;
+        let mut pending: SmallVec<[usize; 4]> = (range.start.deferred_draws_index
+            ..range.end.deferred_draws_index)
+            .filter(|index| !in_a_gap(*index))
+            .collect();
+        while let Some(index) = pending.pop() {
+            let Some(deferred_draw) = deferred_draws.get(index) else {
+                return true;
+            };
+            if !deferred_draw.one_view
+                && deferred_draw.retained_records.clone().any(|drawn| {
+                    records
+                        .get(drawn)
+                        .is_none_or(|drawn| self.own_rebuild_reason(drawn, cx).is_some())
+                })
+            {
+                return true;
+            }
+            let nested = &deferred_draw.prepaint_range;
+            pending.extend(
+                (nested.start.deferred_draws_index..nested.end.deferred_draws_index)
+                    .filter(|nested| *nested > index),
+            );
+        }
+        false
+    }
+
     /// Whether the view `record` stands for can be built on its own, inside
     /// `around`, drawn again around it.
     fn buildable_on_its_own(record: &ViewRecord, around: &ViewRecord) -> bool {
@@ -314,7 +363,10 @@ impl Window {
             gaps.push(index);
             index += nested.nested + 1;
         }
-        (!gaps.is_empty()).then_some(Splice {
+        if gaps.is_empty() || self.copies_a_deferred_view_to_build(record, &gaps, cx) {
+            return None;
+        }
+        Some(Splice {
             previous,
             gaps,
             checked,
@@ -365,6 +417,10 @@ impl Window {
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.replay_a11y_prepaint(
+            range.start.a11y_ops_index..range.end.a11y_ops_index,
+            Point::default(),
+        );
         let nodes = range.start.dispatch_tree_index..range.end.dispatch_tree_index;
         let start = self.next_frame.dispatch_tree.len();
         dispatch.stretches.push((nodes.clone(), start));

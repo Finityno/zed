@@ -686,6 +686,7 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && !window.a11y.replay_unavailable()
                 {
                     #[cfg(feature = "profiler")]
                     window.draw_clock.count_reuse();

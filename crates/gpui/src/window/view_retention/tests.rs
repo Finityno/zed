@@ -224,6 +224,10 @@ impl Render for Card {
         });
         div()
             .id(("card", self.ix))
+            // Nodes for the accessibility tree, when it is built: a group
+            // named after the card, focusable through its focus handle.
+            .role(accesskit::Role::Group)
+            .aria_label(format!("card {}", self.ix))
             .flex()
             .flex_col()
             .w(px(140.))
@@ -278,6 +282,9 @@ impl Render for Inner {
         let word = WORDS[labels[(self.ix + 3) % labels.len()]];
         div()
             .id(("inner", self.ix))
+            .role(accesskit::Role::Button)
+            .aria_label(word)
+            .on_a11y_action(accesskit::Action::Click, |_, _, _| {})
             .flex()
             .flex_row()
             .gap_1()
@@ -498,6 +505,12 @@ struct Oracle {
 
 impl Oracle {
     fn new() -> Self {
+        Self::with_accessibility(false)
+    }
+
+    /// Both windows build their accessibility trees when `accessibility`,
+    /// which the frames compared then describe.
+    pub(super) fn with_accessibility(accessibility: bool) -> Self {
         // Glyphs paint as boxes named after their characters, so what text
         // says is compared as well as where it goes.
         let mut cx = super::super::layout_retention_tests::text_system_context(0);
@@ -523,6 +536,12 @@ impl Oracle {
             let shared = shared.clone();
             move |_, cx| Shell::new(&shared, cx)
         });
+        if accessibility {
+            for window in [retaining, from_scratch] {
+                cx.update_window(window.into(), |_, window, _| window.force_a11y_active())
+                    .unwrap();
+            }
+        }
         Self {
             cx,
             shared,
@@ -763,14 +782,20 @@ impl Oracle {
 /// Views drawn again, and of those drawn again moved, or around views
 /// nested in them that were built, over a run.
 #[derive(Default)]
-struct Reuse {
-    reused: u64,
-    moved: u64,
-    spliced: u64,
+pub(super) struct Reuse {
+    pub(super) reused: u64,
+    pub(super) moved: u64,
+    pub(super) spliced: u64,
 }
 
 fn run(seed: u64, steps: usize) -> Reuse {
-    let mut oracle = Oracle::new();
+    run_with(seed, steps, false)
+}
+
+/// Runs a random history of `steps` changes from `seed`, with both windows
+/// building their accessibility trees when `accessibility`.
+pub(super) fn run_with(seed: u64, steps: usize, accessibility: bool) -> Reuse {
+    let mut oracle = Oracle::with_accessibility(accessibility);
     let mut rng = StdRng::seed_from_u64(seed);
     let mut history: Vec<Vec<Change>> = Vec::new();
     let mut reuse = Reuse::default();
@@ -787,6 +812,12 @@ fn run(seed: u64, steps: usize) -> Reuse {
         }
         history.push(changes);
         let (actual, expected, work) = oracle.draw();
+        if accessibility {
+            assert!(
+                actual.iter().any(|line| line.starts_with("a11y focus")),
+                "the accessibility tree is described"
+            );
+        }
         reuse.reused += work.views_reused;
         reuse.moved += work.views_moved;
         reuse.spliced += work.views_spliced;
@@ -1256,7 +1287,9 @@ fn adding_fonts_builds_every_view_once() {
     assert!(again.views_reused > 0, "{again:?}");
 }
 
-/// While accessibility is active every view is built, so that its nodes are.
+/// The first frame accessibility is active in builds every view, so that
+/// its nodes are: the frame before logged none to draw them again from. The
+/// next frame draws views again. See `a11y_tests.rs`.
 #[test]
 fn accessibility_builds_every_view() {
     let mut cx = TestAppContext::single();
@@ -1274,6 +1307,11 @@ fn accessibility_builds_every_view() {
     });
     assert_eq!(work.views_reused, 0, "{work:?}");
     assert!(work.view_rebuilds.accessibility >= CARDS as u64, "{work:?}");
+    let work = work_after(&mut cx, window, |cx| {
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+    });
+    assert!(work.views_reused > 0, "{work:?}");
+    assert_eq!(work.view_rebuilds.accessibility, 0, "{work:?}");
 }
 
 /// Verification draws a frame that drew views again once more from scratch,

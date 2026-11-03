@@ -1297,6 +1297,9 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+    /// Where the accessibility tree being built stands in its log; see
+    /// [`a11y::replay`].
+    a11y_ops_index: usize,
 }
 
 #[derive(Clone, Default)]
@@ -1312,6 +1315,7 @@ pub(crate) struct PaintIndex {
     tab_handle_index: usize,
     painted_positions_index: usize,
     line_layout_index: LineLayoutIndex,
+    a11y_actions_index: usize,
 }
 
 impl Frame {
@@ -4849,6 +4853,7 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
+        self.a11y.nodes.log.new_frame();
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
             self.a11y.begin_frame();
@@ -5296,6 +5301,7 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
+            a11y_ops_index: self.a11y.nodes.log.ops_len(),
         }
     }
 
@@ -5390,6 +5396,10 @@ impl Window {
                     rebuilt: None,
                 }),
         );
+        self.replay_a11y_prepaint(
+            range.start.a11y_ops_index..range.end.a11y_ops_index,
+            moved_by,
+        );
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -5405,6 +5415,7 @@ impl Window {
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             painted_positions_index: self.next_frame.painted_positions.len(),
             line_layout_index: self.text_system.layout_index(),
+            a11y_actions_index: self.a11y.nodes.log.actions_len(),
         }
     }
 
@@ -5488,6 +5499,7 @@ impl Window {
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
         );
+        self.replay_a11y_paint(range.start.a11y_actions_index..range.end.a11y_actions_index);
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
@@ -5771,6 +5783,7 @@ impl Window {
             .as_mut()
             .map(|engine| engine.begin_transaction());
         let retained_transaction = self.begin_retained_transaction();
+        let a11y_savepoint = self.a11y.savepoint();
         let result = f(self);
         if let Some(start) = layout_transaction
             && let Some(engine) = self.layout_engine.as_mut()
@@ -5781,6 +5794,9 @@ impl Window {
             self.truncate_prepaint(&index);
             // The retained views recorded since point into what was truncated.
             self.roll_back_retained_transaction(retained_transaction);
+            if let Some(savepoint) = a11y_savepoint {
+                self.a11y.roll_back(savepoint);
+            }
         }
         result
     }
@@ -8952,6 +8968,7 @@ impl Window {
         action: accesskit::Action,
         listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
     ) {
+        self.a11y.nodes.log.action(node_id, action);
         self.a11y
             .action_listeners
             .entry(node_id)
