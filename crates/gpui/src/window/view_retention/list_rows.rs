@@ -192,6 +192,13 @@ impl Window {
             culprits::list_row_built(|| format!("{reason:?}"));
             return None;
         }
+        // A view drawn again replays last frame's logged accessibility ops,
+        // but a row is not a view: rows keep being built while accessibility
+        // is active until replaying their ops is covered by tests of its own.
+        if self.a11y.is_active() {
+            culprits::list_row_built(|| "accessibility is active".into());
+            return None;
+        }
         let previous = match self.reusable_record(id, cx) {
             Ok(previous) => previous,
             Err(reason) => {

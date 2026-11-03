@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use collections::HashMap;
-use gpui_util::{ResultExt, maybe};
+use gpui_util::ResultExt;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use windows::{
     Win32::{
@@ -524,44 +524,134 @@ impl DirectWriteState {
         } else {
             gpui::font_name_with_fallbacks_shared(&family, &system_ui_font_name)
         };
-        let fontset = unsafe { collection.GetFontSet().log_err()? };
         let font_family_h = HSTRING::from(family.as_str());
-        let font = unsafe {
-            fontset
+        let from_font_set = unsafe {
+            Self::font_face_from_font_set(collection, &font_family_h, weight, style)
+        };
+        let font_face = match from_font_set {
+            Ok(Some(font_face)) => font_face,
+            // On some machines every font set lookup fails (E_NOTIMPL, Arial
+            // included), and a font that cannot be opened at all panics in
+            // `TextSystem::resolve_font` at startup; the family-name lookup
+            // of the first DirectWrite interfaces still works there.
+            found_none_or_failed => {
+                if let Err(error) = found_none_or_failed {
+                    log::warn!(
+                        "font set lookup of font family {family:?} failed, \
+                         looking it up by name: {error:#}"
+                    );
+                }
+                let font_face = unsafe {
+                    Self::font_face_from_family_name(collection, &font_family_h, weight, style)
+                }
+                .with_context(|| format!("family-name lookup of font family {family:?}"))
+                .log_err()
+                .flatten()?;
+                log::warn!("font family {family:?} resolved through the family-name lookup");
+                font_face
+            }
+        };
+        // The font draws without features that do not apply (tabular
+        // numerals and the like) rather than not at all.
+        let direct_write_features = unsafe { Self::generate_font_features(factory, features) }
+            .or_else(|error| {
+                log::warn!("dropping the features of font family {family:?}: {error:#}");
+                unsafe { factory.CreateTypography() }.context("CreateTypography")
+            })
+            .log_err()?;
+        let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
+            Self::generate_font_fallbacks(fallbacks, factory, system_font_collection)
+                .log_err()
+                .flatten()
+        });
+        Some(FontInfo {
+            font_family_h,
+            font_face,
+            features: direct_write_features,
+            fallbacks,
+            font_collection: collection.clone(),
+        })
+    }
+
+    /// The first face of `family` the collection's font set can open: `None`
+    /// when it has no such face, an error when it has some and none opened.
+    unsafe fn font_face_from_font_set(
+        collection: &IDWriteFontCollection1,
+        family: &HSTRING,
+        weight: FontWeight,
+        style: FontStyle,
+    ) -> Result<Option<IDWriteFontFace3>> {
+        let font_set = unsafe { collection.GetFontSet() }.context("GetFontSet")?;
+        let fonts = unsafe {
+            font_set.GetMatchingFonts(
+                family,
+                font_weight_to_dwrite(weight),
+                DWRITE_FONT_STRETCH_NORMAL,
+                font_style_to_dwrite(style),
+            )
+        }
+        .context("GetMatchingFonts")?;
+        let mut last_error = None;
+        for index in 0..unsafe { fonts.GetFontCount() } {
+            let font_face = unsafe { fonts.GetFontFaceReference(index) }
+                .context("GetFontFaceReference")
+                .and_then(|reference| {
+                    unsafe { reference.CreateFontFace() }
+                        .context("IDWriteFontFaceReference::CreateFontFace")
+                });
+            match font_face {
+                Ok(font_face) => return Ok(Some(font_face)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        last_error.map_or(Ok(None), Err)
+    }
+
+    /// The first face of `family` that opens, best match first, through the
+    /// collection's font families rather than its font set: `None` when it
+    /// has no such family, an error when it has one and no face opened.
+    unsafe fn font_face_from_family_name(
+        collection: &IDWriteFontCollection1,
+        family: &HSTRING,
+        weight: FontWeight,
+        style: FontStyle,
+    ) -> Result<Option<IDWriteFontFace3>> {
+        let mut index = 0;
+        let mut exists = BOOL(0);
+        unsafe { collection.FindFamilyName(family, &mut index, &mut exists) }
+            .context("FindFamilyName")?;
+        if !exists.as_bool() {
+            return Ok(None);
+        }
+        let fonts = unsafe {
+            collection
+                .GetFontFamily(index)
+                .context("GetFontFamily")?
                 .GetMatchingFonts(
-                    &font_family_h,
                     font_weight_to_dwrite(weight),
                     DWRITE_FONT_STRETCH_NORMAL,
                     font_style_to_dwrite(style),
                 )
-                .log_err()?
+                .context("GetMatchingFonts")?
         };
-        let total_number = unsafe { font.GetFontCount() };
-        for index in 0..total_number {
-            let res = maybe!({
-                let font_face_ref = unsafe { font.GetFontFaceReference(index).log_err()? };
-                let font_face = unsafe { font_face_ref.CreateFontFace().log_err()? };
-                let direct_write_features =
-                    unsafe { Self::generate_font_features(factory, features).log_err()? };
-                let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
-                    Self::generate_font_fallbacks(fallbacks, factory, system_font_collection)
-                        .log_err()
-                        .flatten()
+        let mut last_error = None;
+        for index in 0..unsafe { fonts.GetFontCount() } {
+            let font_face = unsafe { fonts.GetFont(index) }
+                .context("IDWriteFontList::GetFont")
+                .and_then(|font| {
+                    unsafe { font.CreateFontFace() }.context("IDWriteFont::CreateFontFace")
+                })
+                .and_then(|font_face| {
+                    font_face
+                        .cast::<IDWriteFontFace3>()
+                        .context("IDWriteFontFace3")
                 });
-                let font_info = FontInfo {
-                    font_family_h: font_family_h.clone(),
-                    font_face,
-                    features: direct_write_features,
-                    fallbacks,
-                    font_collection: collection.clone(),
-                };
-                Some(font_info)
-            });
-            if res.is_some() {
-                return res;
+            match font_face {
+                Ok(font_face) => return Ok(Some(font_face)),
+                Err(error) => last_error = Some(error),
             }
         }
-        None
+        last_error.map_or(Ok(None), Err)
     }
 
     fn layout_line(

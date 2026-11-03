@@ -83,6 +83,17 @@ pub(crate) struct DirectXRenderer {
 
     width: u32,
     height: u32,
+    /// Set when a resize failed on a device that was not lost. The swap
+    /// chains may then have no back buffers to draw into, and `width` and
+    /// `height` already name the size that was asked for, so the next
+    /// [`DirectXRenderer::resize`] to that size runs again instead of being
+    /// skipped as unchanged.
+    resize_failed: bool,
+    /// What a device-lost recovery in progress rebuilds: whether
+    /// DirectComposition was off and whether the overlay was on, taken by
+    /// its first attempt from the resources it then releases. An attempt
+    /// that fails has released them, so a retry reads them from here.
+    recovering_composition: Option<(bool, bool)>,
 
     /// Render into an owned offscreen texture rather than the swap chain, so frames can be
     /// read back. Preserved across device-lost recovery.
@@ -276,6 +287,10 @@ struct DirectCompositionPortal {
     visual: IDCompositionVisual,
     clip: IDCompositionRectangleClip,
     visible: Cell<bool>,
+    /// The bounds last committed. Prepaint places every portal each frame,
+    /// and a DirectComposition commit for bounds that did not change is work
+    /// the compositor does for nothing.
+    bounds: Cell<Option<Bounds<DevicePixels>>>,
 }
 
 impl DirectXRendererDevices {
@@ -356,6 +371,8 @@ impl DirectXRenderer {
             frame_scratch: FrameScratch::default(),
             width: 1,
             height: 1,
+            resize_failed: false,
+            recovering_composition: None,
             headless: false,
             skip_draws: false,
             resize_count: 0,
@@ -415,6 +432,8 @@ impl DirectXRenderer {
             frame_scratch: FrameScratch::default(),
             width: 1,
             height: 1,
+            resize_failed: false,
+            recovering_composition: None,
             headless,
             skip_draws: false,
             resize_count: 0,
@@ -638,8 +657,9 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
-        let overlay_enabled = self.overlay_resources.is_some();
+        let (disable_direct_composition, overlay_enabled) = *self
+            .recovering_composition
+            .get_or_insert((self.direct_composition.is_none(), self.overlay_resources.is_some()));
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -719,7 +739,10 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.recovering_composition = None;
         self.skip_draws = true;
+        // The rebuilt swap chains were created at the recorded size.
+        self.resize_failed = false;
         Ok(())
     }
 
@@ -772,7 +795,7 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
-        if self.skip_draws || self.quiesce_if_device_lost() {
+        if self.skip_draws || self.quiesce_if_device_lost() || !self.can_draw() {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
@@ -808,7 +831,7 @@ impl DirectXRenderer {
         if self.overlay_resources.is_none() {
             return self.draw(scene, clear_color);
         }
-        if self.skip_draws || self.quiesce_if_device_lost() {
+        if self.skip_draws || self.quiesce_if_device_lost() || !self.can_draw() {
             return Ok(());
         }
         let result = self.draw_layered_inner(scene, overlay_start, clear_color);
@@ -1189,7 +1212,7 @@ impl DirectXRenderer {
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
-        if self.width == width && self.height == height {
+        if self.width == width && self.height == height && !self.resize_failed {
             return Ok(());
         }
         self.width = width;
@@ -1200,7 +1223,52 @@ impl DirectXRenderer {
         if self.quiesce_if_device_lost() {
             return Ok(());
         }
+        let result = self.resize_buffers(width, height);
+        self.resize_failed = result.is_err();
+        result
+    }
 
+    /// Whether a resize failed on a device that was not lost, so the window
+    /// has to retry it before it can draw again.
+    pub(crate) fn resize_failed(&self) -> bool {
+        self.resize_failed
+    }
+
+    /// Runs the resize that last failed again, at the size it asked for.
+    pub(crate) fn retry_resize(&mut self) -> Result<()> {
+        if !self.resize_failed {
+            return Ok(());
+        }
+        self.resize(size(
+            DevicePixels(self.width as i32),
+            DevicePixels(self.height as i32),
+        ))
+    }
+
+    /// Whether the device was removed, for a caller deciding whether a failed
+    /// resize needs new devices or only another try.
+    pub(crate) fn is_device_lost(&self) -> bool {
+        self.device_is_lost()
+    }
+
+    /// Whether every plane the next frame draws into has a render target. A
+    /// failed resize leaves a swap chain without one until it is retried.
+    fn can_draw(&self) -> bool {
+        if self.resize_failed {
+            return false;
+        }
+        let base = self
+            .resources
+            .as_ref()
+            .is_some_and(|resources| resources.render_target_view.is_some());
+        let overlay = self
+            .overlay_resources
+            .as_ref()
+            .is_none_or(|overlay| overlay.render_target_view.is_some());
+        base && overlay
+    }
+
+    fn resize_buffers(&mut self, width: u32, height: u32) -> Result<()> {
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
@@ -1800,12 +1868,13 @@ impl DirectXRenderer {
         self.skip_draws = false;
     }
 
-    /// Whether draws are being skipped while a lost device is recovered.
-    /// `draw` and `draw_layered` return `Ok` without presenting then, both
-    /// when the renderer was already parked and when the device went away
-    /// mid-frame, so after a successful draw this says nothing was shown.
+    /// Whether draws are being skipped while a lost device is recovered or a
+    /// failed resize waits to be retried. `draw` and `draw_layered` return
+    /// `Ok` without presenting then, both when the renderer was already
+    /// parked and when the device went away mid-frame, so after a successful
+    /// draw this says nothing was shown.
     pub(crate) fn skipping_draws(&self) -> bool {
-        self.skip_draws
+        self.skip_draws || !self.can_draw()
     }
 }
 
@@ -2026,12 +2095,16 @@ impl DirectComposition {
             visual,
             clip,
             visible: Cell::new(true),
+            bounds: Cell::new(None),
         })
     }
 }
 
 impl PlatformNativeSurface for DirectCompositionPortal {
     fn set_bounds(&self, bounds: Bounds<DevicePixels>) -> Result<()> {
+        if self.bounds.get() == Some(bounds) {
+            return Ok(());
+        }
         let x = bounds.origin.x.0 as f32;
         let y = bounds.origin.y.0 as f32;
         let width = bounds.size.width.0.max(0) as f32;
@@ -2045,6 +2118,9 @@ impl PlatformNativeSurface for DirectCompositionPortal {
             self.clip.SetBottom2(height)?;
             self.comp_device.Commit()?;
         }
+        // Recorded only once committed, so bounds that failed to apply are
+        // tried again by the next frame.
+        self.bounds.set(Some(bounds));
         Ok(())
     }
 
@@ -3652,6 +3728,56 @@ mod swap_chain_tests {
             .render(&scene, [0.0, 0.0, 0.0, 1.0])
             .expect("a frame renders after the resize");
     }
+
+    /// A resize refused on a healthy device leaves the swap chain without a
+    /// render target view. The renderer has already recorded the new size,
+    /// so the retry must not be skipped as unchanged, and nothing may be
+    /// drawn until it has gone through.
+    #[test]
+    fn a_failed_resize_skips_draws_until_it_is_retried() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(mut renderer) = DirectXRenderer::new_windowless(&devices, false).log_err()
+        else {
+            eprintln!("SKIPPED: no composition swap chain");
+            return;
+        };
+        renderer
+            .resize(size(DevicePixels(64), DevicePixels(64)))
+            .expect("the first resize has nothing outstanding");
+        let outstanding_view = renderer
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.render_target_view.clone());
+        assert!(
+            renderer
+                .resize(size(DevicePixels(80), DevicePixels(80)))
+                .is_err(),
+            "ResizeBuffers must refuse while a back-buffer view is held"
+        );
+        assert!(renderer.resize_failed());
+        assert!(!renderer.is_device_lost(), "the refusal leaves the device alone");
+
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer
+            .draw(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("a draw without a render target is skipped, not failed");
+        assert!(renderer.skipping_draws());
+
+        drop(outstanding_view);
+        renderer
+            .retry_resize()
+            .expect("the retry goes through once the view is released");
+        assert!(!renderer.resize_failed());
+        assert!(!renderer.skipping_draws());
+        assert_eq!((renderer.width, renderer.height), (80, 80));
+        renderer
+            .render(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("a frame renders after the retried resize");
+    }
 }
 
 /// Pixel-level verification through the real DirectX pipeline.
@@ -4333,5 +4459,36 @@ mod rendered_pixel_tests {
             !lit(&second_image, device(600.0), device(500.0)),
             "stale path ink from the previous frame ghosted back"
         );
+    }
+}
+
+/// The shared rounded clipping pixel fixtures, drawn by Direct3D.
+#[cfg(all(test, feature = "test-support"))]
+mod rounded_clip_pixel_tests {
+    use crate::DirectXHeadlessRenderer;
+    use gpui::{
+        NoopTextSystem, PlatformHeadlessRenderer, TestAppContext, TestDispatcher,
+        test::rounded_clip_fixtures::check_rounded_clip_fixtures,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn rounded_clip_fixtures_render_on_direct3d() -> anyhow::Result<()> {
+        if DirectXHeadlessRenderer::new().is_none() {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return Ok(());
+        }
+        let mut cx = TestAppContext::build_with_platform(
+            TestDispatcher::new(0),
+            None,
+            Arc::new(NoopTextSystem),
+            Some(Box::new(|| {
+                Ok(DirectXHeadlessRenderer::new()
+                    .map(|renderer| Box::new(renderer) as Box<dyn PlatformHeadlessRenderer>))
+            })),
+        );
+        let failures = check_rounded_clip_fixtures(&mut cx)?;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
     }
 }

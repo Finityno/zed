@@ -334,7 +334,13 @@ impl X11ClientStatePtr {
             return;
         };
         let mut state = client.0.borrow_mut();
-        if state.composing || state.ximc.is_none() {
+        // Before the handshake the handler's input method and context ids
+        // are 0, which fcitx5 answers as it answers `CreateIc` then (see
+        // `enable_ime`).
+        if state.composing
+            || state.ximc.is_none()
+            || !xim_handshake_complete(state.xim_handler.as_ref())
+        {
             return;
         }
 
@@ -882,6 +888,16 @@ impl X11Client {
     pub fn enable_ime(&self) {
         let mut state = self.0.borrow_mut();
         if !state.has_xim() {
+            return;
+        }
+        // An input context belongs to an opened input method, and until the
+        // server's `OpenReply` assigns its id, `CreateIc` names input method
+        // 0. fcitx5 answers that with an `XIM_ERROR` the client cannot parse,
+        // and the client drops its XIM connection for the rest of the session.
+        // The handshake creates an input context of its own once it is done,
+        // for the window focus last went to, so a window focused before then
+        // is covered by it.
+        if !xim_handshake_complete(state.xim_handler.as_ref()) {
             return;
         }
 
@@ -2828,6 +2844,20 @@ fn get_scale_factor(
         return scale;
     }
 
+    // A Wayland compositor that leaves XWayland clients unscaled (Hyprland's
+    // `xwayland:force_zero_scaling`) shows them in physical pixels and states
+    // the session's scale in `GDK_SCALE`, often with no `Xft.dpi`. The RandR
+    // guess from the monitor's physical DPI rarely matches it (17/12 for a
+    // 27" 4K monitor the session scales by 2), and GTK content embedded in
+    // the window, which obeys `GDK_SCALE`, would come out larger than ours.
+    if let Some(scale) = std::env::var("GDK_SCALE")
+        .ok()
+        .and_then(|value| parse_gdk_scale(&value))
+    {
+        log::info!("Using scale factor from GDK_SCALE: {}", scale);
+        return scale;
+    }
+
     if let Some(scale) = get_randr_scale_factor(connection, screen_index) {
         log::info!("Using RandR scale factor: {}", scale);
         return scale;
@@ -2835,6 +2865,21 @@ fn get_scale_factor(
 
     log::info!("Using default scale factor: 1.0");
     1.0
+}
+
+/// Whether the XIM handshake has created its input context, after which a
+/// focused window may create its own.
+fn xim_handshake_complete(xim_handler: Option<&XimHandler>) -> bool {
+    xim_handler.is_some_and(|xim_handler| xim_handler.connected)
+}
+
+/// GDK scales X11 windows by whole numbers only, so any other value is left
+/// to the next source rather than guessed at.
+fn parse_gdk_scale(value: &str) -> Option<f32> {
+    match value.trim().parse::<u32>() {
+        Ok(scale) if scale > 0 => Some(scale as f32),
+        _ => None,
+    }
 }
 
 fn get_randr_scale_factor(connection: &XCBConnection, screen_index: usize) -> Option<f32> {
@@ -3044,6 +3089,28 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_waits_for_the_xim_handshake() {
+        assert!(!xim_handshake_complete(None));
+        assert!(!xim_handshake_complete(Some(&XimHandler::new())));
+        let mut xim_handler = XimHandler::new();
+        xim_handler.connected = true;
+        assert!(xim_handshake_complete(Some(&xim_handler)));
+    }
+
+    #[test]
+    fn a_whole_gdk_scale_is_the_scale_factor() {
+        assert_eq!(parse_gdk_scale("2"), Some(2.0));
+        assert_eq!(parse_gdk_scale(" 1 "), Some(1.0));
+    }
+
+    #[test]
+    fn a_gdk_scale_that_is_not_a_positive_whole_number_is_ignored() {
+        for value in ["", "0", "1.5", "-2", "auto"] {
+            assert_eq!(parse_gdk_scale(value), None, "GDK_SCALE={value:?}");
+        }
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")

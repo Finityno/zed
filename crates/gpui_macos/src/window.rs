@@ -74,7 +74,12 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &CStr = c"windowState";
-const OVERLAY_INPUT_IVAR: &CStr = c"overlayInputActive";
+const OVERLAY_INPUT_IVAR: &CStr = c"overlayInputRegions";
+
+/// Where the overlay plane on screen takes pointer input, in the overlay
+/// view's flipped coordinates; shared with the view, which answers AppKit's
+/// hit tests from it.
+type OverlayHitRegions = Mutex<Vec<Bounds<Pixels>>>;
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
@@ -110,9 +115,25 @@ unsafe fn ivar_slot(object: &AnyObject, name: &CStr) -> *mut *mut c_void {
     }
 }
 
-extern "C" fn overlay_hit_test(this: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
-    let active = unsafe { &*(*ivar_slot(this, OVERLAY_INPUT_IVAR) as *const AtomicBool) };
-    if active.load(Ordering::Acquire) {
+/// Takes the point only over an overlay-plane hitbox. Anywhere else the
+/// overlay is transparent to input, so a native child beneath it (a
+/// WKWebView) keeps taking clicks while a popover, tooltip or toast is open
+/// elsewhere in the window.
+extern "C" fn overlay_hit_test(this: &AnyObject, _: Sel, location: NSPoint) -> *mut AnyObject {
+    let regions = unsafe { &*(*ivar_slot(this, OVERLAY_INPUT_IVAR) as *const OverlayHitRegions) };
+    // `hitTest:` gets the point in the superview's coordinates.
+    let (local, height) = unsafe {
+        let superview: *mut AnyObject = msg_send![this, superview];
+        let local: NSPoint = msg_send![this, convertPoint: location, fromView: superview];
+        let bounds: NSRect = msg_send![this, bounds];
+        (local, bounds.size.height)
+    };
+    let position = point(px(local.x as f32), px((height - local.y) as f32));
+    if regions
+        .lock()
+        .iter()
+        .any(|region| region.contains(&position))
+    {
         ptr::from_ref(this).cast_mut()
     } else {
         ptr::null_mut()
@@ -820,7 +841,10 @@ struct MacWindowState {
     native_view: NonNull<AnyObject>,
     overlay_view: Option<NonNull<AnyObject>>,
     overlay_backdrops: Vec<OverlayBackdrop>,
-    overlay_input_active: Arc<AtomicBool>,
+    overlay_input_regions: Arc<OverlayHitRegions>,
+    /// The overlay input regions of the frame drawn last, which take effect
+    /// once that frame presents.
+    pending_overlay_hit_regions: Vec<Bounds<Pixels>>,
     blurred_view: Option<*mut AnyObject>,
     // Requested glass backdrop tint; applied to `blurred_view` when it is an
     // `NSGlassEffectView`, remembered here so recreations reapply it.
@@ -1378,7 +1402,8 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 overlay_view: None,
                 overlay_backdrops: Vec::new(),
-                overlay_input_active: Arc::new(AtomicBool::new(false)),
+                overlay_input_regions: Arc::new(Mutex::new(Vec::new())),
+                pending_overlay_hit_regions: Vec::new(),
                 blurred_view: None,
                 glass_tint: None,
                 glass_style: WindowGlassStyle::Regular,
@@ -2787,8 +2812,6 @@ impl PlatformWindow for MacWindow {
             this.release_intermediates_if_occluded();
             return report;
         }
-        this.overlay_input_active
-            .store(!this.overlay_scene.is_empty(), Ordering::Release);
         // The overlay draws with the base renderer's drawable-sized
         // intermediates rather than a second set of its own.
         let intermediates = this.renderer.take_intermediates();
@@ -2800,6 +2823,13 @@ impl PlatformWindow for MacWindow {
         let overlay_report = overlay_renderer.draw(&this.overlay_scene);
         let intermediates = overlay_renderer.take_intermediates();
         this.renderer.lend_intermediates(intermediates);
+        // Input follows the overlay on screen: an overlay that did not
+        // present leaves the previous frame's there, and its regions with it.
+        if overlay_report.outcome == PresentOutcome::Presented {
+            let mut regions = this.overlay_input_regions.lock();
+            regions.clear();
+            regions.extend_from_slice(&this.pending_overlay_hit_regions);
+        }
         this.release_intermediates_if_occluded();
         this.sync_overlay_backdrops();
 
@@ -2859,7 +2889,7 @@ impl PlatformWindow for MacWindow {
             *ivar_slot(&*overlay_view, WINDOW_STATE_IVAR) =
                 Arc::into_raw(window_state).cast_mut().cast::<c_void>();
             *ivar_slot(&*overlay_view, OVERLAY_INPUT_IVAR) =
-                Arc::into_raw(this.overlay_input_active.clone()).cast_mut().cast::<c_void>();
+                Arc::into_raw(this.overlay_input_regions.clone()).cast_mut().cast::<c_void>();
 
             let mut overlay_renderer =
                 renderer::new_overlay_renderer(this.renderer_context.clone(), &this.renderer);
@@ -2891,6 +2921,12 @@ impl PlatformWindow for MacWindow {
         Ok(())
     }
 
+    fn set_overlay_hit_regions(&self, regions: &[Bounds<Pixels>]) {
+        let mut this = self.0.lock();
+        this.pending_overlay_hit_regions.clear();
+        this.pending_overlay_hit_regions.extend_from_slice(regions);
+    }
+
     fn disable_scene_overlay(&self) {
         let mut this = self.0.lock();
         let Some(overlay_view) = this.overlay_view.take() else {
@@ -2899,7 +2935,7 @@ impl PlatformWindow for MacWindow {
         // The overlay must stop claiming input before the view goes: a hit
         // test racing the removal would otherwise route a click into a view
         // that is being torn down.
-        this.overlay_input_active.store(false, Ordering::Release);
+        this.overlay_input_regions.lock().clear();
         this.remove_overlay_backdrops();
         // The superview held the only strong reference (the view was added
         // autoreleased), so removing it deallocates the view, which drops the
@@ -3352,7 +3388,7 @@ extern "C" fn dealloc_overlay_view(this: &AnyObject, _: Sel) {
     unsafe {
         drop_window_state(this);
         let raw: *mut c_void = *ivar_slot(this, OVERLAY_INPUT_IVAR);
-        drop(Arc::from_raw(raw as *const AtomicBool));
+        drop(Arc::from_raw(raw as *const OverlayHitRegions));
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
 }

@@ -19,8 +19,10 @@
 //! is drawn again around it, see below), when something it read changed, when a hover it was drawn by changed, when
 //! it inherits something else where it is drawn (a group it hovers by, say,
 //! whose container was built), while the window refreshes, while something is
-//! dragged, while the inspector picks, while accessibility is active, and
-//! when it opted out ([`crate::Context::set_view_retainable`]).
+//! dragged, while the inspector picks, on the first frame accessibility is
+//! active in (see [`super::a11y::replay`] for how a view drawn again builds
+//! its accessibility nodes), and when it opted out
+//! ([`crate::Context::set_view_retainable`]).
 //!
 //! A view drawn somewhere else than it was (scrolled, or pushed down by
 //! something above it that grew) is drawn again moved, its primitives,
@@ -51,6 +53,10 @@ pub(crate) use moving::{PositionedState, ViewMove};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod a11y_tests;
+#[cfg(test)]
+mod scenario_tests;
 #[cfg(test)]
 mod rounded_clip_tests;
 #[cfg(test)]
@@ -129,8 +135,10 @@ pub enum ViewRebuildReason {
     /// The window refreshed, something is being dragged or the inspector is
     /// picking, all of which build every view.
     WindowRefresh,
-    /// Accessibility is active, which builds every view so that its
-    /// accessibility nodes are built.
+    /// Accessibility is active and the last frame logged nothing its
+    /// accessibility nodes could be drawn again from: it was drawn with
+    /// accessibility off, or drawing again in it logged other nodes than it
+    /// had. See [`super::a11y::replay`].
     Accessibility,
     /// The view, or a view nested in it, was notified since the last frame.
     Notified,
@@ -620,6 +628,7 @@ fn prepaint_spans(view: &Range<PrepaintStateIndex>, draw: &Range<PrepaintStateIn
         && start.autoscroll_requests_index == outer.autoscroll_requests_index
         && start.accessed_element_states_index == outer.accessed_element_states_index
         && start.line_layout_index == outer.line_layout_index
+        && start.a11y_ops_index == outer.a11y_ops_index
         && (start.dispatch_tree_index == outer.dispatch_tree_index
             || start.dispatch_tree_index == outer.dispatch_tree_index + 1);
     let (end, outer) = (&view.end, &draw.end);
@@ -631,6 +640,7 @@ fn prepaint_spans(view: &Range<PrepaintStateIndex>, draw: &Range<PrepaintStateIn
         && end.autoscroll_requests_index == outer.autoscroll_requests_index
         && end.accessed_element_states_index == outer.accessed_element_states_index
         && end.line_layout_index == outer.line_layout_index
+        && end.a11y_ops_index == outer.a11y_ops_index
         && end.dispatch_tree_index == outer.dispatch_tree_index
 }
 
@@ -646,6 +656,7 @@ fn paint_spans(view: &Range<PaintIndex>, draw: &Range<PaintIndex>) -> bool {
             && a.tab_handle_index == b.tab_handle_index
             && a.painted_positions_index == b.painted_positions_index
             && a.line_layout_index == b.line_layout_index
+            && a.a11y_actions_index == b.a11y_actions_index
     };
     same(&view.start, &draw.start) && same(&view.end, &draw.end)
 }
@@ -706,6 +717,7 @@ impl PrepaintStateIndex {
             line_layout_index: self
                 .line_layout_index
                 .shifted(&from.line_layout_index, &to.line_layout_index),
+            a11y_ops_index: self.a11y_ops_index - from.a11y_ops_index + to.a11y_ops_index,
         }
     }
 
@@ -718,6 +730,7 @@ impl PrepaintStateIndex {
             && self.dispatch_tree_index == other.dispatch_tree_index
             && self.accessed_element_states_index == other.accessed_element_states_index
             && self.line_layout_index == other.line_layout_index
+            && self.a11y_ops_index == other.a11y_ops_index
     }
 }
 
@@ -746,6 +759,8 @@ impl PaintIndex {
             line_layout_index: self
                 .line_layout_index
                 .shifted(&from.line_layout_index, &to.line_layout_index),
+            a11y_actions_index: self.a11y_actions_index - from.a11y_actions_index
+                + to.a11y_actions_index,
         }
     }
 
@@ -759,6 +774,7 @@ impl PaintIndex {
             && self.tab_handle_index == other.tab_handle_index
             && self.painted_positions_index == other.painted_positions_index
             && self.line_layout_index == other.line_layout_index
+            && self.a11y_actions_index == other.a11y_actions_index
     }
 }
 
@@ -1168,7 +1184,7 @@ impl Window {
         {
             return Some(ViewRebuildReason::WindowRefresh);
         }
-        if self.a11y.is_active() {
+        if self.a11y.replay_unavailable() {
             return Some(ViewRebuildReason::Accessibility);
         }
         None
@@ -2318,6 +2334,9 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
         format!("window control {area:?} {:?}", rounded_pixels(hitbox.bounds))
     }));
     lines.push(format!("overlay starts at {}", frame.overlay_scene_start));
+    if window.a11y.is_active() {
+        lines.extend(super::a11y::replay::describe_a11y_tree(window));
+    }
     lines
 }
 

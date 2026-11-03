@@ -361,4 +361,70 @@ mod tests {
             })
             .unwrap();
     }
+
+    /// The same planes as [`PlanesView`], with every surface taking input.
+    struct HitboxPlanesView;
+
+    impl Render for HitboxPlanesView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .occlude()
+                .child(
+                    deferred(
+                        div()
+                            .w(px(BENEATH_WIDTH))
+                            .h(px(BENEATH_WIDTH))
+                            .occlude()
+                            .child(deferred(
+                                anchored().position(point(px(5.), px(5.))).child(
+                                    div()
+                                        .w(px(NESTED_MENU_WIDTH))
+                                        .h(px(NESTED_MENU_WIDTH))
+                                        .occlude(),
+                                ),
+                            )),
+                    )
+                    .beneath_native_surfaces(),
+                )
+                .child(deferred(
+                    anchored().position(point(px(100.), px(100.))).child(
+                        div()
+                            .w(px(POPOVER_WIDTH))
+                            .h(px(POPOVER_WIDTH))
+                            .occlude(),
+                    ),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_only_overlay_plane_hitboxes_take_input_over_native_surfaces(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| HitboxPlanesView);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                let mut widths = window
+                    .overlay_hit_regions
+                    .iter()
+                    .map(|region| region.size.width.0)
+                    .collect::<Vec<_>>();
+                widths.sort_by(f32::total_cmp);
+                assert_eq!(
+                    widths,
+                    vec![NESTED_MENU_WIDTH, POPOVER_WIDTH],
+                    "the root and the draw kept beneath native surfaces stay on the base plane"
+                );
+                let popover = window
+                    .overlay_hit_regions
+                    .iter()
+                    .find(|region| region.size.width.0 == POPOVER_WIDTH)
+                    .copied();
+                assert_eq!(popover.map(|region| region.origin), Some(point(px(100.), px(100.))));
+            })
+            .unwrap();
+    }
 }

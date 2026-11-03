@@ -99,6 +99,11 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    /// The renderer's failed rebuilds on new devices since it last recovered.
+    pub(crate) device_recovery: Cell<RecoveryAttempts>,
+    /// When a resize that failed again may next be retried; `None` retries
+    /// it on the next frame.
+    pub(crate) resize_retry_at: Cell<Option<std::time::Instant>>,
     /// Whether GPUI wants a frame. The platform's clock threads sleep until
     /// a window they tick asks, and only invalidate windows that asked
     /// (consuming the demand), so an idle window is not painted on every
@@ -217,6 +222,8 @@ impl WindowsWindowState {
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            device_recovery: Cell::new(RecoveryAttempts::default()),
+            resize_retry_at: Cell::new(None),
             frame_request,
             click_state,
             current_cursor: Cell::new(current_cursor),

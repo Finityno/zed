@@ -266,6 +266,10 @@ pub(crate) enum MoveRefusal {
     OutsidePaintMask,
     /// A primitive of it was clipped by the mask around it.
     PrimitiveClippedByOuterMask,
+    /// Accessibility is active and it added a synthetic accessibility node
+    /// with bounds of its own, which its element's code placed and nothing
+    /// says moves with the element.
+    PlacedAccessibilityNode,
 }
 
 /// A callback registered with [`Window::on_replayed_at_offset`].
@@ -445,6 +449,9 @@ impl Window {
         }
         if paint.start.input_handlers_index != paint.end.input_handlers_index {
             return Err(MoveRefusal::InputHandler);
+        }
+        if self.a11y_placed_leaf_in(prepaint.start.a11y_ops_index..prepaint.end.a11y_ops_index) {
+            return Err(MoveRefusal::PlacedAccessibilityNode);
         }
         let frame = &self.rendered_frame;
         if shrinking

@@ -35,6 +35,40 @@ pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T
         .context("DirectXRenderer failed to recover from lost device after multiple attempts")
 }
 
+/// How many device recoveries in a row may fail before a window, or the
+/// platform, stops asking for new devices and leaves its draws skipped.
+pub(crate) const MAX_FAILED_RECOVERIES: u32 = 5;
+
+/// Counts the device recoveries that failed since the last one that worked.
+///
+/// A driver still resetting can lose the devices it just handed out, so one
+/// failed rebuild is worth another set of devices; one that never comes back
+/// must not spin the clock thread forever, nor take the app down with it.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryAttempts {
+    failed: u32,
+}
+
+impl RecoveryAttempts {
+    pub(crate) fn recovered(&mut self) {
+        self.failed = 0;
+    }
+
+    /// Counts a failed recovery and says whether another may be tried.
+    pub(crate) fn failed(&mut self) -> bool {
+        self.failed = self.failed.saturating_add(1);
+        self.failed < MAX_FAILED_RECOVERIES
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.failed >= MAX_FAILED_RECOVERIES
+    }
+
+    pub(crate) fn failures(&self) -> u32 {
+        self.failed
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DirectXDevices {
     pub(crate) adapter: IDXGIAdapter1,
@@ -190,5 +224,33 @@ fn get_device(
         Err(anyhow::anyhow!(
             "Required feature StructuredBuffer is not supported by GPU/driver"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_FAILED_RECOVERIES, RecoveryAttempts};
+
+    #[test]
+    fn recovery_gives_up_after_its_failed_attempts() {
+        let mut attempts = RecoveryAttempts::default();
+        for _ in 1..MAX_FAILED_RECOVERIES {
+            assert!(attempts.failed());
+            assert!(!attempts.exhausted());
+        }
+        assert!(!attempts.failed());
+        assert!(attempts.exhausted());
+        assert_eq!(attempts.failures(), MAX_FAILED_RECOVERIES);
+    }
+
+    #[test]
+    fn a_recovery_that_works_resets_the_attempts() {
+        let mut attempts = RecoveryAttempts::default();
+        for _ in 1..MAX_FAILED_RECOVERIES {
+            attempts.failed();
+        }
+        attempts.recovered();
+        assert!(attempts.failed());
+        assert_eq!(attempts.failures(), 1);
     }
 }
