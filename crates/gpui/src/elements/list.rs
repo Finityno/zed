@@ -11,9 +11,10 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     Overflow, Pixels, Point, ScrollDelta, ScrollEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Window, point, px, size, window::view_retention::list_rows::RowLayout,
 };
 use collections::VecDeque;
+use smallvec::SmallVec;
 use refineable::Refineable as _;
 use std::{cell::RefCell, mem, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
@@ -31,8 +32,11 @@ pub fn list(
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
         measured_item_width: None,
+        rows_replayed: None,
     }
 }
+
+type RowsReplayedFn = dyn FnMut(&[usize], &mut Window, &mut App) + 'static;
 
 /// A list element
 pub struct List {
@@ -41,6 +45,7 @@ pub struct List {
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
     measured_item_width: Option<Box<dyn Fn(Pixels) -> Pixels>>,
+    rows_replayed: Option<Box<RowsReplayedFn>>,
 }
 
 impl List {
@@ -69,6 +74,19 @@ impl List {
     /// keep stale heights after a resize.
     pub fn measured_item_width(mut self, width: impl Fn(Pixels) -> Pixels + 'static) -> Self {
         self.measured_item_width = Some(Box::new(width));
+        self
+    }
+
+    /// Calls `handler`, as the list prepaints, with the rows it drew again
+    /// from the last frame without calling its row closure for them, with
+    /// list row replay on ([`App::set_list_row_replay`]): for what the row
+    /// closure notes about the rows it is called for on every frame (that
+    /// they are shown, what they hold on to) to be noted for these too.
+    pub fn on_rows_replayed(
+        mut self,
+        handler: impl FnMut(&[usize], &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.rows_replayed = Some(Box::new(handler));
         self
     }
 }
@@ -118,12 +136,25 @@ struct StateInner {
     /// per-item readers answer from and `version` does not cover: items can
     /// be measured without the total height changing.
     item_version: crate::window::view_retention::dependencies::StateVersion,
-    /// Bumped when the wheel scrolls the list, which the list element carries
-    /// out as it prepaints: the view drawing the list depends on this rather
-    /// than on `version`, which that prepaint bumps whenever it measures or
-    /// moves anything, and which would build the view on the frame after
-    /// every one it was built in.
-    wheel_scrolls: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped when the wheel or a scrollbar scrolls the list, which the list
+    /// element carries out as it prepaints: the view drawing the list depends
+    /// on this rather than on `version`, which that prepaint bumps whenever it
+    /// measures or moves anything, and which would build the view on the
+    /// frame after every one it was built in. With row replay on, a frame
+    /// that built that view only for this draws its rows again.
+    scrolls: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped when the rows are spliced, reset or remeasured, or the width
+    /// they are laid out at changes: every row's record reads it, with row
+    /// replay on, since rows are known by their index.
+    rows: crate::window::view_retention::dependencies::StateVersion,
+    /// Bumped when what [`ListState::is_scrolled_to_end`] answers changes,
+    /// which a view asking it reads instead of `version`; `at_end_answer` is
+    /// what it answered when last compared.
+    at_end: crate::window::view_retention::dependencies::StateVersion,
+    at_end_answer: Option<bool>,
+    /// Tells this list's rows' records from another list's; see
+    /// [`crate::window::view_retention::list_rows`].
+    serial: u64,
     /// The run of items `layout_items` walks, kept across frames so its
     /// capacity is reused instead of regrown every frame. Empty between calls.
     measured_items_scratch: VecDeque<ListItem>,
@@ -154,6 +185,10 @@ enum PrepaintRetry {
     Autoscroll(ListOffset),
     /// Items above the held item changed height in this layout.
     HeldItem(ListOffset),
+    /// A row laid out from its record could not be drawn again, and built
+    /// asked for another size than it had: the rows are laid out again,
+    /// built.
+    ReplayedRowResized,
 }
 
 /// What can be read of a list's state, compared before and after a change.
@@ -424,8 +459,189 @@ struct LayoutItemsResponse {
 
 struct ItemLayout {
     index: usize,
-    element: AnyElement,
+    element: ItemElement,
     size: Size<Pixels>,
+}
+
+/// A row the list draws this frame.
+enum ItemElement {
+    /// Built by the row closure. With row replay on, it is recorded as `row`
+    /// says, to be drawn again on a later frame.
+    Built {
+        element: AnyElement,
+        row: Option<RecordedRow>,
+    },
+    /// Drawn again from last frame's record `previous` of the row, without
+    /// being built; `record` is its record in this frame once prepainted.
+    /// See [`crate::window::view_retention::list_rows`].
+    Replayed {
+        previous: usize,
+        record: Option<usize>,
+    },
+}
+
+/// A row built this frame and recorded under `id`: its layout until it is
+/// prepainted, then its record.
+struct RecordedRow {
+    id: GlobalElementId,
+    layout: Option<RowLayout>,
+    record: Option<usize>,
+}
+
+/// What laying out the rows a frame shows does with their records, with
+/// row replay on.
+#[derive(Clone, Copy)]
+struct RowRecords {
+    /// Whether a row nothing changed for is drawn again from its record
+    /// instead of being built.
+    replay: bool,
+}
+
+/// Lays out row `index` of the list `serial`, whose rows version is
+/// `rows_version`, at `available_space`: from last frame's record of it with
+/// `records` saying so, if nothing it read changed, or built by
+/// `render_item`, and recorded with `records`.
+#[allow(clippy::too_many_arguments)]
+fn lay_out_row(
+    index: usize,
+    item: &ListItem,
+    records: Option<RowRecords>,
+    serial: u64,
+    rows_version: &crate::window::view_retention::dependencies::StateVersion,
+    available_space: Size<AvailableSpace>,
+    render_item: &mut RenderItemFn,
+    window: &mut Window,
+    cx: &mut App,
+) -> (ItemElement, Size<Pixels>) {
+    let Some(records) = records else {
+        let mut element = render_item(index, window, cx);
+        let size = window.layout_as_list_item(&mut element, index, available_space, cx);
+        return (ItemElement::Built { element, row: None }, size);
+    };
+    let id = window.list_row_id(serial, index);
+    if records.replay
+        && let Some(size) = item.size()
+        && let Some(previous) = window.replayable_list_row(&id, size, cx)
+    {
+        return (
+            ItemElement::Replayed {
+                previous,
+                record: None,
+            },
+            size,
+        );
+    }
+    let (element, size, layout) =
+        build_recorded_row(index, rows_version, available_space, render_item, window, cx);
+    (
+        ItemElement::Built {
+            element,
+            row: Some(RecordedRow {
+                id,
+                layout: Some(layout),
+                record: None,
+            }),
+        },
+        size,
+    )
+}
+
+/// Builds row `index` with the row closure and lays it out, recording what
+/// it reads and the nodes it claims.
+fn build_recorded_row(
+    index: usize,
+    rows_version: &crate::window::view_retention::dependencies::StateVersion,
+    available_space: Size<AvailableSpace>,
+    render_item: &mut RenderItemFn,
+    window: &mut Window,
+    cx: &mut App,
+) -> (AnyElement, Size<Pixels>, RowLayout) {
+    let recording = window.begin_list_row_layout(rows_version, cx);
+    let mut element = render_item(index, window, cx);
+    let size = window.layout_as_list_item(&mut element, index, available_space, cx);
+    let layout = window.finish_list_row_layout(recording, &element, cx);
+    (element, size, layout)
+}
+
+impl ItemLayout {
+    /// Prepaints the row at `origin`: built, or drawn again from its record
+    /// where that draws what building it would. A row that cannot be drawn
+    /// again there is built now, and if it then asks for another size than
+    /// it had, the frame's layout is wrong and has to be done again.
+    #[allow(clippy::too_many_arguments)]
+    fn prepaint_at(
+        &mut self,
+        origin: Point<Pixels>,
+        available_space: Size<AvailableSpace>,
+        serial: u64,
+        rows_version: &crate::window::view_retention::dependencies::StateVersion,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<(), PrepaintRetry> {
+        match &mut self.element {
+            ItemElement::Built { element, row: None } => {
+                element.prepaint_at(origin, window, cx);
+            }
+            ItemElement::Built {
+                element,
+                row: Some(row),
+            } => {
+                if let Some(layout) = row.layout.take() {
+                    row.record =
+                        window.prepaint_list_row(&row.id, layout, origin, self.size, element, cx);
+                }
+            }
+            ItemElement::Replayed { previous, record } => {
+                let bounds = Bounds {
+                    origin,
+                    size: self.size,
+                };
+                if let Some(index) = window.prepaint_replayed_list_row(*previous, bounds, cx) {
+                    *record = Some(index);
+                    return Ok(());
+                }
+                let id = window.list_row_id(serial, self.index);
+                let (mut element, size, layout) = build_recorded_row(
+                    self.index,
+                    rows_version,
+                    available_space,
+                    render_item,
+                    window,
+                    cx,
+                );
+                if size != self.size {
+                    return Err(PrepaintRetry::ReplayedRowResized);
+                }
+                let record = window.prepaint_list_row(&id, layout, origin, size, &mut element, cx);
+                self.element = ItemElement::Built {
+                    element,
+                    row: Some(RecordedRow {
+                        id,
+                        layout: None,
+                        record,
+                    }),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn paint(&mut self, window: &mut Window, cx: &mut App) {
+        match &mut self.element {
+            ItemElement::Built { element, row: None } => element.paint(window, cx),
+            ItemElement::Built {
+                element,
+                row: Some(row),
+            } => window.paint_list_row(row.record, &row.id, element, cx),
+            ItemElement::Replayed {
+                record: Some(index),
+                ..
+            } => window.paint_replayed_list_row(*index),
+            // Not prepainted: the list had no room to show it.
+            ItemElement::Replayed { record: None, .. } => {}
+        }
+    }
 }
 
 /// Frame state used by the [List] element after layout.
@@ -543,8 +759,14 @@ impl ListState {
         crate::window::view_retention::dependencies::note_state_read(&state.item_version);
     }
 
+    /// Marks the list's state changed, for a change about to be made to its
+    /// rows: whether it is scrolled to its end may change too, and every row
+    /// is built again.
     fn changed(&self) {
-        self.0.borrow().version.bump();
+        let state = self.0.borrow();
+        state.version.bump();
+        state.at_end.bump();
+        state.rows.bump();
     }
 
     /// Runs `change`, marking the list's state changed only if what can be
@@ -553,8 +775,10 @@ impl ListState {
     fn changing<R>(&self, change: impl FnOnce() -> R) -> R {
         let before = self.0.borrow().observed();
         let result = change();
-        let state = self.0.borrow();
-        state.version.bump_if(state.observed() != before);
+        let mut state = self.0.borrow_mut();
+        let changed = state.observed() != before;
+        state.version.bump_if(changed);
+        state.note_at_end();
         result
     }
 
@@ -584,7 +808,11 @@ impl ListState {
             height_hint_measurements: HeightHintMeasurements::default(),
             version: Default::default(),
             item_version: Default::default(),
-            wheel_scrolls: Default::default(),
+            scrolls: Default::default(),
+            rows: Default::default(),
+            at_end: Default::default(),
+            at_end_answer: None,
+            serial: crate::window::view_retention::list_rows::next_list_serial(),
             measured_items_scratch: VecDeque::new(),
             last_item_layout_count: 0,
             held_item: None,
@@ -865,22 +1093,14 @@ impl ListState {
 
     /// Whether the list is scrolled to the end, or `None` if the list is
     /// not scrollable or the total content height is not yet known.
+    ///
+    /// A view asking this depends on the answer alone, not on the scroll
+    /// position: a scroll that leaves it as it was builds no view for it.
     pub fn is_scrolled_to_end(&self) -> Option<bool> {
-        self.note_read();
-        let state = self.0.borrow();
-        let bounds = state.last_layout_bounds?;
-        let summary = state.items.summary();
-        if summary.has_unknown_height {
-            return None;
-        }
-        let padding = state.last_padding.unwrap_or_default();
-        let content_height = summary.height + padding.top + padding.bottom;
-        let scroll_max = (content_height - bounds.size.height).max(px(0.));
-        if scroll_max <= px(0.) {
-            return None;
-        }
-        let scroll_top = state.scroll_top(&state.logical_scroll_top());
-        Some(scroll_top >= scroll_max)
+        let mut state = self.0.borrow_mut();
+        state.note_at_end();
+        crate::window::view_retention::dependencies::note_state_read(&state.at_end);
+        state.at_end_answer
     }
 
     /// Inform the list state that the items in `old_range` have been replaced
@@ -1321,10 +1541,19 @@ impl ListState {
     }
 
     /// Set the offset from the scrollbar
+    ///
+    /// This scrolls the list as the wheel does: the view drawing the list is
+    /// built again for it without being notified, and with row replay on
+    /// draws its rows again moved.
     pub fn set_offset_from_scrollbar(&self, point: Point<Pixels>) {
+        let scrolled_before = self.0.borrow().observed().scroll_top;
         self.changing(|| {
             self.0.borrow_mut().set_offset_from_scrollbar(point);
-        })
+        });
+        let state = self.0.borrow();
+        state
+            .scrolls
+            .bump_if(state.observed().scroll_top != scrolled_before);
     }
 
     /// Returns the maximum scroll offset according to the items we have measured.
@@ -1486,6 +1715,33 @@ impl ListState {
 }
 
 impl StateInner {
+    /// See [`ListState::is_scrolled_to_end`].
+    fn scrolled_to_end(&self) -> Option<bool> {
+        let bounds = self.last_layout_bounds?;
+        let summary = self.items.summary();
+        if summary.has_unknown_height {
+            return None;
+        }
+        let padding = self.last_padding.unwrap_or_default();
+        let content_height = summary.height + padding.top + padding.bottom;
+        let scroll_max = (content_height - bounds.size.height).max(px(0.));
+        if scroll_max <= px(0.) {
+            return None;
+        }
+        let scroll_top = self.scroll_top(&self.logical_scroll_top());
+        Some(scroll_top >= scroll_max)
+    }
+
+    /// Marks whether the list is scrolled to its end changed, if it did since
+    /// it was last compared.
+    fn note_at_end(&mut self) {
+        let answer = self.scrolled_to_end();
+        if answer != self.at_end_answer {
+            self.at_end_answer = answer;
+            self.at_end.bump();
+        }
+    }
+
     fn observed(&self) -> ListObserved {
         let summary = self.items.summary();
         ListObserved {
@@ -1607,7 +1863,8 @@ impl StateInner {
         }
         let changed = self.observed() != observed_before;
         self.version.bump_if(changed);
-        self.wheel_scrolls.bump_if(changed);
+        self.scrolls.bump_if(changed);
+        self.note_at_end();
 
         if let Some(handler) = self.scroll_handler.as_mut() {
             let visible_range = Self::visible_range(&self.items, height, scroll_top);
@@ -1701,15 +1958,19 @@ impl StateInner {
         self.item_version.bump_if(items_changed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn layout_items(
         &mut self,
         available_width: Option<Pixels>,
         available_height: Pixels,
         padding: &Edges<Pixels>,
+        records: Option<RowRecords>,
         render_item: &mut RenderItemFn,
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutItemsResponse {
+        let serial = self.serial;
+        let rows_version = self.rows.clone();
         let old_items = self.items.clone();
         let mut measured_items = mem::take(&mut self.measured_items_scratch);
         let mut item_layouts = VecDeque::with_capacity(self.last_item_layout_count);
@@ -1754,9 +2015,19 @@ impl StateInner {
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || item_size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
-                let mut element = render_item(item_index, window, cx);
-                let element_size =
-                    window.layout_as_list_item(&mut element, item_index, available_item_space, cx);
+                // Only rows shown are prepainted, and so recorded.
+                let shown = visible_height < available_height;
+                let (element, element_size) = lay_out_row(
+                    item_index,
+                    item,
+                    records.filter(|_| shown),
+                    serial,
+                    &rows_version,
+                    available_item_space,
+                    render_item,
+                    window,
+                    cx,
+                );
                 item_size = Some(element_size);
                 if item.size().is_none() {
                     height_hint_measurements.record(item, element_size.height);
@@ -1822,11 +2093,15 @@ impl StateInner {
                 cursor.prev();
                 if let Some(item) = cursor.item() {
                     let item_index = cursor.start().0;
-                    let mut element = render_item(item_index, window, cx);
-                    let element_size = window.layout_as_list_item(
-                        &mut element,
+                    let (element, element_size) = lay_out_row(
                         item_index,
+                        item,
+                        records,
+                        serial,
+                        &rows_version,
                         available_item_space,
+                        render_item,
+                        window,
                         cx,
                     );
                     if item.size().is_none() {
@@ -1946,6 +2221,8 @@ impl StateInner {
             while let Some(item) = cursor.item() {
                 if item.contains_focused(window, cx) {
                     let item_index = cursor.start().0;
+                    // Drawn out of view for keyboard input to reach it, and
+                    // not recorded: it is built whenever it is not shown.
                     let mut element = render_item(item_index, window, cx);
                     let size = window.layout_as_list_item(
                         &mut element,
@@ -1955,7 +2232,7 @@ impl StateInner {
                     );
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
-                        element,
+                        element: ItemElement::Built { element, row: None },
                         size,
                     });
                     break;
@@ -2010,12 +2287,14 @@ impl StateInner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepaint_items(
         &mut self,
         bounds: Bounds<Pixels>,
         padding: Edges<Pixels>,
         autoscroll: bool,
         hold: bool,
+        records: Option<RowRecords>,
         render_item: &mut RenderItemFn,
         window: &mut Window,
         cx: &mut App,
@@ -2032,6 +2311,7 @@ impl StateInner {
                 Some(bounds.size.width),
                 bounds.size.height,
                 &padding,
+                records,
                 render_item,
                 window,
                 cx,
@@ -2065,10 +2345,20 @@ impl StateInner {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
                 item_origin.y += bounce_offset;
+                let item_available_space =
+                    size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::MinContent);
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
-                    });
+                        item.prepaint_at(
+                            item_origin,
+                            item_available_space,
+                            self.serial,
+                            &self.rows,
+                            render_item,
+                            window,
+                            cx,
+                        )
+                    })?;
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
                         && autoscroll
@@ -2245,7 +2535,7 @@ impl Element for List {
         // A wheel scroll takes effect as the list prepaints, so the view
         // drawing it depends on the wheel.
         crate::window::view_retention::dependencies::note_state_read(
-            &self.state.0.borrow().wheel_scrolls,
+            &self.state.0.borrow().scrolls,
         );
         let layout_id = match self.sizing_behavior {
             ListSizingBehavior::Infer => {
@@ -2270,15 +2560,19 @@ impl Element for List {
                     // Measuring items here changes what the state answers
                     // before prepaint takes its snapshot to compare against.
                     let observed_before = state.observed();
+                    // Rows laid out here are only measured; the prepaint lays
+                    // out and records the ones it shows.
                     let layout_response = state.layout_items(
                         None,
                         available_height,
                         &padding,
+                        None,
                         &mut self.render_item,
                         window,
                         cx,
                     );
                     state.version.bump_if(state.observed() != observed_before);
+                    state.note_at_end();
                     let max_element_width = layout_response.max_item_width;
 
                     let summary = state.items.summary();
@@ -2372,9 +2666,26 @@ impl Element for List {
 
             state.items = new_items;
             state.item_version.bump();
+            state.rows.bump();
             state.measuring_behavior.reset();
         }
         state.last_measured_item_width = Some(measured_item_width);
+        // Rows are laid out in the list's width whatever width they measure
+        // at, and what fills it (a centred column, say) moves with it.
+        if state
+            .last_layout_bounds
+            .is_some_and(|last| last.size.width != bounds.size.width)
+        {
+            state.rows.bump();
+        }
+        // Asked before the rows are laid out: what the view drawing the list
+        // read is compared with what it read when the rows were recorded.
+        let mut records = cx.records_list_rows().then(|| RowRecords {
+            replay: window.list_rows_replayable(
+                &[&state.scrolls, &state.version, &state.item_version, &state.at_end],
+                cx,
+            ),
+        });
 
         let padding = style
             .padding
@@ -2390,6 +2701,7 @@ impl Element for List {
                 padding,
                 autoscroll,
                 hold,
+                records,
                 &mut self.render_item,
                 window,
                 cx,
@@ -2405,16 +2717,33 @@ impl Element for List {
                     state.logical_scroll_top = Some(scroll_top);
                     hold = false;
                 }
+                Err(PrepaintRetry::ReplayedRowResized) => {
+                    if let Some(records) = records.as_mut() {
+                        records.replay = false;
+                    }
+                }
             }
         };
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
+        if let Some(handler) = self.rows_replayed.as_mut() {
+            let replayed: SmallVec<[usize; 16]> = layout
+                .item_layouts
+                .iter()
+                .filter(|item| matches!(item.element, ItemElement::Replayed { .. }))
+                .map(|item| item.index)
+                .collect();
+            if !replayed.is_empty() {
+                handler(&replayed, window, cx);
+            }
+        }
         window.note_positioned_state(|| self.state.0.clone());
         // Measuring items and following the tail change what the state
         // answers; a prepaint that changed nothing must not mark it changed,
         // or every view reading the list would be built on every frame.
         state.version.bump_if(state.observed() != observed_before);
+        state.note_at_end();
         ListPrepaintState { hitbox, layout }
     }
 
@@ -2469,7 +2798,7 @@ impl Element for List {
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
-                item.element.paint(window, cx);
+                item.paint(window, cx);
             }
         });
     }

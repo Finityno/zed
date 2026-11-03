@@ -36,6 +36,13 @@ pub struct FrameWorkStats {
     /// Of the views drawn again from the last frame, those drawn again
     /// around views nested in them that were built.
     pub views_spliced: u64,
+    /// With list row replay on ([`crate::App::set_list_row_replay`]), the
+    /// rows of `list`s drawn again from the last frame, where they were or
+    /// moved by a scroll, without calling the list's row closure for them.
+    pub list_rows_replayed: u64,
+    /// With list row replay on, the rows of `list`s built by the row closure
+    /// and recorded, to be drawn again on a later frame.
+    pub list_rows_built: u64,
     /// With view retention on, why the views that were built were built
     /// rather than drawn again from the last frame.
     pub view_rebuilds: ViewRebuildCounts,

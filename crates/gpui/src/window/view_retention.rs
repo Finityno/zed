@@ -44,6 +44,7 @@
 
 pub(crate) mod culprits;
 pub(crate) mod dependencies;
+pub(crate) mod list_rows;
 pub(crate) mod moving;
 pub(crate) mod splice;
 
@@ -58,6 +59,8 @@ mod a11y_tests;
 mod scenario_tests;
 #[cfg(test)]
 mod rounded_clip_tests;
+#[cfg(test)]
+mod list_rows_tests;
 
 use super::{ArenaClearNeeded, PaintIndex, PrepaintStateIndex, Window};
 use crate::{
@@ -254,6 +257,11 @@ struct ViewRecord {
     /// Cannot be drawn again moved: it, or a view nested in it, wrote state
     /// as it was prepainted or painted, or opted out.
     stays_put: bool,
+    /// It, or a view nested in it, read the content mask around it as it
+    /// prepainted, which what it drew may then depend on beyond what was
+    /// culled: it is not drawn moved while part of it is out of view. See
+    /// [`moving`].
+    read_mask: bool,
     /// How it moved this frame, drawn again from the last one, for its paint
     /// to move what it copies.
     moved: Option<ViewMove>,
@@ -312,6 +320,7 @@ impl ViewRecord {
             layout: self.layout.clone(),
             unsettled: self.unsettled,
             stays_put: self.stays_put,
+            read_mask: self.read_mask,
             moved: None,
             paint_mask: self.paint_mask,
             source: self.source.clone(),
@@ -417,6 +426,8 @@ struct ViewRecording {
     /// The view being prepainted.
     view: Option<EntityId>,
     writes_start: Writes,
+    /// [`ViewRetention::mask_reads`] as it began.
+    mask_reads_start: u64,
 }
 
 /// Where the writes to entities and globals stood as a view's prepaint or
@@ -525,6 +536,14 @@ pub(crate) struct ViewRetention {
     /// Whether views dirty only because views nested in them are drawn again
     /// around them (off with `GPUI_RETAINED_VIEW_SPLICES=0`); see [`splice`].
     pub(crate) splices_enabled: bool,
+    /// Counts the reads of the content mask made while a retained view
+    /// prepainted (see [`Window::content_mask`]), for its record to tell
+    /// whether it read it.
+    pub(crate) mask_reads: std::cell::Cell<u64>,
+    /// Whether a view partly out of view may be drawn moved where less of it
+    /// shows, as list row replay does (see [`moving`]); set as each frame
+    /// begins.
+    pub(crate) shrinking_moves: bool,
     pub(crate) settling: bool,
     pub(crate) settle_requested: bool,
     pub(crate) moved_this_frame: bool,
@@ -565,6 +584,8 @@ impl ViewRetention {
             verification_interval: verification_interval(),
             moves_enabled: moves_from_environment(),
             splices_enabled: splices_from_environment(),
+            mask_reads: Default::default(),
+            shrinking_moves: false,
             settling: false,
             settle_requested: false,
             moved_this_frame: false,
@@ -1141,15 +1162,8 @@ impl Window {
         if opted_out {
             dependencies::note_state_read(&self.view_retention.every_frame);
         }
-        if self.refreshing
-            || cx.has_active_drag()
-            || self.is_inspector_picking(cx)
-            || self.view_retention.drawn_font_generation != self.text_system().font_generation()
-        {
-            return Err(ViewRebuildReason::WindowRefresh);
-        }
-        if self.a11y.replay_unavailable() {
-            return Err(ViewRebuildReason::Accessibility);
+        if let Some(reason) = self.frame_builds_every_record(cx) {
+            return Err(reason);
         }
         if opted_out {
             return Err(ViewRebuildReason::OptedOut);
@@ -1157,6 +1171,32 @@ impl Window {
         if self.dirty_views.contains(&entity) {
             return Err(ViewRebuildReason::Notified);
         }
+        self.reusable_record(id, cx)
+    }
+
+    /// Why the frame being drawn builds every view instead of drawing any
+    /// again from the last frame, if it does.
+    fn frame_builds_every_record(&self, cx: &App) -> Option<ViewRebuildReason> {
+        if self.refreshing
+            || cx.has_active_drag()
+            || self.is_inspector_picking(cx)
+            || self.view_retention.drawn_font_generation != self.text_system().font_generation()
+        {
+            return Some(ViewRebuildReason::WindowRefresh);
+        }
+        if self.a11y.replay_unavailable() {
+            return Some(ViewRebuildReason::Accessibility);
+        }
+        None
+    }
+
+    /// The record `id` left last frame, if nothing it read or was drawn by
+    /// changed since, whatever it stands for (a view, or a list's row).
+    fn reusable_record(
+        &self,
+        id: &GlobalElementId,
+        cx: &App,
+    ) -> Result<usize, ViewRebuildReason> {
         if self.next_frame.retained_views.by_id.contains_key(id) {
             return Err(ViewRebuildReason::FirstDraw);
         }
@@ -1189,7 +1229,7 @@ impl Window {
     fn view_context(&self, bounds: Bounds<Pixels>) -> ViewContext {
         ViewContext {
             bounds,
-            content_mask: self.content_mask(),
+            content_mask: self.current_content_mask(),
             rounded_clip: self.rounded_clip.clone(),
             text_style: self.text_style(),
             opacity: self.element_opacity,
@@ -1210,7 +1250,7 @@ impl Window {
             && context.bounds == bounds
             && context.opacity == self.element_opacity
             && context.rem_size == self.rem_size()
-            && context.content_mask == self.content_mask()
+            && context.content_mask == self.current_content_mask()
             && context.rounded_clip == self.rounded_clip
             && context.text_style == self.text_style()
             && context.image_cache == self.inherited_image_cache()
@@ -1347,6 +1387,17 @@ impl Window {
         root: LayoutId,
         cx: &mut App,
     ) -> (Option<Rc<RetainedLayout>>, Recorded) {
+        self.finish_layout_recording(recording, Some(root), cx)
+    }
+
+    /// Ends a recording of a layout request, as [`Self::finish_view_layout`]
+    /// does, leaving no layout to take again without a `root`.
+    fn finish_layout_recording(
+        &mut self,
+        recording: LayoutRecording,
+        root: Option<LayoutId>,
+        cx: &mut App,
+    ) -> (Option<Rc<RetainedLayout>>, Recorded) {
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         let Some(keys) = recording.keys else {
             return (None, dependencies);
@@ -1365,6 +1416,9 @@ impl Window {
         {
             return (None, dependencies);
         }
+        let Some(root) = root else {
+            return (None, dependencies);
+        };
         let layout = RetainedLayout {
             root,
             view_key: self.layout_keys.current(),
@@ -1378,6 +1432,21 @@ impl Window {
     /// as its prepaint goes, returning its record in this frame: where it was,
     /// or `moved`.
     fn reuse_view_prepaint(
+        &mut self,
+        previous: usize,
+        moved: Option<ViewMove>,
+        cx: &mut App,
+    ) -> usize {
+        self.frame_work.stats.views_reused += 1;
+        if moved.is_some() {
+            self.frame_work.stats.views_moved += 1;
+        }
+        self.reuse_record_prepaint(previous, moved, cx)
+    }
+
+    /// Draws what last frame's record `previous` stands for (a view, or a
+    /// list's row) again, as [`Self::reuse_view_prepaint`] does.
+    fn reuse_record_prepaint(
         &mut self,
         previous: usize,
         moved: Option<ViewMove>,
@@ -1410,9 +1479,7 @@ impl Window {
             )
         };
         let hovers_start = self.view_retention.hovers.len();
-        self.frame_work.stats.views_reused += 1;
         if moved.is_some() {
-            self.frame_work.stats.views_moved += 1;
             self.view_retention.moved_this_frame = true;
         }
         if let Some(deadline) = dependencies.rebuild_at {
@@ -1495,6 +1562,7 @@ impl Window {
                 layout: record.layout.clone(),
                 unsettled: record.unsettled || moved.is_some(),
                 stays_put: record.stays_put,
+                read_mask: record.read_mask,
                 moved: if index == previous { moved } else { None },
                 paint_mask: match &moved {
                     Some(moved) if index != previous => moved.mask_of(&record.paint_mask),
@@ -1523,7 +1591,7 @@ impl Window {
         let groups = record.groups.clone();
         let recorded = record.paint_context.clone();
         let current = self.paint_context();
-        let paint_mask = self.content_mask();
+        let paint_mask = self.current_content_mask();
         // Moved with what it painted from the mask around it then to the one
         // around it now, which can differ from the ones around its prepaint.
         let moved = record.moved.as_ref().map(|moved| ViewMove {
@@ -1584,8 +1652,19 @@ impl Window {
         source: ViewSource,
         cx: &mut App,
     ) -> ViewRecording {
-        let layout_scope = self.layout_keys.prepaint_scope();
         self.frame_work.stats.views_rendered += 1;
+        self.begin_record_prepaint(id, source, cx)
+    }
+
+    /// Opens the record `id` leaves in this frame, as whatever it stands for
+    /// (a view, or a list's row) prepaints.
+    fn begin_record_prepaint(
+        &mut self,
+        id: &GlobalElementId,
+        source: ViewSource,
+        cx: &mut App,
+    ) -> ViewRecording {
+        let layout_scope = self.layout_keys.prepaint_scope();
         let start = self.prepaint_index();
         let views = &mut self.next_frame.retained_views;
         let index = (!views.by_id.contains_key(id)).then(|| {
@@ -1617,6 +1696,7 @@ impl Window {
                 layout: None,
                 unsettled: false,
                 stays_put: false,
+                read_mask: false,
                 moved: None,
                 paint_mask: ContentMask::default(),
                 source: Rc::new(source),
@@ -1645,6 +1725,7 @@ impl Window {
             hitboxes_start: self.next_hitbox_id.0,
             view: self.rendered_entity_stack.last().copied(),
             writes_start: Writes::now(cx),
+            mask_reads_start: retention.mask_reads.get(),
         }
     }
 
@@ -1671,11 +1752,16 @@ impl Window {
         let views = &mut self.next_frame.retained_views;
         views.open.retain(|open| *open != index);
         let nested = views.records.len() - index - 1;
-        let (unsettled, stays_put) = views.records[index + 1..]
-            .iter()
-            .fold((false, false), |(unsettled, stays_put), record| {
-                (unsettled || record.unsettled, stays_put || record.stays_put)
-            });
+        let (unsettled, stays_put, nested_read_mask) = views.records[index + 1..].iter().fold(
+            (false, false, false),
+            |(unsettled, stays_put, read_mask), record| {
+                (
+                    unsettled || record.unsettled,
+                    stays_put || record.stays_put,
+                    read_mask || record.read_mask,
+                )
+            },
+        );
         let wrote = recording.writes_start != Writes::now(cx);
         let fixed = recording
             .view
@@ -1688,6 +1774,8 @@ impl Window {
         let record = &mut views.records[index];
         record.unsettled = unsettled;
         record.stays_put = stays_put || wrote || fixed;
+        record.read_mask = nested_read_mask
+            || self.view_retention.mask_reads.get() != recording.mask_reads_start;
         record.prepaint_range.end = end;
         record.nested = nested;
         record.context = Rc::new(context);
@@ -1718,7 +1806,7 @@ impl Window {
         self.take_hover_reads();
         self.view_retention.view_stack.push(id.clone());
         let paint_context = self.paint_context();
-        let paint_mask = self.content_mask();
+        let paint_mask = self.current_content_mask();
         let inherited_groups = self.group_hitboxes.tops();
         let record = &mut self.next_frame.retained_views.records[index];
         record.paint_context = paint_context;

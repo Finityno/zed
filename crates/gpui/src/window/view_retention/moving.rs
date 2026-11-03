@@ -24,7 +24,12 @@
 //! - nothing it drew was clipped by the mask around it, only by masks of its
 //!   own, so that every mask moves with what it clips: on each side where a
 //!   hitbox or primitive reached past its mask, the mask's edge is not the
-//!   one around the view;
+//!   one around the view. With list row replay on (see [`super::list_rows`]),
+//!   a view partly out of view, before or now, is drawn moved too where no
+//!   more of it shows than showed, moved, if nothing in it read the content
+//!   mask as it prepainted ([`Window::content_mask`]): what was culled stays
+//!   out of view, and every mask edge that was the one around it is moved to
+//!   the one around it now;
 //! - it deferred nothing (an anchored popover places itself against the
 //!   window, which does not move with it), holds no input handler (the
 //!   platform asks the focused input for bounds), was not painted inside a
@@ -111,7 +116,10 @@ impl ViewMove {
     /// window's masks grown out to whole device pixels.
     pub(crate) fn scaled(&self, window: &Window) -> SceneMove {
         SceneMove {
-            delta: self.delta.scale(window.scale_factor()),
+            delta: {
+                let delta = self.delta.scale(window.scale_factor());
+                crate::point(ScaledPixels(delta.x.0.round()), ScaledPixels(delta.y.0.round()))
+            },
             old_outer: scaled_edges(&window.cover_bounds(self.old_outer.bounds)),
             new_outer: scaled_edges(&window.cover_bounds(self.new_outer.bounds)),
             inherited_clip_depth: self.inherited_clip_depth,
@@ -200,6 +208,17 @@ fn inside(inner: [f32; 4], outer: [f32; 4]) -> bool {
         && inner[3] <= outer[3] + EPSILON
 }
 
+fn intersection(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let left = a[0].max(b[0]);
+    let top = a[1].max(b[1]);
+    [left, top, a[2].min(b[2]).max(left), a[3].min(b[3]).max(top)]
+}
+
+fn is_empty(extent: [f32; 4]) -> bool {
+    const EPSILON: f32 = 1e-3;
+    extent[2] - extent[0] < EPSILON || extent[3] - extent[1] < EPSILON
+}
+
 fn whole_device_pixels(delta: f32) -> bool {
     (delta - delta.round()).abs() < 1e-3
 }
@@ -233,6 +252,12 @@ pub(crate) enum MoveRefusal {
     OutsideMaskBefore,
     /// It reaches past the content mask around it now.
     OutsideMaskNow,
+    /// Partly out of view, before or now, it read the content mask as it
+    /// prepainted, and may have drawn by how much of it showed.
+    ReadMask,
+    /// Partly out of view, it drew past its bounds, where what was culled
+    /// may come into view.
+    DrawnOutside,
     DeferredDraw,
     InputHandler,
     /// A hitbox of it was clipped by the mask around it.
@@ -348,17 +373,56 @@ impl Window {
         if !whole_device_pixels(scaled.x.0) || !whole_device_pixels(scaled.y.0) {
             return Err(MoveRefusal::NotWholeDevicePixels);
         }
+        // Exactly the whole device pixels it moved by: two layouts that place
+        // it by different sums of the same sizes can differ in the last bit,
+        // and moved by that, what it drew would overlap what is drawn beside
+        // it where, built, it only touches.
+        let delta = crate::point(
+            Pixels(scaled.x.0.round() / scale_factor),
+            Pixels(scaled.y.0.round() / scale_factor),
+        );
         if self.rounded_clip != context.rounded_clip {
             return Err(MoveRefusal::InheritedRoundedClip);
         }
-        let mask = self.content_mask();
+        let mask = self.current_content_mask();
         let outer = edges(&context.content_mask.bounds);
-        if !inside(edges(&context.bounds), outer) {
-            return Err(MoveRefusal::OutsideMaskBefore);
-        }
-        if !inside(edges(&bounds), edges(&mask.bounds)) {
-            return Err(MoveRefusal::OutsideMaskNow);
-        }
+        let outside = if !inside(edges(&context.bounds), outer) {
+            Some(MoveRefusal::OutsideMaskBefore)
+        } else if !inside(edges(&bounds), edges(&mask.bounds)) {
+            Some(MoveRefusal::OutsideMaskNow)
+        } else {
+            None
+        };
+        // Partly out of view, it is drawn moved only where no more of it
+        // shows than showed: what was culled stays out of view, and what was
+        // clipped by the mask around it is clipped by the one around it now.
+        let shrinking = match outside {
+            None => false,
+            Some(refusal) => {
+                let showed = intersection(
+                    edges(&context.bounds),
+                    intersection(outer, edges(&record.paint_mask.bounds)),
+                );
+                let shows = intersection(edges(&bounds), edges(&mask.bounds));
+                let showed_moved = [
+                    showed[0] + delta.x.0,
+                    showed[1] + delta.y.0,
+                    showed[2] + delta.x.0,
+                    showed[3] + delta.y.0,
+                ];
+                let shrinks = retention.shrinking_moves
+                    && !record.read_mask
+                    && (is_empty(shows) || (!is_empty(showed) && inside(shows, showed_moved)));
+                if !shrinks {
+                    return Err(if record.read_mask && retention.shrinking_moves {
+                        MoveRefusal::ReadMask
+                    } else {
+                        refusal
+                    });
+                }
+                true
+            }
+        };
         // What it drew by whether its hitboxes were hovered was checked
         // against where they were; moved under the pointer, or out from
         // under it, they may be hovered otherwise.
@@ -390,6 +454,22 @@ impl Window {
             return Err(MoveRefusal::PlacedAccessibilityNode);
         }
         let frame = &self.rendered_frame;
+        if shrinking
+            && !frame.scene.drawn_inside(
+                paint.start.scene_index..paint.end.scene_index,
+                scaled_edges(&self.cover_bounds(context.bounds)),
+            )
+        {
+            return Err(MoveRefusal::DrawnOutside);
+        }
+        if shrinking {
+            return Ok(ViewMove {
+                delta,
+                old_outer: context.content_mask,
+                new_outer: mask,
+                inherited_clip_depth: self.rounded_clip.as_ref().map_or(0, |clip| clip.depth()),
+            });
+        }
         let hitboxes_clipped_inside = frame.hitboxes
             [prepaint.start.hitboxes_index..prepaint.end.hitboxes_index]
             .iter()

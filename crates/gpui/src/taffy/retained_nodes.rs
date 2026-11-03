@@ -71,6 +71,10 @@ pub(crate) struct LayoutRetention {
     /// The fingerprint of the default style, which every text leaf asks for,
     /// under the rem size and scale factor it was taken at.
     default_fingerprint: Option<(Pixels, f32, u64)>,
+    /// Kept measured leaves given a new closure and left clean, to be
+    /// measured again with it before the next layout, under what their log
+    /// holds. See [`TaffyLayoutEngine::request_remeasured_layout`].
+    remeasured: Vec<(LayoutId, Rc<MeasureLog>)>,
     pub(crate) counts: RetentionCounts,
 }
 
@@ -92,6 +96,12 @@ pub(crate) struct RetentionCounts {
 struct RetainedNode {
     id: LayoutId,
     claimed_in_frame: u64,
+    /// How many frames after it was last claimed the node is kept through
+    /// unclaimed, and the last of those: a list row's, for the row scrolled
+    /// out of view and back to find it and what it measured. See
+    /// [`TaffyLayoutEngine::linger`].
+    linger_frames: u64,
+    lingers_until: u64,
     measured: bool,
     /// [`layout_fingerprint`] of the style last asked for.
     style_fingerprint: u64,
@@ -165,6 +175,13 @@ type MeasureLogEntry = (Size<Option<Pixels>>, Size<AvailableSpace>, Size<Pixels>
 const MEASURE_LOG_CAPACITY: usize = 16;
 
 impl MeasureLog {
+    /// Forgets every size logged, for a node dirtied: Taffy holds none of
+    /// them any longer.
+    fn clear(&self) {
+        self.entries.borrow_mut().clear();
+        self.overflowed.set(false);
+    }
+
     fn record(&self, known: Size<Option<Pixels>>, available: Size<AvailableSpace>, size: Size<Pixels>) {
         if self.overflowed.get() {
             return;
@@ -279,6 +296,7 @@ impl LayoutRetention {
         self.transaction_claims = Vec::new();
         self.claimed_keys = Vec::new();
         self.claimed_this_frame = 0;
+        self.remeasured = Vec::new();
     }
 }
 
@@ -298,6 +316,7 @@ impl TaffyLayoutEngine {
             return Claim::Unkeyed;
         }
         node.claimed_in_frame = frame;
+        node.lingers_until = frame + node.linger_frames;
         let id = node.id;
         retention.claimed_this_frame += 1;
         retention.counts.nodes_reused += 1;
@@ -471,9 +490,27 @@ impl TaffyLayoutEngine {
                 && node.claimed_in_frame != frame
             {
                 node.claimed_in_frame = frame;
+                node.lingers_until = frame + node.linger_frames;
                 retention.claimed_this_frame += 1;
                 retention.counts.nodes_kept += 1;
                 retention.note_claim(key);
+            }
+        }
+    }
+
+    /// Keeps the nodes under `keys` through the next `frames` frames even if
+    /// nothing claims them: the nodes of a list row, which a scroll takes out
+    /// of view and soon brings back, to lay it out again with what they
+    /// measured rather than measure its text afresh. A node made again under
+    /// a key whose node lingered is compared with what it is asked for as
+    /// any kept node is.
+    pub(crate) fn linger(&mut self, keys: &[u64], frames: u64) {
+        let retention = &mut self.retention;
+        let until = retention.frame + frames;
+        for key in keys {
+            if let Some(node) = retention.retained.get_mut(key) {
+                node.linger_frames = frames;
+                node.lingers_until = until;
             }
         }
     }
@@ -522,6 +559,8 @@ impl TaffyLayoutEngine {
             RetainedNode {
                 id,
                 claimed_in_frame: retention.frame,
+                linger_frames: 0,
+                lingers_until: 0,
                 measured,
                 style_fingerprint,
                 measurement: None,
@@ -761,6 +800,108 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// Adds a self-measuring leaf given a new closure every frame, as
+    /// [`Self::request_keyed_measured_layout`] does, without dirtying the node
+    /// kept under `key`: the node is measured again with the new closure
+    /// before the next layout, under every constraint Taffy measured it under
+    /// since it was last dirtied, and dirtied, with the nodes above it, only
+    /// if it measures otherwise (see [`Self::check_remeasured_leaves`]). A
+    /// leaf that measures as before leaves what Taffy cached for the nodes
+    /// above it alone.
+    pub(crate) fn request_remeasured_layout(
+        &mut self,
+        key: Option<u64>,
+        style: &Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        measure: Box<MeasureFn>,
+    ) -> LayoutId {
+        let fingerprint = self.style_fingerprint(Some(style), rem_size, scale_factor);
+        let frame = self.retention.frame;
+        let kept_log = key
+            .and_then(|key| self.retention.retained.get(&key))
+            .filter(|node| {
+                node.claimed_in_frame != frame
+                    && node.measured
+                    && node.style_fingerprint == fingerprint
+                    && !aligns_by_baseline(style)
+            })
+            .and_then(|node| node.measure_log.clone());
+        if let Some(log) = kept_log
+            && let Claim::Reused(key, id) = self.claim(key)
+        {
+            if self.taffy.get_node_context(id.into()).is_some() && !self.taffy.dirty(id.into()).unwrap_or(true) {
+                let measure = node_measure(MeasureLog::logged(&log, measure));
+                if let Some(context) = self.taffy.get_node_context_mut(id.into()) {
+                    context.measure = measure;
+                }
+                self.retained_node(key).measurement = None;
+                self.retention.remeasured.push((id, log));
+                return id;
+            }
+            self.release_claim(key);
+        }
+        let log = Rc::<MeasureLog>::default();
+        let id = self.request_keyed_measured_layout(
+            key,
+            Some(style),
+            rem_size,
+            scale_factor,
+            MeasureLog::logged(&log, measure),
+        );
+        if let Some(key) = key
+            && let Some(node) = self.retention.retained.get_mut(&key)
+            && node.id == id
+        {
+            node.measure_log = Some(log);
+        }
+        id
+    }
+
+    /// Measures the leaves [`Self::request_remeasured_layout`] left clean
+    /// with their new closures, under what their logs hold, and dirties each
+    /// that measures otherwise, with the nodes above it. Runs before every
+    /// layout, and as the frame ends for leaves no layout reached.
+    pub(crate) fn check_remeasured_leaves(&mut self, window: &mut Window, cx: &mut App) {
+        if self.retention.remeasured.is_empty() {
+            return;
+        }
+        for (id, log) in mem::take(&mut self.retention.remeasured) {
+            let Some(context) = self.taffy.get_node_context_mut(id.into()) else {
+                continue;
+            };
+            let measure = &mut context.measure;
+            let unchanged = log.replays(
+                &mut |known, available, window: &mut Window, cx: &mut App| {
+                    measure(known, available, window, cx)
+                },
+                &mut self.retention.counts,
+                window,
+                cx,
+            );
+            if unchanged {
+                self.retention.counts.measurements_replayed += 1;
+            } else {
+                log.clear();
+                self.retention.counts.measured_nodes_dirtied += 1;
+                self.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
+                dirty_ancestors(&mut self.taffy, id);
+            }
+        }
+    }
+
+    /// Dirties the leaves [`Self::request_remeasured_layout`] left clean that
+    /// no layout measured again this frame, for the next one to measure.
+    fn dirty_unchecked_remeasured_leaves(&mut self) {
+        for (id, log) in mem::take(&mut self.retention.remeasured) {
+            if self.taffy.get_node_context(id.into()).is_some() {
+                log.clear();
+                self.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
+                dirty_ancestors(&mut self.taffy, id);
+            }
+        }
+    }
+
     /// Adds a self-measuring leaf whose measurement can be carried over from
     /// the element that measured its node last frame, rather than taken
     /// again.
@@ -894,6 +1035,7 @@ impl TaffyLayoutEngine {
     /// Ends the frame for the retained nodes: releases the transient ones and
     /// those no element claimed, and keeps the rest with their caches.
     pub(crate) fn release_unclaimed_nodes(&mut self) {
+        self.dirty_unchecked_remeasured_leaves();
         let retention = &mut self.retention;
         if retention.retained.is_empty() {
             // Nothing is kept, as when retention is turned off: clearing the
@@ -926,7 +1068,7 @@ impl TaffyLayoutEngine {
                 let missing_children = &mut retention.missing_children;
                 let released = &mut retention.counts.nodes_released;
                 retention.retained.retain(|_, node| {
-                    if node.claimed_in_frame == frame {
+                    if node.claimed_in_frame == frame || node.lingers_until > frame {
                         return true;
                     }
                     unstretched_styles.remove(&node.id);

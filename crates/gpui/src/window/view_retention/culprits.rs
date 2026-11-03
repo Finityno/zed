@@ -276,6 +276,22 @@ pub(crate) fn rebuilt(view: EntityId, reason: ViewRebuildReason) {
     });
 }
 
+/// Counts a list row built rather than drawn again from the last frame,
+/// with row replay on, under why, and what was blamed for it.
+pub(crate) fn list_row_built(why: impl FnOnce() -> String) {
+    if !enabled() || SUSPENDED.get() {
+        return;
+    }
+    let why = why();
+    with(|culprits| {
+        let line = match culprits.blamed.take() {
+            Some(blamed) => format!("list row {why} <- {blamed}"),
+            None => format!("list row {why}"),
+        };
+        *culprits.counts.entry(line).or_default() += 1;
+    });
+}
+
 /// Counts a frame, logging the most frequent lines every [`LOG_EVERY`].
 pub(crate) fn frame_finished() {
     if !enabled() {
