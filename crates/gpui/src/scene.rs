@@ -4269,7 +4269,7 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
-    fn rounded_clip(&self) -> u32 {
+    pub(crate) fn rounded_clip(&self) -> u32 {
         match self {
             Self::Shadow(value) => value.rounded_clip,
             Self::Quad(value) => value.rounded_clip,
@@ -4282,7 +4282,7 @@ impl Primitive {
         }
     }
 
-    fn set_rounded_clip(&mut self, index: u32) {
+    pub(crate) fn set_rounded_clip(&mut self, index: u32) {
         match self {
             Self::Shadow(value) => value.rounded_clip = index,
             Self::Quad(value) => value.rounded_clip = index,

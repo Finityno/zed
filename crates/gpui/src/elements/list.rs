@@ -155,6 +155,16 @@ struct StateInner {
     /// Tells this list's rows' records from another list's; see
     /// [`crate::window::view_retention::list_rows`].
     serial: u64,
+    /// With list row replay on, the scale factor the list was last
+    /// prepainted at: the wheel and the scrollbar then scroll it by whole
+    /// device pixels, which is what its rows can be drawn again moved by.
+    snap_scale: Option<f32>,
+    /// The wheel scroll a frame's snapping left over, carried into the next
+    /// frame's, and the scroll top that frame's events scrolled from: a slow
+    /// wheel still moves the list, a device pixel at a time.
+    wheel_remainder: Pixels,
+    wheel_carry: Pixels,
+    wheel_base: Option<Pixels>,
     /// The run of items `layout_items` walks, kept across frames so its
     /// capacity is reused instead of regrown every frame. Empty between calls.
     measured_items_scratch: VecDeque<ListItem>,
@@ -813,6 +823,10 @@ impl ListState {
             at_end: Default::default(),
             at_end_answer: None,
             serial: crate::window::view_retention::list_rows::next_list_serial(),
+            snap_scale: None,
+            wheel_remainder: px(0.),
+            wheel_carry: px(0.),
+            wheel_base: None,
             measured_items_scratch: VecDeque::new(),
             last_item_layout_count: 0,
             held_item: None,
@@ -1715,6 +1729,21 @@ impl ListState {
 }
 
 impl StateInner {
+    /// `scroll_top`, at most `scroll_max`, on a whole device pixel when list
+    /// row replay is on (see `snap_scale`); as it is otherwise.
+    fn snap_to_device_pixels(&self, scroll_top: Pixels, scroll_max: Pixels) -> Pixels {
+        let Some(scale) = self.snap_scale.filter(|scale| *scale > 0.) else {
+            return scroll_top;
+        };
+        // The end stays where it is, on a whole pixel or not, so that a list
+        // scrolled to it reads as at its end.
+        if scroll_top >= scroll_max {
+            return scroll_max;
+        }
+        let snapped = px((scroll_top.0 * scale).round() / scale);
+        if snapped > scroll_max { px((scroll_top.0 * scale).floor() / scale) } else { snapped }
+    }
+
     /// See [`ListState::is_scrolled_to_end`].
     fn scrolled_to_end(&self) -> Option<bool> {
         let bounds = self.last_layout_bounds?;
@@ -1836,9 +1865,16 @@ impl StateInner {
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
+        let base = self.scroll_top(scroll_top);
+        // Events of one frame scroll from where the frame left the list; what
+        // the last frame's snapping left over is carried into the first.
+        if self.wheel_base != Some(base) {
+            self.wheel_base = Some(base);
+            self.wheel_carry = self.wheel_remainder;
+        }
+        let wanted = (base - delta.y + self.wheel_carry).max(px(0.)).min(scroll_max);
+        let new_scroll_top = self.snap_to_device_pixels(wanted, scroll_max);
+        self.wheel_remainder = wanted - new_scroll_top;
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
@@ -2457,7 +2493,8 @@ impl StateInner {
             .scrollbar_drag_start_height
             .unwrap_or_else(|| self.items.summary().height);
         let scroll_max = (content_height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (-point.y).max(px(0.)).min(scroll_max);
+        let new_scroll_top =
+            self.snap_to_device_pixels((-point.y).max(px(0.)).min(scroll_max), scroll_max);
 
         // If content grew during the drag, the frozen bottom is below the
         // live bottom. Treat dragging to the frozen end as resuming tail follow.
@@ -2680,6 +2717,12 @@ impl Element for List {
         }
         // Asked before the rows are laid out: what the view drawing the list
         // read is compared with what it read when the rows were recorded.
+        // Only at a whole scale factor does a whole device pixel keep what
+        // the rows lay out on whole pixels as it was; between, rows are
+        // scrolled as they were and drawn again only when that lands them on
+        // whole device pixels.
+        state.snap_scale = Some(window.scale_factor())
+            .filter(|scale| cx.records_list_rows() && scale.fract() == 0.);
         let mut records = cx.records_list_rows().then(|| RowRecords {
             replay: window.list_rows_replayable(
                 &[&state.scrolls, &state.version, &state.item_version, &state.at_end],

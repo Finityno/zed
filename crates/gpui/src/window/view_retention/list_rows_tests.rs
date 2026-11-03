@@ -243,8 +243,12 @@ impl Fixture {
     }
 
     fn wheel(&self, cx: &mut TestAppContext, delta: f32) {
-        for (window, state) in self.windows.into_iter().zip(&self.list_states) {
-            let position = state.viewport_bounds().center();
+        let position = self.list_states[0].viewport_bounds().center();
+        self.wheel_at(cx, position, delta);
+    }
+
+    fn wheel_at(&self, cx: &mut TestAppContext, position: Point<Pixels>, delta: f32) {
+        for window in self.windows {
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(
                     crate::PlatformInput::Scroll(crate::ScrollEvent {
@@ -419,7 +423,9 @@ fn a_list_dragged_by_its_scrollbar_draws_its_rows_again() {
     fixture.draw_matching(&mut cx, "first frame");
     fixture.draw_matching(&mut cx, "second frame");
     let renders_before = fixture.host_renders[0].get();
-    for offset in [40., 52., 90.] {
+    // A thumb dragged by the pointer sets offsets between device pixels: the
+    // list scrolls to the nearest one, which its rows can be moved by.
+    for offset in [40., 52.3, 61.75, 90.5] {
         for state in &fixture.list_states {
             state.scrollbar_drag_started();
             state.set_offset_from_scrollbar(point(px(0.), px(-offset)));
@@ -430,9 +436,29 @@ fn a_list_dragged_by_its_scrollbar_draws_its_rows_again() {
     }
     assert_eq!(
         fixture.host_renders[0].get(),
-        renders_before + 3,
+        renders_before + 4,
         "the view drawing the list was built once per drag step"
     );
+}
+
+/// A row under the pointer that draws by whether it is hovered is drawn again
+/// moved while the scroll leaves it under the pointer, and built once the
+/// scroll takes it out from under the pointer.
+#[test]
+fn a_hovered_row_moved_while_still_under_the_pointer_is_drawn_again() {
+    let mut cx = super::super::layout_retention_tests::text_system_context_with_ink_in_font_bounds(0);
+    let fixture = fixture(&mut cx, false);
+    fixture.draw_matching(&mut cx, "first frame");
+    let viewport = fixture.list_states[0].viewport_bounds();
+    fixture.move_mouse(&mut cx, point(px(150.), viewport.center().y));
+    fixture.draw_matching(&mut cx, "hovered");
+    let mut replayed = 0;
+    for (step, delta) in [-2., -3., 4., -2., -30., 25., -1.].into_iter().enumerate() {
+        fixture.wheel_at(&mut cx, point(px(150.), viewport.center().y), delta);
+        let (work, _) = fixture.draw_matching(&mut cx, &format!("hovered, scroll {step}"));
+        replayed += work.list_rows_replayed;
+    }
+    assert!(replayed >= 7, "{replayed}");
 }
 
 /// A view asking whether the list is at its end depends on the answer, not

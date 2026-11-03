@@ -208,6 +208,15 @@ fn inside(inner: [f32; 4], outer: [f32; 4]) -> bool {
         && inner[3] <= outer[3] + EPSILON
 }
 
+/// Whether `position` hits `hitbox`, as the window's hit test asks.
+fn hitbox_contains(hitbox: &Hitbox, position: Point<Pixels>) -> bool {
+    hitbox.bounds.intersect(&hitbox.content_mask.bounds).contains(&position)
+        && hitbox
+            .rounded_clip
+            .as_ref()
+            .is_none_or(|clip| clip.contains(position))
+}
+
 fn intersection(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     let left = a[0].max(b[0]);
     let top = a[1].max(b[1]);
@@ -246,8 +255,14 @@ pub(crate) enum MoveRefusal {
     GroupsChanged,
     /// It moved by a fraction of a device pixel.
     NotWholeDevicePixels,
-    /// It drew by hovers, and the pointer is over where it was or is.
+    /// It drew by hovers, and the pointer is over where it was or is (with
+    /// list row replay on: moving it moves a hitbox it drew by under the
+    /// pointer, or out from under it).
     UnderPointer,
+    /// With list row replay on: it drew by a hover that was not answered by
+    /// whether the pointer was over the hitbox (a hitbox above it, keyboard
+    /// input, a captured pointer).
+    HoveredOtherwise,
     /// It reached past the content mask around it in the last frame.
     OutsideMaskBefore,
     /// It reaches past the content mask around it now.
@@ -373,6 +388,20 @@ impl Window {
         if !whole_device_pixels(scaled.x.0) || !whole_device_pixels(scaled.y.0) {
             return Err(MoveRefusal::NotWholeDevicePixels);
         }
+        // With list row replay on, rows are scrolled by whole device pixels
+        // but may sit between them, where what they draw snaps to the nearest
+        // one: moved by a whole number of them, a view between two lands
+        // where laying it out there might round the other way.
+        if retention.shrinking_moves {
+            let old = context.bounds.origin.scale(scale_factor);
+            let new = bounds.origin.scale(scale_factor);
+            if ![old.x.0, old.y.0, new.x.0, new.y.0]
+                .into_iter()
+                .all(whole_device_pixels)
+            {
+                return Err(MoveRefusal::NotWholeDevicePixels);
+            }
+        }
         // Exactly the whole device pixels it moved by: two layouts that place
         // it by different sums of the same sizes can differ in the last bit,
         // and moved by that, what it drew would overlap what is drawn beside
@@ -428,16 +457,50 @@ impl Window {
         // under it, they may be hovered otherwise.
         if !record.hovers.is_empty() {
             let pointer = self.mouse_position;
-            let under_pointer = self.rendered_frame.hitboxes
-                [record.prepaint_range.start.hitboxes_index..record.prepaint_range.end.hitboxes_index]
-                .iter()
-                .any(|hitbox| {
+            let hitboxes = &self.rendered_frame.hitboxes
+                [record.prepaint_range.start.hitboxes_index..record.prepaint_range.end.hitboxes_index];
+            let under_pointer = if retention.shrinking_moves {
+                // With list row replay on, only a hover that would come out
+                // otherwise keeps it in place: one whose hitbox it moves under
+                // or out from under the pointer, or which was not answered
+                // by whether the pointer was over it (another hitbox above
+                // it, keyboard input). What is drawn above it now is checked
+                // again as it paints.
+                let moving = ViewMove {
+                    delta,
+                    old_outer: context.content_mask,
+                    new_outer: mask,
+                    inherited_clip_depth: self.rounded_clip.as_ref().map_or(0, |clip| clip.depth()),
+                };
+                let mut refusal = None;
+                for hover in record.hovers.iter() {
+                    let Some(hitbox) = hitboxes.iter().find(|hitbox| hitbox.id == hover.hitbox)
+                    else {
+                        continue;
+                    };
+                    let before = hitbox_contains(hitbox, pointer);
+                    if before != hover.hovered {
+                        refusal = Some(MoveRefusal::HoveredOtherwise);
+                        break;
+                    }
+                    if hitbox_contains(&moving.hitbox(hitbox), pointer) != before {
+                        refusal = Some(MoveRefusal::UnderPointer);
+                        break;
+                    }
+                }
+                if let Some(refusal) = refusal {
+                    return Err(refusal);
+                }
+                false
+            } else {
+                hitboxes.iter().any(|hitbox| {
                     let moved = Bounds {
                         origin: hitbox.bounds.origin + delta,
                         size: hitbox.bounds.size,
                     };
                     hitbox.bounds.contains(&pointer) || moved.contains(&pointer)
-                });
+                })
+            };
             if under_pointer {
                 return Err(MoveRefusal::UnderPointer);
             }
