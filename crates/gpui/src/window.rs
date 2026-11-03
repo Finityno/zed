@@ -56,6 +56,7 @@ use std::{
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
+    iter,
     marker::PhantomData,
     mem,
     ops::{DerefMut, Range},
@@ -1229,6 +1230,9 @@ pub(crate) struct Frame {
     pub(crate) scene: Scene,
     /// First paint operation that belongs on the GPUI overlay surface.
     pub(crate) overlay_scene_start: usize,
+    /// First hitbox inserted after the deferred draws were prepainted: the
+    /// prompt, drag or tooltip, which draw on the overlay plane.
+    pub(crate) overlay_hitboxes_start: usize,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -1327,6 +1331,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             overlay_scene_start: 0,
+            overlay_hitboxes_start: 0,
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1363,6 +1368,7 @@ impl Frame {
         self.dispatch_tree.clear();
         self.scene.clear();
         self.overlay_scene_start = 0;
+        self.overlay_hitboxes_start = 0;
         shrink.input_handlers.clear_vec(&mut self.input_handlers);
         shrink.tooltip_requests.clear_vec(&mut self.tooltip_requests);
         shrink.cursor_styles.clear_vec(&mut self.cursor_styles);
@@ -1494,6 +1500,34 @@ impl Frame {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
         hit_test
+    }
+
+    /// Collects the clipped bounds of the hitboxes this frame puts on the
+    /// overlay plane: those of every deferred draw not kept beneath native
+    /// surfaces, and those of the prompt, drag or tooltip prepainted after
+    /// them. The platform takes pointer input over the overlay there only.
+    pub(crate) fn overlay_hit_regions(&self, regions: &mut Vec<Bounds<Pixels>>) {
+        regions.clear();
+        let overlay_ranges = self
+            .deferred_draws
+            .iter()
+            .filter(|deferred_draw| !deferred_draw.beneath_native_surfaces)
+            .map(|deferred_draw| {
+                deferred_draw.prepaint_range.start.hitboxes_index
+                    ..deferred_draw.prepaint_range.end.hitboxes_index
+            })
+            .chain(iter::once(self.overlay_hitboxes_start..self.hitboxes.len()));
+        for range in overlay_ranges {
+            let Some(hitboxes) = self.hitboxes.get(range) else {
+                continue;
+            };
+            regions.extend(
+                hitboxes
+                    .iter()
+                    .map(|hitbox| hitbox.bounds.intersect(&hitbox.content_mask.bounds))
+                    .filter(|bounds| !bounds.is_empty()),
+            );
+        }
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -1680,6 +1714,10 @@ pub struct Window {
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
+    /// The overlay plane's input regions last handed to the platform, and
+    /// the buffer the next frame's are collected into before comparing.
+    pub(crate) overlay_hit_regions: Vec<Bounds<Pixels>>,
+    next_overlay_hit_regions: Vec<Bounds<Pixels>>,
     pub(crate) a11y: A11y,
 }
 
@@ -2758,6 +2796,8 @@ impl Window {
             inspector: None,
             #[cfg(feature = "profiler")]
             debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay::new(),
+            overlay_hit_regions: Vec::new(),
+            next_overlay_hit_regions: Vec::new(),
             a11y: A11y::new(
                 a11y_active_flag,
                 accessibility_force_disabled,
@@ -4477,6 +4517,7 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.publish_overlay_hit_regions();
         if self.layout_engine.as_mut().unwrap().shrink_after_low_use() {
             // As after an idle reclaim: the records name nodes of the old tree.
             self.rendered_frame.retained_views.forget_layouts();
@@ -4652,6 +4693,19 @@ impl Window {
             self.mark_view_dirty(entity);
         }
         self.invalidator.replace_views(views);
+    }
+
+    fn publish_overlay_hit_regions(&mut self) {
+        self.rendered_frame
+            .overlay_hit_regions(&mut self.next_overlay_hit_regions);
+        if self.next_overlay_hit_regions != self.overlay_hit_regions {
+            mem::swap(
+                &mut self.overlay_hit_regions,
+                &mut self.next_overlay_hit_regions,
+            );
+            self.platform_window
+                .set_overlay_hit_regions(&self.overlay_hit_regions);
+        }
     }
 
     #[profiling::function]
@@ -4845,6 +4899,7 @@ impl Window {
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
         self.prepaint_deferred_draws(cx);
+        self.next_frame.overlay_hitboxes_start = self.next_frame.hitboxes.len();
 
         let mut prompt_element = None;
         let mut active_drag_element = None;

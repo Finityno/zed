@@ -1530,6 +1530,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         self.draw(scene);
         PresentReport::default()
     }
+    /// Tells the platform where the frame about to be presented puts
+    /// input-taking content on the overlay plane: the clipped bounds of its
+    /// hitboxes, in window coordinates. A platform whose overlay sits above
+    /// native child views takes pointer input there and leaves the rest to
+    /// the views beneath. It keeps the regions until that frame's overlay
+    /// presents and applies them then, so input follows the overlay on
+    /// screen. Only called when the regions change. The default does
+    /// nothing.
+    fn set_overlay_hit_regions(&self, _regions: &[Bounds<Pixels>]) {}
     /// Enables a transparent GPUI surface above native child views.
     ///
     /// This is currently an experimental capability for embedding native

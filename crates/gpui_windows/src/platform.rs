@@ -477,6 +477,7 @@ impl WindowsPlatform {
             ui_thread: unsafe { GetCurrentThreadId() },
             text_system: Arc::downgrade(direct_write_text_system),
             invalidate: self.invalidate_devices.clone(),
+            attempts: RecoveryAttempts::default(),
         };
 
         std::thread::Builder::new()
@@ -575,6 +576,8 @@ struct DeviceRecovery {
     text_system: std::sync::Weak<DirectWriteTextSystem>,
     /// Set when a resize failed and the devices must be recreated.
     invalidate: Arc<AtomicBool>,
+    /// The recoveries that failed since the last one that worked.
+    attempts: RecoveryAttempts,
 }
 
 /// What a clock thread waits on.
@@ -626,6 +629,19 @@ impl ClockSource {
         }
     }
 
+    /// Whether devices must be recreated before the clock parks. A request
+    /// for that made while the clock was awake (a window's renderer failing
+    /// to resize or to rebuild, which can happen inside the clock's own
+    /// recovery) is dropped with the other signals the clock clears.
+    fn devices_pending(&self) -> bool {
+        match self {
+            Self::Compositor { recovery, .. } => {
+                !recovery.attempts.exhausted() && recovery.invalidate.load(Ordering::Acquire)
+            }
+            Self::Monitor(_) => false,
+        }
+    }
+
     /// Waits for the next vblank; `None` once the clock has stopped for good
     /// (its monitor is gone).
     fn wait_for_vsync(&self) -> Option<FrameRequestSource> {
@@ -649,22 +665,45 @@ impl ClockSource {
         else {
             return;
         };
+        if recovery.attempts.exhausted() {
+            // Given up: the windows keep skipping their draws, and the clock
+            // keeps ticking them, rather than recreating devices forever.
+            recovery.invalidate.store(false, Ordering::Release);
+            return;
+        }
         if !check_device_lost(&recovery.devices.device)
             && !recovery.invalidate.fetch_and(false, Ordering::Acquire)
         {
             return;
         }
-        if let Err(err) = handle_gpu_device_lost(
+        let result = handle_gpu_device_lost(
             &mut recovery.devices,
             recovery.platform_window.as_raw(),
             recovery.validation_number,
             recovery.ui_thread,
             all_windows,
             &recovery.text_system,
-        ) {
-            panic!("Device lost: {err}");
+        );
+        let Err(error) = result else {
+            recovery.attempts.recovered();
+            *watch = DeviceRemovedWatch::new(&recovery.devices.device);
+            return;
+        };
+        if recovery.attempts.failed() {
+            log::error!(
+                "Failed to recover from lost device (attempt {} of {MAX_FAILED_RECOVERIES}), \
+                 trying again: {error:#}",
+                recovery.attempts.failures(),
+            );
+            // The devices may have been replaced before the step that failed.
+            *watch = DeviceRemovedWatch::new(&recovery.devices.device);
+            recovery.invalidate.store(true, Ordering::Release);
+        } else {
+            log::error!(
+                "Failed to recover from lost device after {MAX_FAILED_RECOVERIES} attempts; \
+                 windows draw nothing from now on: {error:#}"
+            );
         }
-        *watch = DeviceRemovedWatch::new(&recovery.devices.device);
     }
 }
 
@@ -725,6 +764,7 @@ fn run_clock(
                 }
                 deadline = earliest;
             };
+            let park = park && !source.devices_pending();
             // Not kept while parked: the list going away is how the clock
             // learns the platform did.
             drop(windows);
