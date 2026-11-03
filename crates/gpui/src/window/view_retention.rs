@@ -2295,7 +2295,13 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
         )
         .chain(scene.paths.iter().map(|path| visible(path.clone())))
     {
-        lines.push(match primitive {
+        // A rounded clip is named by its place in the scene's table, which a
+        // frame drawing views again fills in another order: described by
+        // what it clips to instead.
+        let mut primitive = primitive;
+        let clip = describe_rounded_clip(scene, primitive.rounded_clip());
+        primitive.set_rounded_clip(0);
+        let description = match primitive {
             Primitive::Shadow(shadow) => format!("{shadow:?}"),
             Primitive::Quad(quad) => format!("{quad:?}"),
             Primitive::Underline(underline) => format!("{underline:?}"),
@@ -2315,7 +2321,8 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
                 format!("path {} {:?} {:?}", path.order, path.bounds, path.content_mask)
             }
             Primitive::Surface(surface) => format!("surface {:?}", surface.bounds),
-        });
+        };
+        lines.push(format!("{description} {clip}"));
     }
     // Primitives of one draw order do not overlap, so the order they come in
     // within it is not seen; sprites of one order are sorted by their atlas
@@ -2338,6 +2345,37 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
         lines.extend(super::a11y::replay::describe_a11y_tree(window));
     }
     lines
+}
+
+/// The rounded clip at one-based `index` of `scene`'s table and the clips
+/// around it, by the rectangles and radii they clip to.
+fn describe_rounded_clip(scene: &crate::Scene, index: u32) -> String {
+    fn round(value: f32) -> f32 {
+        (value * 64.).round() / 64. + 0.
+    }
+    let mut description = String::new();
+    let mut index = index;
+    while let Some(node) = index.checked_sub(1).and_then(|at| scene.rounded_clips.get(at as usize)) {
+        let bounds = node.bounds;
+        let radii = node.corner_radii;
+        description.push_str(&format!(
+            "clip({} {} {} {} r {} {} {} {}) ",
+            round(bounds.origin.x.0),
+            round(bounds.origin.y.0),
+            round(bounds.size.width.0),
+            round(bounds.size.height.0),
+            round(radii.top_left.0),
+            round(radii.top_right.0),
+            round(radii.bottom_right.0),
+            round(radii.bottom_left.0),
+        ));
+        // Parents come before their children in the table.
+        if node.parent >= index {
+            break;
+        }
+        index = node.parent;
+    }
+    description
 }
 
 /// Where two frames' descriptions first differ, if they do.
