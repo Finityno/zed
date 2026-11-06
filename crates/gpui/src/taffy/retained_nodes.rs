@@ -344,6 +344,7 @@ impl LayoutRetention {
         self.claimed_keys = Vec::new();
         self.claimed_this_frame = 0;
         self.remeasured = Vec::new();
+        self.lingering_scratch = Vec::new();
     }
 }
 
