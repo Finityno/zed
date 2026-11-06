@@ -177,9 +177,13 @@ type MeasureLogEntry = (Size<Option<Pixels>>, Size<AvailableSpace>, Size<Pixels>
 /// Taffy caches up to ten results per node.
 const MEASURE_LOG_CAPACITY: usize = 16;
 
-/// The most nodes a frame keeps lingering: enough for the rows just
-/// scrolled past an edge, which a scroll back finds as they were measured.
-pub(crate) const LINGERING_NODES: usize = 512;
+/// The most nodes a frame keeps lingering, for the rows just scrolled past
+/// an edge, which a scroll back finds as they were measured. A lingering
+/// text node keeps the lines it measured, which for a long text are
+/// megabytes, so this is kept to the few nodes a row's edges hold: at 512,
+/// opening a transcript's tool results kept 8 MB more at its peak than
+/// building every row did, and at 64 no more.
+pub(crate) const LINGERING_NODES: usize = 64;
 
 /// The last frame a node lingering past this frame is released at the end
 /// of: `frame` itself when no more than [`LINGERING_NODES`] linger, and

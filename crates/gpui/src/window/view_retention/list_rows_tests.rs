@@ -652,13 +652,13 @@ fn repeated_scroll_passes_keep_layout_nodes_and_records_steady() {
         passes.push(most);
     }
     assert!(replayed > 0, "no row was drawn again");
-    // A frame keeps at most a few hundred lingering nodes beside the ones it
+    // A frame keeps at most a few dozen lingering nodes beside the ones it
     // uses: the rows in view, a row cut at each edge, and the view around
     // them. Unbounded, a pass kept the nodes of every row it passed in its
     // last 240 frames.
     let rows_in_view = (LIST_HEIGHT / 40.) as usize + 2;
     let used = rows_in_view * LONG_ROW_NODES + 8;
-    let bound = used + crate::taffy::LINGERING_NODES;
+    let bound = used + crate::taffy::LINGERING_NODES + 16;
     for (pass, (nodes, records)) in passes.iter().enumerate() {
         assert!(
             *nodes <= bound,
