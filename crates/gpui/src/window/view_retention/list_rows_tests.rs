@@ -553,3 +553,124 @@ fn random_histories_match_frames_drawn_from_scratch() {
         assert!(replayed > 0, "seed {seed} drew no row again");
     }
 }
+
+/// A view drawing a long list of plain rows of a few nodes each.
+struct LongList {
+    list_state: ListState,
+}
+
+impl Render for LongList {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            list(self.list_state.clone(), |ix, _, _| {
+                div()
+                    .id(("long-row", ix))
+                    .flex()
+                    .h(px(40.))
+                    .w_full()
+                    .line_height(px(36.))
+                    .bg(PALETTE[ix % PALETTE.len()])
+                    .child(div().w(px(12.)).h(px(12.)).bg(PALETTE[(ix + 1) % PALETTE.len()]))
+                    .child(SharedString::from(format!("row {ix}")))
+                    .child(div().w(px(20.)).h(px(8.)).bg(PALETTE[(ix + 2) % PALETTE.len()]))
+                    .into_any_element()
+            })
+            .h(px(LIST_HEIGHT))
+            .w(px(180.)),
+        )
+    }
+}
+
+/// Scrolling through a long list again and again, with row replay on, keeps
+/// as many layout nodes and view records as the first pass did: the rows a
+/// pass leaves behind linger to be found when it comes back, but no more of
+/// them than a frame uses, so the table of nodes does not grow to every row
+/// of the list.
+#[test]
+fn repeated_scroll_passes_keep_layout_nodes_and_records_steady() {
+    const LONG_ROWS: usize = 1500;
+    // The row, its two marks and its text.
+    const LONG_ROW_NODES: usize = 4;
+    const STEP: f32 = 150.;
+    let mut cx = super::super::layout_retention_tests::text_system_context_with_ink_in_font_bounds(0);
+    cx.update(|cx| {
+        cx.set_view_retention(true);
+        cx.set_list_row_replay(true);
+    });
+    let list_state = ListState::new(LONG_ROWS, ListAlignment::Top, px(0.)).measure_all();
+    let window = cx.add_window({
+        let list_state = list_state.clone();
+        move |_, _| LongList { list_state }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let nodes = window.layout_engine.as_ref().map_or(0, |engine| engine.node_count());
+            (nodes, window.rendered_frame.retained_views.records.len())
+        })
+        .unwrap()
+    };
+    let wheel = |cx: &mut TestAppContext, delta: f32| {
+        let position = list_state.viewport_bounds().center();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::Scroll(crate::ScrollEvent {
+                    position,
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: crate::TouchPhase::Moved,
+                    is_momentum: false,
+                    source: crate::ScrollSource::Pointer,
+                    wheel_notches: None,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    };
+    draw(&mut cx);
+    let (_, first_records) = draw(&mut cx);
+    let steps = (LONG_ROWS as f32 * 40. / STEP) as usize + 2;
+    let mut passes = Vec::new();
+    let mut replayed = 0;
+    for _ in 0..3 {
+        let mut most = (0, 0);
+        for direction in [-1., 1.] {
+            for _ in 0..steps {
+                wheel(&mut cx, direction * STEP);
+                let (nodes, records) = draw(&mut cx);
+                most = (most.0.max(nodes), most.1.max(records));
+                replayed += cx
+                    .update_window(window.into(), |_, window, _| {
+                        let work = window.frame_work_stats();
+                        window.reset_frame_work_stats(false);
+                        work.list_rows_replayed
+                    })
+                    .unwrap();
+            }
+        }
+        passes.push(most);
+    }
+    assert!(replayed > 0, "no row was drawn again");
+    // A frame keeps at most a few dozen lingering nodes beside the ones it
+    // uses: the rows in view, a row cut at each edge, and the view around
+    // them. Unbounded, a pass kept the nodes of every row it passed in its
+    // last 240 frames.
+    let rows_in_view = (LIST_HEIGHT / 40.) as usize + 2;
+    let used = rows_in_view * LONG_ROW_NODES + 8;
+    let bound = used + crate::taffy::LINGERING_NODES + 16;
+    for (pass, (nodes, records)) in passes.iter().enumerate() {
+        assert!(
+            *nodes <= bound,
+            "pass {pass} kept {nodes} layout nodes, more than {bound}: {passes:?}"
+        );
+        assert!(
+            *records <= first_records + 8,
+            "pass {pass} kept {records} view records against {first_records} at rest: {passes:?}"
+        );
+    }
+    assert!(
+        passes[2].0 <= passes[0].0 && passes[1].0 <= passes[0].0,
+        "the layout nodes kept grew from pass to pass: {passes:?}"
+    );
+}
