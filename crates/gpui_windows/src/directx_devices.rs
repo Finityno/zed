@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
@@ -35,37 +37,117 @@ pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T
         .context("DirectXRenderer failed to recover from lost device after multiple attempts")
 }
 
-/// How many device recoveries in a row may fail before a window, or the
-/// platform, stops asking for new devices and leaves its draws skipped.
-pub(crate) const MAX_FAILED_RECOVERIES: u32 = 5;
+/// How many device recoveries in a row are tried straight after one another
+/// before the next ones wait for [`SLOW_RECOVERY_INTERVAL`].
+pub(crate) const FAST_RECOVERY_ATTEMPTS: u32 = 5;
 
-/// Counts the device recoveries that failed since the last one that worked.
+/// How long a recovery that keeps failing waits before it is tried again.
+/// Each attempt spends most of a second waiting on the driver, so a driver
+/// that takes longer than the fast attempts to come back (an update, a long
+/// TDR) would otherwise outlast them, and every window would stay blank
+/// until the app restarts although the driver was fine seconds later.
+pub(crate) const SLOW_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What a window's message handler answers `WM_GPUI_GPU_DEVICE_LOST` with
+/// when its renderer could not be rebuilt on the new devices, so that the
+/// recovery that sent them counts as failed and is tried again.
+pub(crate) const DEVICE_REBUILD_FAILED: isize = 1;
+
+/// The device recoveries that failed since the last one that worked.
 ///
-/// A driver still resetting can lose the devices it just handed out, so one
-/// failed rebuild is worth another set of devices; one that never comes back
-/// must not spin the clock thread forever, nor take the app down with it.
+/// A driver still resetting can lose the devices it just handed out, so a
+/// failed recovery is tried again at once a few times. One that keeps
+/// failing is tried every [`SLOW_RECOVERY_INTERVAL`] from then on, for as
+/// long as it takes: the clock thread neither spins on a driver that is not
+/// back yet nor gives up on one that comes back.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(crate) struct RecoveryAttempts {
-    failed: u32,
+pub(crate) enum RecoveryAttempts {
+    /// Nothing failed since the last recovery that worked (or ever).
+    #[default]
+    Settled,
+    /// `failed` recoveries in a row failed; the next is tried at once.
+    Retrying { failed: u32 },
+    /// The fast attempts are used up; the next is tried at `next_attempt`.
+    BackingOff { failed: u32, next_attempt: Instant },
+}
+
+/// What a failed recovery leads to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailedRecovery {
+    /// Within the fast attempts: the next is tried at once.
+    RetryNow { failed: u32 },
+    /// The fast attempts just ran out; the next waits until `next_attempt`.
+    BackoffStarted { next_attempt: Instant },
+    /// Failed again while backing off; the next waits until `next_attempt`.
+    BackingOff { failed: u32, next_attempt: Instant },
 }
 
 impl RecoveryAttempts {
-    pub(crate) fn recovered(&mut self) {
-        self.failed = 0;
+    /// Counts a failed recovery at `now` and says when the next is tried.
+    pub(crate) fn failed(&mut self, now: Instant) -> FailedRecovery {
+        let failed = self.failures().saturating_add(1);
+        if failed < FAST_RECOVERY_ATTEMPTS {
+            *self = Self::Retrying { failed };
+            return FailedRecovery::RetryNow { failed };
+        }
+        let next_attempt = now + SLOW_RECOVERY_INTERVAL;
+        let started = !matches!(self, Self::BackingOff { .. });
+        *self = Self::BackingOff {
+            failed,
+            next_attempt,
+        };
+        if started {
+            FailedRecovery::BackoffStarted { next_attempt }
+        } else {
+            FailedRecovery::BackingOff {
+                failed,
+                next_attempt,
+            }
+        }
     }
 
-    /// Counts a failed recovery and says whether another may be tried.
-    pub(crate) fn failed(&mut self) -> bool {
-        self.failed = self.failed.saturating_add(1);
-        self.failed < MAX_FAILED_RECOVERIES
+    /// Settles after a recovery that worked, returning how many failed
+    /// before it, if any did.
+    pub(crate) fn recovered(&mut self) -> Option<u32> {
+        let failed = self.failures();
+        *self = Self::Settled;
+        (failed > 0).then_some(failed)
     }
 
-    pub(crate) fn exhausted(&self) -> bool {
-        self.failed >= MAX_FAILED_RECOVERIES
+    /// Whether a recovery is due at `now`. `needed` says whether one is
+    /// (a lost device, a window asking for new devices) and is consulted only
+    /// while nothing has failed: while backing off, a window that fails to
+    /// resize on the lost devices asks at every resize, and the attempt
+    /// already scheduled answers it.
+    pub(crate) fn due(&self, now: Instant, needed: impl FnOnce() -> bool) -> bool {
+        match *self {
+            Self::Settled => needed(),
+            Self::Retrying { .. } => true,
+            Self::BackingOff { next_attempt, .. } => next_attempt <= now,
+        }
+    }
+
+    /// When the next recovery is tried, while backing off.
+    pub(crate) fn backoff_until(&self) -> Option<Instant> {
+        match *self {
+            Self::BackingOff { next_attempt, .. } => Some(next_attempt),
+            Self::Settled | Self::Retrying { .. } => None,
+        }
+    }
+
+    /// Brings a recovery that is backing off forward to `now`: the displays
+    /// changing is a sign the driver may be back.
+    pub(crate) fn expedite(&mut self, now: Instant) {
+        if let Self::BackingOff { next_attempt, .. } = self {
+            *next_attempt = (*next_attempt).min(now);
+        }
     }
 
     pub(crate) fn failures(&self) -> u32 {
-        self.failed
+        match *self {
+            Self::Settled => 0,
+            Self::Retrying { failed } | Self::BackingOff { failed, .. } => failed,
+        }
     }
 }
 
@@ -229,28 +311,97 @@ fn get_device(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_FAILED_RECOVERIES, RecoveryAttempts};
+    use super::{FAST_RECOVERY_ATTEMPTS, FailedRecovery, RecoveryAttempts, SLOW_RECOVERY_INTERVAL};
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn recovery_gives_up_after_its_failed_attempts() {
+    fn backing_off(start: Instant) -> RecoveryAttempts {
         let mut attempts = RecoveryAttempts::default();
-        for _ in 1..MAX_FAILED_RECOVERIES {
-            assert!(attempts.failed());
-            assert!(!attempts.exhausted());
+        for _ in 0..FAST_RECOVERY_ATTEMPTS {
+            attempts.failed(start);
         }
-        assert!(!attempts.failed());
-        assert!(attempts.exhausted());
-        assert_eq!(attempts.failures(), MAX_FAILED_RECOVERIES);
+        attempts
     }
 
     #[test]
-    fn a_recovery_that_works_resets_the_attempts() {
+    fn recovery_retries_at_once_then_backs_off() {
+        let start = Instant::now();
         let mut attempts = RecoveryAttempts::default();
-        for _ in 1..MAX_FAILED_RECOVERIES {
-            attempts.failed();
+        assert!(!attempts.due(start, || false));
+        assert!(attempts.due(start, || true));
+        for failed in 1..FAST_RECOVERY_ATTEMPTS {
+            assert_eq!(attempts.failed(start), FailedRecovery::RetryNow { failed });
+            assert!(attempts.due(start, || false));
+            assert_eq!(attempts.backoff_until(), None);
         }
-        attempts.recovered();
-        assert!(attempts.failed());
-        assert_eq!(attempts.failures(), 1);
+        let next_attempt = start + SLOW_RECOVERY_INTERVAL;
+        assert_eq!(attempts.failed(start), FailedRecovery::BackoffStarted { next_attempt });
+        assert_eq!(attempts.backoff_until(), Some(next_attempt));
+        assert_eq!(attempts.failures(), FAST_RECOVERY_ATTEMPTS);
+    }
+
+    #[test]
+    fn recovery_backing_off_waits_for_its_interval_whatever_asks() {
+        let start = Instant::now();
+        let attempts = backing_off(start);
+        assert!(!attempts.due(start, || true));
+        let just_before = start + SLOW_RECOVERY_INTERVAL - Duration::from_millis(1);
+        assert!(!attempts.due(just_before, || true));
+        assert!(attempts.due(start + SLOW_RECOVERY_INTERVAL, || false));
+    }
+
+    #[test]
+    fn recovery_backing_off_never_gives_up() {
+        let start = Instant::now();
+        let mut attempts = backing_off(start);
+        let mut now = start;
+        for round in 1..=1000 {
+            now += SLOW_RECOVERY_INTERVAL;
+            assert!(attempts.due(now, || false));
+            let next_attempt = now + SLOW_RECOVERY_INTERVAL;
+            assert_eq!(
+                attempts.failed(now),
+                FailedRecovery::BackingOff {
+                    failed: FAST_RECOVERY_ATTEMPTS + round,
+                    next_attempt,
+                }
+            );
+            assert_eq!(attempts.backoff_until(), Some(next_attempt));
+        }
+    }
+
+    #[test]
+    fn recovery_that_works_resets_the_attempts() {
+        let start = Instant::now();
+        let mut attempts = RecoveryAttempts::default();
+        assert_eq!(attempts.recovered(), None);
+        attempts.failed(start);
+        attempts.failed(start);
+        assert_eq!(attempts.recovered(), Some(2));
+        assert_eq!(attempts, RecoveryAttempts::Settled);
+
+        let mut attempts = backing_off(start);
+        assert_eq!(attempts.recovered(), Some(FAST_RECOVERY_ATTEMPTS));
+        assert!(!attempts.due(start, || false));
+        assert_eq!(attempts.backoff_until(), None);
+        assert_eq!(attempts.failed(start), FailedRecovery::RetryNow { failed: 1 });
+    }
+
+    #[test]
+    fn recovery_expedited_only_while_backing_off() {
+        let start = Instant::now();
+        let mut attempts = backing_off(start);
+        let changed_at = start + Duration::from_secs(1);
+        attempts.expedite(changed_at);
+        assert_eq!(attempts.backoff_until(), Some(changed_at));
+        assert!(attempts.due(changed_at, || false));
+        attempts.expedite(start + Duration::from_secs(60));
+        assert_eq!(attempts.backoff_until(), Some(changed_at));
+
+        let mut attempts = RecoveryAttempts::default();
+        attempts.expedite(start);
+        assert_eq!(attempts, RecoveryAttempts::Settled);
+        attempts.failed(start);
+        attempts.expedite(start);
+        assert_eq!(attempts, RecoveryAttempts::Retrying { failed: 1 });
     }
 }

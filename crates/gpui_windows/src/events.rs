@@ -1578,32 +1578,32 @@ impl WindowsWindowInner {
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
         let mut attempts = self.state.device_recovery.get();
-        // Tried even once the window has stopped asking for devices: these
-        // may come from a later recovery that the driver has finished.
         let result = self.state.renderer.borrow_mut().handle_device_lost(devices);
         if let Err(error) = result {
             // The renderer is left without devices, so its draws stay skipped
-            // whatever happens next.
-            let retry = attempts.failed();
+            // until the compositor clock, told by the answer, recovers the
+            // devices again and offers them to every window.
+            let failure = attempts.failed(std::time::Instant::now());
             self.state.device_recovery.set(attempts);
-            if retry {
-                log::error!(
-                    "Failed to recover renderer from lost device (attempt {} of \
-                     {MAX_FAILED_RECOVERIES}), asking for new devices: {error:#}",
-                    attempts.failures(),
-                );
-                self.state.invalidate_devices.store(true, Ordering::Release);
-                self.state.frame_request.wake_device_owner();
-            } else if attempts.failures() == MAX_FAILED_RECOVERIES {
-                log::error!(
-                    "Failed to recover renderer from lost device after \
-                     {MAX_FAILED_RECOVERIES} attempts; the window draws nothing until the \
-                     devices are recreated again: {error:#}"
-                );
+            match failure {
+                FailedRecovery::RetryNow { failed } => log::error!(
+                    "Failed to recover renderer from lost device (attempt {failed} of \
+                     {FAST_RECOVERY_ATTEMPTS}), asking for new devices: {error:#}"
+                ),
+                FailedRecovery::BackoffStarted { .. } => log::error!(
+                    "Failed to recover renderer from lost device {FAST_RECOVERY_ATTEMPTS} \
+                     times; the window draws nothing until new devices work, asked for \
+                     every {SLOW_RECOVERY_INTERVAL:?}: {error:#}"
+                ),
+                FailedRecovery::BackingOff { failed, .. } => log::debug!(
+                    "Failed to recover renderer from lost device (attempt {failed}): {error:#}"
+                ),
             }
-            return Some(0);
+            return Some(DEVICE_REBUILD_FAILED);
         }
-        attempts.recovered();
+        if let Some(failed) = attempts.recovered() {
+            log::info!("Recovered renderer from lost device after {failed} failed attempts");
+        }
         self.state.device_recovery.set(attempts);
         #[cfg(test)]
         crate::native_tests::recovered();

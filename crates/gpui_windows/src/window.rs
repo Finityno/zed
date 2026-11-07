@@ -100,6 +100,8 @@ pub struct WindowsWindowState {
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
     /// The renderer's failed rebuilds on new devices since it last recovered.
+    /// It only sets how loudly a failure is logged: the compositor clock
+    /// decides when new devices come.
     pub(crate) device_recovery: Cell<RecoveryAttempts>,
     /// When a resize that failed again may next be retried; `None` retries
     /// it on the next frame.
