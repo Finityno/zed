@@ -920,10 +920,8 @@ impl App {
     pub(crate) fn replay_dependencies(&mut self, dependencies: &RenderDependencies) {
         self.entities.mark_access_boundary();
         let recording = self.entities.access_log.recording();
-        {
-            let accessed = self.entities.accessed_entities.get_mut();
-            accessed.extend(dependencies.entities.iter().map(|(entity, _)| *entity));
-        }
+        self.entities
+            .extend_accessed(dependencies.entities.iter().map(|(entity, _)| *entity));
         if recording {
             let floor = dependencies.floor;
             let start = Stretch {

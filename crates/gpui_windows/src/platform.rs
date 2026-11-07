@@ -565,7 +565,6 @@ struct DeviceRecovery {
     platform_window: SafeHwnd,
     validation_number: usize,
     ui_thread: u32,
-    text_system: std::sync::Weak<DirectWriteTextSystem>,
     /// Set when a resize failed and the devices must be recreated.
     invalidate: Arc<AtomicBool>,
     /// The recoveries that failed since the last one that worked.
@@ -674,7 +673,6 @@ impl ClockSource {
             recovery.validation_number,
             recovery.ui_thread,
             all_windows,
-            &recovery.text_system,
         );
         let Err(error) = result else {
             recovery.attempts.recovered();

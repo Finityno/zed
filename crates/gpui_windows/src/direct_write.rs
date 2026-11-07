@@ -2375,7 +2375,7 @@ mod glyph_pipeline_tests {
             eprintln!("SKIPPED: no D3D11 adapter available");
             return None;
         };
-        let Some(system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
+        let Some(system) = DirectWriteTextSystem::new().log_err() else {
             eprintln!("SKIPPED: could not create the DirectWrite text system");
             return None;
         };

@@ -3857,8 +3857,8 @@ mod rendered_pixel_tests {
     /// `SubpixelSprite`s, and are drawn by a different shader under a dual-source blend state.
     /// Windows always takes that path in production and macOS can never take it.
     fn sweep_origins(subpixel: bool) -> Option<Vec<String>> {
-        let devices = DirectXDevices::new().log_err()?;
-        let text_system = DirectWriteTextSystem::new(Some(&devices)).log_err()?;
+        DirectXDevices::new().log_err()?;
+        let text_system = DirectWriteTextSystem::new().log_err()?;
         DirectXHeadlessRenderer::new()?;
 
         gpui::TestWindow::set_subpixel_rendering_supported(subpixel);
@@ -4011,11 +4011,11 @@ mod rendered_pixel_tests {
     /// the overlay plane darker and less see-through than on the base plane.
     #[test]
     fn translucent_quads_over_a_transparent_target_composite_as_over() {
-        let Some(devices) = DirectXDevices::new().log_err() else {
+        if DirectXDevices::new().log_err().is_none() {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
-        };
-        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
+        }
+        let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -4101,11 +4101,11 @@ mod rendered_pixel_tests {
     /// the window-space position, or it restarts at every tile seam.
     #[test]
     fn path_gradient_fills_are_continuous_across_raster_tiles() {
-        let Some(devices) = DirectXDevices::new().log_err() else {
+        if DirectXDevices::new().log_err().is_none() {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
-        };
-        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
+        }
+        let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -4214,11 +4214,11 @@ mod rendered_pixel_tests {
     /// inside, emptiness outside, and no seam artifacts along tile boundaries.
     #[test]
     fn paths_render_seamlessly_across_raster_tiles() {
-        let Some(devices) = DirectXDevices::new().log_err() else {
+        if DirectXDevices::new().log_err().is_none() {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
-        };
-        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
+        }
+        let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };
@@ -4366,11 +4366,11 @@ mod rendered_pixel_tests {
     /// where that square was, and the spot must render dark.
     #[test]
     fn stale_path_ink_does_not_ghost_through_spanning_rect() {
-        let Some(devices) = DirectXDevices::new().log_err() else {
+        if DirectXDevices::new().log_err().is_none() {
             eprintln!("SKIPPED: no D3D11 adapter");
             return;
-        };
-        let Some(text_system) = DirectWriteTextSystem::new(Some(&devices)).log_err() else {
+        }
+        let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
             return;
         };

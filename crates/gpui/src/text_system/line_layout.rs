@@ -617,11 +617,6 @@ impl LineLayoutIndex {
             lines_index: self.lines_index - from.lines_index + to.lines_index,
             wrapped_lines_index: self.wrapped_lines_index - from.wrapped_lines_index
                 + to.wrapped_lines_index,
-            lines_by_hash_index: self.lines_by_hash_index - from.lines_by_hash_index
-                + to.lines_by_hash_index,
-            wrapped_lines_by_hash_index: self.wrapped_lines_by_hash_index
-                - from.wrapped_lines_by_hash_index
-                + to.wrapped_lines_by_hash_index,
         }
     }
 }
@@ -837,7 +832,8 @@ impl LineLayoutCache {
         lines: impl IntoIterator<Item = (&'a Arc<CacheKey>, &'a Arc<WrappedLineLayout>, usize)>,
     ) {
         let font_generation = self.clear_if_font_generation_changed();
-        let mut current_frame = self.current_frame.write();
+        let mut state = self.state.borrow_mut();
+        let current_frame = &mut state.current_frame;
         for (key, layout, shaped_in) in lines {
             if shaped_in == font_generation && !current_frame.wrapped_lines.contains_key(key) {
                 current_frame
