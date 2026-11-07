@@ -201,13 +201,16 @@ impl FrameWake {
                 handles = [self.event, self.timer, watch.event];
                 &handles
             }
-            DeviceLoss::Polled | DeviceLoss::NotOwned => {
+            DeviceLoss::Polled | DeviceLoss::RetryAt(_) | DeviceLoss::NotOwned => {
                 handles = [self.event, self.timer, self.timer];
                 &handles[..2]
             }
         };
         let timeout = match device_loss {
             DeviceLoss::Polled => DEVICE_POLL_INTERVAL.as_millis() as u32,
+            DeviceLoss::RetryAt(next_attempt) => {
+                wait_millis(next_attempt.saturating_duration_since(Instant::now()))
+            }
             DeviceLoss::Watched(_) | DeviceLoss::NotOwned => INFINITE,
         };
         let mut result = unsafe { WaitForMultipleObjects(handles, false, 0) };
@@ -244,8 +247,18 @@ pub(crate) enum DeviceLoss<'a> {
     Watched(&'a DeviceRemovedWatch),
     /// Windows cannot notify; the clock wakes periodically to check.
     Polled,
+    /// The devices are lost and recovering them keeps failing: the clock
+    /// wakes at this time to try again.
+    RetryAt(Instant),
     /// Another clock recovers the devices: this one sleeps until woken.
     NotOwned,
+}
+
+/// A wait's timeout for `remaining`, rounded up so that the clock does not
+/// wake just before a recovery falls due and park again for a moment.
+fn wait_millis(remaining: Duration) -> u32 {
+    let millis = remaining.as_micros().div_ceil(1000);
+    u32::try_from(millis).unwrap_or(u32::MAX).min(INFINITE - 1)
 }
 
 /// Every clock thread's wake, and which clock ticks which monitor: what a
@@ -714,7 +727,9 @@ pub fn vsync_thread_id() -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceLoss, FrameClocks, FrameDemand, FrameRequest, FrameWake, WakeReason};
+    use super::{
+        DeviceLoss, FrameClocks, FrameDemand, FrameRequest, FrameWake, WakeReason, wait_millis,
+    };
     use std::{
         sync::{
             Arc,
@@ -993,6 +1008,39 @@ mod tests {
         assert!(!is_signalled(&wake));
         assert_eq!(wake.wait(DeviceLoss::NotOwned), WakeReason::DeadlinePassed);
         assert!(Instant::now() >= soon);
+    }
+
+    #[test]
+    fn a_clock_backing_off_wakes_for_its_next_recovery() {
+        let clocks = FrameClocks::new().unwrap();
+        let wake = clocks.compositor().clone();
+        wake.arm(None);
+        let next_attempt = Instant::now() + Duration::from_millis(30);
+        assert_eq!(wake.wait(DeviceLoss::RetryAt(next_attempt)), WakeReason::TimedOut);
+        let woke_at = Instant::now();
+        // A wait's timeout counts in timer ticks, and can end up to one early.
+        assert!(woke_at + Duration::from_millis(16) >= next_attempt);
+        assert!(woke_at.saturating_duration_since(next_attempt) < Duration::from_millis(200));
+
+        assert_eq!(
+            wake.wait(DeviceLoss::RetryAt(next_attempt)),
+            WakeReason::TimedOut,
+            "an attempt already due returns at once"
+        );
+
+        // A display change wakes it before then.
+        wake.wake();
+        let much_later = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(wake.wait(DeviceLoss::RetryAt(much_later)), WakeReason::Requested);
+    }
+
+    #[test]
+    fn a_clock_backing_off_waits_whole_milliseconds() {
+        assert_eq!(wait_millis(Duration::ZERO), 0);
+        assert_eq!(wait_millis(Duration::from_micros(1)), 1);
+        assert_eq!(wait_millis(Duration::from_millis(5)), 5);
+        assert_eq!(wait_millis(Duration::from_micros(5001)), 6);
+        assert!(wait_millis(Duration::MAX) < u32::MAX);
     }
 
     #[test]

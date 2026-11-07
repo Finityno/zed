@@ -100,6 +100,8 @@ pub struct WindowsWindowState {
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
     /// The renderer's failed rebuilds on new devices since it last recovered.
+    /// It only sets how loudly a failure is logged: the compositor clock
+    /// decides when new devices come.
     pub(crate) device_recovery: Cell<RecoveryAttempts>,
     /// When a resize that failed again may next be retried; `None` retries
     /// it on the next frame.
@@ -126,6 +128,7 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+    pub mouse_position: Cell<Point<Pixels>>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -237,6 +240,7 @@ impl WindowsWindowState {
             draw_coordinator,
             direct_manipulation,
             a11y: RefCell::new(None),
+            mouse_position: Cell::new(Point::default()),
         })
     }
 
@@ -1265,7 +1269,7 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state
             .renderer

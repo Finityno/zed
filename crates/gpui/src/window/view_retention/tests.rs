@@ -1587,7 +1587,7 @@ fn draw_pair(cx: &mut TestAppContext, windows: [WindowHandle<Mover>; 2]) -> [Vec
 fn a_view_drawn_again_moves_with_the_transition_it_is_drawn_in() {
     let mut cx = TestAppContext::single();
     let windows = mover_windows(&mut cx);
-    let mut change = |cx: &mut TestAppContext, transition: Option<Duration>| {
+    let change = |cx: &mut TestAppContext, transition: Option<Duration>| {
         for window in windows {
             window
                 .update(cx, |mover, _, cx| {

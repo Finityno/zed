@@ -3965,7 +3965,7 @@ mod tests {
         };
         let build = |fast: bool| {
             let mut scene = Scene::default();
-            let mut insert = |scene: &mut Scene, sprite: MonochromeSprite| {
+            let insert = |scene: &mut Scene, sprite: MonochromeSprite| {
                 if fast {
                     scene.insert_monochrome_sprite(sprite);
                     scene.insert_subpixel_sprite(subpixel(sprite));
@@ -4796,7 +4796,7 @@ impl TransformationMatrix {
     }
 
     /// Move the origin by a given point
-    pub fn translate(mut self, point: Point<ScaledPixels>) -> Self {
+    pub fn translate(self, point: Point<ScaledPixels>) -> Self {
         self.compose(Self {
             rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
             translation: [point.x.0, point.y.0],

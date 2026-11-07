@@ -28,7 +28,7 @@ use windows::{
             Ole::*,
             Power::*,
             SystemInformation::*,
-            SystemServices::POWER_REQUEST_CONTEXT_VERSION,
+            SystemServices::{GUID_POWER_SAVING_STATUS, POWER_REQUEST_CONTEXT_VERSION},
             Threading::{
                 GetCurrentThreadId, POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT,
                 REASON_CONTEXT_0,
@@ -69,13 +69,13 @@ pub struct WindowsPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    direct_write_text_system: Option<Arc<DirectWriteTextSystem>>,
     drop_target_helper: Option<IDropTargetHelper>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     invalidate_devices: Arc<AtomicBool>,
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
+    power_saving_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
@@ -103,6 +103,24 @@ pub(crate) struct WindowsPlatformState {
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     directx_devices: RefCell<Option<DirectXDevices>>,
+    low_power_mode_enabled: Cell<bool>,
+    /// Reaches the compositor clock while it runs, to bring a device
+    /// recovery that is backing off forward when the displays change.
+    recovery_nudge: RefCell<Option<RecoveryNudge>>,
+}
+
+/// Brings the compositor clock's device recovery forward, if it is backing
+/// off, and wakes the clock to try it.
+struct RecoveryNudge {
+    display_changed: Arc<AtomicBool>,
+    compositor: Arc<FrameWake>,
+}
+
+impl RecoveryNudge {
+    fn displays_changed(&self) {
+        self.display_changed.store(true, Ordering::Release);
+        self.compositor.wake();
+    }
 }
 
 #[derive(Default)]
@@ -116,6 +134,7 @@ struct PlatformCallbacks {
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+    low_power_mode_change: Cell<Option<Box<dyn FnMut()>>>,
     displays_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -132,6 +151,8 @@ impl WindowsPlatformState {
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
+            recovery_nudge: RefCell::new(None),
+            low_power_mode_enabled: Cell::new(false),
             menus: RefCell::new(Vec::new()),
         }
     }
@@ -188,20 +209,11 @@ impl WindowsPlatform {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
         // A platform that can become windowed needs the real text system from the start: the app
-        // keeps the one it's created with. It gets DirectX devices when it becomes windowed.
-        let (text_system, direct_write_text_system) = if !headless {
-            let dw_text_system = Arc::new(
-                DirectWriteTextSystem::new(None).context("Error creating DirectWriteTextSystem")?,
-            );
-            (
-                dw_text_system.clone() as Arc<dyn PlatformTextSystem>,
-                Some(dw_text_system),
-            )
+        // keeps the one it's created with.
+        let text_system: Arc<dyn PlatformTextSystem> = if !headless {
+            Arc::new(DirectWriteTextSystem::new().context("Error creating DirectWriteTextSystem")?)
         } else {
-            (
-                Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>,
-                None,
-            )
+            Arc::new(gpui::NoopTextSystem::new())
         };
 
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
@@ -249,6 +261,14 @@ impl WindowsPlatform {
             .inner
             .take()
             .context("CreateWindowExW did not run correctly")??;
+        let mut power_status = SYSTEM_POWER_STATUS::default();
+        match unsafe { GetSystemPowerStatus(&mut power_status) } {
+            Ok(()) => inner
+                .state
+                .low_power_mode_enabled
+                .set(power_status.SystemStatusFlag == 1),
+            Err(error) => log::warn!("Failed to query Windows battery saver status: {error}"),
+        }
         let dispatcher = context
             .dispatcher
             .take()
@@ -285,8 +305,8 @@ impl WindowsPlatform {
             background_executor,
             foreground_executor,
             text_system,
-            direct_write_text_system,
             suspend_resume_notification: RefCell::new(None),
+            power_saving_notification: RefCell::new(None),
             disable_direct_composition,
             has_package_identity: has_package_identity(),
             drop_target_helper,
@@ -419,9 +439,6 @@ impl WindowsPlatform {
     /// Creates the DirectX devices that windows draw with, and starts vsync.
     fn attach_gpu(&self) -> Result<()> {
         let devices = DirectXDevices::new().context("Creating DirectX devices")?;
-        if let Some(text_system) = &self.direct_write_text_system {
-            text_system.handle_gpu_lost(&devices)?;
-        }
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
         if let Err(error) = self.begin_vsync_thread() {
             self.inner.state.directx_devices.borrow_mut().take();
@@ -438,9 +455,7 @@ impl WindowsPlatform {
         if let Some(clocks) = self.frame_clocks.borrow_mut().take() {
             clocks.stop();
         }
-        if let Some(text_system) = &self.direct_write_text_system {
-            text_system.release_gpu();
-        }
+        self.inner.state.recovery_nudge.borrow_mut().take();
         self.inner.state.directx_devices.borrow_mut().take();
     }
 
@@ -461,22 +476,24 @@ impl WindowsPlatform {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
             return Ok(());
         };
-        let Some(direct_write_text_system) = &self.direct_write_text_system else {
-            return Ok(());
-        };
         let clocks = FrameClocks::new()?;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         // One cache for every clock thread, so a window moving between
         // monitors switches clocks at once instead of falling between two
         // caches that disagree.
         let monitors: Arc<Mutex<WindowMonitors>> = Arc::default();
+        let display_changed = Arc::new(AtomicBool::new(false));
+        *self.inner.state.recovery_nudge.borrow_mut() = Some(RecoveryNudge {
+            display_changed: display_changed.clone(),
+            compositor: clocks.compositor().clone(),
+        });
         let recovery = DeviceRecovery {
             devices: directx_devices,
             platform_window: self.handle.into(),
             validation_number: self.inner.validation_number,
             ui_thread: unsafe { GetCurrentThreadId() },
-            text_system: Arc::downgrade(direct_write_text_system),
             invalidate: self.invalidate_devices.clone(),
+            display_changed,
             attempts: RecoveryAttempts::default(),
         };
 
@@ -573,11 +590,22 @@ struct DeviceRecovery {
     platform_window: SafeHwnd,
     validation_number: usize,
     ui_thread: u32,
-    text_system: std::sync::Weak<DirectWriteTextSystem>,
     /// Set when a resize failed and the devices must be recreated.
     invalidate: Arc<AtomicBool>,
+    /// Set when the displays changed, which brings a recovery that is
+    /// backing off forward: a driver that finished installing resets them.
+    display_changed: Arc<AtomicBool>,
     /// The recoveries that failed since the last one that worked.
     attempts: RecoveryAttempts,
+}
+
+impl DeviceRecovery {
+    /// Whether the clock has devices to recreate, or to check, at its next
+    /// vblank rather than parking.
+    fn pending(&self, now: std::time::Instant) -> bool {
+        self.display_changed.load(Ordering::Acquire)
+            || self.attempts.due(now, || self.invalidate.load(Ordering::Acquire))
+    }
 }
 
 /// What a clock thread waits on.
@@ -612,8 +640,13 @@ impl ClockSource {
 
     fn device_loss(&self) -> DeviceLoss<'_> {
         match self {
-            Self::Compositor { watch: Some(watch), .. } => DeviceLoss::Watched(watch),
-            Self::Compositor { watch: None, .. } => DeviceLoss::Polled,
+            Self::Compositor {
+                recovery, watch, ..
+            } => match (recovery.attempts.backoff_until(), watch) {
+                (Some(next_attempt), _) => DeviceLoss::RetryAt(next_attempt),
+                (None, Some(watch)) => DeviceLoss::Watched(watch),
+                (None, None) => DeviceLoss::Polled,
+            },
             Self::Monitor(_) => DeviceLoss::NotOwned,
         }
     }
@@ -623,7 +656,7 @@ impl ClockSource {
         match self {
             Self::Compositor { recovery, .. } => {
                 matches!(reason, WakeReason::DeviceRemoved | WakeReason::TimedOut)
-                    || recovery.invalidate.load(Ordering::Acquire)
+                    || recovery.pending(std::time::Instant::now())
             }
             Self::Monitor(_) => false,
         }
@@ -631,13 +664,11 @@ impl ClockSource {
 
     /// Whether devices must be recreated before the clock parks. A request
     /// for that made while the clock was awake (a window's renderer failing
-    /// to resize or to rebuild, which can happen inside the clock's own
-    /// recovery) is dropped with the other signals the clock clears.
+    /// to resize, which can happen inside the clock's own recovery) is
+    /// dropped with the other signals the clock clears.
     fn devices_pending(&self) -> bool {
         match self {
-            Self::Compositor { recovery, .. } => {
-                !recovery.attempts.exhausted() && recovery.invalidate.load(Ordering::Acquire)
-            }
+            Self::Compositor { recovery, .. } => recovery.pending(std::time::Instant::now()),
             Self::Monitor(_) => false,
         }
     }
@@ -665,15 +696,13 @@ impl ClockSource {
         else {
             return;
         };
-        if recovery.attempts.exhausted() {
-            // Given up: the windows keep skipping their draws, and the clock
-            // keeps ticking them, rather than recreating devices forever.
-            recovery.invalidate.store(false, Ordering::Release);
-            return;
+        let now = std::time::Instant::now();
+        if recovery.display_changed.swap(false, Ordering::AcqRel) {
+            recovery.attempts.expedite(now);
         }
-        if !check_device_lost(&recovery.devices.device)
-            && !recovery.invalidate.fetch_and(false, Ordering::Acquire)
-        {
+        let asked = recovery.invalidate.swap(false, Ordering::AcqRel);
+        let device = &recovery.devices.device;
+        if !recovery.attempts.due(now, || asked || check_device_lost(device)) {
             return;
         }
         let result = handle_gpu_device_lost(
@@ -682,27 +711,31 @@ impl ClockSource {
             recovery.validation_number,
             recovery.ui_thread,
             all_windows,
-            &recovery.text_system,
         );
-        let Err(error) = result else {
-            recovery.attempts.recovered();
-            *watch = DeviceRemovedWatch::new(&recovery.devices.device);
-            return;
+        // The devices may have been replaced before a step that failed.
+        *watch = DeviceRemovedWatch::new(&recovery.devices.device);
+        let error = match result {
+            Ok(()) => {
+                if let Some(failed) = recovery.attempts.recovered() {
+                    log::info!("Recovered from lost device after {failed} failed attempts");
+                }
+                return;
+            }
+            Err(error) => error,
         };
-        if recovery.attempts.failed() {
-            log::error!(
-                "Failed to recover from lost device (attempt {} of {MAX_FAILED_RECOVERIES}), \
-                 trying again: {error:#}",
-                recovery.attempts.failures(),
-            );
-            // The devices may have been replaced before the step that failed.
-            *watch = DeviceRemovedWatch::new(&recovery.devices.device);
-            recovery.invalidate.store(true, Ordering::Release);
-        } else {
-            log::error!(
-                "Failed to recover from lost device after {MAX_FAILED_RECOVERIES} attempts; \
-                 windows draw nothing from now on: {error:#}"
-            );
+        match recovery.attempts.failed(std::time::Instant::now()) {
+            FailedRecovery::RetryNow { failed } => log::error!(
+                "Failed to recover from lost device (attempt {failed} of \
+                 {FAST_RECOVERY_ATTEMPTS}), trying again: {error:#}"
+            ),
+            FailedRecovery::BackoffStarted { .. } => log::error!(
+                "Failed to recover from lost device {FAST_RECOVERY_ATTEMPTS} times; trying \
+                 again every {SLOW_RECOVERY_INTERVAL:?} until it works: {error:#}"
+            ),
+            FailedRecovery::BackingOff { failed, .. } => log::debug!(
+                "Failed to recover from lost device (attempt {failed}), trying again in \
+                 {SLOW_RECOVERY_INTERVAL:?}: {error:#}"
+            ),
         }
     }
 }
@@ -1416,6 +1449,33 @@ impl Platform for WindowsPlatform {
         }
     }
 
+    fn power_mode(&self) -> PowerMode {
+        if self.inner.state.low_power_mode_enabled.get() {
+            PowerMode::LowPower
+        } else {
+            PowerMode::HighPower
+        }
+    }
+
+    fn on_power_mode_change(&self, callback: Box<dyn FnMut()>) {
+        self.inner
+            .state
+            .callbacks
+            .low_power_mode_change
+            .set(Some(callback));
+        let mut notification = self.power_saving_notification.borrow_mut();
+        if notification.is_none() {
+            *notification = unsafe {
+                RegisterPowerSettingNotification(
+                    HANDLE(self.handle.0),
+                    &GUID_POWER_SAVING_STATUS,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                )
+                .log_err()
+            };
+        }
+    }
+
     fn set_app_identity(&self, identifier: &str, name: &str) {
         // If the process has package identity, it's automatally granted an AUMID by the system.
         if self.has_package_identity {
@@ -1737,7 +1797,7 @@ impl WindowsPlatformInner {
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
             | WM_GPUI_DISPLAYS_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
-            WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
+            WM_POWERBROADCAST => self.handle_power_broadcast(wparam, lparam),
             WM_DISPLAYCHANGE => self.handle_display_change(handle),
             WM_QUERYENDSESSION => Some(1),
             WM_ENDSESSION if wparam.0 != 0 => self.handle_end_session(),
@@ -1785,6 +1845,9 @@ impl WindowsPlatformInner {
     }
 
     fn handle_displays_changed(&self) -> Option<isize> {
+        if let Some(nudge) = &*self.state.recovery_nudge.borrow() {
+            nudge.displays_changed();
+        }
         self.with_callback(
             |callbacks| &callbacks.displays_changed,
             |callback| callback(),
@@ -1933,13 +1996,23 @@ impl WindowsPlatformInner {
         Some(0)
     }
 
-    fn handle_power_broadcast(&self, wparam: WPARAM) -> Option<isize> {
+    fn handle_power_broadcast(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         match wparam.0 as u32 {
             PBT_APMSUSPEND => {
                 self.with_callback(|callbacks| &callbacks.system_sleep, |callback| callback());
             }
             PBT_APMRESUMEAUTOMATIC => {
                 self.with_callback(|callbacks| &callbacks.system_wake, |callback| callback());
+            }
+            PBT_POWERSETTINGCHANGE => {
+                if let Some(enabled) = unsafe { power_saving_status(lparam) } {
+                    if self.state.low_power_mode_enabled.replace(enabled) != enabled {
+                        self.with_callback(
+                            |callbacks| &callbacks.low_power_mode_change,
+                            |callback| callback(),
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -1959,6 +2032,23 @@ impl WindowsPlatformInner {
     }
 }
 
+unsafe fn power_saving_status(lparam: LPARAM) -> Option<bool> {
+    let setting = unsafe { (lparam.0 as *const POWERBROADCAST_SETTING).as_ref()? };
+    if setting.PowerSetting != GUID_POWER_SAVING_STATUS || setting.DataLength != 4 {
+        return None;
+    }
+    let data = unsafe {
+        std::ptr::addr_of!(setting.Data)
+            .cast::<u32>()
+            .read_unaligned()
+    };
+    match data {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         // Not joined: a clock can be sending this thread a message. Each
@@ -1971,6 +2061,9 @@ impl Drop for WindowsPlatform {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
                 UnregisterSuspendResumeNotification(notification).log_err();
+            }
+            if let Some(notification) = self.power_saving_notification.borrow_mut().take() {
+                UnregisterPowerSettingNotification(notification).log_err();
             }
             DestroyWindow(self.handle)
                 .context("Destroying platform window")
@@ -2284,7 +2377,8 @@ fn snapshot_windows(
         .collect()
 }
 
-/// Synchronously sends `message` to each window of `windows` that is still open.
+/// Synchronously sends `message` to each window of `windows` that is still
+/// open, returning how many answered [`DEVICE_REBUILD_FAILED`].
 ///
 /// Must be called with the window list unlocked. `SendMessageW` blocks until
 /// the UI thread handles the message, and the UI thread takes the list for
@@ -2299,7 +2393,8 @@ fn send_to_windows(
     message: u32,
     validation_number: usize,
     lparam: Option<LPARAM>,
-) {
+) -> usize {
+    let mut failed = 0;
     for (hwnd, frame_request) in windows {
         if frame_request.is_closed()
             || unsafe { GetWindowThreadProcessId(hwnd.as_raw(), None) } != ui_thread
@@ -2308,15 +2403,19 @@ fn send_to_windows(
         }
         #[cfg(test)]
         crate::native_tests::recovery_sending();
-        unsafe {
+        let result = unsafe {
             SendMessageW(
                 hwnd.as_raw(),
                 message,
                 Some(WPARAM(validation_number)),
                 lparam,
-            );
+            )
+        };
+        if result.0 == DEVICE_REBUILD_FAILED {
+            failed += 1;
         }
     }
+    failed
 }
 
 fn handle_gpu_device_lost(
@@ -2325,7 +2424,6 @@ fn handle_gpu_device_lost(
     validation_number: usize,
     ui_thread: u32,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
-    text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
     #[cfg(test)]
     crate::native_tests::recovery_started();
@@ -2348,16 +2446,13 @@ fn handle_gpu_device_lost(
         );
     }
 
-    if let Some(text_system) = text_system.upgrade() {
-        text_system.handle_gpu_lost(&directx_devices)?;
-    }
     // Taken after the platform window has the new devices: a window opened
     // from here on is created with them, so missing it here is harmless.
     let Some(windows) = all_windows.upgrade().map(|all_windows| snapshot_windows(&all_windows))
     else {
         return Ok(());
     };
-    send_to_windows(
+    let failed = send_to_windows(
         &windows,
         ui_thread,
         WM_GPUI_GPU_DEVICE_LOST,
@@ -2374,6 +2469,14 @@ fn handle_gpu_device_lost(
     );
     #[cfg(test)]
     crate::native_tests::recovery_finished();
+    // Recovered again, the devices are offered to every window, so one whose
+    // renderer failed to rebuild is retried with the others.
+    if failed > 0 {
+        return Err(anyhow!(
+            "{failed} of {} windows failed to rebuild their renderers on the new devices",
+            windows.len()
+        ));
+    }
     Ok(())
 }
 

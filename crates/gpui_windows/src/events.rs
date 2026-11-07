@@ -547,10 +547,10 @@ impl WindowsWindowInner {
         self.start_tracking_mouse(handle, TME_LEAVE);
         self.restore_cursor_after_hide();
 
-        let Some(mut func) = self.state.callbacks.input.take() else {
-            return Some(1);
-        };
+        let x = lparam.signed_loword() as f32;
+        let y = lparam.signed_hiword() as f32;
         let scale_factor = self.state.scale_factor.get();
+        let new_position = logical_point(x, y, scale_factor);
 
         let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
             flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
@@ -564,16 +564,27 @@ impl WindowsWindowInner {
             }
             _ => None,
         };
-        let x = lparam.signed_loword() as f32;
-        let y = lparam.signed_hiword() as f32;
+
+        // Suppress synthetic WM_MOUSEMOVE events that Windows fires when a window
+        // repaints under the cursor (e.g. command palette opening). These are not
+        // real mouse movements and should not move the editor cursor or clobber
+        // selections. A real move always has a different position OR a button held.
+        if pressed_button.is_none() && new_position == self.state.mouse_position.get() {
+            return Some(1);
+        }
+        self.state.mouse_position.set(new_position);
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+
         let input = PlatformInput::MouseMove(MouseMoveEvent {
-            position: logical_point(x, y, scale_factor),
+            position: new_position,
             pressed_button,
             modifiers: current_modifiers(),
         });
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
-
         if handled { Some(0) } else { Some(1) }
     }
 
@@ -1578,32 +1589,32 @@ impl WindowsWindowInner {
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
         let mut attempts = self.state.device_recovery.get();
-        // Tried even once the window has stopped asking for devices: these
-        // may come from a later recovery that the driver has finished.
         let result = self.state.renderer.borrow_mut().handle_device_lost(devices);
         if let Err(error) = result {
             // The renderer is left without devices, so its draws stay skipped
-            // whatever happens next.
-            let retry = attempts.failed();
+            // until the compositor clock, told by the answer, recovers the
+            // devices again and offers them to every window.
+            let failure = attempts.failed(std::time::Instant::now());
             self.state.device_recovery.set(attempts);
-            if retry {
-                log::error!(
-                    "Failed to recover renderer from lost device (attempt {} of \
-                     {MAX_FAILED_RECOVERIES}), asking for new devices: {error:#}",
-                    attempts.failures(),
-                );
-                self.state.invalidate_devices.store(true, Ordering::Release);
-                self.state.frame_request.wake_device_owner();
-            } else if attempts.failures() == MAX_FAILED_RECOVERIES {
-                log::error!(
-                    "Failed to recover renderer from lost device after \
-                     {MAX_FAILED_RECOVERIES} attempts; the window draws nothing until the \
-                     devices are recreated again: {error:#}"
-                );
+            match failure {
+                FailedRecovery::RetryNow { failed } => log::error!(
+                    "Failed to recover renderer from lost device (attempt {failed} of \
+                     {FAST_RECOVERY_ATTEMPTS}), asking for new devices: {error:#}"
+                ),
+                FailedRecovery::BackoffStarted { .. } => log::error!(
+                    "Failed to recover renderer from lost device {FAST_RECOVERY_ATTEMPTS} \
+                     times; the window draws nothing until new devices work, asked for \
+                     every {SLOW_RECOVERY_INTERVAL:?}: {error:#}"
+                ),
+                FailedRecovery::BackingOff { failed, .. } => log::debug!(
+                    "Failed to recover renderer from lost device (attempt {failed}): {error:#}"
+                ),
             }
-            return Some(0);
+            return Some(DEVICE_REBUILD_FAILED);
         }
-        attempts.recovered();
+        if let Some(failed) = attempts.recovered() {
+            log::info!("Recovered renderer from lost device after {failed} failed attempts");
+        }
         self.state.device_recovery.set(attempts);
         #[cfg(test)]
         crate::native_tests::recovered();
