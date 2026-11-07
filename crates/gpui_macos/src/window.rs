@@ -856,10 +856,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
-    /// The window's `CAMetalDisplayLink`, on macOS 14 and later when
-    /// [`crate::metal_display_link_enabled`]; `None` otherwise. It paces the
-    /// window while it is visible; a window that renders while hidden falls
-    /// back to `frame_source` then.
+    /// The window's `CAMetalDisplayLink`, on macOS 14 and later unless turned
+    /// off ([`crate::metal_display_link_enabled`]); `None` otherwise. It paces
+    /// the window while it is visible; a window that renders while hidden
+    /// falls back to `frame_source` then.
     metal_frames: Option<Rc<MetalFrames>>,
     /// Whether GPUI wants a frame request on the next display refresh. The
     /// display link only wakes this window while it is set, so an idle
@@ -4618,6 +4618,7 @@ fn metal_frame(
         update.targetTimestamp(),
         objc2_core_video::CVGetHostClockFrequency(),
     )
+    .map(|target| crate::metal_frame_deadline(objc2_core_video::CVGetCurrentHostTime(), target))
     .filter(|_| {
         lock.interactive_until
             .is_some_and(|until| Instant::now() < until)
