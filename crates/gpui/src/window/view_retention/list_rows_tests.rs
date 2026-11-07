@@ -419,6 +419,29 @@ fn a_row_drawn_again_for_a_while_is_built_again_on_its_nodes() {
     );
 }
 
+/// With row replay on the wheel scrolls by whole device pixels, carrying
+/// what it leaves over into the next events. A list painted again where it
+/// was, because the view drawing it was built for something else, still
+/// takes that carry up: a slow wheel keeps moving it.
+#[test]
+fn a_slow_wheel_moves_a_list_painted_again_between_its_events() {
+    let mut cx = super::super::layout_retention_tests::text_system_context_with_ink_in_font_bounds(0);
+    let fixture = fixture(&mut cx, false);
+    fixture.move_mouse(&mut cx, point(px(500.), px(500.)));
+    fixture.draw_matching(&mut cx, "first frame");
+    fixture.draw_matching(&mut cx, "second frame");
+    for step in 0..10 {
+        fixture.wheel(&mut cx, -0.3);
+        fixture.update_hosts(&mut cx, |_, cx| cx.notify());
+        fixture.draw_matching(&mut cx, &format!("slow wheel {step}"));
+    }
+    let scrolled = fixture.list_states[0].scroll_px_offset_for_scrollbar().y;
+    assert!(
+        scrolled <= px(-2.),
+        "ten events of 0.3 px scrolled the list by {scrolled:?}"
+    );
+}
+
 /// A view drawn in a row that is notified is built with its row; the other
 /// rows are drawn again.
 #[test]
