@@ -3,8 +3,8 @@ use super::{
     ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, ReadOnlyConfigOptions,
     UnsupportedVersion, apply_v2_session_notification, close_undelivered_session,
     drain_foreground_queue, enqueue_notification, first_class_terminal_auth_task,
-    is_disconnect_error, map_acp_error, mcp_configurations_for_project, runtime, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    is_disconnect_error, is_resource_not_found, map_acp_error, mcp_configurations_for_project,
+    runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -13,9 +13,10 @@ use acp_thread::{
 };
 use action_log::ActionLog;
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, InitializeOutcome, JsonRpcRequest, JsonRpcResponse, Lines,
-    PreparedRequest, RequestCancellationHandle, V2ConnectionTo,
-    schema::{ProtocolVersion, v2 as acp},
+    Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, Lines, RequestCancellationHandle,
+    schema::ProtocolVersion,
+    v2::schema as acp,
+    v2::{ConnectionTo as V2ConnectionTo, InitializeOutcome, PreparedRequest},
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
@@ -39,6 +40,8 @@ fn is_connection_closed(connection: &V2ConnectionTo<Agent>) -> bool {
     connection.is_incoming_closed() || connection.termination().is_some()
 }
 
+/// The SDK reports JSON-RPC IDs with the v1 type, which allows `null`. It never assigns
+/// `null` to a request it sends and rejects incoming v2 requests that use it.
 fn cancel_request_elicitations(
     request_id: acp::RequestId,
     cx: &mut AsyncApp,
@@ -91,6 +94,7 @@ fn validate_prompt_content(
     capabilities: &acp::PromptCapabilities,
     content: &[acp::ContentBlock],
 ) -> Result<()> {
+    anyhow::ensure!(!content.is_empty(), "Prompt must not be empty");
     for block in content {
         let supported = match block {
             acp::ContentBlock::Text(_) | acp::ContentBlock::ResourceLink(_) => true,
@@ -409,8 +413,9 @@ impl AcpV2Connection {
                 .url(acp::ElicitationUrlCapabilities::new()),
         );
         if supports_terminal_auth {
-            capabilities = capabilities
-                .auth(acp::AuthCapabilities::new().terminal(acp::TerminalAuthCapabilities::new()));
+            capabilities = capabilities.auth(
+                acp::ClientAuthCapabilities::new().terminal(acp::TerminalAuthCapabilities::new()),
+            );
         }
         let initialize_request =
             acp::InitializeRequest::new(ProtocolVersion::V2, info).capabilities(capabilities);
@@ -1345,9 +1350,22 @@ impl AgentConnection for AcpV2Connection {
                     })?;
                     let result = (|| {
                         for notification in notifications {
+                            // Traffic for the new session's subagents goes to their own threads,
+                            // which the announcements before it created.
+                            let target = this
+                                .sessions
+                                .borrow()
+                                .get(&notification.session_id)
+                                .map(|session| session.thread.clone())
+                                .with_context(|| {
+                                    format!(
+                                        "Session update for unannounced session {}",
+                                        notification.session_id
+                                    )
+                                })?;
                             apply_v2_session_notification(
                                 notification,
-                                &thread.downgrade(),
+                                &target,
                                 &this.sessions,
                                 cx,
                             )?;
@@ -1439,6 +1457,11 @@ impl AgentConnection for AcpV2Connection {
         self.initialize_response.capabilities.session.is_some()
     }
 
+    fn announces_subagents(&self) -> bool {
+        // Subagents are part of v2's baseline session model.
+        true
+    }
+
     fn close_session(
         self: Rc<Self>,
         session_id: &acp::SessionId,
@@ -1518,6 +1541,13 @@ impl AgentConnection for AcpV2Connection {
                     if result.is_err() {
                         drain_foreground_queue(&dispatch_tx).await.log_err();
                     }
+                    let result = result.or_else(|error| {
+                        if is_resource_not_found(&error) {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    });
                     if let Some(this) = this.upgrade() {
                         if result.is_ok() {
                             if let Some(thread) = thread.upgrade() {
@@ -1575,6 +1605,12 @@ impl AgentConnection for AcpV2Connection {
             .as_ref()
             .context("This agent does not advertise session support")?;
         validate_prompt_content(&session.prompt.clone().unwrap_or_default(), content)
+    }
+
+    fn answers_permission_requests_on_cancel(&self) -> bool {
+        // Only the agent knows which requests belong to the cancelled foreground work:
+        // requests for background work stay open, and the rest get `$/cancel_request`.
+        false
     }
 
     fn should_close_sessions_on_release(&self) -> bool {
@@ -1637,6 +1673,40 @@ impl AgentConnection for AcpV2Connection {
         self.connection
             .send_notification(acp::CancelSessionNotification::new(session_id.clone()))
             .map_err(map_acp_error)
+    }
+
+    fn cancel_tool_call(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let response = Self::scoped_request(
+            &self.connection,
+            &self.dispatch_tx,
+            acp::CancelToolCallRequest::new(session_id.clone(), tool_call_id.clone()),
+        );
+        cx.foreground_executor().spawn(async move {
+            response.await?;
+            Ok(())
+        })
+    }
+
+    fn cancel_terminal(
+        &self,
+        session_id: &acp::SessionId,
+        terminal_id: &acp::TerminalId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let response = Self::scoped_request(
+            &self.connection,
+            &self.dispatch_tx,
+            acp::CancelTerminalRequest::new(session_id.clone(), terminal_id.clone()),
+        );
+        cx.foreground_executor().spawn(async move {
+            response.await?;
+            Ok(())
+        })
     }
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
@@ -1747,8 +1817,11 @@ impl AgentSessionList for V2SessionList {
             acp::DeleteSessionRequest::new(session_id.clone()),
         );
         cx.foreground_executor().spawn(async move {
-            response.await?;
-            Ok(())
+            match response.await {
+                Ok(_) => Ok(()),
+                Err(error) if is_resource_not_found(&error) => Ok(()),
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -1923,8 +1996,8 @@ mod tests {
     use super::*;
     use acp_thread::ElicitationStatus;
     use agent_client_protocol::{
-        Responder,
-        schema::v1::{self as acp_v1, ErrorCode},
+        v1::schema::{self as acp_v1, ErrorCode},
+        v2::Responder,
     };
     use gpui::TestAppContext;
     use serde_json::json;
@@ -2241,8 +2314,7 @@ mod tests {
             .expect_err("barrier has no session owner");
             assert_eq!(
                 error,
-                agent_client_protocol::Error::internal_error()
-                    .data("unknown session: unbound-barrier")
+                acp::Error::session_not_found("unbound-barrier").into()
             );
         }
 
@@ -2363,10 +2435,9 @@ mod tests {
                 acp::SessionConfigOption::boolean("enabled", "Enabled", false)
                     .meta(meta("initial-config")),
             ])
-            .available_commands(vec![
-                acp::AvailableCommand::new("initial", "Initial command")
-                    .meta(meta("initial-command")),
-            ])
+            .available_commands(vec![acp::AvailableCommand::Command(
+                acp::Command::new("initial", "Initial command").meta(meta("initial-command")),
+            )])
             .meta(meta("delivery-not-session"))
     }
 
@@ -2585,7 +2656,7 @@ mod tests {
                 .expect("resume");
             harness.resume_state(acp::StateUpdate::Idle(acp::IdleStateUpdate::new()));
             announce_running_child();
-            // A subagent whose replayed history ends, as claude-agent-acp replays each one.
+            // A subagent whose replayed history ends with an outcome.
             harness.send_update(
                 "saved",
                 acp::SessionUpdate::SubagentUpdate(acp::SubagentUpdate::new("finished")),
@@ -2609,11 +2680,15 @@ mod tests {
             let child = child.expect("the subagent was announced before the response");
             let finished = finished.expect("the subagent was announced before the response");
             finished.read_with(cx, |finished, _| {
-                assert_eq!(
-                    finished.foreground_state(),
-                    Some(&cancelled()),
-                    "a replayed outcome confirms no activity, so it stays"
-                );
+                if replay_history {
+                    assert_eq!(
+                        finished.foreground_state(),
+                        None,
+                        "a replayed outcome is history too"
+                    );
+                } else {
+                    assert_eq!(finished.foreground_state(), Some(&cancelled()));
+                }
             });
             child.read_with(cx, |child, _| {
                 let association = child.subagent_association().expect("subagent");
@@ -2636,7 +2711,9 @@ mod tests {
             });
 
             if replay_history {
+                // The agent reports current states after the response.
                 announce_running_child();
+                harness.send_update("finished", acp::SessionUpdate::StateUpdate(cancelled()));
                 harness.drain_updates(cx).await;
                 child.read_with(cx, |child, _| {
                     assert!(child.subagent_association().expect("subagent").can_cancel);
@@ -2645,10 +2722,92 @@ mod tests {
                         acp_thread::ForegroundActivity::Running
                     );
                 });
+                finished.read_with(cx, |finished, _| {
+                    assert_eq!(finished.foreground_state(), Some(&cancelled()));
+                });
             }
             drop((parent, child, finished));
             cx.run_until_parked();
         }
+    }
+
+    #[gpui::test]
+    async fn v2_subagent_directories_inherit_through_nested_subagents(cx: &mut TestAppContext) {
+        use agent_client_protocol::schema::MaybeUndefined;
+
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let parent = harness.thread(cx).await;
+        harness.send_update(
+            "session",
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("child")
+                    .cwd(acp::AbsolutePath::new(session_path("worktree"))),
+            ),
+        );
+        harness.send_update(
+            "child",
+            acp::SessionUpdate::SubagentUpdate(acp::SubagentUpdate::new("grandchild")),
+        );
+        harness.drain_updates(cx).await;
+        let child = parent
+            .read_with(cx, |parent, _| parent.subagent(&"child".into()).cloned())
+            .expect("child");
+        let grandchild = child
+            .read_with(cx, |child, _| child.subagent(&"grandchild".into()).cloned())
+            .expect("grandchild");
+        let work_dirs = |thread: &Entity<AcpThread>, cx: &mut TestAppContext| {
+            thread.read_with(cx, |thread, _| {
+                thread
+                    .work_dirs()
+                    .expect("working directories")
+                    .ordered_paths()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        };
+        let parent_dirs = work_dirs(&parent, cx);
+        let mut expected = parent_dirs.clone();
+        expected[0] = session_path("worktree");
+        assert_eq!(
+            work_dirs(&child, cx),
+            expected,
+            "the child keeps the parent's other dirs"
+        );
+        assert_eq!(
+            work_dirs(&grandchild, cx),
+            expected,
+            "the grandchild inherits the child's"
+        );
+
+        harness.send_update(
+            "session",
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("child").additional_directories(Vec::new()),
+            ),
+        );
+        harness.drain_updates(cx).await;
+        assert_eq!(work_dirs(&child, cx), [session_path("worktree")]);
+        assert_eq!(
+            work_dirs(&grandchild, cx),
+            [session_path("worktree")],
+            "a change to the child's directories reaches the grandchild"
+        );
+
+        harness.send_update(
+            "session",
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("child")
+                    .cwd(MaybeUndefined::Null)
+                    .additional_directories(MaybeUndefined::Null),
+            ),
+        );
+        harness.drain_updates(cx).await;
+        assert_eq!(
+            work_dirs(&child, cx),
+            parent_dirs,
+            "cleared fields inherit again"
+        );
+        assert_eq!(work_dirs(&grandchild, cx), parent_dirs);
     }
 
     #[gpui::test]
@@ -2657,6 +2816,7 @@ mod tests {
         use agent_client_protocol::schema::MaybeUndefined;
 
         let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        assert!(harness.client.announces_subagents());
         let parent = harness.thread(cx).await;
         harness.send_update(
             "session",
@@ -2689,6 +2849,8 @@ mod tests {
                     title: Some("Investigator".into()),
                     description: None,
                     can_cancel: true,
+                    cwd: None,
+                    additional_directories: None,
                 })
             );
             assert_eq!(child.entries().len(), 1, "child traffic reaches the child");
@@ -2741,6 +2903,8 @@ mod tests {
                     title: None,
                     description: None,
                     can_cancel: true,
+                    cwd: None,
+                    additional_directories: None,
                 })
             );
             assert_eq!(child.subagents().count(), 0);
@@ -3090,6 +3254,179 @@ mod tests {
                 thread.submission(id).expect("receipt retained").state,
                 SubmissionState::Accepted { echoed: false, .. }
             ));
+        });
+    }
+
+    #[gpui::test]
+    async fn v2_cancel_sdk_leaves_permission_requests_to_the_agent(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::StateUpdate(acp::StateUpdate::Running(
+                acp::RunningStateUpdate::new(),
+            )),
+        );
+        let permission = harness
+            .agent
+            .send_request(acp::RequestPermissionRequest::new(
+                session_id.clone(),
+                "Keep watching",
+                vec![acp::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    acp::PermissionOptionKind::AllowOnce,
+                )],
+            ));
+        let permission_cancellation = permission.cancellation_handle();
+        let permission = cx.background_spawn(permission.block_task());
+        harness.drain_updates(cx).await;
+        let _cancellation = thread.update(cx, |thread, cx| thread.cancel(cx));
+        bounded(harness.cancellations.recv(), cx)
+            .await
+            .expect("session cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.pending_permission_requests().count()),
+            1,
+            "only the agent knows whether the request belongs to the cancelled work"
+        );
+        permission_cancellation.cancel().expect("cancel request");
+        let error = bounded(permission, cx)
+            .await
+            .expect_err("cancelled by the agent");
+        assert_eq!(
+            error.code,
+            agent_client_protocol::ErrorCode::REQUEST_CANCELLED
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.pending_permission_requests().count()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_background_work_is_tracked_and_stoppable(cx: &mut TestAppContext) {
+        use acp_thread::ToolCallStatus;
+
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new("watcher")
+                    .status(acp::ToolCallStatus::Paused)
+                    .capabilities(
+                        acp::ToolCallCapabilities::new()
+                            .cancel(acp::ToolCallCancelCapabilities::new()),
+                    ),
+            ),
+        );
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new("fixed").status(acp::ToolCallStatus::InProgress),
+            ),
+        );
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::TerminalUpdate(acp::TerminalUpdate::new("server").capabilities(
+                acp::TerminalCapabilities::new().cancel(acp::TerminalCancelCapabilities::new()),
+            )),
+        );
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::StateUpdate(acp::StateUpdate::Idle(
+                acp::IdleStateUpdate::new()
+                    .stop_reason(acp::StopReason::EndTurn)
+                    .background(vec![
+                        acp::BackgroundWork::Terminal(acp::BackgroundTerminal::new("server")),
+                        acp::BackgroundWork::ToolCall(acp::BackgroundToolCall::new("watcher")),
+                    ]),
+            )),
+        );
+        harness.drain_updates(cx).await;
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.background_work().map(<[_]>::len), Some(2));
+            let (_, watcher) = thread.tool_call(&"watcher".into()).expect("watcher");
+            assert_eq!(watcher.status(), ToolCallStatus::Paused);
+            assert!(
+                watcher.can_cancel(),
+                "paused tool calls can advertise cancel"
+            );
+            let (_, fixed) = thread.tool_call(&"fixed".into()).expect("fixed");
+            assert!(!fixed.can_cancel());
+            assert!(
+                thread
+                    .terminal("server".into())
+                    .expect("server")
+                    .read(cx)
+                    .can_cancel()
+            );
+        });
+
+        // The agent has no handler for these methods, so the SDK answers -32602 once a
+        // request reaches it. A local refusal never sends one.
+        let sent_code = |result: Result<()>| {
+            result
+                .expect_err("the harness agent rejects cancellation")
+                .downcast_ref::<agent_client_protocol::Error>()
+                .map(|error| error.code)
+        };
+        let invalid_params = Some(agent_client_protocol::ErrorCode::INVALID_PARAMS);
+        let stop_watcher = thread.update(cx, |thread, cx| {
+            thread.cancel_tool_call(&"watcher".into(), cx)
+        });
+        assert_eq!(sent_code(bounded(stop_watcher, cx).await), invalid_params);
+        let stop_fixed = thread.update(cx, |thread, cx| {
+            thread.cancel_tool_call(&"fixed".into(), cx)
+        });
+        assert_eq!(
+            sent_code(bounded(stop_fixed, cx).await),
+            None,
+            "an unadvertised tool call is never sent tool_call/cancel"
+        );
+        let stop_server = thread.update(cx, |thread, cx| {
+            thread.cancel_terminal(&"server".into(), cx)
+        });
+        assert_eq!(sent_code(bounded(stop_server, cx).await), invalid_params);
+
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::TerminalUpdate(
+                acp::TerminalUpdate::new("server").exit_status(acp::TerminalExitStatus::new()),
+            ),
+        );
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new("watcher").status(acp::ToolCallStatus::Cancelled),
+            ),
+        );
+        harness.send_update(
+            &session_id.0,
+            acp::SessionUpdate::StateUpdate(acp::StateUpdate::Idle(acp::IdleStateUpdate::new())),
+        );
+        harness.drain_updates(cx).await;
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.background_work(),
+                None,
+                "an omitted list means background work is unknown"
+            );
+            let (_, watcher) = thread.tool_call(&"watcher".into()).expect("watcher");
+            assert!(!watcher.can_cancel(), "final tool calls can't be stopped");
+            assert!(
+                !thread
+                    .terminal("server".into())
+                    .expect("server")
+                    .read(cx)
+                    .can_cancel(),
+                "exited terminals can't be stopped"
+            );
         });
     }
 
@@ -3454,6 +3791,7 @@ done
             );
             assert!(validate_prompt_content(&capabilities, &[block]).is_ok());
         }
+        assert!(validate_prompt_content(&acp::PromptCapabilities::default(), &[]).is_err());
     }
 
     #[gpui::test]
@@ -3774,6 +4112,109 @@ done
     }
 
     #[gpui::test]
+    async fn v2_delete_sdk_treats_resource_not_found_as_deleted(cx: &mut TestAppContext) {
+        let capabilities = acp::AgentCapabilities::new()
+            .session(acp::SessionCapabilities::new().delete(acp::SessionDeleteCapabilities::new()));
+        let harness = SessionHarness::new(capabilities, vec![], vec![], cx).await;
+        let list = cx
+            .update(|cx| harness.client.session_list(cx))
+            .expect("session discovery");
+        let deleted = cx.update(|cx| list.delete_session(&"missing".into(), cx));
+        let (_, responder) = bounded(harness.delete_requests.recv(), cx)
+            .await
+            .expect("delete");
+        responder
+            .respond_with_error(acp::Error::session_not_found("missing").into())
+            .expect("not found");
+        bounded(deleted, cx)
+            .await
+            .expect("-32002 counts as deleted");
+    }
+
+    #[gpui::test]
+    async fn v2_close_sdk_treats_resource_not_found_as_closed(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.resumed_thread(None, cx).await;
+        harness.defer_closes();
+        let closing = harness.close(cx);
+        let (request, responder) = bounded(harness.close_requests.recv(), cx)
+            .await
+            .expect("close");
+        responder
+            .respond_with_error(acp::Error::session_not_found(request.session_id).into())
+            .expect("not found");
+        bounded(closing, cx).await.expect("-32002 counts as closed");
+        bounded(harness.close(cx), cx)
+            .await
+            .expect_err("the closed session was released");
+        assert!(harness.close_requests.is_empty());
+        drop(thread);
+    }
+
+    #[gpui::test]
+    async fn v2_new_session_keeps_subagent_traffic_sent_before_its_response(
+        cx: &mut TestAppContext,
+    ) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        *harness.hold_new_responses.lock().expect("new mode") = true;
+        let creation = harness.create(cx);
+        let (_, response) = bounded(harness.new_replies.recv(), cx)
+            .await
+            .expect("new request");
+        let message = |id: &str, text: &str| {
+            acp::SessionUpdate::AgentMessage(acp::AgentMessage::new(id).content(vec![text.into()]))
+        };
+        harness.send_update(
+            "session",
+            acp::SessionUpdate::SubagentUpdate(acp::SubagentUpdate::new("child")),
+        );
+        harness.send_update("child", message("child-message", "child works"));
+        harness.send_update(
+            "child",
+            acp::SessionUpdate::SubagentUpdate(acp::SubagentUpdate::new("grandchild")),
+        );
+        harness.send_update(
+            "grandchild",
+            message("grandchild-message", "grandchild works"),
+        );
+        // Traffic for a session nobody announced is still not delivered.
+        harness.send_update("stranger", message("stranger-message", "unrelated"));
+        cx.run_until_parked();
+        response
+            .respond(initial_response())
+            .expect("new session response");
+        let parent = bounded(creation, cx).await.expect("created session");
+        cx.run_until_parked();
+
+        let child = parent
+            .read_with(cx, |parent, _| parent.subagent(&"child".into()).cloned())
+            .expect("announced before the response");
+        let grandchild = child
+            .read_with(cx, |child, _| child.subagent(&"grandchild".into()).cloned())
+            .expect("announced before the response");
+        for (thread, text) in [(&child, "child works"), (&grandchild, "grandchild works")] {
+            thread.read_with(cx, |thread, cx| {
+                assert!(
+                    thread.to_markdown(cx).contains(text),
+                    "a subagent's traffic sent before the response reaches it"
+                );
+            });
+        }
+        parent.read_with(cx, |parent, cx| {
+            let transcript = parent.to_markdown(cx);
+            assert!(!transcript.contains("child works"));
+            assert!(!transcript.contains("unrelated"));
+        });
+        assert!(
+            !harness
+                .client
+                .sessions
+                .borrow()
+                .contains_key(&acp::SessionId::new("stranger"))
+        );
+    }
+
+    #[gpui::test]
     async fn v2_new_sdk_correlates_concurrent_prefixes_by_response_id(cx: &mut TestAppContext) {
         use acp_thread::ForegroundActivity;
         let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
@@ -3838,7 +4279,7 @@ done
         harness.send_update(
             "second",
             acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![
-                acp::AvailableCommand::new("prefix", "Prefix"),
+                acp::AvailableCommand::Command(acp::Command::new("prefix", "Prefix")),
             ])),
         );
         cx.run_until_parked();
@@ -3854,7 +4295,9 @@ done
         let config = vec![acp::SessionConfigOption::boolean(
             "response", "Response", true,
         )];
-        let commands = vec![acp::AvailableCommand::new("response", "Response")];
+        let commands = vec![acp::AvailableCommand::Command(acp::Command::new(
+            "response", "Response",
+        ))];
         second_response
             .respond(
                 acp::NewSessionResponse::new("second")
@@ -4154,7 +4597,10 @@ done
             assert_eq!(thread.session_info().title.as_deref(), Some("Early title"));
             assert!(thread.to_markdown(cx).contains("Early content"));
             let (_, tool) = thread.tool_call(&"early-tool".into()).expect("early tool");
-            assert_eq!(tool.content().len(), 2);
+            let [content] = tool.content() else {
+                panic!("the chunk continues the text block");
+            };
+            assert_eq!(content.to_markdown(cx), "tool prefixtool suffix");
             let terminal = thread
                 .terminal("early-terminal".into())
                 .expect("early terminal");
@@ -5517,7 +5963,7 @@ while IFS= read -r request; do
             printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"info":{"name":"session-stdio","version":"1"},"capabilities":{"session":{}}}}\n' "$id"
             ;;
         *'"method":"session/new"'*)
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"stdio-session","configOptions":[{"configId":"enabled","name":"Enabled","type":"boolean","currentValue":false}],"availableCommands":[{"name":"initial","description":"Initial"}]}}\n' "$id"
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"stdio-session","configOptions":[{"configId":"enabled","name":"Enabled","type":"boolean","currentValue":false}],"availableCommands":[{"type":"command","name":"initial","description":"Initial"}]}}\n' "$id"
             printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stdio-session","update":{"sessionUpdate":"session_info_update","title":"Immediate stdio title"}}}\n'
             ;;
         *'"method":"session/set_config_option"'*)
@@ -7317,10 +7763,12 @@ done
         // A v2 SDK server rewrites replies to its negotiated version; use a real v1 peer.
         let _agent_task = cx.background_spawn(
             Agent
-                .builder()
+                .v1()
                 .on_receive_request(
                     async move |_request: acp_v1::InitializeRequest,
-                                responder: Responder<acp_v1::InitializeResponse>,
+                                responder: agent_client_protocol::v1::Responder<
+                        acp_v1::InitializeResponse,
+                    >,
                                 _| {
                         responder.respond(acp_v1::InitializeResponse::new(ProtocolVersion::V1))
                     },
@@ -7656,7 +8104,7 @@ exec sleep 60
                     .downcast_ref::<agent_client_protocol::InitializationVersionMismatch>()
                     .unwrap_or_else(|| panic!("version diagnostic was replaced: {error:?}"));
                 assert_eq!(mismatch.requested, ProtocolVersion::V2);
-                assert_eq!(mismatch.selected, ProtocolVersion::V1);
+                assert_eq!(mismatch.selected(), ProtocolVersion::V1);
             }
         }
     }

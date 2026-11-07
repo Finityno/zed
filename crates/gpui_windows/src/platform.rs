@@ -28,7 +28,7 @@ use windows::{
             Ole::*,
             Power::*,
             SystemInformation::*,
-            SystemServices::POWER_REQUEST_CONTEXT_VERSION,
+            SystemServices::{GUID_POWER_SAVING_STATUS, POWER_REQUEST_CONTEXT_VERSION},
             Threading::{
                 GetCurrentThreadId, POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT,
                 REASON_CONTEXT_0,
@@ -69,13 +69,13 @@ pub struct WindowsPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    direct_write_text_system: Option<Arc<DirectWriteTextSystem>>,
     drop_target_helper: Option<IDropTargetHelper>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     invalidate_devices: Arc<AtomicBool>,
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
+    power_saving_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
@@ -103,6 +103,7 @@ pub(crate) struct WindowsPlatformState {
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     directx_devices: RefCell<Option<DirectXDevices>>,
+    low_power_mode_enabled: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -116,6 +117,7 @@ struct PlatformCallbacks {
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+    low_power_mode_change: Cell<Option<Box<dyn FnMut()>>>,
     displays_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -132,6 +134,7 @@ impl WindowsPlatformState {
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
+            low_power_mode_enabled: Cell::new(false),
             menus: RefCell::new(Vec::new()),
         }
     }
@@ -188,20 +191,11 @@ impl WindowsPlatform {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
         // A platform that can become windowed needs the real text system from the start: the app
-        // keeps the one it's created with. It gets DirectX devices when it becomes windowed.
-        let (text_system, direct_write_text_system) = if !headless {
-            let dw_text_system = Arc::new(
-                DirectWriteTextSystem::new(None).context("Error creating DirectWriteTextSystem")?,
-            );
-            (
-                dw_text_system.clone() as Arc<dyn PlatformTextSystem>,
-                Some(dw_text_system),
-            )
+        // keeps the one it's created with.
+        let text_system: Arc<dyn PlatformTextSystem> = if !headless {
+            Arc::new(DirectWriteTextSystem::new().context("Error creating DirectWriteTextSystem")?)
         } else {
-            (
-                Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>,
-                None,
-            )
+            Arc::new(gpui::NoopTextSystem::new())
         };
 
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
@@ -249,6 +243,14 @@ impl WindowsPlatform {
             .inner
             .take()
             .context("CreateWindowExW did not run correctly")??;
+        let mut power_status = SYSTEM_POWER_STATUS::default();
+        match unsafe { GetSystemPowerStatus(&mut power_status) } {
+            Ok(()) => inner
+                .state
+                .low_power_mode_enabled
+                .set(power_status.SystemStatusFlag == 1),
+            Err(error) => log::warn!("Failed to query Windows battery saver status: {error}"),
+        }
         let dispatcher = context
             .dispatcher
             .take()
@@ -285,8 +287,8 @@ impl WindowsPlatform {
             background_executor,
             foreground_executor,
             text_system,
-            direct_write_text_system,
             suspend_resume_notification: RefCell::new(None),
+            power_saving_notification: RefCell::new(None),
             disable_direct_composition,
             has_package_identity: has_package_identity(),
             drop_target_helper,
@@ -419,9 +421,6 @@ impl WindowsPlatform {
     /// Creates the DirectX devices that windows draw with, and starts vsync.
     fn attach_gpu(&self) -> Result<()> {
         let devices = DirectXDevices::new().context("Creating DirectX devices")?;
-        if let Some(text_system) = &self.direct_write_text_system {
-            text_system.handle_gpu_lost(&devices)?;
-        }
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
         if let Err(error) = self.begin_vsync_thread() {
             self.inner.state.directx_devices.borrow_mut().take();
@@ -437,9 +436,6 @@ impl WindowsPlatform {
         // to the devices then.
         if let Some(clocks) = self.frame_clocks.borrow_mut().take() {
             clocks.stop();
-        }
-        if let Some(text_system) = &self.direct_write_text_system {
-            text_system.release_gpu();
         }
         self.inner.state.directx_devices.borrow_mut().take();
     }
@@ -461,9 +457,6 @@ impl WindowsPlatform {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
             return Ok(());
         };
-        let Some(direct_write_text_system) = &self.direct_write_text_system else {
-            return Ok(());
-        };
         let clocks = FrameClocks::new()?;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         // One cache for every clock thread, so a window moving between
@@ -475,7 +468,6 @@ impl WindowsPlatform {
             platform_window: self.handle.into(),
             validation_number: self.inner.validation_number,
             ui_thread: unsafe { GetCurrentThreadId() },
-            text_system: Arc::downgrade(direct_write_text_system),
             invalidate: self.invalidate_devices.clone(),
             attempts: RecoveryAttempts::default(),
         };
@@ -1416,6 +1408,33 @@ impl Platform for WindowsPlatform {
         }
     }
 
+    fn power_mode(&self) -> PowerMode {
+        if self.inner.state.low_power_mode_enabled.get() {
+            PowerMode::LowPower
+        } else {
+            PowerMode::HighPower
+        }
+    }
+
+    fn on_power_mode_change(&self, callback: Box<dyn FnMut()>) {
+        self.inner
+            .state
+            .callbacks
+            .low_power_mode_change
+            .set(Some(callback));
+        let mut notification = self.power_saving_notification.borrow_mut();
+        if notification.is_none() {
+            *notification = unsafe {
+                RegisterPowerSettingNotification(
+                    HANDLE(self.handle.0),
+                    &GUID_POWER_SAVING_STATUS,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                )
+                .log_err()
+            };
+        }
+    }
+
     fn set_app_identity(&self, identifier: &str, name: &str) {
         // If the process has package identity, it's automatally granted an AUMID by the system.
         if self.has_package_identity {
@@ -1737,7 +1756,7 @@ impl WindowsPlatformInner {
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
             | WM_GPUI_DISPLAYS_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
-            WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
+            WM_POWERBROADCAST => self.handle_power_broadcast(wparam, lparam),
             WM_DISPLAYCHANGE => self.handle_display_change(handle),
             WM_QUERYENDSESSION => Some(1),
             WM_ENDSESSION if wparam.0 != 0 => self.handle_end_session(),
@@ -1933,13 +1952,23 @@ impl WindowsPlatformInner {
         Some(0)
     }
 
-    fn handle_power_broadcast(&self, wparam: WPARAM) -> Option<isize> {
+    fn handle_power_broadcast(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         match wparam.0 as u32 {
             PBT_APMSUSPEND => {
                 self.with_callback(|callbacks| &callbacks.system_sleep, |callback| callback());
             }
             PBT_APMRESUMEAUTOMATIC => {
                 self.with_callback(|callbacks| &callbacks.system_wake, |callback| callback());
+            }
+            PBT_POWERSETTINGCHANGE => {
+                if let Some(enabled) = unsafe { power_saving_status(lparam) } {
+                    if self.state.low_power_mode_enabled.replace(enabled) != enabled {
+                        self.with_callback(
+                            |callbacks| &callbacks.low_power_mode_change,
+                            |callback| callback(),
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -1959,6 +1988,23 @@ impl WindowsPlatformInner {
     }
 }
 
+unsafe fn power_saving_status(lparam: LPARAM) -> Option<bool> {
+    let setting = unsafe { (lparam.0 as *const POWERBROADCAST_SETTING).as_ref()? };
+    if setting.PowerSetting != GUID_POWER_SAVING_STATUS || setting.DataLength != 4 {
+        return None;
+    }
+    let data = unsafe {
+        std::ptr::addr_of!(setting.Data)
+            .cast::<u32>()
+            .read_unaligned()
+    };
+    match data {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         // Not joined: a clock can be sending this thread a message. Each
@@ -1971,6 +2017,9 @@ impl Drop for WindowsPlatform {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
                 UnregisterSuspendResumeNotification(notification).log_err();
+            }
+            if let Some(notification) = self.power_saving_notification.borrow_mut().take() {
+                UnregisterPowerSettingNotification(notification).log_err();
             }
             DestroyWindow(self.handle)
                 .context("Destroying platform window")
@@ -2325,7 +2374,6 @@ fn handle_gpu_device_lost(
     validation_number: usize,
     ui_thread: u32,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
-    text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
     #[cfg(test)]
     crate::native_tests::recovery_started();
@@ -2348,9 +2396,6 @@ fn handle_gpu_device_lost(
         );
     }
 
-    if let Some(text_system) = text_system.upgrade() {
-        text_system.handle_gpu_lost(&directx_devices)?;
-    }
     // Taken after the platform window has the new devices: a window opened
     // from here on is created with them, so missing it here is harmless.
     let Some(windows) = all_windows.upgrade().map(|all_windows| snapshot_windows(&all_windows))
