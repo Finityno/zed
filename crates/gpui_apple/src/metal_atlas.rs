@@ -62,6 +62,12 @@ impl MetalAtlas {
     }
 }
 
+// Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
+const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(16384),
+    height: DevicePixels(16384),
+};
+
 struct MetalAtlasTextures {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     supports_shared_storage: bool,
@@ -193,6 +199,16 @@ impl MetalAtlasTextures {
         size: Size<DevicePixels>,
         texture_kind: AtlasTextureKind,
     ) -> Result<AtlasTile> {
+        // No page can hold it, and a page pushed for it would stay empty.
+        if size.width.0 > MAX_ATLAS_SIZE.width.0 || size.height.0 > MAX_ATLAS_SIZE.height.0 {
+            anyhow::bail!(
+                "atlas tile {}x{} exceeds the {}x{} page limit",
+                size.width.0,
+                size.height.0,
+                MAX_ATLAS_SIZE.width.0,
+                MAX_ATLAS_SIZE.height.0
+            );
+        }
         {
             let textures = self
                 .textures_mut(texture_kind)
@@ -218,11 +234,6 @@ impl MetalAtlasTextures {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
-        };
-        // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
-        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(16384),
-            height: DevicePixels(16384),
         };
         let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
         let pixel_format = match kind {
@@ -557,6 +568,34 @@ mod tests {
     }
 
     #[test]
+    fn test_oversized_tile_is_refused_without_a_page() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let mut state = atlas.0.lock();
+        for (width, height) in [(16385, 1), (1, 16385)] {
+            let bytes = vec![0u8; width * height];
+            assert_eq!(
+                state
+                    .backend
+                    .insert(
+                        AtlasTextureKind::Monochrome,
+                        size(DevicePixels(width as i32), DevicePixels(height as i32)),
+                        &bytes,
+                    )
+                    .err()
+                    .map(|error| error.to_string()),
+                Some(format!(
+                    "atlas tile {width}x{height} exceeds the 16384x16384 page limit"
+                ))
+            );
+            let textures = &state.backend.monochrome_textures;
+            assert_eq!((textures.textures.len(), textures.free_list.len()), (0, 0));
+        }
+        assert_eq!(state.backend.allocated_bytes(), (0, 0));
+    }
+
+    #[test]
     fn test_texture_upload_preserves_pixel_layout() -> Result<()> {
         let Some(atlas) = create_atlas() else {
             return Ok(());
@@ -659,7 +698,6 @@ mod tests {
             .expect("inserting atlas tile")
             .expect("retrieving inserted atlas tile")
     }
-
 
     #[test]
     fn test_atlas_pages_are_reported_to_the_render_memory_gauges() {

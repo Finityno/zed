@@ -444,8 +444,8 @@ impl WindowFrameSource {
 /// The link keeps a drawable pool of its own, five drawables deep at 120 Hz
 /// and four at 60 Hz on macOS 27, whatever the layer's
 /// `maximumDrawableCount` (which raises an exception if set while a link
-/// drives the layer) or the link's `preferredFrameLatency` say. A window that
-/// draws steadily so holds one or two more full-size drawables than the
+/// drives the layer) or the link's `preferredFrameLatency` say. So a window
+/// that draws steadily holds one or two more full-size drawables than the
 /// three the `CVDisplayLink` pacing keeps.
 pub(crate) fn metal_display_link_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
