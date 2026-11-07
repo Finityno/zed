@@ -377,6 +377,48 @@ fn a_change_builds_the_rows_that_read_it() {
     assert!(work.list_rows_replayed > 0, "{work:?}");
 }
 
+/// The lines shaped and layout nodes made when the rows are built again
+/// after a few frames of small scrolls, with row replay on or off, and how
+/// many rows were drawn again on the way.
+fn work_building_rows_after_scrolls(replay: bool) -> (u64, u64, u64) {
+    let mut cx = super::super::layout_retention_tests::text_system_context_with_ink_in_font_bounds(0);
+    let fixture = fixture(&mut cx, false);
+    cx.update(|cx| cx.set_list_row_replay(replay));
+    fixture.move_mouse(&mut cx, point(px(500.), px(500.)));
+    fixture.draw_matching(&mut cx, "first frame");
+    fixture.draw_matching(&mut cx, "second frame");
+    let mut replayed = 0;
+    for step in 0..4 {
+        fixture.wheel(&mut cx, -3.);
+        let (work, _) = fixture.draw_matching(&mut cx, &format!("scroll {step}"));
+        replayed += work.list_rows_replayed;
+    }
+    fixture.update_hosts(&mut cx, |host, cx| {
+        host.accent += 1;
+        cx.notify();
+    });
+    let (work, built) = fixture.draw_matching(&mut cx, "accent changed");
+    assert!(built.len() > 2, "{built:?}");
+    (work.lines_shaped, work.layout_nodes_created, replayed)
+}
+
+/// A row drawn again over a few frames keeps its layout nodes: built again,
+/// it lays out on them and shapes no lines afresh, as a row built on every
+/// frame does. The list measures every row on its first frame and then lays
+/// the rows in view out again; the rows drawn again from then on are the
+/// ones recorded on that frame.
+#[test]
+fn a_row_drawn_again_for_a_while_is_built_again_on_its_nodes() {
+    let (shaped_off, created_off, _) = work_building_rows_after_scrolls(false);
+    let (shaped_on, created_on, replayed) = work_building_rows_after_scrolls(true);
+    assert!(replayed >= 8, "{replayed}");
+    assert_eq!(
+        (shaped_on, created_on),
+        (shaped_off, created_off),
+        "rows drawn again then built: lines shaped and layout nodes made, against rows built every frame"
+    );
+}
+
 /// A view drawn in a row that is notified is built with its row; the other
 /// rows are drawn again.
 #[test]

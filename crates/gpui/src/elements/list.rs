@@ -1977,7 +1977,7 @@ impl StateInner {
         for (ix, item) in cursor.enumerate() {
             let size = item.size().unwrap_or_else(|| {
                 let mut element = render_item(ix, window, cx);
-                window.layout_as_list_item(&mut element, ix, available_item_space, cx)
+                window.measure_as_list_item(&mut element, ix, available_item_space, cx)
             });
             if item.size().is_none() {
                 height_hint_measurements.record(item, size.height);
@@ -2193,7 +2193,7 @@ impl StateInner {
                 } else {
                     let item_index = cursor.start().0;
                     let mut element = render_item(item_index, window, cx);
-                    let item_size = window.layout_as_list_item(
+                    let item_size = window.measure_as_list_item(
                         &mut element,
                         item_index,
                         available_item_space,
