@@ -1,10 +1,11 @@
 //! Frame pacing for macOS windows.
 //!
-//! On macOS 14 and later a visible window is paced by a `CAMetalDisplayLink`
-//! on its layer ([`gpui_apple::display_link::MetalFrameSource`], shared with
-//! GPUI's frame waker through [`MetalFrames`]). Earlier systems, and windows
-//! that keep rendering while hidden, use the shared `CVDisplayLink` registry
-//! described below ([`WindowFrameSource`]).
+//! Windows are paced by the shared `CVDisplayLink` registry described below
+//! ([`WindowFrameSource`]). On macOS 14 and later a visible window can
+//! instead be paced by a `CAMetalDisplayLink` on its layer
+//! ([`gpui_apple::display_link::MetalFrameSource`], shared with GPUI's frame
+//! waker through [`MetalFrames`]), but only when asked for; see
+//! [`metal_display_link_enabled`].
 //!
 //! CVDisplayLink has no safe teardown: `CVDisplayLinkStop` merely flags the
 //! link's io thread to exit "soon" and returns immediately, and there is no
@@ -71,7 +72,7 @@ use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -434,6 +435,32 @@ impl WindowFrameSource {
     pub fn is_running(&self) -> bool {
         self.registration.is_some()
     }
+}
+
+/// Whether visible windows are paced by a `CAMetalDisplayLink`: only with
+/// `GPUI_METAL_DISPLAY_LINK=1`, on a system that has one.
+///
+/// Measured against the `CVDisplayLink` pacing on macOS 27 (2026-11), the
+/// link costs two things the fork's off-thread drawable acquirer does not:
+///
+/// * It keeps a drawable pool of its own, five drawables deep at 120 Hz and
+///   four at 60 Hz, whatever the layer's `maximumDrawableCount` (which
+///   raises an exception if set while a link drives the layer) or the link's
+///   `preferredFrameLatency` say. A window that draws steadily holds one or
+///   two more full-size drawables than the three it keeps otherwise: 22 to
+///   46 MB of device memory for a 3000×1900 window.
+/// * Its update arrives a whole refresh before the frame is due, where a
+///   `CVDisplayLink` frame starts about 2.5 ms before its deadline at
+///   120 Hz. The frame work interval passes that slack on, and the
+///   performance controller answers it by running interactive frames on
+///   the slower cores: scrolling took 21% more CPU time and its 90th
+///   percentile draw 74% longer for the same instructions.
+pub(crate) fn metal_display_link_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GPUI_METAL_DISPLAY_LINK").is_ok_and(|value| value == "1")
+            && MetalFrameSource::is_available()
+    })
 }
 
 /// A window's `CAMetalDisplayLink`, shared with GPUI's frame waker so that a

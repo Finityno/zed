@@ -856,9 +856,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
-    /// The window's `CAMetalDisplayLink`, on macOS 14 and later; `None` where
-    /// the system has none. It paces the window while it is visible; a
-    /// window that renders while hidden falls back to `frame_source` then.
+    /// The window's `CAMetalDisplayLink`, on macOS 14 and later when
+    /// [`crate::metal_display_link_enabled`]; `None` otherwise. It paces the
+    /// window while it is visible; a window that renders while hidden falls
+    /// back to `frame_source` then.
     metal_frames: Option<Rc<MetalFrames>>,
     /// Whether GPUI wants a frame request on the next display refresh. The
     /// display link only wakes this window while it is set, so an idle
@@ -1339,7 +1340,7 @@ pub(crate) struct MacWindow(
     Arc<Mutex<MacWindowState>>,
     MainThreadMarker,
     /// The Metal link's frame waker, kept outside the lock so waking never
-    /// waits on it. `None` where the system has no `CAMetalDisplayLink`.
+    /// waits on it. `None` unless [`crate::metal_display_link_enabled`].
     Option<Rc<MetalFrames>>,
 );
 
@@ -1471,7 +1472,8 @@ impl MacWindow {
             let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
             assert!(!native_view.is_null());
 
-            let metal_frames = MetalFrameSource::is_available().then(Rc::<MetalFrames>::default);
+            let metal_frames =
+                crate::metal_display_link_enabled().then(Rc::<MetalFrames>::default);
             let state = Arc::new(Mutex::new(MacWindowState {
                 handle,
                 foreground_executor,
