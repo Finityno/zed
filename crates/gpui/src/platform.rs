@@ -54,7 +54,7 @@ use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
 use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
-use image::{DynamicImage, Frame, Rgba};
+use image::{DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -3978,7 +3978,7 @@ pub(crate) fn decode_webp_image(bytes: &[u8]) -> Result<SmallVec<[Frame; 1]>> {
     let mut decoder = WebPDecoder::new(Cursor::new(bytes))?;
 
     if decoder.has_animation() {
-        let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
+        let _ = decoder.set_background_color(image::Rgba([0, 0, 0, 0]));
         decode_animated_frames(decoder, "WebP")
     } else {
         decode_static_image_from_decoder(decoder)

@@ -462,6 +462,7 @@ impl Window {
                 retained_records: deferred_draw.retained_records.clone(),
                 one_view: deferred_draw.one_view,
                 rebuilt: None,
+                accessed_entities: deferred_draw.accessed_entities.clone(),
             };
             self.next_frame.deferred_draws.push(copy);
         }
