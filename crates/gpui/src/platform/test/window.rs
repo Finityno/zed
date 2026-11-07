@@ -190,6 +190,8 @@ impl TestWindow {
         sender.is_some_and(|sender| sender.send(result).is_ok())
     }
 
+    /// Runs the close callback the window registered, as the platform does
+    /// when the native window closes.
     pub fn simulate_close(&self) {
         let callback = self.0.lock().close_callback.take();
         if let Some(callback) = callback {

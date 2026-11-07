@@ -2336,7 +2336,7 @@ mod pre_cull_regression_tests {
                                 .text_system()
                                 .shape_line(TEXT.into(), FONT_SIZE, &runs, None)
                         });
-                        let mut paint = |window: &mut Window, cx: &mut crate::App| {
+                        let paint = |window: &mut Window, cx: &mut crate::App| {
                             let origin = point(px(10.), px(20.));
                             line.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
                                 .unwrap();

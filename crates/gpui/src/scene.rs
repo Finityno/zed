@@ -3965,7 +3965,7 @@ mod tests {
         };
         let build = |fast: bool| {
             let mut scene = Scene::default();
-            let mut insert = |scene: &mut Scene, sprite: MonochromeSprite| {
+            let insert = |scene: &mut Scene, sprite: MonochromeSprite| {
                 if fast {
                     scene.insert_monochrome_sprite(sprite);
                     scene.insert_subpixel_sprite(subpixel(sprite));

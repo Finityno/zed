@@ -3020,7 +3020,7 @@ mod test {
             }
         }
 
-        let mut draw = |cx: &mut gpui::VisualTestContext| {
+        let draw = |cx: &mut gpui::VisualTestContext| {
             let state = state.clone();
             let last_row_bounds = last_row_bounds.clone();
             cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
