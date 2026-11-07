@@ -31,10 +31,8 @@ core-foundation.workspace = true
 core-foundation-sys.workspace = true
 core-graphics.workspace = true
 core-text = { workspace = true, optional = true }
-derive_more.workspace = true
 dispatch2 = { workspace = true, features = ["block2"] }
 etagere.workspace = true
-foreign-types.workspace = true
 futures.workspace = true
 # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
 font-kit = { workspace = true, optional = true, features = ["source"] }
@@ -43,7 +41,6 @@ image.workspace = true
 libc.workspace = true
 log.workspace = true
 mach2.workspace = true
-metal.workspace = true
 objc2.workspace = true
 objc2-core-foundation = { workspace = true, features = ["std", "CFData", "CFDictionary", "CFString", "CFNumber", "CFBase", "CFCGTypes"] }
 objc2-core-graphics = { workspace = true, features = ["CGColorSpace"] }
@@ -59,6 +56,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLCommandBuffer",
     "MTLCommandEncoder",
     "MTLCommandQueue",
+    "MTLDepthStencil",
     "MTLDevice",
     "MTLDrawable",
     "MTLLibrary",
@@ -69,6 +67,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLResource",
     "MTLTexture",
     "MTLTypes",
+    "objc2-core-foundation",
 ] }
 objc2-foundation = { workspace = true, features = ["NSThread", "NSNotification", "NSOperation", "NSProcessInfo", "block2"] }
 objc2-quartz-core = { workspace = true, features = ["objc2-core-foundation", "objc2-core-graphics", "objc2-metal"] }

@@ -10,9 +10,28 @@
 //! spent there. Asked here, the main thread waits only as long as it chooses
 //! to and defers the present when no drawable came in time.
 
-use metal::{MetalDrawable, MetalDrawableRef, MetalLayer};
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::{sync::Arc, thread, time::Instant};
+
+type MetalDrawable = Retained<ProtocolObject<dyn CAMetalDrawable>>;
+
+/// A drawable handed between the acquire thread and the presenting thread.
+struct SentDrawable(MetalDrawable);
+
+// SAFETY: A drawable is only ever used by one thread at a time: the acquire
+// thread hands it over through the state mutex and never touches it again.
+// Core Animation's drawables may be presented and released from any thread.
+unsafe impl Send for SentDrawable {}
+
+/// The layer the acquire thread asks for drawables.
+struct SentLayer(Retained<CAMetalLayer>);
+
+// SAFETY: The acquire thread only calls `nextDrawable` on the layer, which
+// Core Animation documents as callable from any thread, and retains and
+// releases it, which are atomic.
+unsafe impl Send for SentLayer {}
 
 /// What [`DrawableAcquirer::take`] found.
 pub(crate) enum Acquired {
@@ -28,7 +47,7 @@ struct State {
     /// The generation of the request the thread is serving, or is about to.
     requested: Option<u64>,
     /// The answer to the last request, until the renderer takes it.
-    ready: Option<Option<MetalDrawable>>,
+    ready: Option<Option<SentDrawable>>,
     /// Bumped by [`DrawableAcquirer::discard`], so a drawable that comes back
     /// for a request made before it is released instead of kept.
     generation: u64,
@@ -73,12 +92,12 @@ impl AcquireGate {
 
 pub(crate) struct DrawableAcquirer {
     shared: Arc<Shared>,
-    layer: MetalLayer,
+    layer: Retained<CAMetalLayer>,
     thread_started: bool,
 }
 
 impl DrawableAcquirer {
-    pub(crate) fn new(layer: MetalLayer) -> Self {
+    pub(crate) fn new(layer: Retained<CAMetalLayer>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
@@ -134,20 +153,26 @@ impl DrawableAcquirer {
     /// Whether an answer is waiting that a present can take: a drawable that
     /// `fits`, or none at all from a faulted layer, which the present reports
     /// as it always has.
-    pub(crate) fn ready_fits(&self, fits: impl Fn(&MetalDrawableRef) -> bool) -> bool {
+    pub(crate) fn ready_fits(
+        &self,
+        fits: impl Fn(&ProtocolObject<dyn CAMetalDrawable>) -> bool,
+    ) -> bool {
         match &self.shared.state.lock().ready {
-            Some(Some(drawable)) => fits(drawable),
+            Some(Some(drawable)) => fits(&drawable.0),
             Some(None) => true,
             None => false,
         }
     }
 
     /// Releases a drawable that came back and is waiting, unless it `fits`.
-    pub(crate) fn release_ready_unless(&self, fits: impl Fn(&MetalDrawableRef) -> bool) {
+    pub(crate) fn release_ready_unless(
+        &self,
+        fits: impl Fn(&ProtocolObject<dyn CAMetalDrawable>) -> bool,
+    ) {
         let released = {
             let mut state = self.shared.state.lock();
             match &state.ready {
-                Some(Some(drawable)) if !fits(drawable) => state.ready.take(),
+                Some(Some(drawable)) if !fits(&drawable.0) => state.ready.take(),
                 _ => None,
             }
         };
@@ -157,7 +182,7 @@ impl DrawableAcquirer {
     /// Takes the requested drawable if it has come back.
     pub(crate) fn take(&self) -> Acquired {
         match self.shared.state.lock().ready.take() {
-            Some(drawable) => Acquired::Ready(drawable),
+            Some(drawable) => Acquired::Ready(drawable.map(|drawable| drawable.0)),
             None => Acquired::Pending,
         }
     }
@@ -185,7 +210,7 @@ impl DrawableAcquirer {
         }
         self.thread_started = true;
         let shared = Arc::clone(&self.shared);
-        let layer = self.layer.clone();
+        let layer = SentLayer(self.layer.clone());
         let spawned = thread::Builder::new()
             .name("gpui-drawable-acquire".into())
             .spawn(move || serve_requests(&shared, &layer));
@@ -194,11 +219,10 @@ impl DrawableAcquirer {
             // defers, so fall back to asking on the calling thread.
             log::error!("failed to start the drawable acquire thread: {error}");
             self.thread_started = false;
-            let drawable =
-                objc2::rc::autoreleasepool(|_| self.layer.next_drawable().map(ToOwned::to_owned));
+            let drawable = objc2::rc::autoreleasepool(|_| self.layer.nextDrawable());
             let mut state = self.shared.state.lock();
             state.requested = None;
-            state.ready = Some(drawable);
+            state.ready = Some(drawable.map(SentDrawable));
         }
     }
 }
@@ -218,7 +242,7 @@ impl Drop for DrawableAcquirer {
     }
 }
 
-fn serve_requests(shared: &Shared, layer: &MetalLayer) {
+fn serve_requests(shared: &Shared, layer: &SentLayer) {
     let mut state = shared.state.lock();
     loop {
         if state.shutdown {
@@ -236,7 +260,7 @@ fn serve_requests(shared: &Shared, layer: &MetalLayer) {
             shared.gate.pass();
             // The drawable comes back autoreleased; it is retained before
             // this thread's pool drains, and released wherever it is dropped.
-            objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
+            objc2::rc::autoreleasepool(|_| layer.0.nextDrawable().map(SentDrawable))
         });
         state.requested = None;
         shared.changed.notify_all();
