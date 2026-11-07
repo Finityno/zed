@@ -1,4 +1,10 @@
-//! Frame pacing for macOS windows, built on `CVDisplayLink`.
+//! Frame pacing for macOS windows.
+//!
+//! On macOS 14 and later a visible window is paced by a `CAMetalDisplayLink`
+//! on its layer ([`gpui_apple::display_link::MetalFrameSource`], shared with
+//! GPUI's frame waker through [`MetalFrames`]). Earlier systems, and windows
+//! that keep rendering while hidden, use the shared `CVDisplayLink` registry
+//! described below ([`WindowFrameSource`]).
 //!
 //! CVDisplayLink has no safe teardown: `CVDisplayLinkStop` merely flags the
 //! link's io thread to exit "soon" and returns immediately, and there is no
@@ -57,9 +63,11 @@ use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
 use gpui::{FrameRequestSource, PlatformFrameSignal};
+use gpui_apple::display_link::MetalFrameSource;
 use gpui_util::ResultExt;
 use scheduler::Instant;
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, btree_map},
     ffi::c_void,
     sync::{
@@ -428,6 +436,70 @@ impl WindowFrameSource {
     }
 }
 
+/// A window's `CAMetalDisplayLink`, shared with GPUI's frame waker so that a
+/// wake reaches the current link without taking the window's lock.
+///
+/// The link pauses after any update in which GPUI neither drew, presented,
+/// nor asked for another frame, so an idle window acquires no drawables. GPUI
+/// decides when frames are needed (including presenting after high-rate
+/// input); this only stops the link between those decisions.
+#[derive(Default)]
+pub struct MetalFrames {
+    source: RefCell<Option<MetalFrameSource>>,
+    /// Whether GPUI asked for a frame since the current update began.
+    woken: Cell<bool>,
+}
+
+impl MetalFrames {
+    pub fn replace(&self, source: Option<MetalFrameSource>) {
+        *self.source.borrow_mut() = source;
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.source.borrow().is_some()
+    }
+
+    pub fn wake(&self) {
+        self.woken.set(true);
+        // A source being replaced starts unpaused, so skipping it is safe.
+        if let Ok(source) = self.source.try_borrow()
+            && let Some(source) = source.as_ref()
+        {
+            source.set_paused(false);
+        }
+    }
+
+    pub fn begin_frame(&self) {
+        self.woken.set(false);
+    }
+
+    /// Ends an update, pausing the link if GPUI neither used its drawable nor
+    /// asked for another frame while it ran. Returns whether it paused.
+    pub fn end_frame(&self, used_drawable: bool) -> bool {
+        let pause = !used_drawable && !self.woken.get();
+        if pause && let Some(source) = self.source.borrow().as_ref() {
+            source.set_paused(true);
+        }
+        pause
+    }
+}
+
+/// The host time (in `mach_absolute_time` ticks, at `host_clock_frequency`
+/// ticks per second) of a Core Animation media time, which counts seconds on
+/// the same clock. `None` for a time that does not convert to a usable
+/// deadline.
+pub(crate) fn media_time_to_host_time(media_time: f64, host_clock_frequency: f64) -> Option<u64> {
+    if !media_time.is_finite()
+        || media_time <= 0.0
+        || !host_clock_frequency.is_finite()
+        || host_clock_frequency <= 0.0
+    {
+        return None;
+    }
+    let host_time = (media_time * host_clock_frequency).round();
+    (host_time >= 1.0 && host_time < u64::MAX as f64).then_some(host_time as u64)
+}
+
 impl Drop for WindowFrameSource {
     fn drop(&mut self) {
         self.stop();
@@ -622,6 +694,84 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2::AnyThread;
+    use objc2_quartz_core::CAMetalDisplayLink;
+
+    #[test]
+    fn metal_frames_pause_only_when_gpui_neither_draws_nor_asks_again() {
+        let frames = MetalFrames::default();
+
+        frames.begin_frame();
+        assert!(
+            !frames.end_frame(true),
+            "a frame that drew keeps the link running"
+        );
+
+        frames.begin_frame();
+        frames.wake();
+        assert!(
+            !frames.end_frame(false),
+            "a wake during the update, like a throttled frame's retry, keeps it running"
+        );
+
+        frames.wake();
+        frames.begin_frame();
+        assert!(
+            frames.end_frame(false),
+            "a wake before the update was served by it"
+        );
+
+        frames.begin_frame();
+        assert!(frames.end_frame(false), "an idle update pauses the link");
+    }
+
+    #[test]
+    fn a_renderer_draws_normally_after_its_display_link_is_invalidated() -> anyhow::Result<()> {
+        if !MetalFrameSource::is_available() {
+            return Ok(());
+        }
+        let mut renderer = crate::renderer::MetalRenderer::new(Default::default(), false, false)?;
+        renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
+        let layer = renderer
+            .layer()
+            .map(objc2::Message::retain)
+            .ok_or_else(|| anyhow::anyhow!("a window renderer has a layer"))?;
+        // The link is never added to a run loop: attaching it to the layer is
+        // the state under test.
+        let link = CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), &layer);
+        assert!(renderer.can_attach_display_link());
+        renderer.set_display_link_attached(true);
+        assert_eq!(
+            renderer.draw(&gpui::Scene::default()).outcome,
+            gpui::PresentOutcome::Deferred,
+            "a present outside the link's update has no drawable"
+        );
+
+        link.invalidate();
+        renderer.set_display_link_attached(false);
+        assert_eq!(
+            renderer.draw(&gpui::Scene::default()).outcome,
+            gpui::PresentOutcome::Presented
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn media_time_converts_to_host_ticks() {
+        assert_eq!(media_time_to_host_time(2.0, 24e6), Some(48_000_000));
+        assert_eq!(media_time_to_host_time(0.5, 1e9), Some(500_000_000));
+        for (media_time, frequency) in [
+            (0.0, 24e6),
+            (-1.0, 24e6),
+            (f64::NAN, 24e6),
+            (f64::INFINITY, 24e6),
+            (1.0, 0.0),
+            (1.0, f64::NAN),
+            (f64::MAX, 24e6),
+        ] {
+            assert_eq!(media_time_to_host_time(media_time, frequency), None);
+        }
+    }
 
     #[test]
     fn host_timestamp_preserves_request_age_at_different_clock_rates() {

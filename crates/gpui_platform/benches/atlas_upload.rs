@@ -234,7 +234,10 @@ fn tile_scene(tile: AtlasTile) -> Scene {
                 l: 1.0,
                 a: 1.0,
             },
+            effect: Default::default(),
             transformation: TransformationMatrix::default(),
+            rounded_clip: 0,
+            clip_padding: 0,
         }),
         AtlasTextureKind::Polychrome => scene.insert_primitive(PolychromeSprite {
             order: 0,
@@ -245,6 +248,8 @@ fn tile_scene(tile: AtlasTile) -> Scene {
             bounds,
             content_mask,
             corner_radii: Corners::default(),
+            rounded_clip: 0,
+            clip_padding: 0,
         }),
         AtlasTextureKind::Subpixel => unreachable!(),
     }
