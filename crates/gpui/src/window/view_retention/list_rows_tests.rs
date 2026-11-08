@@ -404,9 +404,10 @@ fn work_building_rows_after_scrolls(replay: bool) -> (u64, u64, u64) {
 
 /// A row drawn again over a few frames keeps its layout nodes: built again,
 /// it lays out on them and shapes no lines afresh, as a row built on every
-/// frame does. The list measures every row on its first frame and then lays
-/// the rows in view out again; the rows drawn again from then on are the
-/// ones recorded on that frame.
+/// frame does. The test compares the lines shaped and layout nodes made on
+/// the frame where an accent change builds every row in view again, after
+/// four scroll frames that drew those rows again (with replay on) or built
+/// them (with it off).
 #[test]
 fn a_row_drawn_again_for_a_while_is_built_again_on_its_nodes() {
     let (shaped_off, created_off, _) = work_building_rows_after_scrolls(false);
