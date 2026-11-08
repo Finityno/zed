@@ -159,12 +159,18 @@ struct StateInner {
     /// prepainted at: the wheel and the scrollbar then scroll it by whole
     /// device pixels, which is what its rows can be drawn again moved by.
     snap_scale: Option<f32>,
-    /// The wheel scroll a frame's snapping left over, carried into the next
-    /// frame's, and the scroll top that frame's events scrolled from: a slow
-    /// wheel still moves the list, a device pixel at a time.
+    /// The wheel scroll the snapping left over, carried into the events of
+    /// the next listener painted, and the listener whose events scroll from
+    /// that carry: a slow wheel still moves the list, a device pixel at a
+    /// time. Each painted listener adds up its own events from zero, so the
+    /// carry is taken up per listener, not per position: a list painted
+    /// again where it was (its view built for another reason) would
+    /// otherwise lose what the last listener left over and stall.
     wheel_remainder: Pixels,
     wheel_carry: Pixels,
-    wheel_base: Option<Pixels>,
+    wheel_listener: Option<u64>,
+    /// How many wheel listeners the list has painted, which stamps each.
+    wheel_listeners_painted: u64,
     /// The run of items `layout_items` walks, kept across frames so its
     /// capacity is reused instead of regrown every frame. Empty between calls.
     measured_items_scratch: VecDeque<ListItem>,
@@ -826,7 +832,8 @@ impl ListState {
             snap_scale: None,
             wheel_remainder: px(0.),
             wheel_carry: px(0.),
-            wheel_base: None,
+            wheel_listener: None,
+            wheel_listeners_painted: 0,
             measured_items_scratch: VecDeque::new(),
             last_item_layout_count: 0,
             held_item: None,
@@ -1849,6 +1856,7 @@ impl StateInner {
     fn scroll(
         &mut self,
         scroll_top: &ListOffset,
+        listener: u64,
         height: Pixels,
         delta: Point<Pixels>,
         current_view: EntityId,
@@ -1867,10 +1875,10 @@ impl StateInner {
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
         let base = self.scroll_top(scroll_top);
-        // Events of one frame scroll from where the frame left the list; what
-        // the last frame's snapping left over is carried into the first.
-        if self.wheel_base != Some(base) {
-            self.wheel_base = Some(base);
+        // A listener's events add up from where its frame left the list; what
+        // the snapping left over before it is carried into the first.
+        if self.wheel_listener != Some(listener) {
+            self.wheel_listener = Some(listener);
             self.wheel_carry = self.wheel_remainder;
         }
         let wanted = (base - delta.y + self.wheel_carry).max(px(0.)).min(scroll_max);
@@ -1978,7 +1986,7 @@ impl StateInner {
         for (ix, item) in cursor.enumerate() {
             let size = item.size().unwrap_or_else(|| {
                 let mut element = render_item(ix, window, cx);
-                window.layout_as_list_item(&mut element, ix, available_item_space, cx)
+                window.measure_as_list_item(&mut element, ix, available_item_space, cx)
             });
             if item.size().is_none() {
                 height_hint_measurements.record(item, size.height);
@@ -2194,7 +2202,7 @@ impl StateInner {
                 } else {
                     let item_index = cursor.start().0;
                     let mut element = render_item(item_index, window, cx);
-                    let item_size = window.layout_as_list_item(
+                    let item_size = window.measure_as_list_item(
                         &mut element,
                         item_index,
                         available_item_space,
@@ -2817,6 +2825,11 @@ impl Element for List {
         let height = bounds.size.height;
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
+        let listener = {
+            let mut state = self.state.0.borrow_mut();
+            state.wheel_listeners_painted += 1;
+            state.wheel_listeners_painted
+        };
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
@@ -2825,6 +2838,7 @@ impl Element for List {
                 let mut state = list_state.0.borrow_mut();
                 state.scroll(
                     &scroll_top,
+                    listener,
                     height,
                     pixel_delta,
                     current_view,

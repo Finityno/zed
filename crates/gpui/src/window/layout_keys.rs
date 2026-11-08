@@ -246,6 +246,37 @@ impl Window {
         self.layout_keys.pop();
         size
     }
+
+    /// Lays `element` out as the item at `index` of a list only to measure
+    /// it, as [`Self::layout_as_list_item`] does, handing back the nodes it
+    /// claimed.
+    ///
+    /// A list measures an item it has no size for and then lays it out again
+    /// to show it in the same frame. Kept claimed, the measure's nodes would
+    /// make the item shown find its key taken and lay out on nodes of its own
+    /// under its index, and, with list row replay, be recorded on those: the
+    /// next frame to build it would lay it out under its key again, on nodes
+    /// made afresh, and measure and shape its text again. Handed back, the
+    /// item shown claims the measure's nodes, measured as they are.
+    pub(crate) fn measure_as_list_item(
+        &mut self,
+        element: &mut AnyElement,
+        index: usize,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        let start = self
+            .layout_engine
+            .as_mut()
+            .map(|engine| engine.begin_transaction());
+        let size = self.layout_as_list_item(element, index, available_space, cx);
+        if let Some(start) = start
+            && let Some(engine) = self.layout_engine.as_mut()
+        {
+            engine.end_transaction(start, true);
+        }
+        size
+    }
 }
 
 #[cfg(test)]
