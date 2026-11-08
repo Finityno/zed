@@ -1,104 +1,81 @@
-use anyhow::{Context as _, Result};
-use collections::FxHashMap;
-use derive_more::{Deref, DerefMut};
+use anyhow::{Context as _, Result, ensure};
 use etagere::BucketedAtlasAllocator;
 use gpui::{
-    ATLAS_TILE_MAX_IDLE_FRAMES, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, RenderMemoryGauge,
-    RenderMemoryLedger, Scene, Size, TileId,
+    ATLAS_TILE_MAX_IDLE_FRAMES, AtlasBackend, AtlasKey, AtlasState, AtlasTextureId,
+    AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point,
+    RenderMemoryGauge, RenderMemoryLedger, Scene, Size,
 };
-use metal::Device;
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_metal::{
+    MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResource, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+};
 use parking_lot::Mutex;
-use std::borrow::Cow;
+use std::{borrow::Cow, ptr::NonNull};
 
-pub struct MetalAtlas(Mutex<MetalAtlasState>);
+pub struct MetalAtlas(Mutex<AtlasState<MetalAtlasTextures>>);
 
 impl MetalAtlas {
-    pub(crate) fn new(device: Device, supports_shared_storage: bool) -> Self {
-        MetalAtlas(Mutex::new(MetalAtlasState {
-            device: AssertSend(device),
+    pub(crate) fn new(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        supports_shared_storage: bool,
+    ) -> Self {
+        MetalAtlas(Mutex::new(AtlasState::new(MetalAtlasTextures {
+            device,
             supports_shared_storage,
-            monochrome_textures: Default::default(),
-            polychrome_textures: Default::default(),
-            tiles_by_key: Default::default(),
-            frame: 0,
-            retire_cursor: 0,
+            monochrome_textures: AtlasTextureList::default(),
+            polychrome_textures: AtlasTextureList::default(),
             render_memory: RenderMemoryLedger::default(),
-        }))
+        })))
     }
 
     /// Returns the GPU texture backing `id`, or `None` once every tile in it
     /// has been removed. A scene can still reference such a texture when a
     /// cached view replays a paint from before the image was dropped, so
     /// callers must skip those sprites rather than assume the texture exists.
-    pub(crate) fn metal_texture(&self, id: AtlasTextureId) -> Option<metal::Texture> {
-        Some(self.0.lock().texture(id)?.metal_texture.clone())
+    pub(crate) fn metal_texture(
+        &self,
+        id: AtlasTextureId,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+        Some(self.0.lock().backend.texture(id)?.metal_texture.clone())
     }
 
     /// The renderer's once-per-frame hook: marks every tile `scene` draws as used
     /// this frame, then lets one page's idle tiles go. Marking must
     /// come first so a tile drawn this very frame can never be the one retired.
     pub fn on_frame_drawn(&self, scene: &Scene) {
-        self.note_frame_drawn(scene);
-        self.retire_unused(ATLAS_TILE_MAX_IDLE_FRAMES);
+        let mut lock = self.0.lock();
+        lock.note_frame_drawn(scene);
+        lock.retire_unused(ATLAS_TILE_MAX_IDLE_FRAMES);
     }
 
     /// Marks `scene`'s tiles as used in the current frame without advancing
-    /// it; see [`MetalRenderer::note_scene_tiles`].
+    /// it; see [`crate::metal_renderer::MetalRenderer::note_scene_tiles`].
     pub fn note_scene_tiles(&self, scene: &Scene) {
         self.0.lock().mark_scene_tiles(scene);
     }
-}
 
-impl MetalAtlas {
     /// Device bytes the atlas's textures hold, as (monochrome, polychrome).
     /// Read by the renderer's GPU stats logging.
     pub(crate) fn allocated_bytes(&self) -> (u64, u64) {
-        self.0.lock().allocated_bytes()
-    }
-
-    #[cfg(test)]
-    fn published_bytes(&self) -> (u64, u64) {
-        let lock = self.0.lock();
-        (
-            lock.render_memory
-                .published(RenderMemoryGauge::AtlasMonochrome),
-            lock.render_memory
-                .published(RenderMemoryGauge::AtlasPolychrome),
-        )
-    }
-
-    #[cfg(test)]
-    fn contains_key(&self, key: &AtlasKey) -> bool {
-        self.0.lock().tiles_by_key.contains_key(key)
-    }
-
-    #[cfg(test)]
-    fn texture_is_live(&self, id: AtlasTextureId) -> bool {
-        let lock = self.0.lock();
-        lock.textures(id.kind)
-            .textures
-            .get(id.index as usize)
-            .is_some_and(|slot| slot.is_some())
+        self.0.lock().backend.allocated_bytes()
     }
 }
 
-struct MetalAtlasState {
-    device: AssertSend<Device>,
+// Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
+const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(16384),
+    height: DevicePixels(16384),
+};
+
+struct MetalAtlasTextures {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
     supports_shared_storage: bool,
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
-    tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
-    /// Frames seen through `note_frame_drawn`. Shared across every window drawing
-    /// with this atlas, which is why `Window` compares against it before replaying
-    /// a retained scene.
-    frame: u64,
     /// What this atlas has reported into the process-wide render memory
     /// gauges; refreshed whenever a page is created or freed.
     render_memory: RenderMemoryLedger,
-    /// Position in the concatenated (monochrome, polychrome) page list that the
-    /// next `retire_unused` call examines.
-    retire_cursor: usize,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -107,145 +84,90 @@ impl PlatformAtlas for MetalAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        let mut lock = self.0.lock();
-        if let Some(tile) = lock.tiles_by_key.get(&key).copied() {
-            let frame = lock.frame;
-            lock.touch(tile, frame);
-            Ok(Some(tile))
-        } else {
-            let Some((size, bytes)) = build()? else {
-                return Ok(None);
-            };
-            let tile = lock.allocate(size, &key).context("failed to allocate")?;
-            let texture = lock
-                .texture(tile.texture_id)
-                .context("allocated tile refers to a missing texture")?;
-            texture.upload(tile.bounds, &bytes);
-            lock.tiles_by_key.insert(key, tile);
-            Ok(Some(tile))
-        }
+        self.0.lock().get_or_insert_with(key, build)
     }
 
     fn remove(&self, key: &AtlasKey) {
-        let mut lock = self.0.lock();
-        let Some(tile) = lock.tiles_by_key.remove(key) else {
-            return;
-        };
-        lock.release_tile(tile);
+        self.0.lock().remove(key);
     }
 
     fn note_frame_drawn(&self, scene: &Scene) {
-        let mut lock = self.0.lock();
-        lock.frame += 1;
-        lock.mark_scene_tiles(scene);
+        self.0.lock().note_frame_drawn(scene);
     }
 
     fn retire_unused(&self, max_idle_frames: u64) {
-        let mut lock = self.0.lock();
-        let monochrome_count = lock.monochrome_textures.textures.len();
-        let page_count = monochrome_count + lock.polychrome_textures.textures.len();
-        if page_count == 0 {
-            return;
-        }
-        let cursor = lock.retire_cursor % page_count;
-        lock.retire_cursor = cursor + 1;
-        let (kind, index) = if cursor < monochrome_count {
-            (AtlasTextureKind::Monochrome, cursor)
-        } else {
-            (AtlasTextureKind::Polychrome, cursor - monochrome_count)
-        };
-
-        let frame = lock.frame;
-        let Some(Some(texture)) = lock.textures(kind).textures.get(index) else {
-            return;
-        };
-        let idle_keys: Vec<AtlasKey> = texture
-            .tiles
-            .values()
-            .filter(|record| frame.saturating_sub(record.last_used_frame) >= max_idle_frames)
-            .map(|record| record.key.clone())
-            .collect();
-        if idle_keys.is_empty() {
-            return;
-        }
-        let retired = idle_keys.len();
-        for key in idle_keys {
-            if let Some(tile) = lock.tiles_by_key.remove(&key) {
-                lock.release_tile(tile);
-            }
-        }
-        let page_freed = lock
-            .textures(kind)
-            .textures
-            .get(index)
-            .is_some_and(|slot| slot.is_none());
-        log::debug!(
-            "[atlas] retired {retired} idle {kind:?} tile(s) from page {index} at frame {frame}{}",
-            if page_freed { "; page freed" } else { "" }
-        );
+        self.0.lock().retire_unused(max_idle_frames);
     }
 
     fn frame_index(&self) -> u64 {
-        self.0.lock().frame
+        self.0.lock().frame_index()
+    }
+
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    fn contains(&self, key: &AtlasKey) -> bool {
+        self.0.lock().contains(key)
     }
 }
 
-impl MetalAtlasState {
-    /// Records every tile `scene` references as used in the current frame.
-    fn mark_scene_tiles(&mut self, scene: &Scene) {
-        let frame = self.frame;
-        // `Scene::finish` sorts each sprite list by texture and then tile id within
-        // a draw order, so a glyph repeated across a line of text collapses to one
-        // lookup here.
-        let mut previous: Option<(AtlasTextureId, TileId)> = None;
-        let tiles = scene
-            .monochrome_sprites
-            .iter()
-            .map(|sprite| sprite.tile)
-            .chain(scene.subpixel_sprites.iter().map(|sprite| sprite.tile))
-            .chain(scene.polychrome_sprites.iter().map(|sprite| sprite.tile));
-        for tile in tiles {
-            let identity = (tile.texture_id, tile.tile_id);
-            if previous == Some(identity) {
-                continue;
-            }
-            previous = Some(identity);
-            self.touch(tile, frame);
-        }
+impl AtlasBackend for MetalAtlasTextures {
+    fn insert(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+        bytes: &[u8],
+    ) -> Result<AtlasTile> {
+        let upload = AtlasUpload::new(kind, size, bytes)?;
+        let tile = self.allocate(size, kind)?;
+        let texture = self
+            .texture(tile.texture_id)
+            .context("looking up allocated atlas texture")?;
+        texture.upload(tile.bounds.origin, &upload)?;
+        Ok(tile)
     }
 
-    fn textures(&self, kind: AtlasTextureKind) -> &AtlasTextureList<MetalAtlasTexture> {
+    fn remove(&mut self, tile: AtlasTile) {
+        let id = tile.texture_id;
+        let Some(textures) = self.textures_mut(id.kind) else {
+            return;
+        };
+        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
+            return;
+        };
+
+        let mut page_freed = false;
+        if let Some(mut texture) = texture_slot.take() {
+            texture.allocator.deallocate(tile.tile_id.into());
+            texture.decrement_ref_count();
+            if texture.is_unreferenced() {
+                textures.free_list.push(id.index as usize);
+                page_freed = true;
+            } else {
+                *texture_slot = Some(texture);
+            }
+        }
+        if page_freed {
+            self.publish_memory();
+        }
+    }
+}
+
+impl MetalAtlasTextures {
+    fn textures(&self, kind: AtlasTextureKind) -> Option<&AtlasTextureList<MetalAtlasTexture>> {
         match kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &self.polychrome_textures,
-            AtlasTextureKind::Subpixel => unreachable!(),
+            AtlasTextureKind::Monochrome => Some(&self.monochrome_textures),
+            AtlasTextureKind::Polychrome => Some(&self.polychrome_textures),
+            AtlasTextureKind::Subpixel => None,
         }
     }
 
     fn textures_mut(
         &mut self,
         kind: AtlasTextureKind,
-    ) -> &mut AtlasTextureList<MetalAtlasTexture> {
+    ) -> Option<&mut AtlasTextureList<MetalAtlasTexture>> {
         match kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => unreachable!(),
-        }
-    }
-
-    fn touch(&mut self, tile: AtlasTile, frame: u64) {
-        let id = tile.texture_id;
-        // A scene can name a tile this atlas no longer holds (a retained scene
-        // outliving the idle window before `Window` catches it); there is nothing
-        // to mark then, and the draw already reads whatever the slot holds.
-        if let Some(record) = self
-            .textures_mut(id.kind)
-            .textures
-            .get_mut(id.index as usize)
-            .and_then(|slot| slot.as_mut())
-            .and_then(|texture| texture.tiles.get_mut(&tile.tile_id))
-        {
-            record.last_used_frame = frame;
+            AtlasTextureKind::Monochrome => Some(&mut self.monochrome_textures),
+            AtlasTextureKind::Polychrome => Some(&mut self.polychrome_textures),
+            AtlasTextureKind::Subpixel => None,
         }
     }
 
@@ -255,7 +177,7 @@ impl MetalAtlasState {
             list.textures
                 .iter()
                 .flatten()
-                .map(|texture| texture.metal_texture.allocated_size())
+                .map(|texture| texture.metal_texture.allocatedSize() as u64)
                 .sum()
         }
         (
@@ -272,140 +194,114 @@ impl MetalAtlasState {
             .publish(RenderMemoryGauge::AtlasPolychrome, polychrome);
     }
 
-    /// Returns a tile's space to its page and drops the page once it holds nothing.
-    /// The caller removes the `tiles_by_key` entry.
-    fn release_tile(&mut self, tile: AtlasTile) {
-        let id = tile.texture_id;
-        let textures = self.textures_mut(id.kind);
-        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
-            return;
-        };
-        let mut page_freed = false;
-        if let Some(mut texture) = texture_slot.take() {
-            if texture.tiles.remove(&tile.tile_id).is_some() {
-                texture.allocator.deallocate(tile.tile_id.into());
-            }
-            if texture.tiles.is_empty() {
-                textures.free_list.push(id.index as usize);
-                page_freed = true;
-            } else {
-                *texture_slot = Some(texture);
-            }
+    fn allocate(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Result<AtlasTile> {
+        // No page can hold it, and a page pushed for it would stay empty.
+        if size.width.0 > MAX_ATLAS_SIZE.width.0 || size.height.0 > MAX_ATLAS_SIZE.height.0 {
+            anyhow::bail!(
+                "atlas tile {}x{} exceeds the {}x{} page limit",
+                size.width.0,
+                size.height.0,
+                MAX_ATLAS_SIZE.width.0,
+                MAX_ATLAS_SIZE.height.0
+            );
         }
-        if page_freed {
-            self.publish_memory();
-        }
-    }
-
-    fn allocate(&mut self, size: Size<DevicePixels>, key: &AtlasKey) -> Option<AtlasTile> {
-        let frame = self.frame;
-        let texture_kind = key.texture_kind();
-        if let Some(tile) = self
-            .textures_mut(texture_kind)
-            .iter_mut()
-            .rev()
-            .find_map(|texture| texture.allocate(size, key, frame))
         {
-            return Some(tile);
+            let textures = self
+                .textures_mut(texture_kind)
+                .context("Metal does not render subpixel sprites")?;
+            if let Some(tile) = textures
+                .iter_mut()
+                .rev()
+                .find_map(|texture| texture.allocate(size))
+            {
+                return Ok(tile);
+            }
         }
 
-        let texture = self.push_texture(size, texture_kind);
-        texture.allocate(size, key, frame)
+        let texture = self.push_texture(size, texture_kind)?;
+        texture.allocate(size).context("allocating atlas tile")
     }
 
     fn push_texture(
         &mut self,
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
-    ) -> &mut MetalAtlasTexture {
+    ) -> Result<&mut MetalAtlasTexture> {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
         };
-        // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
-        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(16384),
-            height: DevicePixels(16384),
-        };
         let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.into());
-        texture_descriptor.set_height(size.height.into());
-        let pixel_format;
-        let usage;
-        match kind {
-            AtlasTextureKind::Monochrome => {
-                pixel_format = metal::MTLPixelFormat::A8Unorm;
-                usage = metal::MTLTextureUsage::ShaderRead;
-            }
-            AtlasTextureKind::Polychrome => {
-                pixel_format = metal::MTLPixelFormat::BGRA8Unorm;
-                usage = metal::MTLTextureUsage::ShaderRead;
-            }
-            AtlasTextureKind::Subpixel => unreachable!(),
+        let pixel_format = match kind {
+            AtlasTextureKind::Monochrome => MTLPixelFormat::A8Unorm,
+            AtlasTextureKind::Polychrome => MTLPixelFormat::BGRA8Unorm,
+            AtlasTextureKind::Subpixel => anyhow::bail!("Metal does not render subpixel sprites"),
+        };
+        let texture_descriptor = MTLTextureDescriptor::new();
+        // SAFETY: Both dimensions are clamped to the existing 1024..=16384 atlas size limits.
+        unsafe {
+            texture_descriptor.setWidth(size.width.0 as usize);
+            texture_descriptor.setHeight(size.height.0 as usize);
         }
-        texture_descriptor.set_pixel_format(pixel_format);
-        texture_descriptor.set_usage(usage);
+        texture_descriptor.setPixelFormat(pixel_format);
+        texture_descriptor.setUsage(MTLTextureUsage::ShaderRead);
         // Shared memory mode can be used only on Apple GPU families
         // https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared
-        texture_descriptor.set_storage_mode(if self.supports_shared_storage {
-            metal::MTLStorageMode::Shared
+        texture_descriptor.setStorageMode(if self.supports_shared_storage {
+            MTLStorageMode::Shared
         } else {
-            metal::MTLStorageMode::Managed
+            MTLStorageMode::Managed
         });
-        let metal_texture = self.device.new_texture(&texture_descriptor);
+        let metal_texture = self
+            .device
+            .newTextureWithDescriptor(&texture_descriptor)
+            .context("allocating atlas texture")?;
 
-        let texture_list = self.textures_mut(kind);
-
-        let index = texture_list.free_list.pop();
-
-        let atlas_texture = MetalAtlasTexture {
+        let texture_list = self
+            .textures_mut(kind)
+            .context("Metal does not render subpixel sprites")?;
+        let index = texture_list.free_list.pop().unwrap_or_else(|| {
+            let index = texture_list.textures.len();
+            texture_list.textures.push(None);
+            index
+        });
+        texture_list.textures[index] = Some(MetalAtlasTexture {
             id: AtlasTextureId {
-                index: index.unwrap_or(texture_list.textures.len()) as u32,
+                index: index as u32,
                 kind,
             },
-            allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
-            metal_texture: AssertSend(metal_texture),
-            tiles: FxHashMap::default(),
-        };
-
-        let ix = match index {
-            Some(ix) => {
-                texture_list.textures[ix] = Some(atlas_texture);
-                ix
-            }
-            None => {
-                texture_list.textures.push(Some(atlas_texture));
-                texture_list.textures.len() - 1
-            }
-        };
+            allocator: BucketedAtlasAllocator::new(size_to_etagere(size)),
+            metal_texture,
+            live_atlas_keys: 0,
+        });
         self.publish_memory();
-        self.textures_mut(kind).textures[ix].as_mut().unwrap()
+        self.textures_mut(kind)
+            .and_then(|list| list.textures.get_mut(index))
+            .and_then(Option::as_mut)
+            .context("looking up the atlas texture just created")
     }
 
     fn texture(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
-        self.textures(id.kind)
+        self.textures(id.kind)?
             .textures
             .get(id.index as usize)?
             .as_ref()
     }
 }
 
-struct TileRecord {
-    key: AtlasKey,
-    last_used_frame: u64,
-}
-
 struct MetalAtlasTexture {
     id: AtlasTextureId,
     allocator: BucketedAtlasAllocator,
-    metal_texture: AssertSend<metal::Texture>,
-    /// Every live tile on this page. Empty means the page can be dropped.
-    tiles: FxHashMap<TileId, TileRecord>,
+    metal_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    live_atlas_keys: u32,
 }
 
 impl MetalAtlasTexture {
-    fn allocate(&mut self, size: Size<DevicePixels>, key: &AtlasKey, frame: u64) -> Option<AtlasTile> {
+    fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
         let allocation = self.allocator.allocate(size_to_etagere(size))?;
         let tile = AtlasTile {
             texture_id: self.id,
@@ -416,38 +312,96 @@ impl MetalAtlasTexture {
             },
             padding: 0,
         };
-        self.tiles.insert(
-            tile.tile_id,
-            TileRecord {
-                key: key.clone(),
-                last_used_frame: frame,
-            },
-        );
+        self.live_atlas_keys += 1;
         Some(tile)
     }
 
-    fn upload(&self, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let region = metal::MTLRegion::new_2d(
-            bounds.origin.x.into(),
-            bounds.origin.y.into(),
-            bounds.size.width.into(),
-            bounds.size.height.into(),
+    fn upload(&self, origin: Point<DevicePixels>, upload: &AtlasUpload<'_>) -> Result<()> {
+        ensure!(
+            self.id.kind == upload.kind,
+            "atlas upload kind does not match texture"
         );
-        self.metal_texture.replace_region(
-            region,
-            0,
-            bytes.as_ptr() as *const _,
-            bounds.size.width.to_bytes(self.bytes_per_pixel()) as u64,
+        ensure!(
+            origin.x.0 >= 0
+                && origin.y.0 >= 0
+                && (origin.x.0 as usize)
+                    .checked_add(upload.size.width.0 as usize)
+                    .is_some_and(|end| end <= self.metal_texture.width())
+                && (origin.y.0 as usize)
+                    .checked_add(upload.size.height.0 as usize)
+                    .is_some_and(|end| end <= self.metal_texture.height()),
+            "atlas upload is outside texture bounds"
         );
+        let region = MTLRegion {
+            origin: MTLOrigin {
+                x: origin.x.0 as usize,
+                y: origin.y.0 as usize,
+                z: 0,
+            },
+            size: MTLSize {
+                width: upload.size.width.0 as usize,
+                height: upload.size.height.0 as usize,
+                depth: 1,
+            },
+        };
+        // SAFETY: Validated bytes cover every row of the checked region in this CPU-accessible texture.
+        // The borrowed bytes remain live for the copy; GPU ordering is a separate caller requirement.
+        unsafe {
+            self.metal_texture
+                .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    region,
+                    0,
+                    NonNull::from(upload.bytes).cast(),
+                    upload.bytes_per_row,
+                );
+        }
+        Ok(())
     }
 
-    fn bytes_per_pixel(&self) -> u8 {
-        use metal::MTLPixelFormat::*;
-        match self.metal_texture.pixel_format() {
-            A8Unorm | R8Unorm => 1,
-            RGBA8Unorm | BGRA8Unorm => 4,
-            _ => unimplemented!(),
-        }
+    fn decrement_ref_count(&mut self) {
+        self.live_atlas_keys = self.live_atlas_keys.saturating_sub(1);
+    }
+
+    fn is_unreferenced(&self) -> bool {
+        self.live_atlas_keys == 0
+    }
+}
+
+struct AtlasUpload<'a> {
+    kind: AtlasTextureKind,
+    size: Size<DevicePixels>,
+    bytes: &'a [u8],
+    bytes_per_row: usize,
+}
+
+impl<'a> AtlasUpload<'a> {
+    fn new(kind: AtlasTextureKind, size: Size<DevicePixels>, bytes: &'a [u8]) -> Result<Self> {
+        ensure!(
+            size.width.0 > 0 && size.height.0 > 0,
+            "atlas dimensions must be positive"
+        );
+        let bytes_per_pixel = match kind {
+            AtlasTextureKind::Monochrome => 1,
+            AtlasTextureKind::Polychrome => 4,
+            AtlasTextureKind::Subpixel => anyhow::bail!("Metal does not render subpixel sprites"),
+        };
+        let bytes_per_row = (size.width.0 as usize)
+            .checked_mul(bytes_per_pixel)
+            .context("calculating atlas row byte count")?;
+        let byte_count = bytes_per_row
+            .checked_mul(size.height.0 as usize)
+            .context("calculating atlas byte count")?;
+        ensure!(
+            bytes.len() >= byte_count,
+            "atlas upload byte length is {}, expected at least {byte_count}",
+            bytes.len()
+        );
+        Ok(Self {
+            kind,
+            size,
+            bytes,
+            bytes_per_row,
+        })
     }
 }
 
@@ -462,38 +416,12 @@ fn point_from_etagere(value: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
-#[derive(Deref, DerefMut)]
-struct AssertSend<T>(T);
-
-unsafe impl<T> Send for AssertSend<T> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::PlatformAtlas;
+    use gpui::{PlatformAtlas, point, size};
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLGPUFamily};
     use std::borrow::Cow;
-
-    fn create_atlas() -> Option<MetalAtlas> {
-        let device = metal::Device::system_default()?;
-        Some(MetalAtlas::new(device, true))
-    }
-
-    fn make_image_key(image_id: usize, frame_index: usize) -> AtlasKey {
-        AtlasKey::Image(gpui::RenderImageParams {
-            image_id: gpui::ImageId(image_id),
-            frame_index,
-        })
-    }
-
-    fn insert_tile(atlas: &MetalAtlas, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
-        atlas
-            .get_or_insert_with(key, &mut || {
-                let byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4;
-                Ok(Some((size, Cow::Owned(vec![0u8; byte_count]))))
-            })
-            .expect("allocation should succeed")
-            .expect("callback returns Some")
-    }
 
     #[test]
     fn test_remove_clears_stale_keys_from_tiles_by_key() {
@@ -530,6 +458,7 @@ mod tests {
         // Re-inserting A must allocate a fresh tile on a new texture,
         // NOT return a stale tile referencing the deleted texture.
         let tile_a2 = insert_tile(&atlas, key_a, small);
+        assert_eq!(tile_a2.texture_id, tile_a.texture_id);
 
         // The texture must actually exist — this would panic before the fix.
         assert!(atlas.metal_texture(tile_a2.texture_id).is_some());
@@ -593,6 +522,181 @@ mod tests {
         };
         let key = make_image_key(999, 0);
         atlas.remove(&key);
+    }
+
+    #[test]
+    fn test_invalid_upload_does_not_allocate() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let mut state = atlas.0.lock();
+        for (kind, short_bytes, short_error) in [
+            (
+                AtlasTextureKind::Monochrome,
+                &[][..],
+                "atlas upload byte length is 0, expected at least 1",
+            ),
+            (
+                AtlasTextureKind::Polychrome,
+                &[0][..],
+                "atlas upload byte length is 1, expected at least 4",
+            ),
+        ] {
+            for (width, height, bytes, expected_error) in [
+                (1, 1, short_bytes, short_error),
+                (0, 1, &[][..], "atlas dimensions must be positive"),
+                (1, 0, &[][..], "atlas dimensions must be positive"),
+                (i32::MIN, 1, &[][..], "atlas dimensions must be positive"),
+                (1, i32::MIN, &[][..], "atlas dimensions must be positive"),
+            ] {
+                assert_eq!(
+                    state
+                        .backend
+                        .insert(kind, size(DevicePixels(width), DevicePixels(height)), bytes)
+                        .err()
+                        .map(|error| error.to_string()),
+                    Some(expected_error.to_owned())
+                );
+                for textures in [
+                    &state.backend.monochrome_textures,
+                    &state.backend.polychrome_textures,
+                ] {
+                    assert_eq!((textures.textures.len(), textures.free_list.len()), (0, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_oversized_tile_is_refused_without_a_page() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let mut state = atlas.0.lock();
+        for (width, height) in [(16385, 1), (1, 16385)] {
+            let bytes = vec![0u8; width * height];
+            assert_eq!(
+                state
+                    .backend
+                    .insert(
+                        AtlasTextureKind::Monochrome,
+                        size(DevicePixels(width as i32), DevicePixels(height as i32)),
+                        &bytes,
+                    )
+                    .err()
+                    .map(|error| error.to_string()),
+                Some(format!(
+                    "atlas tile {width}x{height} exceeds the 16384x16384 page limit"
+                ))
+            );
+            let textures = &state.backend.monochrome_textures;
+            assert_eq!((textures.textures.len(), textures.free_list.len()), (0, 0));
+        }
+        assert_eq!(state.backend.allocated_bytes(), (0, 0));
+    }
+
+    #[test]
+    fn test_texture_upload_preserves_pixel_layout() -> Result<()> {
+        let Some(atlas) = create_atlas() else {
+            return Ok(());
+        };
+        let mut state = atlas.0.lock();
+        for (kind, bytes_per_pixel) in [
+            (AtlasTextureKind::Monochrome, 1),
+            (AtlasTextureKind::Polychrome, 4),
+        ] {
+            let texture = state
+                .backend
+                .push_texture(size(DevicePixels(8), DevicePixels(8)), kind)?;
+            texture.upload(
+                Point::default(),
+                &AtlasUpload::new(
+                    kind,
+                    size(DevicePixels(8), DevicePixels(8)),
+                    &vec![0; 8 * 8 * bytes_per_pixel],
+                )?,
+            )?;
+            let pixels = (1..=3 * 2 * bytes_per_pixel)
+                .map(|value| value as u8)
+                .collect::<Vec<_>>();
+            texture.upload(
+                point(DevicePixels(2), DevicePixels(3)),
+                &AtlasUpload::new(kind, size(DevicePixels(3), DevicePixels(2)), &pixels)?,
+            )?;
+            let mut actual = vec![0; 8 * 8 * bytes_per_pixel];
+            unsafe {
+                texture
+                    .metal_texture
+                    .getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                        NonNull::from(actual.as_mut_slice()).cast(),
+                        8 * bytes_per_pixel,
+                        MTLRegion {
+                            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                            size: MTLSize {
+                                width: 8,
+                                height: 8,
+                                depth: 1,
+                            },
+                        },
+                        0,
+                    );
+            }
+            let mut expected = vec![0; actual.len()];
+            for row in 0..2 {
+                let start = ((row + 3) * 8 + 2) * bytes_per_pixel;
+                let source = row * 3 * bytes_per_pixel;
+                expected[start..start + 3 * bytes_per_pixel]
+                    .copy_from_slice(&pixels[source..source + 3 * bytes_per_pixel]);
+            }
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    impl MetalAtlas {
+        fn published_bytes(&self) -> (u64, u64) {
+            let lock = self.0.lock();
+            (
+                lock.backend
+                    .render_memory
+                    .published(RenderMemoryGauge::AtlasMonochrome),
+                lock.backend
+                    .render_memory
+                    .published(RenderMemoryGauge::AtlasPolychrome),
+            )
+        }
+
+        fn contains_key(&self, key: &AtlasKey) -> bool {
+            self.0.lock().contains(key)
+        }
+
+        fn texture_is_live(&self, id: AtlasTextureId) -> bool {
+            self.0.lock().backend.texture(id).is_some()
+        }
+    }
+
+    fn create_atlas() -> Option<MetalAtlas> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let supports_shared_storage =
+            cfg!(target_os = "ios") || device.supportsFamily(MTLGPUFamily::Apple1);
+        Some(MetalAtlas::new(device, supports_shared_storage))
+    }
+
+    fn make_image_key(image_id: usize, frame_index: usize) -> AtlasKey {
+        AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(image_id),
+            frame_index,
+        })
+    }
+
+    fn insert_tile(atlas: &MetalAtlas, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        atlas
+            .get_or_insert_with(key, &mut || {
+                let byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4;
+                Ok(Some((size, Cow::Owned(vec![0u8; byte_count]))))
+            })
+            .expect("inserting atlas tile")
+            .expect("retrieving inserted atlas tile")
     }
 
     #[test]
