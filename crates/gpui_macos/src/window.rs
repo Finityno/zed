@@ -13,7 +13,7 @@ use gpui::{
     Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, NativeMenuItem, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PresentOutcome, PresentReport,
-    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab,
+    PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab, Task,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowGlassStyle, WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
@@ -865,6 +865,10 @@ struct MacWindowState {
     /// display link only wakes this window while it is set, so an idle
     /// window costs nothing per vsync. Starts set so the first frame draws.
     frame_demand: Arc<AtomicBool>,
+    /// The wake for a frame GPUI asked for at a later time
+    /// ([`PlatformWindow::request_frame_at`]). The next such request replaces
+    /// it, which drops this one's timer.
+    deferred_frame: Option<Task<()>>,
     /// Until when frames answer the user; only those are reported to the
     /// performance controller (see `frame_work_interval`).
     interactive_until: Option<Instant>,
@@ -1493,6 +1497,7 @@ impl MacWindow {
                 frame_source: None,
                 metal_frames: metal_frames.clone(),
                 frame_demand: Arc::new(AtomicBool::new(true)),
+                deferred_frame: None,
                 interactive_until: None,
                 render_while_hidden,
                 // `LatencyCritical` is the part that matters: user-initiated
@@ -2722,6 +2727,29 @@ impl PlatformWindow for MacWindow {
         if let Some(metal_frames) = &self.2 {
             metal_frames.wake();
         }
+    }
+
+    // Without this GPUI wakes the frame source after every frame of a scene
+    // that animates on its own, so the link runs (and hands out a drawable)
+    // on every refresh between the animation's steps, however far apart.
+    fn request_frame_at(&self, at: Instant) -> bool {
+        let Some(wait) = deferred_frame_wait(Instant::now(), at) else {
+            return false;
+        };
+        let mut lock = self.0.lock();
+        let frame_demand = lock.frame_demand.clone();
+        let metal_frames = self.2.as_ref().map(Rc::downgrade);
+        let timer = lock.background_executor.timer(wait);
+        // As in `frame_waker`, the window state is not captured.
+        let wake = lock.foreground_executor.spawn(async move {
+            timer.await;
+            frame_demand.store(true, Ordering::Release);
+            if let Some(metal_frames) = metal_frames.as_ref().and_then(std::rc::Weak::upgrade) {
+                metal_frames.wake();
+            }
+        });
+        lock.deferred_frame = Some(wake);
+        true
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -4564,6 +4592,19 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     }
 }
 
+/// The shortest wait for which a window stops its frame source until a frame
+/// GPUI asked for at a later time. A paused link takes a refresh or two to
+/// deliver again, which a 30 or 60 fps animation would show as a late step,
+/// so a nearer frame is waited for with the link running.
+const MIN_DEFERRED_FRAME_WAIT: Duration = Duration::from_millis(100);
+
+/// How long to sleep for a frame GPUI asked for at `at`, or `None` when it is
+/// too near to stop the frame source for.
+fn deferred_frame_wait(now: Instant, at: Instant) -> Option<Duration> {
+    at.checked_duration_since(now)
+        .filter(|wait| *wait >= MIN_DEFERRED_FRAME_WAIT)
+}
+
 extern "C" fn step(view: *mut c_void) {
     let view = view as *mut AnyObject;
     let window_state = unsafe { get_window_state(&*view) };
@@ -5285,6 +5326,26 @@ extern "C" fn toggle_tab_bar(this: &AnyObject, _sel: Sel, _id: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_due_soon_keeps_the_frame_source_running() {
+        let now = Instant::now();
+        // The steps of a 60 and a 30 fps animation, and a frame already due.
+        for wait in [Duration::from_millis(16), Duration::from_millis(33)] {
+            assert_eq!(deferred_frame_wait(now, now + wait), None, "{wait:?}");
+        }
+        assert_eq!(deferred_frame_wait(now, now), None);
+        assert_eq!(deferred_frame_wait(now + Duration::from_secs(1), now), None);
+    }
+
+    #[test]
+    fn a_frame_due_later_is_slept_for() {
+        let now = Instant::now();
+        // An inactive window's animation step, and one held for a day.
+        for wait in [Duration::from_millis(250), Duration::from_secs(24 * 60 * 60)] {
+            assert_eq!(deferred_frame_wait(now, now + wait), Some(wait), "{wait:?}");
+        }
+    }
 
     #[test]
     fn display_id_for_screen_handles_missing_metadata() {

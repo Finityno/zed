@@ -2580,23 +2580,7 @@ impl Window {
                 // repeating error as deferred would be asked for a frame on
                 // every request, so errors must stay `Dropped`.
                 let present_owed = handle
-                    .update(&mut cx, |_, window, _| {
-                        let present_owed = window.needs_present.get();
-                        if window.invalidator.is_dirty()
-                            || !window.next_frame_callbacks.borrow().is_empty()
-                            || window.scene_animates.get()
-                            || present_owed
-                        {
-                            window.platform_window.schedule_frame();
-                        }
-                        present_owed
-                    })
-                    .with_context(|| {
-                        format!(
-                            "scheduling follow-up frame for window {:?}",
-                            handle.window_id()
-                        )
-                    })
+                    .update(&mut cx, |_, window, _| window.needs_present.get())
                     .log_err()
                     .unwrap_or(false);
 
@@ -2619,16 +2603,18 @@ impl Window {
                 //
                 // When the scene animating or transitioning is the only
                 // reason, the next useful request is when its next step is
-                // due, so a platform that can wait for that is asked to.
+                // due, so a platform that can wait for that is asked to, and
+                // is then asked for nothing sooner: scheduling a frame as
+                // well would resume a frame source it stopped to wait.
                 let needs_next_frame_now = invalidator.is_dirty()
                     || !next_frame_callbacks.borrow().is_empty()
                     || present_owed
                     || deferred_force_render
                     || input_rate_tracker.borrow().is_high_rate();
-                if needs_next_frame_now {
-                    invalidator.wake_platform();
-                } else if scene_animates.get() || scene_transitioning.get() {
-                    let next_step_scheduled = next_time_animation_present_at(
+                let animating = scene_animates.get() || scene_transitioning.get();
+                let waits_for_next_step = !needs_next_frame_now
+                    && animating
+                    && next_time_animation_present_at(
                         last_present_at.get(),
                         scene_animates.get(),
                         scene_moves.get(),
@@ -2644,9 +2630,25 @@ impl Window {
                             .log_err()
                             .unwrap_or(false)
                     });
-                    if !next_step_scheduled {
-                        invalidator.wake_platform();
+                if needs_next_frame_now || (animating && !waits_for_next_step) {
+                    if invalidator.is_dirty()
+                        || !next_frame_callbacks.borrow().is_empty()
+                        || scene_animates.get()
+                        || present_owed
+                    {
+                        handle
+                            .update(&mut cx, |_, window, _| {
+                                window.platform_window.schedule_frame();
+                            })
+                            .with_context(|| {
+                                format!(
+                                    "scheduling follow-up frame for window {:?}",
+                                    handle.window_id()
+                                )
+                            })
+                            .log_err();
                     }
+                    invalidator.wake_platform();
                 }
                 #[cfg(feature = "profiler")]
                 if !should_draw {
@@ -11894,6 +11896,41 @@ mod tests {
         let baseline = test_window.frame_wake_count();
         test_window.simulate_frame_request(RequestFrameOptions::default());
         assert!(test_window.frame_wake_count() > baseline);
+    }
+
+    /// A platform that took the deadline of an animating scene's next step
+    /// has stopped its frame source to wait for it, so it is not also asked
+    /// to schedule a frame, which would start the source again; one that
+    /// declined is scheduled as before.
+    #[gpui::test]
+    fn test_time_animation_waiting_for_its_next_step_schedules_no_frame(cx: &mut TestAppContext) {
+        for takes_deadlines in [true, false] {
+            let window = cx.add_window(|_, _| EmptyView);
+            let test_window = cx.test_window(window.into());
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+            // An idle window's frames ask for no further one.
+            for _ in 0..4 {
+                test_window.simulate_scheduled_frame();
+            }
+            assert!(!test_window.frame_scheduled());
+
+            if takes_deadlines {
+                test_window.accept_frame_deadlines();
+            }
+            window
+                .update(cx, |_, window, _| {
+                    window.scene_animates.set(true);
+                    window.last_present_at.set(Some(std::time::Instant::now()));
+                })
+                .unwrap();
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+            assert_eq!(
+                test_window.frame_scheduled(),
+                !takes_deadlines,
+                "takes deadlines: {takes_deadlines}"
+            );
+        }
     }
 
     #[gpui::test]
