@@ -1467,13 +1467,6 @@ struct Wrapper {
     cycle: bool,
 }
 
-impl IntoElement for Wrapper {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
 
 impl crate::Element for Wrapper {
     type RequestLayoutState = AnyElement;

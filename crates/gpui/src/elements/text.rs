@@ -284,14 +284,6 @@ macro_rules! text {
     }};
 }
 
-impl IntoElement for Text {
-    type Element = Self;
-    #[inline]
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for Text {
     type RequestLayoutState = TextLayout;
     type PrepaintState = ();
@@ -389,7 +381,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::new_static(self), None, window, cx);
         (layout_id, state)
     }
 
@@ -420,14 +412,6 @@ impl Element for &'static str {
         cx: &mut App,
     ) {
         text_layout.paint(self, window, cx)
-    }
-}
-
-impl IntoElement for &'static str {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -498,14 +482,6 @@ impl Element for SharedString {
         cx: &mut App,
     ) {
         text_layout.paint(self.as_ref(), window, cx)
-    }
-}
-
-impl IntoElement for SharedString {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -735,14 +711,6 @@ impl Element for StyledText {
     }
 }
 
-impl IntoElement for StyledText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 /// Renders text with a moving shimmer highlight using a shared GPUI text layout.
 ///
 /// The element uses the current window text style for layout and font metrics,
@@ -914,14 +882,6 @@ impl Element for ShimmerText {
         } else {
             self.layout.paint(&self.text, window, cx);
         }
-    }
-}
-
-impl IntoElement for ShimmerText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -1717,14 +1677,6 @@ impl Element for InteractiveText {
     }
 }
 
-impl IntoElement for InteractiveText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,13 +1819,6 @@ mod tests {
         layout: Rc<RefCell<Option<TextLayout>>>,
     }
 
-    impl IntoElement for Detached {
-        type Element = Self;
-
-        fn into_element(self) -> Self {
-            self
-        }
-    }
 
     impl Element for Detached {
         type RequestLayoutState = ();

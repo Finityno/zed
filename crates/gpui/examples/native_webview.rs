@@ -113,13 +113,6 @@ mod macos {
         webview: Rc<NativeWebView>,
     }
 
-    impl IntoElement for NativeWebViewElement {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
 
     impl Element for NativeWebViewElement {
         type RequestLayoutState = ();

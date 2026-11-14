@@ -613,13 +613,6 @@ mod tests {
         spin_in: Rc<Cell<SpinIn>>,
     }
 
-    impl IntoElement for MeasuredLeaf {
-        type Element = Self;
-
-        fn into_element(self) -> Self {
-            self
-        }
-    }
 
     impl crate::Element for MeasuredLeaf {
         type RequestLayoutState = ();

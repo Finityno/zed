@@ -82,13 +82,6 @@ fn update_entity<V: 'static + Render, E: 'static>(
 /// out its items: outside the layout tree of the view around it.
 struct RootPlacer(Option<AnyElement>);
 
-impl IntoElement for RootPlacer {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
 
 impl Element for RootPlacer {
     type RequestLayoutState = ();

@@ -5,7 +5,7 @@
 //! others shows up here rather than in a screenshot.
 
 use crate::{
-    AppContext as _, Context, Div, Entity, IntoElement, ParentElement as _, Path, Render,
+    AppContext as _, Context, Div, Entity, IntoElement, ParentElement as _, PathBuilder, Render,
     StyleRefinement, Styled as _, TestAppContext, Window, canvas, div, point, px, rgb, size,
 };
 use std::{cell::Cell, rc::Rc};
@@ -223,12 +223,15 @@ const FIXTURES: &[Fixture] = &[
                     canvas(
                         |_, _, _| (),
                         |bounds, (), window, _| {
-                            let mut path = Path::new(bounds.origin);
-                            path.line_to(bounds.top_right());
-                            path.line_to(bounds.bottom_right());
-                            path.line_to(bounds.bottom_left());
-                            path.line_to(bounds.origin);
-                            window.paint_path(path, rgb(BLACK));
+                            let mut builder = PathBuilder::fill();
+                            builder.move_to(bounds.origin);
+                            builder.line_to(bounds.top_right());
+                            builder.line_to(bounds.bottom_right());
+                            builder.line_to(bounds.bottom_left());
+                            builder.close();
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, rgb(BLACK));
+                            }
                         },
                     )
                     .size(px(SIDE)),
@@ -322,12 +325,15 @@ fn corner_path(left: f32, color: u32) -> impl IntoElement {
         |_, _, _| (),
         move |bounds, (), window, _| {
             let start = bounds.origin + point(px(left), px(0.));
-            let mut path = Path::new(start);
-            path.line_to(start + point(px(16.), px(0.)));
-            path.line_to(start + point(px(16.), px(16.)));
-            path.line_to(start + point(px(0.), px(16.)));
-            path.line_to(start);
-            window.paint_path(path, rgb(color));
+            let mut builder = PathBuilder::fill();
+            builder.move_to(start);
+            builder.line_to(start + point(px(16.), px(0.)));
+            builder.line_to(start + point(px(16.), px(16.)));
+            builder.line_to(start + point(px(0.), px(16.)));
+            builder.close();
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, rgb(color));
+            }
         },
     )
     .absolute()

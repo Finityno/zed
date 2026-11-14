@@ -2263,7 +2263,7 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
             }
             Primitive::Path(path) => {
                 path.bounds = bounds;
-                path.content_mask.bounds = clip;
+                path.paint.content_mask.bounds = clip;
             }
             Primitive::Surface(surface) => {
                 surface.bounds = bounds;
@@ -2318,7 +2318,7 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
                 sprite.order, sprite.bounds, sprite.content_mask
             ),
             Primitive::Path(path) => {
-                format!("path {} {:?} {:?}", path.order, path.bounds, path.content_mask)
+                format!("path {} {:?} {:?}", path.order, path.bounds, path.paint.content_mask)
             }
             Primitive::Surface(surface) => format!("surface {:?}", surface.bounds),
         };

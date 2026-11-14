@@ -598,11 +598,6 @@ impl AdmittedStyledText {
     pub fn layout(&self) -> &AdmittedTextLayout { &self.layout }
 }
 
-impl crate::IntoElement for AdmittedStyledText {
-    type Element = Self;
-    fn into_element(self) -> Self { self }
-}
-
 impl crate::Element for AdmittedStyledText {
     type RequestLayoutState = ();
     type PrepaintState = ();

@@ -411,6 +411,14 @@ impl WindowFrameSource {
         Ok(())
     }
 
+    pub fn debug_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "CVDisplayLink",
+            "attached": self.registration.is_some(),
+            "display_id": self.registration.map(|(display_id, _)| display_id),
+        })
+    }
+
     pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {
         self.signal.take()
     }
@@ -514,6 +522,20 @@ impl MetalFrames {
 
     pub fn begin_frame(&self) {
         self.woken.set(false);
+    }
+
+    pub fn debug_state(&self) -> serde_json::Value {
+        let paused = self
+            .source
+            .try_borrow()
+            .ok()
+            .and_then(|source| source.as_ref().map(MetalFrameSource::is_paused));
+        serde_json::json!({
+            "kind": "CAMetalDisplayLink",
+            "attached": self.is_attached(),
+            "paused": paused,
+            "woken": self.woken.get(),
+        })
     }
 
     /// Ends an update, pausing the link if GPUI neither used its drawable nor

@@ -10,7 +10,7 @@
 use crate::{
     Along as _, AnyElement, App, AvailableSpace, Axis, Bounds, ContentMask, DispatchPhase, Edges,
     Element, EntityId, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, Overflow, Pixels, Point, ScrollDelta, ScrollEvent, Size, Style, StyleRefinement,
+    Overflow, Pixels, Point, ScrollDelta, ScrollEvent, Size, Style, StyleRefinement,
     Styled, Window, point, px, size, window::view_retention::list_rows::RowLayout,
 };
 use collections::VecDeque;
@@ -2872,14 +2872,6 @@ fn content_insets(style: &Style, size: Size<Pixels>, rem_size: Pixels) -> Edges<
     let border = style.border_widths.to_pixels(rem_size);
 
     padding + border
-}
-
-impl IntoElement for List {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Styled for List {

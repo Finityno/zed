@@ -671,13 +671,6 @@ struct Segments {
     keyed: bool,
 }
 
-impl IntoElement for Segments {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
 
 impl Element for Segments {
     type RequestLayoutState = ();
@@ -1501,13 +1494,6 @@ struct KeyedLeaf {
     key: u64,
 }
 
-impl IntoElement for KeyedLeaf {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
 
 impl Element for KeyedLeaf {
     type RequestLayoutState = ();
@@ -1630,13 +1616,6 @@ struct CarriedLeaf {
 /// The state a [`CarriedLeaf`] leaves on its node.
 struct CarriedState(usize);
 
-impl IntoElement for CarriedLeaf {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
 
 impl Element for CarriedLeaf {
     type RequestLayoutState = ();

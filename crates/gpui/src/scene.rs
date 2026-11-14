@@ -5,16 +5,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, util::CapacityShrink,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Path,
+    PathTiles, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    util::CapacityShrink,
 };
-use std::{
-    fmt::Debug,
-    iter::Peekable,
-    ops::{Add, Range, Sub},
-    slice,
-    sync::OnceLock,
-};
+use std::{fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice, sync::OnceLock};
 
 /// How glyph-drop reporting is configured by `GPUI_DEBUG_GLYPH_DROPS`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,10 +87,6 @@ fn mask_miss_distances(bounds: &Bounds<ScaledPixels>, mask: &Bounds<ScaledPixels
     (horizontal, vertical)
 }
 
-#[allow(non_camel_case_types, unused)]
-#[expect(missing_docs)]
-pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
-
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
@@ -121,7 +112,7 @@ pub struct Scene {
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
-    pub paths: Vec<Path<ScaledPixels>>,
+    pub paths: Vec<PaintedPath>,
     pub underlines: Vec<Underline>,
     /// Filled by `finish`, in draw order, from the painted sprites below.
     pub monochrome_sprites: Vec<MonochromeSprite>,
@@ -644,7 +635,6 @@ impl Scene {
             }
             Primitive::Path(path) => {
                 path.order = order;
-                path.id = PathId(self.paths.len());
                 self.paths.push(path.clone());
             }
             Primitive::Underline(underline) => {
@@ -4087,12 +4077,8 @@ impl SceneMove {
                 quad.content_mask = self.mask(&quad.content_mask);
             }
             Primitive::Path(path) => {
-                path.bounds = self.bounds(path.bounds);
-                path.content_mask = self.mask(&path.content_mask);
-                for vertex in &mut path.vertices {
-                    vertex.xy_position = vertex.xy_position + self.delta;
-                    vertex.content_mask = self.mask(&vertex.content_mask);
-                }
+                let content_mask = self.mask(&path.paint.content_mask);
+                path.translate(self.delta, content_mask);
             }
             Primitive::Underline(underline) => {
                 underline.bounds = self.bounds(underline.bounds);
@@ -4259,7 +4245,7 @@ pub(crate) enum PaintOperation {
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
-    Path(Path<ScaledPixels>),
+    Path(PaintedPath),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
@@ -4273,7 +4259,7 @@ impl Primitive {
         match self {
             Self::Shadow(value) => value.rounded_clip,
             Self::Quad(value) => value.rounded_clip,
-            Self::Path(value) => value.rounded_clip,
+            Self::Path(value) => value.paint.rounded_clip,
             Self::Underline(value) => value.rounded_clip,
             Self::MonochromeSprite(value) => value.rounded_clip,
             Self::SubpixelSprite(value) => value.rounded_clip,
@@ -4286,7 +4272,7 @@ impl Primitive {
         match self {
             Self::Shadow(value) => value.rounded_clip = index,
             Self::Quad(value) => value.rounded_clip = index,
-            Self::Path(value) => value.rounded_clip = index,
+            Self::Path(value) => value.paint.rounded_clip = index,
             Self::Underline(value) => value.rounded_clip = index,
             Self::MonochromeSprite(value) => value.rounded_clip = index,
             Self::SubpixelSprite(value) => value.rounded_clip = index,
@@ -4312,7 +4298,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
-            Primitive::Path(path) => &path.content_mask,
+            Primitive::Path(path) => &path.paint.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
@@ -4337,7 +4323,7 @@ struct BatchIterator<'a> {
     blended_quad_indices: &'a [u32],
     blended_quad_indices_start: usize,
     paths_start: usize,
-    paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
+    paths_iter: Peekable<slice::Iter<'a, PaintedPath>>,
     underlines_start: usize,
     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
     monochrome_sprites_start: usize,
@@ -5446,175 +5432,140 @@ impl From<PaintSurface> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[expect(missing_docs)]
-pub struct PathId(pub usize);
-
-/// A line made up of a series of vertices and control points.
-#[derive(Clone, Debug)]
-#[expect(missing_docs)]
-pub struct Path<P: Clone + Debug + Default + PartialEq> {
-    pub id: PathId,
-    pub order: DrawOrder,
-    pub bounds: Bounds<P>,
-    pub content_mask: ContentMask<P>,
-    pub rounded_clip: u32,
-    pub vertices: Vec<PathVertex<P>>,
-    pub color: Background,
-    start: Point<P>,
-    current: Point<P>,
-    contour_count: usize,
-}
-
-impl Path<Pixels> {
-    /// Create a new path with the given starting point.
-    pub fn new(start: Point<Pixels>) -> Self {
-        Self {
-            id: PathId(0),
-            order: DrawOrder::default(),
-            vertices: Vec::new(),
-            start,
-            current: start,
-            bounds: Bounds {
-                origin: start,
-                size: Default::default(),
-            },
-            content_mask: Default::default(),
-            rounded_clip: 0,
-            color: Default::default(),
-            contour_count: 0,
-        }
-    }
-
-    /// Scale this path by the given factor.
-    pub fn scale(&self, factor: f32) -> Path<ScaledPixels> {
-        Path {
-            id: self.id,
-            order: self.order,
-            bounds: self.bounds.scale(factor),
-            content_mask: self.content_mask.scale(factor),
-            rounded_clip: self.rounded_clip,
-            vertices: self
-                .vertices
-                .iter()
-                .map(|vertex| vertex.scale(factor))
-                .collect(),
-            start: self.start.map(|start| start.scale(factor)),
-            current: self.current.scale(factor),
-            contour_count: self.contour_count,
-            color: self.color,
-        }
-    }
-
-    /// Move the start, current point to the given point.
-    pub fn move_to(&mut self, to: Point<Pixels>) {
-        self.contour_count += 1;
-        self.start = to;
-        self.current = to;
-    }
-
-    /// Draw a straight line from the current point to the given point.
-    pub fn line_to(&mut self, to: Point<Pixels>) {
-        self.contour_count += 1;
-        if self.contour_count > 1 {
-            self.push_triangle(
-                (self.start, self.current, to),
-                (point(0., 1.), point(0., 1.), point(0., 1.)),
-            );
-        }
-        self.current = to;
-    }
-
-    /// Draw a curve from the current point to the given point, using the given control point.
-    pub fn curve_to(&mut self, to: Point<Pixels>, ctrl: Point<Pixels>) {
-        self.contour_count += 1;
-        if self.contour_count > 1 {
-            self.push_triangle(
-                (self.start, self.current, to),
-                (point(0., 1.), point(0., 1.), point(0., 1.)),
-            );
-        }
-
-        self.push_triangle(
-            (self.current, ctrl, to),
-            (point(0., 0.), point(0.5, 0.), point(1., 1.)),
-        );
-        self.current = to;
-    }
-
-    /// Push a triangle to the Path.
-    pub fn push_triangle(
-        &mut self,
-        xy: (Point<Pixels>, Point<Pixels>, Point<Pixels>),
-        st: (Point<f32>, Point<f32>, Point<f32>),
-    ) {
-        self.bounds = self
-            .bounds
-            .union(&Bounds {
-                origin: xy.0,
-                size: Default::default(),
-            })
-            .union(&Bounds {
-                origin: xy.1,
-                size: Default::default(),
-            })
-            .union(&Bounds {
-                origin: xy.2,
-                size: Default::default(),
-            });
-
-        self.vertices.push(PathVertex {
-            xy_position: xy.0,
-            st_position: st.0,
-            content_mask: Default::default(),
-        });
-        self.vertices.push(PathVertex {
-            xy_position: xy.1,
-            st_position: st.1,
-            content_mask: Default::default(),
-        });
-        self.vertices.push(PathVertex {
-            xy_position: xy.2,
-            st_position: st.2,
-            content_mask: Default::default(),
-        });
-    }
-}
-
-impl<T> Path<T>
-where
-    T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
-{
-    #[allow(unused)]
-    #[expect(missing_docs)]
-    pub fn clipped_bounds(&self) -> Bounds<T> {
-        self.bounds.intersect(&self.content_mask.bounds)
-    }
-}
-
-impl From<Path<ScaledPixels>> for Primitive {
-    fn from(path: Path<ScaledPixels>) -> Self {
-        Primitive::Path(path)
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
-pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {
-    pub xy_position: Point<P>,
-    pub st_position: Point<f32>,
-    pub content_mask: ContentMask<P>,
+pub struct PathCurve {
+    pub p0: Point<f32>,
+    pub p1: Point<f32>,
+    pub a: Point<f32>,
+    pub b: Point<f32>,
+    pub sign: f32,
+    pub pad: u32, // align to 8 bytes
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct PathPaint {
+    /// The path's bounds, in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: Background,
+    pub even_odd: PaddedBool32,
+    /// One-based index into [`Scene::rounded_clips`], or zero for no mask.
+    pub rounded_clip: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct PathTile {
+    pub paint: u32,
+    pub curve_start: u32,
+    pub curve_count: u32,
+    pub backdrop: i32,
+    pub top_left: Point<f32>,
+    pub bottom_right: Point<f32>,
+    pub reference: Point<f32>,
+    pub curves_top_left: Point<f32>,
+    pub curves_bottom_right: Point<f32>,
+}
+
+#[derive(Clone, Debug)]
+#[expect(missing_docs)]
+pub struct PaintedPath {
+    pub(crate) order: DrawOrder,
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    tiles: Rc<PathTiles>,
+    pub(crate) paint: PathPaint,
 }
 
 #[expect(missing_docs)]
-impl PathVertex<Pixels> {
-    pub fn scale(&self, factor: f32) -> PathVertex<ScaledPixels> {
-        PathVertex {
-            xy_position: self.xy_position.scale(factor),
-            st_position: self.st_position,
-            content_mask: self.content_mask.scale(factor),
+impl PaintedPath {
+    /// Bins `path` into tiles, to be filled with `color` within `content_mask`.
+    pub fn new(
+        path: Path,
+        scale_factor: f32,
+        content_mask: ContentMask<Pixels>,
+        color: Background,
+    ) -> Self {
+        let content_mask = content_mask.scale(scale_factor);
+        let mut tiles = path.bin(scale_factor);
+        tiles.retain_visible(content_mask.bounds);
+        let paint = PathPaint {
+            bounds: tiles.bounds(),
+            content_mask,
+            color,
+            even_odd: path.even_odd().into(),
+            rounded_clip: 0,
+        };
+        Self {
+            order: 0,
+            bounds: tiles.painted_bounds(),
+            tiles: Rc::new(tiles),
+            paint,
         }
+    }
+
+    pub fn order(&self) -> DrawOrder {
+        self.order
+    }
+
+    /// The device pixels the path may paint, before its content mask.
+    pub fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+    }
+
+    pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+        &self.paint.content_mask
+    }
+
+    pub fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds.intersect(&self.paint.content_mask.bounds)
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.tiles().len()
+    }
+
+    pub fn append_to(
+        &self,
+        paints: &mut Vec<PathPaint>,
+        curves: &mut Vec<PathCurve>,
+        tiles: &mut Vec<PathTile>,
+    ) {
+        let paint_index = paints.len() as u32;
+        let curve_start = curves.len() as u32;
+        paints.push(self.paint);
+        curves.extend_from_slice(self.tiles.curves());
+        tiles.extend(self.tiles.tiles().iter().map(|tile| PathTile {
+            paint: paint_index,
+            curve_start: curve_start + tile.curve_start,
+            ..*tile
+        }));
+    }
+
+    /// Moves the path by `delta` and gives it `content_mask`. The tiles were
+    /// culled against the mask the path was painted with, so one that a wider
+    /// mask would show is not drawn until the path is painted again.
+    pub(crate) fn translate(
+        &mut self,
+        delta: Point<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) {
+        self.bounds.origin = self.bounds.origin + delta;
+        self.paint.bounds.origin = self.paint.bounds.origin + delta;
+        self.paint.content_mask = content_mask;
+        if delta != Point::default() {
+            self.tiles = Rc::new(self.tiles.translated(point(delta.x.0, delta.y.0)));
+        }
+    }
+}
+
+impl From<PaintedPath> for Primitive {
+    fn from(path: PaintedPath) -> Self {
+        Primitive::Path(path)
     }
 }
 
