@@ -1,8 +1,10 @@
 use super::*;
 
 /// Drawn frames without a backdrop blur after which the scratch textures are
-/// released. Frames rather than time, for the reason given at
-/// [`PATH_INTERMEDIATE_IDLE_FRAMES`].
+/// released. Frames, not time: an idle window stops drawing entirely, so a
+/// time-based ttl would fire while the textures might be wanted again on the
+/// very next redraw, while drawn frames mean sustained rendering that needed
+/// no blur at all.
 const BACKDROP_BLUR_IDLE_FRAMES: u32 = 120;
 /// Scratch texture sets kept, one per bucketed region size. A frame with more
 /// blurs of distinct sizes than this recreates the least recently used set.
@@ -223,7 +225,7 @@ impl BackdropBlurPipeline {
             params_buffer: create_constant_buffer::<BackdropBlurParams>(device)?,
             sampler,
             replace_blend_state: create_opaque_blend_state(device)?,
-            over_blend_state: create_blend_state_for_path_rasterization(device)?,
+            over_blend_state: create_premultiplied_over_blend_state(device)?,
         })
     }
 

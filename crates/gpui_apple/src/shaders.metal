@@ -8,11 +8,17 @@ using namespace metal;
 // mask tile differs from plain text only in having no shimmer band.
 constant uint SPRITE_EFFECT_SHIMMER = 1u;
 
+// Set in a flat instance id when the fragment shader can shade the primitive
+// from its interpolated inputs alone, without loading the instance.
+constant uint SIMPLE_PRIMITIVE_FLAG = 1u << 31;
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
 float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
+float4 to_device_position_impl(float2 position,
+                               constant Size_DevicePixels *viewport_size);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           constant Size_DevicePixels *viewport_size);
 float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -24,10 +30,17 @@ float rounded_clip_interior_inset(RoundedClipNode mask);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
-float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                               Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
+
+struct ClippedVertex {
+  float2 position;
+  // The corner as a fraction of the original bounds.
+  float2 unit_vertex;
+};
+
+ClippedVertex clip_to_mask(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                           Bounds_ScaledPixels mask);
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
@@ -36,10 +49,6 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
-float gaussian(float x, float sigma);
-float2 erf(float2 x);
-float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
@@ -63,7 +72,6 @@ struct QuadVertexOutput {
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
   float4 solid_interior [[flat]];
-  float clip_distance [[clip_distance]][4];
 };
 
 struct QuadFragmentInput {
@@ -91,11 +99,11 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   uint quad_id = quad_indices[instance_id];
   Quad quad = quads[quad_id];
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, quad.bounds, quad.content_mask.bounds);
   float4 device_position =
-      to_device_position(unit_vertex, quad.bounds, viewport_size);
+      to_device_position_impl(clipped.position, viewport_size);
   device_position.z = quad_depth(quad_id);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
-                                                 quad.content_mask.bounds);
   float4 border_color = hsla_to_rgba(quad.border_color);
 
   GradientColor gradient = prepare_fill_color(
@@ -114,8 +122,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       gradient.solid,
       gradient.color0,
       gradient.color1,
-      quad_solid_interior(quad, rounded_masks),
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      quad_solid_interior(quad, rounded_masks)};
 }
 
 // Whether `bounds` lies where a float resolves well under the margins the
@@ -528,7 +535,6 @@ float quarter_ellipse_sdf(float2 point, float2 radii) {
 struct OpaqueQuadVertexOutput {
   float4 position [[position]];
   float4 color [[flat]];
-  float clip_distance [[clip_distance]][4];
 };
 
 struct OpaqueQuadFragmentInput {
@@ -599,23 +605,21 @@ vertex OpaqueQuadVertexOutput opaque_quad_vertex(
 
   if (core.size.width <= 0.0 || core.size.height <= 0.0) {
     // Zero-area triangles are rejected before rasterization.
-    return OpaqueQuadVertexOutput{float4(0.0, 0.0, 0.0, 1.0), float4(0.0),
-                                  {1.0, 1.0, 1.0, 1.0}};
+    return OpaqueQuadVertexOutput{float4(0.0, 0.0, 0.0, 1.0), float4(0.0)};
   }
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  float4 device_position = to_device_position(unit_vertex, core, viewport_size);
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, core, quad.content_mask.bounds);
+  float4 device_position =
+      to_device_position_impl(clipped.position, viewport_size);
   device_position.z = quad_depth(quad_id);
-  float4 clip_distance =
-      distance_from_clip_rect(unit_vertex, core, quad.content_mask.bounds);
   // Matches the blended quad shader's solid-background output exactly: tag-0
   // quads resolve to `hsla_to_rgba(solid)`, and alpha-1 blending is an
   // overwrite.
   float4 color = hsla_to_rgba(quad.background.solid);
 
-  return OpaqueQuadVertexOutput{
-      device_position, color,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+  return OpaqueQuadVertexOutput{device_position, color};
 }
 
 fragment float4 opaque_quad_fragment(OpaqueQuadFragmentInput input
@@ -623,12 +627,22 @@ fragment float4 opaque_quad_fragment(OpaqueQuadFragmentInput input
   return input.color;
 }
 
+struct PreparedBlurredRoundedRect {
+  float4 shape;
+  float4 r1;
+  float4 exponent;
+  float4 scale;
+};
+
 struct ShadowVertexOutput {
   uint rounded_clip [[flat]];
   float4 position [[position]];
   float4 color [[flat]];
   uint shadow_id [[flat]];
-  float clip_distance [[clip_distance]][4];
+  float4 blur_shape [[flat]];
+  float4 blur_r1 [[flat]];
+  float4 blur_exponent [[flat]];
+  float4 blur_scale [[flat]];
 };
 
 struct ShadowFragmentInput {
@@ -636,7 +650,72 @@ struct ShadowFragmentInput {
   float4 position [[position]];
   float4 color [[flat]];
   uint shadow_id [[flat]];
+  float4 blur_shape [[flat]];
+  float4 blur_r1 [[flat]];
+  float4 blur_exponent [[flat]];
+  float4 blur_scale [[flat]];
 };
+
+float erf7(float x) {
+  x = clamp(x, -10., 10.) * (2. / sqrt(M_PI_F));
+  float xx = x * x;
+  x = x + (0.24295 + (0.03395 + 0.0104 * xx) * xx) * (x * xx);
+  return x / sqrt(1. + x * x);
+}
+
+// Raph Levien's blurred rounded rectangle approximation, whose blur s is sigma * sqrt(2):
+// https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
+//
+// Everything here depends only on the shadow, so it runs once per vertex and
+// reaches the fragment shader flat.
+PreparedBlurredRoundedRect prepare_blurred_rounded_rect(float2 size, Corners_ScaledPixels corner_radii, float sigma) {
+  float s = max(sigma * sqrt(2.), 1e-6);
+  float s_inv = 1. / s;
+  float min_edge = min(size.x, size.y);
+  float r_max = 0.5 * min_edge;
+  float4 radii = float4(corner_radii.top_left, corner_radii.top_right,
+                        corner_radii.bottom_right, corner_radii.bottom_left);
+  float4 r0 = min(sqrt(radii * radii + 1.15 * 1.15 * s * s), r_max);
+  float4 r1 = min(sqrt(radii * radii + 4. * s * s), r_max);
+
+  float2 half_extent = 0.5 * s_inv * size;
+  float delta = 1.25 * s * (exp(-half_extent.x * half_extent.x) - exp(-half_extent.y * half_extent.y));
+  float2 adjusted_size = float2(size.x + min(delta, 0.), size.y - max(delta, 0.));
+  float4 peak = s_inv * 0.5 * (max(adjusted_size.x, adjusted_size.y) - 0.5 * radii);
+
+  PreparedBlurredRoundedRect output;
+  output.shape = float4(0.5 * adjusted_size, s_inv, min_edge);
+  output.r1 = r1;
+  output.exponent = 2. * r1 / r0;
+  output.scale = 0.5 * float4(erf7(peak.x), erf7(peak.y), erf7(peak.z), erf7(peak.w));
+  return output;
+}
+
+float pick_corner(float2 center_to_point, float4 values) {
+  Corners_ScaledPixels corners = {values.x, values.y, values.z, values.w};
+  return pick_corner_radius(center_to_point, corners);
+}
+
+float blurred_rounded_rect(float2 center_to_point, PreparedBlurredRoundedRect prepared) {
+  float r1 = pick_corner(center_to_point, prepared.r1);
+  float exponent = pick_corner(center_to_point, prepared.exponent);
+  float scale = pick_corner(center_to_point, prepared.scale);
+  float s_inv = prepared.shape.z;
+  float min_edge = prepared.shape.w;
+
+  float2 p0 = abs(center_to_point) - (prepared.shape.xy - r1);
+  float2 p1 = max(p0, 0.);
+  float d_pos;
+  if (p1.x > 0. && p1.y > 0.) {
+    d_pos = pow(pow(p1.x, exponent) + pow(p1.y, exponent), 1. / exponent);
+  } else {
+    d_pos = p1.x + p1.y;
+  }
+
+  float d_neg = min(max(p0.x, p0.y), 0.);
+  float d = d_pos + d_neg - r1;
+  return scale * (erf7(s_inv * (min_edge + d)) - erf7(s_inv * d));
+}
 
 vertex ShadowVertexOutput shadow_vertex(
     uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
@@ -651,7 +730,7 @@ vertex ShadowVertexOutput shadow_vertex(
   if (shadow.inset != 0u) {
     bounds = shadow.element_bounds;
   } else {
-    // Leave room for the gaussian tail outside the shadow rect.
+    // Leave room for the tail of the blur outside the shadow rect.
     float margin = 3. * shadow.blur_radius;
     bounds = shadow.bounds;
     bounds.origin.x -= margin;
@@ -660,18 +739,24 @@ vertex ShadowVertexOutput shadow_vertex(
     bounds.size.height += 2. * margin;
   }
 
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, bounds, shadow.content_mask.bounds);
   float4 device_position =
-      to_device_position(unit_vertex, bounds, viewport_size);
-  float4 clip_distance =
-      distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+      to_device_position_impl(clipped.position, viewport_size);
   float4 color = hsla_to_rgba(shadow.color);
+  PreparedBlurredRoundedRect blur = prepare_blurred_rounded_rect(
+      float2(shadow.bounds.size.width, shadow.bounds.size.height),
+      shadow.corner_radii, shadow.blur_radius);
 
   return ShadowVertexOutput{
       shadow.rounded_clip,
       device_position,
       color,
       shadow_id,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      blur.shape,
+      blur.r1,
+      blur.exponent,
+      blur.scale};
 }
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
@@ -680,47 +765,17 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
   Shadow shadow = shadows[input.shadow_id];
 
-  float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
-  float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
-  float2 half_size = size / 2.;
-  float2 center = origin + half_size;
-  float2 point = input.position.xy - center;
-  float corner_radius;
-  if (point.x < 0.) {
-    if (point.y < 0.) {
-      corner_radius = shadow.corner_radii.top_left;
-    } else {
-      corner_radius = shadow.corner_radii.bottom_left;
-    }
-  } else {
-    if (point.y < 0.) {
-      corner_radius = shadow.corner_radii.top_right;
-    } else {
-      corner_radius = shadow.corner_radii.bottom_right;
-    }
-  }
-
   float alpha;
   if (shadow.blur_radius == 0.) {
     float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
     alpha = saturate(0.5 - distance);
   } else {
-    // The signal is only non-zero in a limited range, so don't waste samples
-    float low = point.y - half_size.y;
-    float high = point.y + half_size.y;
-    float start = clamp(-3. * shadow.blur_radius, low, high);
-    float end = clamp(3. * shadow.blur_radius, low, high);
-
-    // Accumulate samples (we can get away with surprisingly few samples)
-    float step = (end - start) / 4.;
-    float y = start + step * 0.5;
-    alpha = 0.;
-    for (int i = 0; i < 4; i++) {
-      alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
-               gaussian(y, shadow.blur_radius) * step;
-      y += step;
-    }
+    float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
+    float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
+    float2 center = origin + size / 2.;
+    PreparedBlurredRoundedRect blur = {input.blur_shape, input.blur_r1,
+                                       input.blur_exponent, input.blur_scale};
+    alpha = blurred_rounded_rect(input.position.xy - center, blur);
   }
 
   if (shadow.inset != 0u) {
@@ -738,7 +793,6 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 struct BackdropBlurVertexOutput {
   float4 position [[position]];
   uint blur_id [[flat]];
-  float clip_distance [[clip_distance]][4];
 };
 
 struct BackdropBlurFragmentInput {
@@ -754,14 +808,13 @@ vertex BackdropBlurVertexOutput backdrop_blur_vertex(
     [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   BackdropBlur blur = blurs[blur_id];
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, blur.bounds, blur.content_mask.bounds);
   float4 device_position =
-      to_device_position(unit_vertex, blur.bounds, viewport_size);
-  float4 clip_distance =
-      distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask.bounds);
+      to_device_position_impl(clipped.position, viewport_size);
   return BackdropBlurVertexOutput{
       device_position,
-      blur_id,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      blur_id};
 }
 
 struct BackdropBlurPassVertexOutput {
@@ -902,7 +955,6 @@ struct UnderlineVertexOutput {
   float4 position [[position]];
   float4 color [[flat]];
   uint underline_id [[flat]];
-  float clip_distance [[clip_distance]][4];
 };
 
 struct UnderlineFragmentInput {
@@ -920,17 +972,16 @@ vertex UnderlineVertexOutput underline_vertex(
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
+  ClippedVertex clipped = clip_to_mask(unit_vertex, underline.bounds,
+                                       underline.content_mask.bounds);
   float4 device_position =
-      to_device_position(unit_vertex, underline.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
-                                                 underline.content_mask.bounds);
+      to_device_position_impl(clipped.position, viewport_size);
   float4 color = hsla_to_rgba(underline.color);
   return UnderlineVertexOutput{
       underline.rounded_clip,
       device_position,
       color,
-      underline_id,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      underline_id | (underline.wavy == 0u ? SIMPLE_PRIMITIVE_FLAG : 0u)};
 }
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
@@ -940,29 +991,29 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
-  Underline underline = underlines[input.underline_id];
-  if (underline.wavy) {
-    float half_thickness = underline.thickness * 0.5;
-    float2 origin =
-        float2(underline.bounds.origin.x, underline.bounds.origin.y);
-
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
-                float2(0., 0.5);
-    float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
-    float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
-
-    float sine = sin(st.x * frequency) * amplitude;
-    float dSine = cos(st.x * frequency) * amplitude * frequency;
-    float distance = (st.y - sine) / sqrt(1. + dSine * dSine);
-    float distance_in_pixels = distance * underline.bounds.size.height;
-    float distance_from_top_border = distance_in_pixels - half_thickness;
-    float distance_from_bottom_border = distance_in_pixels + half_thickness;
-    float alpha = saturate(
-        0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return (input.color * float4(1., 1., 1., alpha)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
-  } else {
+  if ((input.underline_id & SIMPLE_PRIMITIVE_FLAG) != 0u) {
     return (input.color) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
   }
+
+  Underline underline = underlines[input.underline_id];
+  float half_thickness = underline.thickness * 0.5;
+  float2 origin =
+      float2(underline.bounds.origin.x, underline.bounds.origin.y);
+
+  float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
+              float2(0., 0.5);
+  float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
+  float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
+
+  float sine = sin(st.x * frequency) * amplitude;
+  float dSine = cos(st.x * frequency) * amplitude * frequency;
+  float distance = (st.y - sine) / sqrt(1. + dSine * dSine);
+  float distance_in_pixels = distance * underline.bounds.size.height;
+  float distance_from_top_border = distance_in_pixels - half_thickness;
+  float distance_from_bottom_border = distance_in_pixels + half_thickness;
+  float alpha = saturate(
+      0.5 - max(-distance_from_bottom_border, distance_from_top_border));
+  return (input.color * float4(1., 1., 1., alpha)) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 struct MonochromeSpriteVertexOutput {
@@ -1090,7 +1141,7 @@ struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
-  float clip_distance [[clip_distance]][4];
+  float opacity [[flat]];
 };
 
 struct PolychromeSpriteFragmentInput {
@@ -1098,6 +1149,7 @@ struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
+  float opacity [[flat]];
 };
 
 vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
@@ -1111,17 +1163,23 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
   float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds);
-  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+      to_device_position_impl(clipped.position, viewport_size);
+  float2 tile_position =
+      to_tile_position(clipped.unit_vertex, sprite.tile, atlas_size);
+  bool simple = sprite.grayscale == 0u &&
+                sprite.corner_radii.top_left == 0.0 &&
+                sprite.corner_radii.top_right == 0.0 &&
+                sprite.corner_radii.bottom_right == 0.0 &&
+                sprite.corner_radii.bottom_left == 0.0;
   return PolychromeSpriteVertexOutput{
       sprite.rounded_clip,
       device_position,
       tile_position,
-      sprite_id,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      sprite_id | (simple ? SIMPLE_PRIMITIVE_FLAG : 0u),
+      sprite.opacity};
 }
 
 fragment float4 polychrome_sprite_fragment(
@@ -1129,158 +1187,207 @@ fragment float4 polychrome_sprite_fragment(
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
     constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
-  PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
+  float4 color =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
-  float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+  if ((input.sprite_id & SIMPLE_PRIMITIVE_FLAG) != 0u) {
+    return float4(color.rgb, color.a * input.opacity) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
+  }
 
-  float4 color = sample;
+  PolychromeSprite sprite = sprites[input.sprite_id];
   if (sprite.grayscale) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.r = grayscale;
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  float distance =
+      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+  color.a *= input.opacity * saturate(0.5 - distance);
   return (color) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
-struct PathRasterizationVertexOutput {
+struct PathTileFragmentInput {
   uint rounded_clip [[flat]];
   float4 position [[position]];
-  float2 st_position;
-  // Screen-space position: `position` lands in the batch's slot of the
-  // intermediate, but fills are defined against the path's screen bounds.
-  float2 screen_position;
-  uint vertex_id [[flat]];
-  float clip_rect_distance [[clip_distance]][4];
+  uint tile_id [[flat]];
+  float4 curve_box [[flat]];
+  uint background_tag [[flat]];
+  float4 background_solid [[flat]];
+  float4 background_color0 [[flat]];
+  float4 background_color1 [[flat]];
 };
 
-struct PathRasterizationFragmentInput {
-  uint rounded_clip [[flat]];
-  float4 position [[position]];
-  float2 st_position;
-  float2 screen_position;
-  uint vertex_id [[flat]];
-};
+vertex PathTileFragmentInput path_tile_vertex(
+    uint unit_vertex_id [[vertex_id]], uint tile_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(PathTileInputIndex_Vertices)]],
+    constant PathTile *tiles [[buffer(PathTileInputIndex_Tiles)]],
+    constant PathPaint *paints [[buffer(PathTileInputIndex_Paints)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(PathTileInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  PathTile tile = tiles[tile_id];
+  PathPaint paint = paints[tile.paint];
 
-vertex PathRasterizationVertexOutput path_rasterization_vertex(
-  uint vertex_id [[vertex_id]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]],
-  constant float2 *slot_offset [[buffer(PathRasterizationInputIndex_SlotOffset)]]
-) {
-  PathRasterizationVertex v = vertices[vertex_id];
-  float2 screen_position = float2(v.xy_position.x, v.xy_position.y);
-  float2 vertex_position = screen_position + *slot_offset;
-  float4 position = float4(
-    vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
-    0.,
-    1.
+  float2 mask_top_left = float2(paint.content_mask.bounds.origin.x,
+                                paint.content_mask.bounds.origin.y);
+  float2 mask_bottom_right =
+      mask_top_left + float2(paint.content_mask.bounds.size.width,
+                             paint.content_mask.bounds.size.height);
+  float2 top_left = clamp(float2(tile.top_left.x, tile.top_left.y),
+                          mask_top_left, mask_bottom_right);
+  float2 bottom_right = clamp(float2(tile.bottom_right.x, tile.bottom_right.y),
+                              top_left, mask_bottom_right);
+  // Neighbouring tiles store the edge they share as the same number, so
+  // each corner is selected rather than interpolated: `a + (b - a)` is not
+  // always `b`, and edges that differ in their last bit leave a seam.
+  float2 position = float2(unit_vertex.x != 0.0 ? bottom_right.x : top_left.x,
+                           unit_vertex.y != 0.0 ? bottom_right.y : top_left.y);
+
+  GradientColor gradient = prepare_fill_color(
+    paint.color.tag,
+    paint.color.color_space,
+    paint.color.solid,
+    paint.color.colors[0].color,
+    paint.color.colors[1].color
   );
-  return PathRasterizationVertexOutput{
-      v.rounded_clip,
-      position,
-      float2(v.st_position.x, v.st_position.y),
-      screen_position,
-      vertex_id,
-      {
-        v.xy_position.x - v.bounds.origin.x,
-        v.bounds.origin.x + v.bounds.size.width - v.xy_position.x,
-        v.xy_position.y - v.bounds.origin.y,
-        v.bounds.origin.y + v.bounds.size.height - v.xy_position.y
-      }
-  };
+
+  return PathTileFragmentInput{
+      paint.rounded_clip,
+      to_device_position_impl(position, viewport_size),
+      tile_id,
+      float4(tile.curves_top_left.x, tile.curves_top_left.y,
+             tile.curves_bottom_right.x, tile.curves_bottom_right.y),
+      paint.color.tag,
+      gradient.solid,
+      gradient.color0,
+      gradient.color1};
 }
 
-fragment float4 path_rasterization_fragment(
-  PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
-,
-    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
-  float2 dx = dfdx(input.st_position);
-  float2 dy = dfdy(input.st_position);
+// Solves a*t^2 + b*t + c = 0 for the root in [0, 1] on a monotone piece.
+float monotone_quadratic_root(float a, float b, float c, float direction) {
+  float discriminant = max(b * b - 4.0 * a * c, 0.0);
+  float denominator = b + direction * sqrt(discriminant);
+  if (denominator == 0.0) {
+    return 0.0;
+  }
+  return saturate(-2.0 * c / denominator);
+}
 
-  PathRasterizationVertex v = vertices[input.vertex_id];
-  Background background = v.color;
-  Bounds_ScaledPixels path_bounds = v.bounds;
-  float alpha;
-  if (length(float2(dx.x, dy.x)) < 0.001) {
-    alpha = 1.0;
-  } else {
-    float2 gradient = float2(
-      (2. * input.st_position.x) * dx.x - dx.y,
-      (2. * input.st_position.x) * dy.x - dy.y
-    );
-    float f = (input.st_position.x * input.st_position.x) - input.st_position.y;
-    float distance = f / length(gradient);
-    alpha = saturate(0.5 - distance);
+// Coverage estimate adapted from https://github.com/EricLengyel/Slug/blob/be3c13eb7d63f9e8aa5c583e42d92c374cb91d98/SlugPixelShader.hlsl
+// Copyright (c) 2017 Eric Lengyel.
+// Licensed under the MIT license.
+
+// Accumulates the curve's winding along the pixel's leftward and upward rays.
+// Like Slug, a crossing within half a pixel of the center counts fractionally.
+void add_curve_winding(PathCurve curve, float2 center, thread float2 &winding,
+                       thread float2 &weight) {
+  float2 p0 = float2(curve.p0.x, curve.p0.y);
+  float2 p1 = float2(curve.p1.x, curve.p1.y);
+  float2 a = float2(curve.a.x, curve.a.y);
+  float2 b = float2(curve.b.x, curve.b.y);
+  float min_x = min(p0.x, p1.x);
+  float max_x = max(p0.x, p1.x);
+
+  if (p0.y <= center.y && center.y < p1.y) {
+    if (max_x <= center.x - 0.5) {
+      winding.x += curve.sign;
+    } else {
+      float t = monotone_quadratic_root(a.y, b.y, p0.y - center.y, 1.0);
+      float x = (a.x * t + b.x) * t + p0.x;
+      float distance = center.x - x;
+      winding.x += curve.sign * saturate(distance + 0.5);
+      weight.x = max(weight.x, saturate(1.0 - 2.0 * abs(distance)));
+    }
   }
 
-  GradientColor gradient_color = prepare_fill_color(
-    background.tag,
-    background.color_space,
-    background.solid,
-    background.colors[0].color,
-    background.colors[1].color
-  );
-
-  float4 color = fill_color(
-    background,
-    input.screen_position,
-    path_bounds,
-    gradient_color.solid,
-    gradient_color.color0,
-    gradient_color.color1
-  );
-  return (float4(color.rgb * color.a * alpha, alpha * color.a)) * rounded_clip_coverage(input.rounded_clip, input.screen_position, rounded_masks);
+  if (min_x <= center.x && center.x < max_x) {
+    float direction = p1.x > p0.x ? 1.0 : -1.0;
+    if (p1.y <= center.y - 0.5) {
+      winding.y -= curve.sign * direction;
+    } else if (p0.y < center.y + 0.5) {
+      float t = monotone_quadratic_root(a.x, b.x, p0.x - center.x, direction);
+      float y = (a.y * t + b.y) * t + p0.y;
+      float distance = center.y - y;
+      winding.y -= curve.sign * direction * saturate(distance + 0.5);
+      weight.y = max(weight.y, saturate(1.0 - 2.0 * abs(distance)));
+    }
+  }
 }
 
-struct PathSpriteVertexOutput {
-  float4 position [[position]];
-  float2 texture_coords;
-};
-
-vertex PathSpriteVertexOutput path_sprite_vertex(
-  uint unit_vertex_id [[vertex_id]],
-  uint sprite_id [[instance_id]],
-  constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-  constant PathSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-  constant Size_DevicePixels *viewport_size [[buffer(SpriteInputIndex_ViewportSize)]]
-) {
-  float2 unit_vertex = unit_vertices[unit_vertex_id];
-  PathSprite sprite = sprites[sprite_id];
-  // Don't apply content mask because it was already accounted for when
-  // rasterizing the path.
-  float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-
-  float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 slot_position = screen_position + float2(sprite.slot_offset.x, sprite.slot_offset.y);
-  float2 texture_coords = slot_position / float2(viewport_size->width, viewport_size->height);
-
-  return PathSpriteVertexOutput{
-    device_position,
-    texture_coords
-  };
+// The backdrop gives the unlisted curves' winding along a leftward ray from
+// the tile's reference corner. We need it at the current pixel, along both
+// leftward and upward rays. Because paths are closed, chains of unlisted
+// curves can only begin or end where a listed curve does. So, we can compute
+// the winding at the current pixel by correcting the backdrop for each listed
+// endpoint between its ray and the pixel.
+void correct_for_endpoint(float2 endpoint, float step, float2 reference,
+                          float2 center, thread float2 &winding) {
+  if (endpoint.x <= reference.x) {
+    winding.x -= step * (float(endpoint.y <= center.y) -
+                         float(endpoint.y <= reference.y));
+  }
+  if (endpoint.y <= reference.y && endpoint.x <= center.x) {
+    winding.y += step;
+  }
 }
 
-fragment float4 path_sprite_fragment(
-  PathSpriteVertexOutput input [[stage_in]],
-  texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
-) {
-  constexpr sampler intermediate_texture_sampler(mag_filter::linear, min_filter::linear);
-  return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+fragment float4 path_tile_fragment(
+    PathTileFragmentInput input [[stage_in]],
+    constant PathTile *tiles [[buffer(PathTileInputIndex_Tiles)]],
+    constant PathCurve *curves [[buffer(PathTileInputIndex_Curves)]],
+    constant PathPaint *paints [[buffer(PathTileInputIndex_Paints)]],
+    constant RoundedClipNode *rounded_masks [[buffer(15)]]) {
+  float2 center = floor(input.position.xy) + 0.5;
+  // A solid fill well inside the path needs neither its curves nor its paint.
+  if (input.background_tag == 0u &&
+      (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
+    return input.background_solid * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
+  }
+  PathTile tile = tiles[input.tile_id];
+  PathPaint paint = paints[tile.paint];
+  float2 reference = float2(tile.reference.x, tile.reference.y);
+
+  float2 winding = float2(float(tile.backdrop));
+  float2 weight = float2(0.0);
+  for (uint i = 0u; i < tile.curve_count; i++) {
+    PathCurve curve = curves[tile.curve_start + i];
+    float2 p0 = float2(curve.p0.x, curve.p0.y);
+    float2 p1 = float2(curve.p1.x, curve.p1.y);
+    if (min(p0.x, p1.x) >= center.x + 0.5) {
+      break;
+    }
+    if (p0.y < center.y + 0.5) {
+      add_curve_winding(curve, center, winding, weight);
+      correct_for_endpoint(p0, curve.sign, reference, center, winding);
+      correct_for_endpoint(p1, -curve.sign, reference, center, winding);
+    }
+  }
+
+  // Weight the winding computed by each ray by its nearest crossing's distance
+  // from the pixel center, using Slug's technique.
+  float coverage =
+      max(abs(dot(winding, weight)) / max(weight.x + weight.y, 1.0 / 65536.0),
+          min(abs(winding.x), abs(winding.y)));
+  coverage = paint.even_odd != 0u
+                 ? 1.0 - abs(1.0 - fract(coverage * 0.5) * 2.0)
+                 : saturate(coverage);
+
+  if (coverage == 0.0) {
+    return float4(0.0);
+  }
+
+  float4 color = fill_color(paint.color, input.position.xy, paint.bounds,
+                            input.background_solid, input.background_color0,
+                            input.background_color1);
+  return float4(color.rgb, color.a * coverage) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
 struct SurfaceVertexOutput {
   uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 texture_position;
-  float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
@@ -1299,18 +1406,17 @@ vertex SurfaceVertexOutput surface_vertex(
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, surface.bounds, surface.content_mask.bounds);
   float4 device_position =
-      to_device_position(unit_vertex, surface.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
-                                                 surface.content_mask.bounds);
+      to_device_position_impl(clipped.position, viewport_size);
   // We are going to copy the whole texture, so the texture position corresponds
-  // to the current vertex of the unit triangle.
-  float2 texture_position = unit_vertex;
+  // to the vertex's position within the unclipped surface bounds.
+  float2 texture_position = clipped.unit_vertex;
   return SurfaceVertexOutput{
       surface.rounded_clip,
       device_position,
-      texture_position,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      texture_position};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
@@ -1430,16 +1536,21 @@ float4 oklab_to_srgb(float4 color) {
   return float4(linear_to_srgb(linear_rgb), color.a);
 }
 
-float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          constant Size_DevicePixels *input_viewport_size) {
-  float2 position =
-      unit_vertex * float2(bounds.size.width, bounds.size.height) +
-      float2(bounds.origin.x, bounds.origin.y);
+float4 to_device_position_impl(float2 position,
+                               constant Size_DevicePixels *input_viewport_size) {
   float2 viewport_size = float2((float)input_viewport_size->width,
                                 (float)input_viewport_size->height);
   float2 device_position =
       position / viewport_size * float2(2., -2.) + float2(-1., 1.);
   return float4(device_position, 0., 1.);
+}
+
+float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                          constant Size_DevicePixels *input_viewport_size) {
+  float2 position =
+      unit_vertex * float2(bounds.size.width, bounds.size.height) +
+      float2(bounds.origin.x, bounds.origin.y);
+  return to_device_position_impl(position, input_viewport_size);
 }
 
 // Must match `gpui::quad_depth`.
@@ -1527,39 +1638,22 @@ float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
     }
 }
 
-// A standard gaussian function, used for weighting samples
-float gaussian(float x, float sigma) {
-  return exp(-(x * x) / (2. * sigma * sigma)) / (sqrt(2. * M_PI_F) * sigma);
-}
+// Moves a unit quad's corner inside `mask`, so that what the mask clips is
+// never rasterized.
+ClippedVertex clip_to_mask(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                           Bounds_ScaledPixels mask) {
+  float2 bounds_origin = float2(bounds.origin.x, bounds.origin.y);
+  float2 bounds_size = float2(bounds.size.width, bounds.size.height);
+  float2 mask_origin = float2(mask.origin.x, mask.origin.y);
+  float2 mask_size = float2(mask.size.width, mask.size.height);
+  float2 origin = max(bounds_origin, mask_origin);
+  float2 corner = min(bounds_origin + bounds_size, mask_origin + mask_size);
+  float2 size = max(corner - origin, float2(0.));
 
-// This approximates the error function, needed for the gaussian integral
-float2 erf(float2 x) {
-  float2 s = sign(x);
-  float2 a = abs(x);
-  float2 r1 = 1. + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
-  float2 r2 = r1 * r1;
-  return s - s / (r2 * r2);
-}
-
-float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
-  float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
-  float2 integral =
-      0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
-  return integral.y - integral.x;
-}
-
-float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                               Bounds_ScaledPixels clip_bounds) {
-  float2 position =
-      unit_vertex * float2(bounds.size.width, bounds.size.height) +
-      float2(bounds.origin.x, bounds.origin.y);
-  return float4(position.x - clip_bounds.origin.x,
-                clip_bounds.origin.x + clip_bounds.size.width - position.x,
-                position.y - clip_bounds.origin.y,
-                clip_bounds.origin.y + clip_bounds.size.height - position.y);
+  ClippedVertex result;
+  result.position = origin + unit_vertex * size;
+  result.unit_vertex = (result.position - bounds_origin) / bounds_size;
+  return result;
 }
 
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,

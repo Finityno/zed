@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
-    PrimitiveBatch, RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size,
+    AtlasTextureId, BackdropBlur, Bounds, DevicePixels, GpuSpecs, PrimitiveBatch,
+    RenderMemoryGauge, RenderMemoryLedger, ScaledPixels, Scene, Size,
     get_gamma_correction_ratios, quad_depth,
 };
 use log::warn;
@@ -28,23 +28,6 @@ const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 /// the life of the window.
 const INSTANCE_SHRINK_FRAMES: u32 = 120;
 
-/// Consecutive path-free frames after which the window-sized path targets are
-/// released, the Metal renderer's count (DirectX uses 300). Frames, not time:
-/// GPUI only draws on activity and the renderer has no clock, so a window that
-/// goes idle keeps its targets for the very next redraw, while two seconds of
-/// sustained 60 Hz drawing with no path means they are not wanted. A path that
-/// comes back costs one allocation, the same as a resize step.
-const PATH_TARGET_IDLE_FRAMES: u32 = 120;
-
-/// Paths rasterize through a multisampled tile of at most this size, as on
-/// DirectX, instead of a window-sized MSAA target: at 3200x2000 a 4-sample
-/// window target is 102.4 MB and every path batch cleared and resolved all of
-/// it, while a 512x512 tile is 4 MiB. Each batch rasterizes only the tiles its
-/// sprites sample, resolves each and copies it into the window-sized
-/// single-sample intermediate, so the work follows the path area (corner
-/// masks, small indicators) instead of the window area.
-const PATH_RASTER_TILE_SIZE: u32 = 512;
-
 /// Region-sized scratch texture sets kept for backdrop blurs. A frame with
 /// more blurs of distinct sizes than this recreates the oldest set.
 const MAX_BACKDROP_TEXTURES: usize = 4;
@@ -60,9 +43,11 @@ const MAX_BACKDROP_BLUR_SIGMA: f32 = 64.;
 const MAX_BACKDROP_TEXEL_SIGMA: f32 = 8.;
 
 /// Consecutive frames without a backdrop blur after which its scratch
-/// textures, parameter buffer and offscreen frame are released, counted like
-/// the path targets.
-const BACKDROP_IDLE_FRAMES: u32 = PATH_TARGET_IDLE_FRAMES;
+/// textures, parameter buffer and offscreen frame are released. Frames, not
+/// time: GPUI only draws on activity and the renderer has no clock, so a
+/// window that goes idle keeps them for the very next redraw, while two
+/// seconds of sustained 60 Hz drawing with no blur means they are not wanted.
+const BACKDROP_IDLE_FRAMES: u32 = 120;
 
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
@@ -104,7 +89,9 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    path_paint_base: u32,
+    path_curve_base: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -162,23 +149,6 @@ struct BackdropCompositeParams {
 /// its own slot of the frame's parameter buffer.
 const BACKDROP_PARAM_SLOTS_PER_BLUR: u64 = 3;
 
-#[derive(Clone, Debug)]
-#[repr(C)]
-struct PathSprite {
-    bounds: Bounds<ScaledPixels>,
-}
-
-#[derive(Clone, Debug)]
-#[repr(C)]
-struct PathRasterizationVertex {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
-    rounded_clip: u32,
-    clip_padding: u32,
-}
-
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
@@ -210,8 +180,7 @@ struct WgpuPipelines {
     // frame draws it. Replacing `WgpuPipelines` (transparency change, device
     // recovery) starts them over.
     shadows: OnceLock<wgpu::RenderPipeline>,
-    path_rasterization: OnceLock<wgpu::RenderPipeline>,
-    paths: OnceLock<wgpu::RenderPipeline>,
+    path_tiles: OnceLock<wgpu::RenderPipeline>,
     poly_sprites: OnceLock<wgpu::RenderPipeline>,
     backdrop_blur: OnceLock<wgpu::RenderPipeline>,
     backdrop_composite: OnceLock<wgpu::RenderPipeline>,
@@ -222,7 +191,6 @@ struct WgpuPipelines {
 struct PipelineKey {
     surface_format: wgpu::TextureFormat,
     alpha_mode: wgpu::CompositeAlphaMode,
-    path_sample_count: u32,
     depth_format: wgpu::TextureFormat,
     dual_source_blending: bool,
     uses_webgl_instance_data: bool,
@@ -271,7 +239,6 @@ impl PipelineCache {
             &layouts,
             key.surface_format,
             key.alpha_mode,
-            key.path_sample_count,
             key.depth_format,
             key.dual_source_blending,
             key.uses_webgl_instance_data,
@@ -288,7 +255,6 @@ struct PipelineFactory {
     color_target: wgpu::ColorTargetState,
     surface_format: wgpu::TextureFormat,
     depth_format: wgpu::TextureFormat,
-    path_sample_count: u32,
 }
 
 impl PipelineFactory {
@@ -383,57 +349,18 @@ impl WgpuPipelines {
         })
     }
 
-    fn path_rasterization(&self) -> &wgpu::RenderPipeline {
-        self.path_rasterization.get_or_init(|| {
+    fn path_tiles(&self) -> &wgpu::RenderPipeline {
+        self.path_tiles.get_or_init(|| {
             let factory = &self.factory;
             factory.create_pipeline(
-                "path_rasterization",
-                "vs_path_rasterization",
-                "fs_path_rasterization",
+                "path_tiles",
+                "vs_path_tile",
+                "fs_path_tile",
                 &factory.layouts.globals,
-                &factory.layouts.instances,
+                &factory.layouts.path_tiles,
                 None,
-                wgpu::PrimitiveTopology::TriangleList,
-                &[Some(wgpu::ColorTargetState {
-                    format: factory.surface_format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                None,
-                factory.path_sample_count,
-                &factory.shader_module,
-            )
-        })
-    }
-
-    fn paths(&self) -> &wgpu::RenderPipeline {
-        self.paths.get_or_init(|| {
-            let factory = &self.factory;
-            let paths_blend = wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            };
-            factory.create_pipeline(
-                "paths",
-                "vs_path",
-                "fs_path",
-                &factory.layouts.globals,
-                &factory.layouts.instances,
-                Some(&factory.layouts.texture),
                 wgpu::PrimitiveTopology::TriangleStrip,
-                &[Some(wgpu::ColorTargetState {
-                    format: factory.surface_format,
-                    blend: Some(paths_blend),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                &[Some(factory.color_target.clone())],
                 factory.depth_stencil(false),
                 1,
                 &factory.shader_module,
@@ -517,9 +444,27 @@ struct InstanceBinding {
     first_instance: u32,
 }
 
+/// Where one array of instance data was written this frame.
+struct InstanceAllocation {
+    offset: u64,
+    size: u64,
+    first_instance: u32,
+}
+
+/// The frame's path tiles, bound with the curves and paints they index.
+struct PathTileBinding {
+    tiles: InstanceBinding,
+    /// The first tile of each path in `Scene::paths`, plus the total, so a
+    /// batch of paths draws `tile_starts[range.start]..tile_starts[range.end]`.
+    tile_starts: Vec<u32>,
+    paint_base: u32,
+    curve_base: u32,
+}
+
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
+    path_tiles: PathTileBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
@@ -531,6 +476,7 @@ struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     quads: wgpu::BindGroupLayout,
+    path_tiles: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     backdrop: wgpu::BindGroupLayout,
 }
@@ -561,19 +507,11 @@ struct WgpuResources {
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
-    path_globals_bind_group: wgpu::BindGroup,
     rounded_clip_texture: wgpu::Texture,
     rounded_clip_view: wgpu::TextureView,
     instance_data: InstanceData,
     depth_texture: Option<wgpu::Texture>,
     depth_view: Option<wgpu::TextureView>,
-    path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
-    path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
-    path_tile_texture: Option<wgpu::Texture>,
-    path_tile_view: Option<wgpu::TextureView>,
-    path_free_frames: u32,
     /// Most recently used last.
     backdrop_textures: Vec<BackdropTextures>,
     backdrop_params_buffer: Option<wgpu::Buffer>,
@@ -619,7 +557,7 @@ impl WgpuResources {
         self.depth_view = None;
         self.backdrop_textures.clear();
         self.backdrop_frame = None;
-        self.release_path_targets();
+        self.publish_target_memory();
     }
 
     /// Dropping is enough here too: submitted work keeps what it uses alive.
@@ -635,14 +573,6 @@ impl WgpuResources {
     /// that happens without a draw (resize, hidden window) is seen at once.
     fn publish_target_memory(&mut self) {
         let depth = texture_bytes(self.depth_texture.as_ref());
-        let paths = [
-            &self.path_intermediate_texture,
-            &self.path_msaa_texture,
-            &self.path_tile_texture,
-        ]
-        .into_iter()
-        .map(|texture| texture_bytes(texture.as_ref()))
-        .sum();
         let backdrop = self
             .backdrop_textures
             .iter()
@@ -652,21 +582,7 @@ impl WgpuResources {
         self.render_memory
             .publish(RenderMemoryGauge::DepthTextures, depth);
         self.render_memory
-            .publish(RenderMemoryGauge::PathTextures, paths);
-        self.render_memory
             .publish(RenderMemoryGauge::BackdropTextures, backdrop);
-    }
-
-    /// Dropping is enough: wgpu keeps a texture alive until the submitted work
-    /// that references it has finished.
-    fn release_path_targets(&mut self) {
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
-        self.path_tile_texture = None;
-        self.path_tile_view = None;
-        self.publish_target_memory();
     }
 }
 
@@ -678,84 +594,6 @@ fn texture_bytes(texture: Option<&wgpu::Texture>) -> u64 {
             * u64::from(bytes_per_texel)
             * u64::from(texture.sample_count())
     })
-}
-
-/// Paths with different draw orders are composited through one rect spanning
-/// all of them, so every tile under it is cleared and redrawn in this batch and
-/// no tile content from an earlier batch can show through.
-fn path_sprites(paths: &[Path<ScaledPixels>]) -> Vec<PathSprite> {
-    let Some(first_path) = paths.first() else {
-        return Vec::new();
-    };
-    if paths.last().map(|path| &path.order) == Some(&first_path.order) {
-        paths
-            .iter()
-            .map(|path| PathSprite {
-                bounds: path.clipped_bounds(),
-            })
-            .collect()
-    } else {
-        let mut bounds = first_path.clipped_bounds();
-        for path in paths.iter().skip(1) {
-            bounds = bounds.union(&path.clipped_bounds());
-        }
-        vec![PathSprite { bounds }]
-    }
-}
-
-fn path_tile_size(size: Size<DevicePixels>) -> Size<u32> {
-    Size {
-        width: (size.width.0.max(1) as u32).min(PATH_RASTER_TILE_SIZE),
-        height: (size.height.0.max(1) as u32).min(PATH_RASTER_TILE_SIZE),
-    }
-}
-
-/// The tiles of the target a set of path sprites samples, each clamped to the
-/// target, in row order and without repeats. Sprite bounds are widened by a
-/// pixel so that a fractional edge, and any texel a filtered sample could
-/// touch beside it, lands in a rasterized tile.
-fn path_tiles(
-    sprites: &[PathSprite],
-    size: Size<DevicePixels>,
-    tile_size: Size<u32>,
-) -> Vec<Bounds<u32>> {
-    let width = size.width.0.max(0) as u32;
-    let height = size.height.0.max(0) as u32;
-    let mut tiles = Vec::new();
-    for sprite in sprites {
-        let bounds = sprite.bounds;
-        let left = ((bounds.origin.x.0).floor() - 1.).clamp(0., width as f32) as u32;
-        let top = ((bounds.origin.y.0).floor() - 1.).clamp(0., height as f32) as u32;
-        let right = ((bounds.origin.x.0 + bounds.size.width.0).ceil() + 1.)
-            .clamp(0., width as f32) as u32;
-        let bottom = ((bounds.origin.y.0 + bounds.size.height.0).ceil() + 1.)
-            .clamp(0., height as f32) as u32;
-        if bounds.size.width.0 <= 0. || bounds.size.height.0 <= 0. || right <= left || bottom <= top
-        {
-            continue;
-        }
-        for row in top / tile_size.height..=(bottom - 1) / tile_size.height {
-            for column in left / tile_size.width..=(right - 1) / tile_size.width {
-                tiles.push((row, column));
-            }
-        }
-    }
-    tiles.sort_unstable();
-    tiles.dedup();
-    tiles
-        .into_iter()
-        .map(|(row, column)| {
-            let x = column * tile_size.width;
-            let y = row * tile_size.height;
-            Bounds {
-                origin: Point { x, y },
-                size: Size {
-                    width: tile_size.width.min(width - x),
-                    height: tile_size.height.min(height - y),
-                },
-            }
-        })
-        .collect()
 }
 
 /// The instance usage of the frames since the last frame that used a quarter
@@ -791,7 +629,6 @@ impl InstanceUsageWindow {
 struct WgpuRendererCore {
     resources: WgpuResources,
     atlas: Arc<WgpuAtlas>,
-    path_globals_offset: u64,
     gamma_offset: u64,
     instance_data_capacity: u64,
     initial_instance_data_capacity: u64,
@@ -1244,7 +1081,23 @@ impl WgpuRendererCore {
             },
         });
 
-        let texture = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        // Path tiles read their curves and paints too. The texture transport
+        // reads all three from the one instance texture.
+        let storage_path_tile_entries = [
+            storage_buffer_entry(0),
+            storage_buffer_entry(1),
+            storage_buffer_entry(2),
+        ];
+        let path_tiles = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("path_tiles_layout"),
+            entries: if uses_webgl_instance_data {
+                &webgl_quad_entries
+            } else {
+                &storage_path_tile_entries
+            },
+        });
+
+        let texture =device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -1306,6 +1159,7 @@ impl WgpuRendererCore {
             globals,
             instances,
             quads,
+            path_tiles,
             texture,
             backdrop,
         }
@@ -1354,7 +1208,6 @@ impl WgpuRendererCore {
         layouts: &WgpuBindGroupLayouts,
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
-        path_sample_count: u32,
         depth_format: wgpu::TextureFormat,
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
@@ -1419,7 +1272,6 @@ impl WgpuRendererCore {
             },
             surface_format,
             depth_format,
-            path_sample_count,
         };
 
         let quads = factory.create_pipeline(
@@ -1524,8 +1376,7 @@ impl WgpuRendererCore {
             mono_sprites,
             subpixel_sprites,
             shadows: OnceLock::new(),
-            path_rasterization: OnceLock::new(),
-            paths: OnceLock::new(),
+            path_tiles: OnceLock::new(),
             poly_sprites: OnceLock::new(),
             backdrop_blur: OnceLock::new(),
             backdrop_composite: OnceLock::new(),
@@ -1555,83 +1406,6 @@ impl WgpuRendererCore {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         (texture, view)
-    }
-
-    fn create_path_intermediate(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_intermediate"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
-    /// The single-sample tile a path tile is rasterized into (or resolved
-    /// into, with MSAA) before being copied to its place in the intermediate.
-    fn create_path_tile(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        tile_size: Size<u32>,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_tile"),
-            size: wgpu::Extent3d {
-                width: tile_size.width,
-                height: tile_size.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
-    fn create_msaa_if_needed(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-        sample_count: u32,
-    ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
-        if sample_count <= 1 {
-            return None;
-        }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_msaa"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Some((texture, view))
     }
 }
 
@@ -1675,15 +1449,6 @@ impl WgpuRenderer {
         if let Some(ref texture) = resources.depth_texture {
             texture.destroy();
         }
-        if let Some(ref texture) = resources.path_intermediate_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_msaa_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_tile_texture {
-            texture.destroy();
-        }
         if let Some(ref frame) = resources.backdrop_frame {
             frame.texture.destroy();
         }
@@ -1720,18 +1485,7 @@ impl WgpuRenderer {
         let Some(core) = self.core_mut() else {
             return;
         };
-        let resources = &mut core.resources;
-        resources.pipelines = resources.pipeline_cache.get_or_create(
-            &resources.device,
-            PipelineKey {
-                surface_format: format,
-                alpha_mode: new_alpha_mode,
-                path_sample_count: core.rendering_params.path_sample_count,
-                depth_format: core.rendering_params.depth_format,
-                dual_source_blending: core.dual_source_blending,
-                uses_webgl_instance_data: core.uses_webgl_instance_data,
-            },
-        );
+        core.select_pipelines(format, new_alpha_mode);
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1872,7 +1626,7 @@ impl WgpuRendererCore {
     ) -> Self {
         let device = Arc::clone(&context.device);
         let queue = Arc::clone(&context.queue);
-        let rendering_params = RenderingParameters::new(&context.adapter, target_format);
+        let rendering_params = RenderingParameters::new(&context.adapter);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         if uses_webgl_instance_data {
             // The texture transport cannot express the quad index indirection
@@ -1886,7 +1640,6 @@ impl WgpuRendererCore {
         let key = PipelineKey {
             surface_format: target_format,
             alpha_mode,
-            path_sample_count: rendering_params.path_sample_count,
             depth_format: rendering_params.depth_format,
             dual_source_blending,
             uses_webgl_instance_data,
@@ -1904,8 +1657,7 @@ impl WgpuRendererCore {
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
-        let path_globals_offset = globals_size.next_multiple_of(uniform_alignment);
-        let gamma_offset = (path_globals_offset + globals_size).next_multiple_of(uniform_alignment);
+        let gamma_offset = globals_size.next_multiple_of(uniform_alignment);
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals_buffer"),
             size: gamma_offset + gamma_size,
@@ -1976,29 +1728,6 @@ impl WgpuRendererCore {
                 },
             ],
         });
-        let path_globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("path_globals_bind_group"),
-            layout: &bind_group_layouts.globals,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&rounded_clip_view) },
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &globals_buffer,
-                        offset: path_globals_offset,
-                        size: NonZeroU64::new(globals_size),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &globals_buffer,
-                        offset: gamma_offset,
-                        size: NonZeroU64::new(gamma_size),
-                    }),
-                },
-            ],
-        });
         let max_texture_size = device.limits().max_texture_dimension_2d;
         let mut render_memory = RenderMemoryLedger::default();
         render_memory.publish(RenderMemoryGauge::InstanceBuffers, instance_data_capacity);
@@ -2014,19 +1743,11 @@ impl WgpuRendererCore {
                 atlas_texture_bind_groups: FxHashMap::default(),
                 globals_buffer,
                 globals_bind_group,
-                path_globals_bind_group,
                 rounded_clip_texture,
                 rounded_clip_view,
                 instance_data,
                 depth_texture: None,
                 depth_view: None,
-                path_intermediate_texture: None,
-                path_intermediate_view: None,
-                path_msaa_texture: None,
-                path_msaa_view: None,
-                path_tile_texture: None,
-                path_tile_view: None,
-                path_free_frames: 0,
                 backdrop_textures: Vec::new(),
                 backdrop_params_buffer: None,
                 backdrop_frame: None,
@@ -2035,7 +1756,6 @@ impl WgpuRendererCore {
                 render_memory,
             },
             atlas,
-            path_globals_offset,
             gamma_offset,
             instance_data_capacity,
             initial_instance_data_capacity: instance_data_capacity,
@@ -2060,71 +1780,44 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// The depth buffer and the path targets must match the frame target's
-    /// dimensions, so they are keyed by size and rebuilt on mismatch. The path
-    /// intermediate and its MSAA companion are only read by path batches, which
-    /// come from `scene.paths`, so they are created only for a frame that has
-    /// paths (before recording, so a path batch always finds them) and released
-    /// after `PATH_TARGET_IDLE_FRAMES` path-free frames or a path-free resize.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>, scene_has_paths: bool) {
+    /// Takes the shared pipeline set for a new surface format or alpha mode:
+    /// the color target's blend state depends on both.
+    fn select_pipelines(
+        &mut self,
+        surface_format: wgpu::TextureFormat,
+        alpha_mode: wgpu::CompositeAlphaMode,
+    ) {
+        let key = PipelineKey {
+            surface_format,
+            alpha_mode,
+            depth_format: self.rendering_params.depth_format,
+            dual_source_blending: self.dual_source_blending,
+            uses_webgl_instance_data: self.uses_webgl_instance_data,
+        };
+        let resources = &mut self.resources;
+        resources.pipelines = resources
+            .pipeline_cache
+            .get_or_create(&resources.device, key);
+    }
+
+    /// The depth buffer must match the frame target's dimensions, so it is
+    /// keyed by size and rebuilt on mismatch.
+    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
-        let matches_size =
-            |texture: &wgpu::Texture| texture.width() == width && texture.height() == height;
-        let format = self.target_format;
-        let path_sample_count = self.rendering_params.path_sample_count;
         let depth_format = self.rendering_params.depth_format;
         let resources = &mut self.resources;
 
-        if !resources.depth_texture.as_ref().is_some_and(matches_size) {
+        if !resources
+            .depth_texture
+            .as_ref()
+            .is_some_and(|texture| texture.width() == width && texture.height() == height)
+        {
             let (depth_texture, depth_view) =
                 Self::create_depth_texture(&resources.device, depth_format, width, height);
             resources.depth_texture = Some(depth_texture);
             resources.depth_view = Some(depth_view);
         }
-
-        let path_targets_match = resources
-            .path_intermediate_texture
-            .as_ref()
-            .is_some_and(matches_size);
-        if !scene_has_paths {
-            resources.path_free_frames = resources.path_free_frames.saturating_add(1);
-            if !path_targets_match || resources.path_free_frames >= PATH_TARGET_IDLE_FRAMES {
-                resources.release_path_targets();
-            }
-            return;
-        }
-
-        resources.path_free_frames = 0;
-        if path_targets_match {
-            return;
-        }
-
-        // Release the stale pair first so the old and new targets are never
-        // resident together.
-        resources.release_path_targets();
-        let (texture, view) =
-            Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(texture);
-        resources.path_intermediate_view = Some(view);
-
-        let tile_size = path_tile_size(size);
-        let (tile_texture, tile_view) =
-            Self::create_path_tile(&resources.device, format, tile_size);
-        resources.path_tile_texture = Some(tile_texture);
-        resources.path_tile_view = Some(tile_view);
-
-        let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
-            format,
-            tile_size.width,
-            tile_size.height,
-            path_sample_count,
-        )
-        .map(|(texture, view)| (Some(texture), Some(view)))
-        .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
     }
 
     fn create_rounded_clip_texture(device: &wgpu::Device, height: u32) -> wgpu::Texture {
@@ -2145,18 +1838,17 @@ impl WgpuRendererCore {
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
         let gamma_offset = self.gamma_offset;
-        let path_offset = self.path_globals_offset;
         let resources = self.resources_mut();
         if resources.rounded_clip_texture.height() < height
             || resources.rounded_clip_texture.height() > height.saturating_mul(4)
         {
             resources.rounded_clip_texture = Self::create_rounded_clip_texture(&resources.device, height);
             resources.rounded_clip_view = resources.rounded_clip_texture.create_view(&Default::default());
-            let make_group = |offset| resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            resources.globals_bind_group = resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("globals with rounded clips"), layout: &resources.bind_group_layouts.globals,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &resources.globals_buffer, offset, size: NonZeroU64::new(globals_size),
+                        buffer: &resources.globals_buffer, offset: 0, size: NonZeroU64::new(globals_size),
                     }) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &resources.globals_buffer, offset: gamma_offset, size: NonZeroU64::new(gamma_size),
@@ -2164,8 +1856,6 @@ impl WgpuRendererCore {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&resources.rounded_clip_view) },
                 ],
             });
-            resources.globals_bind_group = make_group(0);
-            resources.path_globals_bind_group = make_group(path_offset);
         }
         if scene.rounded_clips.is_empty() { return Ok(()); }
         let mut bytes = vec![0u8; height as usize * 256 * 16];
@@ -2204,7 +1894,7 @@ impl WgpuRendererCore {
 
         self.upload_rounded_clips(scene)?;
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size, !scene.paths.is_empty());
+        self.ensure_intermediate_textures(size);
         self.retire_idle_backdrop_resources(scene);
         self.resources.publish_target_memory();
 
@@ -2215,25 +1905,6 @@ impl WgpuRendererCore {
             is_bgr: self.is_bgr as u32,
             _pad: 0,
         };
-        let globals = GlobalParams {
-            viewport_size: [size.width.0 as f32, size.height.0 as f32],
-            premultiplied_alpha: premultiplied_alpha as u32,
-            pad: 0,
-        };
-        let path_globals = GlobalParams {
-            premultiplied_alpha: 0,
-            ..globals
-        };
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            0,
-            bytemuck::bytes_of(&globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.path_globals_offset,
-            bytemuck::bytes_of(&path_globals),
-        );
         self.resources.queue.write_buffer(
             &self.resources.globals_buffer,
             self.gamma_offset,
@@ -2253,6 +1924,7 @@ impl WgpuRendererCore {
                 target_view,
                 &depth_view,
                 size,
+                premultiplied_alpha,
                 clear_color,
             )
             .inspect_err(|_| {
@@ -2276,6 +1948,7 @@ impl WgpuRendererCore {
         target_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
+        premultiplied_alpha: bool,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset: u64 = 0;
@@ -2294,6 +1967,19 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
+        // The path array bases are only known once the instances are written.
+        let globals = GlobalParams {
+            viewport_size: [size.width.0 as f32, size.height.0 as f32],
+            premultiplied_alpha: premultiplied_alpha as u32,
+            path_paint_base: instance_bindings.path_tiles.paint_base,
+            path_curve_base: instance_bindings.path_tiles.curve_base,
+            _pad: [0; 3],
+        };
+        self.resources().queue.write_buffer(
+            &self.resources().globals_buffer,
+            0,
+            bytemuck::bytes_of(&globals),
+        );
         self.prepare_texture_bind_groups(scene);
         self.ensure_backdrop_params_capacity(scene.backdrop_blurs.len());
         let target_is_copy_source = target_texture
@@ -2400,32 +2086,19 @@ impl WgpuRendererCore {
                         &mut pass,
                     ),
                     PrimitiveBatch::Paths(range) => {
-                        let paths = &scene.paths[range];
-                        if paths.is_empty() {
+                        let path_tiles = &instance_bindings.path_tiles;
+                        let (Some(&first_tile), Some(&end_tile)) = (
+                            path_tiles.tile_starts.get(range.start),
+                            path_tiles.tile_starts.get(range.end),
+                        ) else {
                             continue;
-                        }
-
-                        drop(pass);
-                        let sprites = path_sprites(paths);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            paths,
-                            &sprites,
-                            size,
-                            &mut instance_offset,
-                        )?;
-
-                        pass =
-                            Self::begin_continued_main_pass(&mut encoder, frame_view, depth_view);
-                        Self::set_pass_depth_range(&mut pass, size, batch_depth, batch_depth);
-
-                        if rasterized {
-                            self.draw_paths_from_intermediate(
-                                &sprites,
-                                &mut instance_offset,
-                                &mut pass,
-                            )?;
-                        }
+                        };
+                        self.draw_instances(
+                            &path_tiles.tiles,
+                            WgpuPipelines::path_tiles,
+                            first_tile..end_tile,
+                            &mut pass,
+                        );
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
                         &instance_bindings.underlines,
@@ -2525,6 +2198,7 @@ impl WgpuRendererCore {
                 instance_offset,
                 &scene.shadows,
             )?,
+            path_tiles: self.write_path_tiles(scene, instance_offset)?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",
                 instance_offset,
@@ -2719,8 +2393,8 @@ impl WgpuRendererCore {
         );
     }
 
-    /// Resumes the main pass after it was ended to rasterize paths or run a
-    /// backdrop blur, keeping what it drew. Callers set the viewport again.
+    /// Resumes the main pass after it was ended to run a backdrop blur,
+    /// keeping what it drew. Callers set the viewport again.
     fn begin_continued_main_pass<'encoder>(
         encoder: &'encoder mut wgpu::CommandEncoder,
         frame_view: &wgpu::TextureView,
@@ -2808,156 +2482,6 @@ impl WgpuRendererCore {
                 std::mem::size_of_val(instances),
             )
         }
-    }
-
-    fn draw_paths_from_intermediate(
-        &mut self,
-        sprites: &[PathSprite],
-        instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
-    ) -> Result<()> {
-        let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
-            return Ok(());
-        };
-        let instances =
-            self.write_instance_binding("path_sprites_bind_group", instance_offset, sprites)?;
-        let texture = self.create_texture_bind_group(
-            "path_intermediate_texture_bind_group",
-            &path_intermediate_view,
-        );
-        let resources = self.resources();
-        pass.set_pipeline(resources.pipelines.paths());
-        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-        pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &texture, &[]);
-        pass.draw(
-            0..4,
-            instances.first_instance..instances.first_instance + sprites.len() as u32,
-        );
-        Ok(())
-    }
-
-    /// Rasterizes `paths` into every tile that `sprites` will sample and
-    /// copies each tile into the intermediate. Tiles the sprites do not reach
-    /// keep stale content from earlier batches, which nothing reads.
-    fn draw_paths_to_intermediate(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        paths: &[Path<ScaledPixels>],
-        sprites: &[PathSprite],
-        size: Size<DevicePixels>,
-        instance_offset: &mut u64,
-    ) -> Result<bool> {
-        if paths.iter().all(|path| path.vertices.is_empty()) {
-            return Ok(false);
-        }
-        if self.resources().path_intermediate_texture.is_none()
-            || self.resources().path_tile_view.is_none()
-        {
-            return Ok(false);
-        }
-
-        let mut vertices = Vec::new();
-        for path in paths {
-            let bounds = path.clipped_bounds();
-            vertices.extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
-                rounded_clip: path.rounded_clip,
-                clip_padding: 0,
-                xy_position: vertex.xy_position,
-                st_position: vertex.st_position,
-                color: path.color,
-                bounds,
-            }));
-        }
-        // Uploaded once per batch: every tile draws the same window-space
-        // vertices and only moves its viewport.
-        let vertex_binding = self.write_instance_binding(
-            "path_rasterization_bind_group",
-            instance_offset,
-            &vertices,
-        )?;
-
-        let tile_size = path_tile_size(size);
-        for tile in path_tiles(sprites, size, tile_size) {
-            let resources = self.resources();
-            let (Some(intermediate), Some(tile_texture), Some(tile_view)) = (
-                resources.path_intermediate_texture.as_ref(),
-                resources.path_tile_texture.as_ref(),
-                resources.path_tile_view.as_ref(),
-            ) else {
-                return Ok(false);
-            };
-            let (target_view, resolve_target) = match resources.path_msaa_view.as_ref() {
-                Some(msaa_view) => (msaa_view, Some(tile_view)),
-                None => (tile_view, None),
-            };
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("path_rasterization_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target_view,
-                        resolve_target,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-
-                // A window-sized viewport placed at minus the tile's origin
-                // maps window clip space onto this tile, the same transform
-                // the full-window target used shifted by whole pixels. wgpu
-                // accepts viewport origins down to -2 * max_texture_dimension_2d,
-                // which covers any tile of a window within that dimension.
-                pass.set_viewport(
-                    -(tile.origin.x as f32),
-                    -(tile.origin.y as f32),
-                    size.width.0 as f32,
-                    size.height.0 as f32,
-                    0.,
-                    1.,
-                );
-                pass.set_pipeline(resources.pipelines.path_rasterization());
-                pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
-                pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
-                // The path rasterization shader loads records by vertex
-                // index rather than instance index, so the allocation's
-                // base shifts the vertex range here.
-                pass.draw(
-                    vertex_binding.first_instance
-                        ..vertex_binding.first_instance + vertices.len() as u32,
-                    0..1,
-                );
-            }
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: tile_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: intermediate,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: tile.origin.x,
-                        y: tile.origin.y,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: tile.size.width,
-                    height: tile.size.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        Ok(true)
     }
 
     /// Counts a drawn frame against the backdrop blur resources, releasing
@@ -3365,18 +2889,13 @@ impl WgpuRendererCore {
         pass.draw(0..4, 0..1);
     }
 
-    fn write_instance_binding<T>(
-        &mut self,
-        label: &str,
-        instance_offset: &mut u64,
-        instances: &[T],
-    ) -> Result<InstanceBinding> {
-        let data = unsafe { Self::instance_bytes(instances) };
+    /// The alignment of an allocation of `byte_len` bytes of `stride`-sized
+    /// records, and the bytes it takes up from that aligned offset.
+    fn instance_allocation_layout(&self, stride: u64, byte_len: u64) -> (u64, u64) {
         // wgpu rejects zero-sized bindings, so empty primitive arrays still
         // reserve the 16-byte minimum.
-        let size = (data.len() as u64).max(16);
-        let stride = (std::mem::size_of::<T>() as u64).max(1);
-        let (alignment, allocation_size) = if self.uses_webgl_instance_data {
+        let size = byte_len.max(16);
+        if self.uses_webgl_instance_data {
             // The texture transport has no binding offset: the shader indexes
             // the instance texture absolutely, so each allocation must start on
             // a whole instance (a stride multiple) and a whole texel, and must
@@ -3388,7 +2907,37 @@ impl WgpuRendererCore {
             )
         } else {
             (self.instance_data_alignment.max(1), size)
-        };
+        }
+    }
+
+    /// The most space `instances` can take up, including alignment padding.
+    fn instance_allocation_bound<T>(&self, instances: &[T]) -> u64 {
+        let stride = (std::mem::size_of::<T>() as u64).max(1);
+        let (alignment, allocation_size) =
+            self.instance_allocation_layout(stride, std::mem::size_of_val(instances) as u64);
+        alignment + allocation_size
+    }
+
+    /// Grows the instance data up front if `size` more bytes won't fit, so the
+    /// allocations that follow land in the same buffer or texture.
+    fn reserve_instance_data(&mut self, instance_offset: &mut u64, size: u64) -> Result<()> {
+        if *instance_offset + size > self.instance_data_capacity {
+            self.grow_instance_data(size)?;
+            *instance_offset = 0;
+        }
+        Ok(())
+    }
+
+    fn write_instance_data<T>(
+        &mut self,
+        instance_offset: &mut u64,
+        instances: &[T],
+    ) -> Result<InstanceAllocation> {
+        let data = unsafe { Self::instance_bytes(instances) };
+        let size = (data.len() as u64).max(16);
+        let stride = (std::mem::size_of::<T>() as u64).max(1);
+        let (alignment, allocation_size) =
+            self.instance_allocation_layout(stride, data.len() as u64);
         let mut offset = (*instance_offset).next_multiple_of(alignment);
         if offset + allocation_size > self.instance_data_capacity {
             self.grow_instance_data(allocation_size)?;
@@ -3411,6 +2960,35 @@ impl WgpuRendererCore {
                 }
             }
         }
+        Ok(InstanceAllocation {
+            offset,
+            size,
+            first_instance,
+        })
+    }
+
+    fn instance_binding_resource(
+        &self,
+        allocation: &InstanceAllocation,
+    ) -> wgpu::BindingResource<'_> {
+        match &self.resources().instance_data {
+            InstanceData::Storage(buffer) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: allocation.offset,
+                size: NonZeroU64::new(allocation.size),
+            }),
+            InstanceData::Texture { view, .. } => wgpu::BindingResource::TextureView(view),
+        }
+    }
+
+    fn write_instance_binding<T>(
+        &mut self,
+        label: &str,
+        instance_offset: &mut u64,
+        instances: &[T],
+    ) -> Result<InstanceBinding> {
+        let allocation = self.write_instance_data(instance_offset, instances)?;
+        let resources = self.resources();
         let bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3418,23 +2996,86 @@ impl WgpuRendererCore {
                 layout: &resources.bind_group_layouts.instances,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: match &resources.instance_data {
-                        InstanceData::Storage(buffer) => {
-                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer,
-                                offset,
-                                size: NonZeroU64::new(size),
-                            })
-                        }
-                        InstanceData::Texture { view, .. } => {
-                            wgpu::BindingResource::TextureView(view)
-                        }
-                    },
+                    resource: self.instance_binding_resource(&allocation),
                 }],
             });
         Ok(InstanceBinding {
             bind_group,
-            first_instance,
+            first_instance: allocation.first_instance,
+        })
+    }
+
+    fn write_path_tiles(
+        &mut self,
+        scene: &Scene,
+        instance_offset: &mut u64,
+    ) -> Result<PathTileBinding> {
+        let mut paint_data = Vec::with_capacity(scene.paths.len());
+        let mut curve_data = Vec::new();
+        let mut tile_data = Vec::new();
+        let mut tile_starts = Vec::with_capacity(scene.paths.len() + 1);
+        for path in &scene.paths {
+            tile_starts.push(
+                u32::try_from(tile_data.len()).context("path tile count exceeds u32 range")?,
+            );
+            path.append_to(&mut paint_data, &mut curve_data, &mut tile_data);
+        }
+        tile_starts
+            .push(u32::try_from(tile_data.len()).context("path tile count exceeds u32 range")?);
+
+        // All three arrays are bound together, so they must not be split by a
+        // grow partway through.
+        let reserved = self.instance_allocation_bound(&paint_data)
+            + self.instance_allocation_bound(&curve_data)
+            + self.instance_allocation_bound(&tile_data);
+        self.reserve_instance_data(instance_offset, reserved)?;
+
+        let paints = self.write_instance_data(instance_offset, &paint_data)?;
+        let curves = self.write_instance_data(instance_offset, &curve_data)?;
+        let tiles = self.write_instance_data(instance_offset, &tile_data)?;
+
+        let resources = self.resources();
+        let bind_group = if self.uses_webgl_instance_data {
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("path_tiles_bind_group"),
+                    layout: &resources.bind_group_layouts.path_tiles,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.instance_binding_resource(&tiles),
+                    }],
+                })
+        } else {
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("path_tiles_bind_group"),
+                    layout: &resources.bind_group_layouts.path_tiles,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.instance_binding_resource(&tiles),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.instance_binding_resource(&curves),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.instance_binding_resource(&paints),
+                        },
+                    ],
+                })
+        };
+        Ok(PathTileBinding {
+            tiles: InstanceBinding {
+                bind_group,
+                first_instance: tiles.first_instance,
+            },
+            tile_starts,
+            paint_base: paints.first_instance,
+            curve_base: curves.first_instance,
         })
     }
 
@@ -3625,6 +3266,7 @@ impl WgpuRenderer {
         } else {
             self.opaque_alpha_mode
         };
+        let alpha_mode_changed = alpha_mode != self.surface_config.alpha_mode;
 
         self.surface_config.width = width;
         self.surface_config.height = height;
@@ -3646,6 +3288,9 @@ impl WgpuRenderer {
                 anyhow::bail!("Cannot replace the surface: GPU resources have been released")
             }
         };
+        if alpha_mode_changed {
+            core.select_pipelines(self.surface_config.format, alpha_mode);
+        }
         surface.configure(&core.resources.device, &self.surface_config);
         core.resources.invalidate_intermediate_textures();
         self.state = RendererState::Ready { surface, core };
@@ -4156,7 +3801,6 @@ fn create_surface(
 }
 
 struct RenderingParameters {
-    path_sample_count: u32,
     depth_format: wgpu::TextureFormat,
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -4164,14 +3808,8 @@ struct RenderingParameters {
 }
 
 impl RenderingParameters {
-    fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
+    fn new(adapter: &wgpu::Adapter) -> Self {
         use std::env;
-
-        let format_features = adapter.get_texture_format_features(surface_format);
-        let path_sample_count = [4, 2, 1]
-            .into_iter()
-            .find(|&n| format_features.flags.sample_count_supported(n))
-            .unwrap_or(1);
 
         // Depth16Unorm is a core WebGPU format that wgpu reports as
         // depth-renderable on Vulkan, Metal, DX12 and GL (WebGL2 exposes it
@@ -4214,7 +3852,6 @@ impl RenderingParameters {
             .max(0.0);
 
         Self {
-            path_sample_count,
             depth_format,
             gamma_ratios,
             grayscale_enhanced_contrast,
@@ -4227,12 +3864,14 @@ impl RenderingParameters {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, MonochromeSprite,
-        PolychromeSprite, Quad, Shadow, Size, SubpixelSprite, Underline, linear_color_stop,
-        linear_gradient,
+        BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, MonochromeSprite, PathCurve,
+        PathPaint, PathTile, Point, PolychromeSprite, Quad, Shadow, Size, SubpixelSprite,
+        Underline, linear_color_stop, linear_gradient,
     };
     #[cfg(target_os = "linux")]
-    use gpui::{DevicePixels, PlatformAtlas, PlatformHeadlessRenderer, Scene};
+    use gpui::{
+        DevicePixels, PaintedPath, PathBuilder, PlatformAtlas, PlatformHeadlessRenderer, Scene,
+    };
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -4309,7 +3948,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn rounded_clip_intersects_quad_and_path_without_covering_the_backdrop() -> anyhow::Result<()> {
+    fn rounded_clip_intersects_quad_without_covering_the_backdrop() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
         let mut scene = Scene::default();
         scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 32.0, gpui::blue()));
@@ -4339,18 +3978,6 @@ mod tests {
         assert_eq!(nested.get_pixel(3, 3), image.get_pixel(3, 3));
         assert_pixel(&nested, 1, 1, BLUE);
         assert_pixel(&nested, 16, 16, RED);
-
-        let mut path_scene = Scene::default();
-        path_scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 32.0, gpui::blue()));
-        path_scene.rounded_clips = scene.rounded_clips.clone();
-        let mut path = red_square_path(32.0);
-        path.rounded_clip = 100;
-        path_scene.insert_primitive(path);
-        path_scene.finish();
-        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
-        assert_pixel(&image, 1, 1, BLUE);
-        assert_pixel(&image, 16, 16, RED);
-        assert_pixel(&image, 30, 30, BLUE);
         Ok(())
     }
 
@@ -4404,100 +4031,97 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn red_square_path(size: f32) -> gpui::Path<ScaledPixels> {
-        let mut path = gpui::Path::new(gpui::point(gpui::px(0.), gpui::px(0.)));
-        path.line_to(gpui::point(gpui::px(size), gpui::px(0.)));
-        path.line_to(gpui::point(gpui::px(size), gpui::px(size)));
-        path.line_to(gpui::point(gpui::px(0.), gpui::px(size)));
-        path.content_mask = ContentMask {
+    fn square_path(x: f32, y: f32, size: f32, color: Hsla) -> anyhow::Result<PaintedPath> {
+        let mut builder = PathBuilder::fill();
+        builder.move_to(gpui::point(gpui::px(x), gpui::px(y)));
+        builder.line_to(gpui::point(gpui::px(x + size), gpui::px(y)));
+        builder.line_to(gpui::point(gpui::px(x + size), gpui::px(y + size)));
+        builder.line_to(gpui::point(gpui::px(x), gpui::px(y + size)));
+        builder.close();
+        let content_mask = ContentMask {
             bounds: Bounds {
                 origin: gpui::point(gpui::px(0.), gpui::px(0.)),
                 size: Size {
-                    width: gpui::px(size),
-                    height: gpui::px(size),
+                    width: gpui::px(1024.),
+                    height: gpui::px(1024.),
                 },
             },
         };
-        path.color = gpui::red().into();
-        path.scale(1.0)
+        Ok(PaintedPath::new(builder.build()?, 1.0, content_mask, color.into()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn red_square_path(size: f32) -> anyhow::Result<PaintedPath> {
+        square_path(0., 0., size, gpui::red())
+    }
+
+    /// Paths are drawn as tiles in the main pass, so a frame with a path
+    /// allocates no target beyond the depth buffer every frame has.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filled_path_draws_in_the_main_pass() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let published = |renderer: &WgpuHeadlessRenderer, gauge| {
+            renderer.core.resources.render_memory.published(gauge)
+        };
+        let mut path_scene = Scene::default();
+        path_scene.insert_primitive(red_square_path(16.0)?);
+        path_scene.finish();
+
+        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
+        assert_pixel(&image, 12, 4, RED);
+        assert_pixel(&image, 4, 12, RED);
+        assert_pixel(&image, 15, 15, RED);
+        assert_pixel(&image, 16, 8, BLACK);
+        assert_pixel(&image, 8, 16, BLACK);
+        assert_pixel(&image, 24, 24, BLACK);
+        assert_eq!(published(&renderer, RenderMemoryGauge::PathTextures), 0);
+        assert_eq!(
+            published(&renderer, RenderMemoryGauge::DepthTextures),
+            texture_bytes(renderer.core.resources.depth_texture.as_ref())
+        );
+
+        // A path with a fractional edge covers the pixel it crosses partially.
+        let mut fractional_scene = Scene::default();
+        fractional_scene.insert_primitive(square_path(4., 4., 8.5, gpui::red())?);
+        fractional_scene.finish();
+        let image = renderer.render_scene_to_image(&fractional_scene, device_size(32, 32))?;
+        assert_pixel(&image, 8, 8, RED);
+        let edge = image.get_pixel(12, 8).0;
+        assert!(
+            (100..=155).contains(&edge[0]) && edge[1] == 0 && edge[2] == 0,
+            "half-covered edge pixel was {edge:?}"
+        );
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn path_targets_exist_only_around_frames_with_paths() -> anyhow::Result<()> {
+    fn overlapping_paths_draw_in_paint_order() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
-        let path_targets_resident = |renderer: &WgpuHeadlessRenderer| {
-            let resources = &renderer.core.resources;
-            let has_msaa = renderer.core.rendering_params.path_sample_count > 1;
-            assert_eq!(
-                resources.path_intermediate_view.is_some(),
-                resources.path_intermediate_texture.is_some()
-            );
-            assert_eq!(
-                resources.path_msaa_texture.is_some(),
-                has_msaa && resources.path_intermediate_texture.is_some()
-            );
-            assert_eq!(
-                resources.path_tile_texture.is_some(),
-                resources.path_intermediate_texture.is_some()
-            );
-            let published = resources
-                .render_memory
-                .published(RenderMemoryGauge::PathTextures);
-            assert_eq!(
-                published > 0,
-                resources.path_intermediate_texture.is_some(),
-                "path texture gauge reads {published} bytes"
-            );
-            resources.path_intermediate_texture.is_some()
-        };
-        let published = |renderer: &WgpuHeadlessRenderer, gauge| {
-            renderer.core.resources.render_memory.published(gauge)
-        };
-        assert_eq!(
-            published(&renderer, RenderMemoryGauge::InstanceBuffers),
-            renderer.core.instance_data_capacity
-        );
-        let mut path_scene = Scene::default();
-        path_scene.insert_primitive(red_square_path(16.0));
-        path_scene.finish();
-        let empty_scene = Scene::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(square_path(0., 0., 20., gpui::red())?);
+        scene.insert_primitive(square_path(10., 10., 20., gpui::blue())?);
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, device_size(32, 32))?;
+        assert_pixel(&image, 5, 5, RED);
+        assert_pixel(&image, 15, 15, BLUE);
+        assert_pixel(&image, 25, 25, BLUE);
+        assert_pixel(&image, 25, 5, BLACK);
 
-        renderer.render_scene(&empty_scene, device_size(32, 32))?;
-        assert!(!path_targets_resident(&renderer));
-        assert!(renderer.core.resources.depth_texture.is_some());
-        assert!(published(&renderer, RenderMemoryGauge::DepthTextures) >= 32 * 32 * 2);
-
-        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
-        assert!(path_targets_resident(&renderer));
-        // The intermediate alone is 32x32 at four bytes per texel.
-        let path_bytes = published(&renderer, RenderMemoryGauge::PathTextures);
-        assert!(path_bytes >= 32 * 32 * 4);
-        assert!(gpui::render_memory_gauges().path_texture_bytes >= path_bytes);
-        assert_pixel(&image, 12, 4, RED);
-        assert_pixel(&image, 4, 12, RED);
-        assert_pixel(&image, 24, 24, BLACK);
-
-        for _ in 1..PATH_TARGET_IDLE_FRAMES {
-            renderer.render_scene(&empty_scene, device_size(32, 32))?;
-        }
-        assert!(path_targets_resident(&renderer));
-        renderer.render_scene(&empty_scene, device_size(32, 32))?;
-        assert!(!path_targets_resident(&renderer));
-
-        let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
-        assert!(path_targets_resident(&renderer));
-        assert_pixel(&image, 12, 4, RED);
-
-        renderer.render_scene(&empty_scene, device_size(32, 33))?;
-        assert!(!path_targets_resident(&renderer));
-
-        // A release without a draw is seen at once.
-        renderer.render_scene(&path_scene, device_size(32, 33))?;
-        assert!(path_targets_resident(&renderer));
-        renderer.core.resources.invalidate_intermediate_textures();
-        assert!(!path_targets_resident(&renderer));
-        assert_eq!(published(&renderer, RenderMemoryGauge::DepthTextures), 0);
+        // Two path batches separated by a quad that covers the first path,
+        // with the second path drawn over the quad.
+        let mut scene = Scene::default();
+        scene.insert_primitive(square_path(0., 0., 16., gpui::red())?);
+        scene.insert_primitive(solid_quad(8.0, 8.0, 16.0, 16.0, gpui::blue()));
+        scene.insert_primitive(square_path(16., 16., 16., gpui::red())?);
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, device_size(32, 32))?;
+        assert_pixel(&image, 4, 4, RED);
+        assert_pixel(&image, 12, 12, BLUE);
+        assert_pixel(&image, 20, 20, RED);
+        assert_pixel(&image, 28, 28, RED);
+        assert_pixel(&image, 28, 4, BLACK);
         Ok(())
     }
 
@@ -4591,7 +4215,7 @@ mod tests {
         let mut headless = WgpuHeadlessRenderer::new()?;
         let mut scene = Scene::default();
         scene.insert_primitive(solid_quad(16.0, 0.0, 16.0, 32.0, gpui::blue()));
-        scene.insert_primitive(red_square_path(16.0));
+        scene.insert_primitive(red_square_path(16.0)?);
         scene.finish();
         headless.render_scene(&scene, device_size(32, 32))?;
 
@@ -4599,13 +4223,12 @@ mod tests {
         hidden.unconfigure_surface();
         assert!(hidden.is_unconfigured());
         let resident_bytes = |renderer: &WgpuRenderer| {
-            let ledger = &renderer
+            renderer
                 .core()
                 .expect("core is kept")
                 .resources
-                .render_memory;
-            ledger.published(RenderMemoryGauge::DepthTextures)
-                + ledger.published(RenderMemoryGauge::PathTextures)
+                .render_memory
+                .published(RenderMemoryGauge::DepthTextures)
         };
         assert_eq!(resident_bytes(&hidden), 0);
 
@@ -4614,7 +4237,6 @@ mod tests {
         assert_eq!(resident_bytes(&hidden), 0);
         let resources = &hidden.core().expect("core is kept").resources;
         assert!(resources.depth_texture.is_none());
-        assert!(resources.path_intermediate_texture.is_none());
 
         let RendererState::Unconfigured { core } =
             std::mem::replace(&mut hidden.state, RendererState::Released)
@@ -4627,7 +4249,6 @@ mod tests {
         assert_pixel(&image, 24, 8, BLUE);
         assert_pixel(&image, 8, 24, BLACK);
         assert!(headless.core.resources.depth_texture.is_some());
-        assert!(headless.core.resources.path_intermediate_texture.is_some());
         Ok(())
     }
 
@@ -4663,7 +4284,6 @@ mod tests {
         assert_eq!(hidden.viewport_size(), device_size(48, 40));
         let resources = &hidden.core().expect("core is kept").resources;
         assert!(resources.depth_texture.is_none());
-        assert!(resources.path_intermediate_texture.is_none());
 
         assert!(hidden.restore_surface(&UnavailableWindow).is_err());
         assert!(hidden.is_unconfigured());
@@ -4815,10 +4435,10 @@ mod tests {
 
         // A pipeline one window compiles on first use is there for the other.
         let mut path_scene = Scene::default();
-        path_scene.insert_primitive(red_square_path(16.0));
+        path_scene.insert_primitive(red_square_path(16.0)?);
         path_scene.finish();
         renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
-        assert!(second.resources.pipelines.paths.get().is_some());
+        assert!(second.resources.pipelines.path_tiles.get().is_some());
 
         let third = WgpuRendererCore::new(
             &renderer.context,
@@ -4856,27 +4476,26 @@ mod tests {
             let pipelines = &renderer.core.resources.pipelines;
             [
                 pipelines.shadows.get().is_some(),
-                pipelines.path_rasterization.get().is_some(),
-                pipelines.paths.get().is_some(),
+                pipelines.path_tiles.get().is_some(),
                 pipelines.poly_sprites.get().is_some(),
             ]
         };
-        assert_eq!(compiled(&renderer), [false; 4]);
+        assert_eq!(compiled(&renderer), [false; 3]);
 
         let mut quad_scene = Scene::default();
         quad_scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::blue()));
         quad_scene.finish();
         let image = renderer.render_scene_to_image(&quad_scene, device_size(32, 32))?;
         assert_pixel(&image, 8, 8, BLUE);
-        assert_eq!(compiled(&renderer), [false; 4]);
+        assert_eq!(compiled(&renderer), [false; 3]);
 
         let mut path_scene = Scene::default();
-        path_scene.insert_primitive(red_square_path(16.0));
+        path_scene.insert_primitive(red_square_path(16.0)?);
         path_scene.finish();
         let image = renderer.render_scene_to_image(&path_scene, device_size(32, 32))?;
         assert_pixel(&image, 8, 8, RED);
         assert_pixel(&image, 24, 24, BLACK);
-        assert_eq!(compiled(&renderer), [false, true, true, false]);
+        assert_eq!(compiled(&renderer), [false, true, false]);
 
         let sprite = |tile: gpui::AtlasTile| {
             let bounds = Bounds {
@@ -4916,7 +4535,7 @@ mod tests {
         stale_scene.finish();
         let image = renderer.render_scene_to_image(&stale_scene, device_size(32, 32))?;
         assert_pixel(&image, 24, 24, BLACK);
-        assert_eq!(compiled(&renderer), [false, true, true, false]);
+        assert_eq!(compiled(&renderer), [false, true, false]);
 
         // Polychrome uploads are BGRA; green reads the same either way.
         const GREEN: [u8; 4] = [0, 255, 0, 255];
@@ -4967,23 +4586,25 @@ mod tests {
         assert_pixel(&image, 8, 24, RED);
         assert_pixel(&image, 24, 24, GREEN);
         assert_pixel(&image, 24, 8, BLACK);
-        assert_eq!(compiled(&renderer), [true; 4]);
+        assert_eq!(compiled(&renderer), [true; 3]);
         Ok(())
     }
 
     /// A lens with curved, antialiased edges and a fractional origin, clipped
-    /// to a 1100x700 window: three columns and two rows of path tiles.
+    /// to a 1100x700 window.
     #[cfg(target_os = "linux")]
-    fn lens_path(x: f32, y: f32, color: Background) -> gpui::Path<ScaledPixels> {
+    fn lens_path(x: f32, y: f32, color: Hsla) -> anyhow::Result<PaintedPath> {
         let point_at = |offset_x: f32, offset_y: f32| {
             gpui::point(gpui::px(x + offset_x), gpui::px(y + offset_y))
         };
-        let mut path = gpui::Path::new(point_at(0., 20.));
-        path.line_to(point_at(20., 0.));
-        path.curve_to(point_at(40., 20.), point_at(40., 0.));
-        path.line_to(point_at(20., 40.));
-        path.curve_to(point_at(0., 20.), point_at(0., 40.));
-        path.content_mask = ContentMask {
+        let mut builder = PathBuilder::fill();
+        builder.move_to(point_at(0., 20.));
+        builder.line_to(point_at(20., 0.));
+        builder.curve_to(point_at(40., 20.), point_at(40., 0.));
+        builder.line_to(point_at(20., 40.));
+        builder.curve_to(point_at(0., 20.), point_at(0., 40.));
+        builder.close();
+        let content_mask = ContentMask {
             bounds: Bounds {
                 origin: gpui::point(gpui::px(0.), gpui::px(0.)),
                 size: Size {
@@ -4992,8 +4613,7 @@ mod tests {
                 },
             },
         };
-        path.color = color;
-        path.scale(1.0)
+        Ok(PaintedPath::new(builder.build()?, 1.0, content_mask, color.into()))
     }
 
     #[cfg(target_os = "linux")]
@@ -5008,7 +4628,7 @@ mod tests {
     ) -> anyhow::Result<image::RgbaImage> {
         let mut scene = Scene::default();
         for &(x, y) in origins {
-            scene.insert_primitive(lens_path(x, y, gpui::red().into()));
+            scene.insert_primitive(lens_path(x, y, gpui::red())?);
         }
         scene.finish();
         renderer.render_scene_to_image(&scene, device_size(TILED_WIDTH, TILED_HEIGHT))
@@ -5027,12 +4647,13 @@ mod tests {
         }
     }
 
-    /// Paths rasterize tile by tile; a lens placed across tile seams, at the
-    /// window's edges, or inside one tile must render the same pixels, and a
-    /// tile left over from an earlier frame must never show through.
+    /// A path's coverage is computed from its curves at each pixel, so a lens
+    /// at the same subpixel offset renders the same pixels wherever it is
+    /// placed, including clipped by the window's edges, and nothing drawn in
+    /// an earlier frame shows through.
     #[cfg(target_os = "linux")]
     #[test]
-    fn tiled_paths_render_the_same_across_tiles_and_edges() -> anyhow::Result<()> {
+    fn curved_paths_render_the_same_across_placements_and_edges() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
         let (reference_x, reference_y) = (100, 100);
         let reference = render_lenses(
@@ -5042,8 +4663,6 @@ mod tests {
         assert_pixel(&reference, 120, 120, RED);
         assert_black_outside(&reference, &[(reference_x, reference_y)]);
 
-        // Across the first column seam, the first corner, the last column's
-        // seam, and clipped by each window edge.
         let placements = [(492, 100), (492, 492), (1004, 300), (1070, 660), (-15, 300), (600, -12)];
         let mut max_difference = 0;
         for (left, top) in placements {
@@ -5066,27 +4685,24 @@ mod tests {
             }
             assert_black_outside(&image, &[(left, top)]);
         }
-        // Each placement maps through a differently offset viewport; one level
-        // of slack absorbs a driver whose rasterizer rounds that offset onto
-        // the other side of a sample.
+        // Positions differ by whole pixels, but float rounding of the curve
+        // coordinates differs with their magnitude.
         assert!(
             max_difference <= 1,
             "lens pixels differ by {max_difference} between placements"
         );
 
-        // A middle tile drawn in one frame, then a single mixed-order batch
-        // whose spanning sprite covers it without drawing there.
         render_lenses(&mut renderer, &[(700.3, 200.6)])?;
         let image = render_lenses(&mut renderer, &[(100.3, 100.6), (1000.3, 600.6)])?;
         assert_pixel(&image, 120, 120, RED);
         assert_pixel(&image, 1020, 620, RED);
         assert_black_outside(&image, &[(100, 100), (1000, 600)]);
 
-        // Two batches separated by a quad, in different tiles.
+        // Two batches separated by a quad.
         let mut scene = Scene::default();
-        scene.insert_primitive(lens_path(100.3, 100.6, gpui::red().into()));
+        scene.insert_primitive(lens_path(100.3, 100.6, gpui::red())?);
         scene.insert_primitive(solid_quad(300.0, 600.0, 20.0, 20.0, gpui::blue()));
-        scene.insert_primitive(lens_path(800.3, 400.6, gpui::red().into()));
+        scene.insert_primitive(lens_path(800.3, 400.6, gpui::red())?);
         scene.finish();
         let image =
             renderer.render_scene_to_image(&scene, device_size(TILED_WIDTH, TILED_HEIGHT))?;
@@ -5191,8 +4807,9 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 42 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 30 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<PathTile>(), 14 * 4);
+        assert_eq!(std::mem::size_of::<PathCurve>(), 10 * 4);
+        assert_eq!(std::mem::size_of::<PathPaint>(), 28 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 18 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 46 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 46 * 4);
@@ -5352,6 +4969,10 @@ mod tests {
             ("SpriteEffect", size_of::<gpui::SpriteEffect>()),
             ("Quad", size_of::<Quad>()),
             ("Shadow", size_of::<Shadow>()),
+            ("PathTile", size_of::<PathTile>()),
+            ("PathCurve", size_of::<PathCurve>()),
+            ("PathPaint", size_of::<PathPaint>()),
+            ("GlobalParams", size_of::<GlobalParams>()),
             ("Underline", size_of::<Underline>()),
             ("MonochromeSprite", size_of::<MonochromeSprite>()),
             ("PolychromeSprite", size_of::<PolychromeSprite>()),

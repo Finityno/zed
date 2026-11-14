@@ -31,24 +31,12 @@ mod backdrop_blur;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
-// This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
-const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-/// Drawn frames without a path batch before the path intermediates are
-/// released. Frames, not time: an idle window stops drawing entirely, so a
-/// time-based ttl would fire while the surfaces might be wanted again on the
-/// very next redraw, while 300 *drawn* frames means sustained rendering that
-/// needed no paths at all.
-const PATH_INTERMEDIATE_IDLE_FRAMES: u32 = 300;
-/// Paths rasterize through a fixed MSAA tile of this size instead of a
-/// window-sized MSAA target. At 4K a window-sized 4-sample surface is 127.5MB
-/// of committed memory for the window's life (D3D11 has no memoryless storage,
-/// unlike Metal on Apple Silicon, so Windows pays real commit for it); a
-/// 512x512 tile is 4MB. Each tile a batch touches is rasterized, resolved and
-/// region-copied into the window-sized single-sample intermediate, and typical
-/// frames touch a handful of tiles (corner masks, small indicators), so total
-/// fill work goes down as well, not up.
-const PATH_RASTER_TILE_SIZE: u32 = 512;
+/// Shader resource slots of the path curve and paint tables (`path_curves`
+/// and `path_paints` in shaders.hlsl). The slots before them are taken by the
+/// instance buffer, the quad indices, the rounded clips and the backdrop blur
+/// source.
+const PATH_CURVES_SLOT: u32 = 5;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -68,8 +56,8 @@ pub(crate) struct DirectXRenderer {
     overlay_resources: Option<OverlayResources>,
     /// The plane the frame in progress is drawing into: the base swap chain,
     /// or the overlay while `draw_layered` encodes the overlay scene. Anything
-    /// that rebinds render targets mid-scene (the path intermediate) must come
-    /// back to that plane's target, not always the base plane's.
+    /// that rebinds render targets mid-scene (a backdrop blur) must come back
+    /// to that plane's target, not always the base plane's.
     ///
     /// The plane, never its render target view: a view kept here across
     /// frames is an outstanding reference to a swap chain back buffer, and
@@ -113,14 +101,6 @@ pub(crate) struct DirectXRenderer {
     resize_count: u32,
     logged_first_present: bool,
 
-    /// Path-batch census: what fraction of drawn frames carry any path batch
-    /// decides how the path intermediates are managed (they are created
-    /// lazily and released after [`PATH_INTERMEDIATE_IDLE_FRAMES`] path-free
-    /// frames).
-    frames_drawn: u64,
-    frames_with_paths: u64,
-    frames_since_paths: u32,
-
     /// The backdrop blur pipeline and scratch textures, created by the first
     /// frame that carries a blur.
     backdrop_blurs: BackdropBlurs,
@@ -142,12 +122,6 @@ struct DirectXResources {
     swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
-    /// Created on the first frame that carries a path batch and released after
-    /// a stretch of path-free frames, not held for the window's life: these are
-    /// the two largest textures in the process (a 4-sample MSAA target plus its
-    /// resolve, ~160MB of commit at 4K), and D3D11 has no equivalent of the
-    /// Metal renderer's memoryless storage that would make them free.
-    path_intermediates: Option<PathIntermediates>,
     // `Option` so a resize can drop the outgoing texture before the
     // replacement is created; it is rebuilt in the same call.
     depth_stencil_texture: Option<ID3D11Texture2D>,
@@ -175,51 +149,6 @@ struct OverlayResources {
     render_target_view: Option<ID3D11RenderTargetView>,
 }
 
-/// The intermediates path rasterization renders through. `texture` is the
-/// window-sized single-sample surface the path-sprite pass samples;
-/// `msaa_texture` is a fixed [`PATH_RASTER_TILE_SIZE`] MSAA tile the path
-/// triangles are drawn into, one touched tile at a time, and `resolve_texture`
-/// is the equally tile-sized single-sample surface each tile resolves to
-/// before being region-copied into `texture` (D3D11's `ResolveSubresource`
-/// has no partial form, so the copy is what places a tile at its window
-/// position).
-struct PathIntermediates {
-    texture: ID3D11Texture2D,
-    srv: Option<ID3D11ShaderResourceView>,
-    /// For clearing `texture` before a mixed-draw-order batch, whose sprite
-    /// pass samples a spanning rect that can cross tiles the batch never
-    /// rewrites (see `draw_paths_to_intermediate`).
-    render_target_view: Option<ID3D11RenderTargetView>,
-    msaa_texture: ID3D11Texture2D,
-    msaa_view: Option<ID3D11RenderTargetView>,
-    resolve_texture: ID3D11Texture2D,
-}
-
-impl PathIntermediates {
-    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
-        let (texture, srv, render_target_view) =
-            create_path_intermediate_texture(device, width, height)?;
-        let (msaa_texture, msaa_view) = create_path_intermediate_msaa_texture_and_view(
-            device,
-            PATH_RASTER_TILE_SIZE,
-            PATH_RASTER_TILE_SIZE,
-        )?;
-        let resolve_texture = create_path_intermediate_resolve_texture(
-            device,
-            PATH_RASTER_TILE_SIZE,
-            PATH_RASTER_TILE_SIZE,
-        )?;
-        Ok(Self {
-            texture,
-            srv,
-            render_target_view,
-            msaa_texture,
-            msaa_view,
-            resolve_texture,
-        })
-    }
-}
-
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
@@ -227,8 +156,9 @@ struct DirectXRenderPipelines {
     /// `quad_pipeline`'s blend state for quads marked as glass content.
     quad_glass_blend_state: ID3D11BlendState,
     opaque_quad_pipeline: OpaqueQuadPipeline,
-    path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
-    path_sprite_pipeline: PipelineState<PathSprite>,
+    path_tile_pipeline: PipelineState<PathTile>,
+    path_curves: StructuredBuffer<PathCurve>,
+    path_paints: StructuredBuffer<PathPaint>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -237,10 +167,11 @@ struct DirectXRenderPipelines {
 
 #[derive(Default)]
 struct FrameScratch {
-    path_vertices: Vec<PathRasterizationSprite>,
-    path_sprites: Vec<PathSprite>,
-    /// Raster-tile occupancy grid for the current path batch.
-    path_tiles: Vec<bool>,
+    /// Every path of the scene being drawn, flattened into the tables the
+    /// path tile shader reads.
+    path_paints: Vec<PathPaint>,
+    path_curves: Vec<PathCurve>,
+    path_tiles: Vec<PathTile>,
     /// The layered present's two halves, kept so their vectors hold their
     /// capacity across frames instead of being allocated per present.
     base_scene: Scene,
@@ -377,9 +308,6 @@ impl DirectXRenderer {
             skip_draws: false,
             resize_count: 0,
             logged_first_present: false,
-            frames_drawn: 0,
-            frames_with_paths: 0,
-            frames_since_paths: 0,
             backdrop_blurs: BackdropBlurs::default(),
         })
     }
@@ -438,9 +366,6 @@ impl DirectXRenderer {
             skip_draws: false,
             resize_count: 0,
             logged_first_present: false,
-            frames_drawn: 0,
-            frames_with_paths: 0,
-            frames_since_paths: 0,
             backdrop_blurs: BackdropBlurs::default(),
         })
     }
@@ -608,47 +533,6 @@ impl DirectXRenderer {
         result.ok().context("Presenting swap chain failed")
     }
 
-    /// Path-batch census, and the release half of the lazy path intermediates:
-    /// after a sustained run of drawn frames with no path batch, the ~160MB of
-    /// window-sized MSAA surfaces go away until some frame needs them again.
-    fn note_frame_paths(&mut self, frame_had_paths: bool) {
-        self.frames_drawn += 1;
-        if frame_had_paths {
-            self.frames_with_paths += 1;
-            self.frames_since_paths = 0;
-        } else {
-            self.frames_since_paths = self.frames_since_paths.saturating_add(1);
-            if self.frames_since_paths == PATH_INTERMEDIATE_IDLE_FRAMES {
-                // The last path-sprite draw left the intermediate bound at
-                // slot 0 of both shader stages, and a bound resource stays
-                // alive however many references drop; unbind it so the
-                // release is real.
-                if let Some(devices) = self.devices.as_ref() {
-                    unsafe {
-                        devices.device_context.VSSetShaderResources(0, Some(&[None]));
-                        devices.device_context.PSSetShaderResources(0, Some(&[None]));
-                    }
-                }
-                if let Some(resources) = self.resources.as_mut()
-                    && resources.path_intermediates.take().is_some()
-                {
-                    log::debug!(
-                        "[directx-mem] released path intermediates after \
-                         {PATH_INTERMEDIATE_IDLE_FRAMES} path-free frames (commit {})",
-                        private_commit_label(),
-                    );
-                }
-            }
-        }
-        if self.frames_drawn.is_multiple_of(1000) {
-            log::debug!(
-                "[directx-mem] path census: {}/{} drawn frames carried a path batch",
-                self.frames_with_paths,
-                self.frames_drawn,
-            );
-        }
-    }
-
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         try_to_recover_from_device_lost(|| {
             self.handle_device_lost_impl(directx_devices)
@@ -806,7 +690,6 @@ impl DirectXRenderer {
 
     fn draw_inner(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
         self.render(scene, clear_color)?;
-        self.note_frame_paths(!scene.paths.is_empty());
         self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
         self.atlas.on_frame_drawn(scene);
         self.present()
@@ -870,7 +753,6 @@ impl DirectXRenderer {
 
         self.pre_draw(ScenePlane::Overlay, &[0.0; 4])?;
         self.draw_scene(overlay_scene)?;
-        self.note_frame_paths(!scene.paths.is_empty());
         self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
         // Both planes are replays of `scene`, so marking it covers every tile
         // this present draws, before anything idle is retired.
@@ -1000,6 +882,7 @@ impl DirectXRenderer {
         );
 
         let mut quad_cursor: u32 = 0;
+        let mut path_tile_cursor = 0;
         let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
         for batch in scene.batches() {
             let batch_order = scene.batch_order(&batch);
@@ -1033,9 +916,12 @@ impl DirectXRenderer {
                     self.draw_blended_quads_segmented(scene, blended_range)
                 }
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
+                    let tiles_start = path_tile_cursor;
+                    path_tile_cursor += scene.paths[range]
+                        .iter()
+                        .map(PaintedPath::tile_count)
+                        .sum::<usize>();
+                    self.draw_paths(tiles_start..path_tile_cursor)
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -1335,6 +1221,48 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.paths.is_empty() {
+            let scratch = &mut self.frame_scratch;
+            scratch.path_paints.clear();
+            scratch.path_curves.clear();
+            scratch.path_tiles.clear();
+            for path in &scene.paths {
+                path.append_to(
+                    &mut scratch.path_paints,
+                    &mut scratch.path_curves,
+                    &mut scratch.path_tiles,
+                );
+            }
+
+            self.pipelines.path_tile_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scratch.path_tiles,
+            )?;
+            self.pipelines.path_curves.write(
+                &devices.device,
+                &devices.device_context,
+                &scratch.path_curves,
+            )?;
+            self.pipelines.path_paints.write(
+                &devices.device,
+                &devices.device_context,
+                &scratch.path_paints,
+            )?;
+            let tables = [
+                self.pipelines.path_curves.view.clone(),
+                self.pipelines.path_paints.view.clone(),
+            ];
+            unsafe {
+                devices
+                    .device_context
+                    .VSSetShaderResources(PATH_CURVES_SLOT, Some(&tables));
+                devices
+                    .device_context
+                    .PSSetShaderResources(PATH_CURVES_SLOT, Some(&tables));
+            }
+        }
+
         if !scene.underlines.is_empty() {
             self.pipelines.underline_pipeline.update_buffer(
                 &devices.device,
@@ -1456,263 +1384,23 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        if paths.is_empty() {
+    /// Draws one instanced quad per path tile, straight into the plane being
+    /// drawn, at the batch's depth like every other non-quad primitive.
+    fn draw_paths(&mut self, tile_range: Range<usize>) -> Result<()> {
+        if tile_range.is_empty() {
             return Ok(());
         }
-
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_mut().context("resources missing")?;
-        let intermediates = match &mut resources.path_intermediates {
-            Some(intermediates) => intermediates,
-            None => {
-                let created = PathIntermediates::new(&devices.device, self.width, self.height)?;
-                log::debug!(
-                    "[directx-mem] created path intermediates at {}x{} (commit {})",
-                    self.width,
-                    self.height,
-                    private_commit_label(),
-                );
-                resources.path_intermediates.insert(created)
-            }
-        };
-        // A batch that mixes draw orders is sampled back through ONE spanning
-        // rect (see `draw_paths_from_intermediate`), and that rect can cross
-        // tiles no path in this batch touches. Those texels hold whatever an
-        // earlier batch left in the intermediate — or driver-recycled garbage
-        // on a texture rebuilt after a resize — and without this clear they
-        // re-composite to the screen every frame: a dismissed selection
-        // highlight or a moved corner mask stays visible as a ghost. A
-        // uniform-order batch samples only per-path bounds, whose tiles are
-        // all rewritten below, so it skips the window-sized clear.
-        let mixed_orders = match (paths.first(), paths.last()) {
-            (Some(first), Some(last)) => first.order != last.order,
-            _ => false,
-        };
-        if mixed_orders {
-            unsafe {
-                devices.device_context.ClearRenderTargetView(
-                    intermediates
-                        .render_target_view
-                        .as_ref()
-                        .context("path intermediate render target view missing")?,
-                    &[0.0; 4],
-                );
-            }
-        }
-        // Which raster tiles does this batch touch? Marked over a
-        // ceil(width/T) x ceil(height/T) grid from each path's clipped bounds.
-        let tile = PATH_RASTER_TILE_SIZE;
-        let tiles_x = self.width.div_ceil(tile).max(1);
-        let tiles_y = self.height.div_ceil(tile).max(1);
-        let touched = &mut self.frame_scratch.path_tiles;
-        touched.clear();
-        touched.resize((tiles_x * tiles_y) as usize, false);
-        for path in paths {
-            let bounds = path.clipped_bounds();
-            let left = ((bounds.origin.x.0.max(0.0) as u32) / tile).min(tiles_x - 1);
-            let top = ((bounds.origin.y.0.max(0.0) as u32) / tile).min(tiles_y - 1);
-            let right = ((bounds.bottom_right().x.0.ceil().max(0.0) as u32)
-                .div_ceil(tile)
-                .max(1))
-            .min(tiles_x);
-            let bottom = ((bounds.bottom_right().y.0.ceil().max(0.0) as u32)
-                .div_ceil(tile)
-                .max(1))
-            .min(tiles_y);
-            for tile_y in top..bottom {
-                for tile_x in left..right {
-                    touched[(tile_y * tiles_x + tile_x) as usize] = true;
-                }
-            }
-        }
-
-        // Collect all vertices for a single upload; each touched tile re-draws
-        // the full set with a shifted viewport and the rasterizer clips to the
-        // tile, so every covered pixel is still rasterized exactly once.
-        let vertices = &mut self.frame_scratch.path_vertices;
-        vertices.clear();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
-                rounded_clip: path.rounded_clip,
-                clip_padding: 0,
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.clipped_bounds(),
-            }));
-        }
-
-        self.pipelines.path_rasterization_pipeline.update_buffer(
-            &devices.device,
+        self.pipelines.path_tile_pipeline.draw_range(
             &devices.device_context,
-            vertices,
-        )?;
-
-        // The batch's depth-collapsed viewport must come back for the sprite
-        // pass that follows, so capture whatever is current rather than
-        // rebuilding it from resources.viewport.
-        let mut saved_viewports = [D3D11_VIEWPORT::default()];
-        let mut saved_viewport_count = 1u32;
-        unsafe {
-            devices
-                .device_context
-                .RSGetViewports(&mut saved_viewport_count, Some(saved_viewports.as_mut_ptr()));
-        }
-
-        self.pipelines
-            .opaque_quad_pipeline
-            .disable_depth(&devices.device_context);
-
-        for tile_y in 0..tiles_y {
-            for tile_x in 0..tiles_x {
-                if !touched[(tile_y * tiles_x + tile_x) as usize] {
-                    continue;
-                }
-                let tile_left = tile_x * tile;
-                let tile_top = tile_y * tile;
-                unsafe {
-                    devices.device_context.ClearRenderTargetView(
-                        intermediates
-                            .msaa_view
-                            .as_ref()
-                            .context("msaa view missing")?,
-                        &[0.0; 4],
-                    );
-                    devices
-                        .device_context
-                        .OMSetRenderTargets(Some(slice::from_ref(&intermediates.msaa_view)), None);
-                    // A window-sized viewport with a negative origin: window-space
-                    // geometry keeps its NDC mapping and this tile's region lands
-                    // at the tile texture's origin, with the rasterizer clipping
-                    // to the tile's extent.
-                    let viewport = D3D11_VIEWPORT {
-                        TopLeftX: -(tile_left as f32),
-                        TopLeftY: -(tile_top as f32),
-                        Width: self.width as f32,
-                        Height: self.height as f32,
-                        MinDepth: 0.0,
-                        MaxDepth: 1.0,
-                    };
-                    devices
-                        .device_context
-                        .RSSetViewports(Some(slice::from_ref(&viewport)));
-                }
-
-                self.pipelines.path_rasterization_pipeline.draw(
-                    &devices.device_context,
-                    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                    vertices.len() as u32,
-                    1,
-                )?;
-
-                unsafe {
-                    devices.device_context.ResolveSubresource(
-                        &intermediates.resolve_texture,
-                        0,
-                        &intermediates.msaa_texture,
-                        0,
-                        RENDER_TARGET_FORMAT,
-                    );
-                    let copy_width = (self.width - tile_left).min(tile);
-                    let copy_height = (self.height - tile_top).min(tile);
-                    let source_box = D3D11_BOX {
-                        left: 0,
-                        top: 0,
-                        front: 0,
-                        right: copy_width,
-                        bottom: copy_height,
-                        back: 1,
-                    };
-                    devices.device_context.CopySubresourceRegion(
-                        &intermediates.texture,
-                        0,
-                        tile_left,
-                        tile_top,
-                        0,
-                        &intermediates.resolve_texture,
-                        0,
-                        Some(&source_box),
-                    );
-                }
-            }
-        }
-
-        // Restore the render target this scene is drawing into (the overlay's
-        // while `draw_layered` encodes the overlay scene, not always the base
-        // plane's) and the batch's viewport.
-        let active_render_target_view = match self.active_plane {
-            ScenePlane::Base => &resources.render_target_view,
-            ScenePlane::Overlay => &self
-                .overlay_resources
+            self.globals
+                .batch_params_buffer
                 .as_ref()
-                .context("overlay resources missing")?
-                .render_target_view,
-        };
-        unsafe {
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(active_render_target_view)),
-                resources.depth_stencil_view.as_ref(),
-            );
-            if saved_viewport_count > 0 {
-                devices
-                    .device_context
-                    .RSSetViewports(Some(&saved_viewports[..1]));
-            }
-            self.pipelines
-                .opaque_quad_pipeline
-                .enable_depth_test(&devices.device_context);
-        }
-
-        Ok(())
-    }
-
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        let Some(first_path) = paths.first() else {
-            return Ok(());
-        };
-
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites = &mut self.frame_scratch.path_sprites;
-        sprites.clear();
-        if paths.last().unwrap().order == first_path.order {
-            sprites.extend(paths.iter().map(|path| PathSprite {
-                bounds: path.clipped_bounds(),
-            }));
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites.push(PathSprite { bounds });
-        }
-
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let intermediates = self
-            .resources
-            .as_ref()
-            .context("resources missing")?
-            .path_intermediates
-            .as_ref()
-            .context("path intermediates missing")?;
-        self.pipelines.path_sprite_pipeline.update_buffer(
-            &devices.device,
-            &devices.device_context,
-            sprites,
-        )?;
-
-        // Draw the sprites with the path texture
-        self.pipelines.path_sprite_pipeline.draw_with_texture(
-            &devices.device_context,
-            slice::from_ref(&intermediates.srv),
-            slice::from_ref(&self.globals.sampler),
-            sprites.len() as u32,
+                .context("batch params buffer missing")?,
+            4,
+            u32::try_from(tile_range.start).context("path tile range start overflows u32")?,
+            u32::try_from(tile_range.len()).context("path tile count overflows u32")?,
+            None,
         )
     }
 
@@ -1907,7 +1595,6 @@ impl DirectXResources {
             headless,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediates: None,
             depth_stencil_texture: Some(depth_stencil_texture),
             depth_stencil_view,
             viewport,
@@ -1931,15 +1618,6 @@ impl DirectXResources {
         self.render_target_view = None;
         self.depth_stencil_view = None;
         self.depth_stencil_texture = None;
-        // Not recreated here: the next frame that draws paths rebuilds them at
-        // the new size, and a resize while no paths are on screen never pays
-        // for them at all. Unbound from slot 0 of both shader stages first,
-        // or the context's reference keeps the old intermediate alive.
-        unsafe {
-            devices.device_context.VSSetShaderResources(0, Some(&[None]));
-            devices.device_context.PSSetShaderResources(0, Some(&[None]));
-        }
-        self.path_intermediates = None;
         unsafe { devices.device_context.Flush() };
 
         let (render_target, render_target_view, depth_stencil_texture, depth_stencil_view, viewport) =
@@ -1970,20 +1648,15 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
         let quad_glass_blend_state = create_glass_blend_state(device)?;
-        let path_rasterization_pipeline = PipelineState::new(
+        let path_tile_pipeline = PipelineState::new(
             device,
-            "path_rasterization_pipeline",
-            ShaderModule::PathRasterization,
-            32,
-            create_blend_state_for_path_rasterization(device)?,
+            "path_tile_pipeline",
+            ShaderModule::PathTile,
+            64,
+            create_blend_state(device)?,
         )?;
-        let path_sprite_pipeline = PipelineState::new(
-            device,
-            "path_sprite_pipeline",
-            ShaderModule::PathSprite,
-            4,
-            create_blend_state_for_path_sprite(device)?,
-        )?;
+        let path_curves = StructuredBuffer::new(device, "path_curves", 256)?;
+        let path_paints = StructuredBuffer::new(device, "path_paints", 64)?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -2019,8 +1692,9 @@ impl DirectXRenderPipelines {
             quad_pipeline,
             quad_glass_blend_state,
             opaque_quad_pipeline,
-            path_rasterization_pipeline,
-            path_sprite_pipeline,
+            path_tile_pipeline,
+            path_curves,
+            path_paints,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -2254,6 +1928,64 @@ struct BatchParams {
 
 const _: () = assert!(std::mem::size_of::<BatchParams>() == 16);
 
+/// A structured buffer read by index rather than drawn as instances, grown to
+/// the next power of two when a frame outgrows it.
+struct StructuredBuffer<T> {
+    label: &'static str,
+    buffer: ID3D11Buffer,
+    capacity: usize,
+    view: Option<ID3D11ShaderResourceView>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> StructuredBuffer<T> {
+    fn new(device: &ID3D11Device, label: &'static str, capacity: usize) -> Result<Self> {
+        let buffer = create_buffer(device, std::mem::size_of::<T>(), capacity)?;
+        let view = create_buffer_view(device, &buffer)?;
+        Ok(StructuredBuffer {
+            label,
+            buffer,
+            capacity,
+            view,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn write(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        data: &[T],
+    ) -> Result<()> {
+        if self.capacity < data.len() {
+            let element_size = std::mem::size_of::<T>().max(1);
+            let required_size = data.len().checked_mul(element_size);
+            anyhow::ensure!(
+                required_size.is_some_and(|size| size <= MAX_INSTANCE_BUFFER_SIZE),
+                "{} buffer needs {} elements of {element_size} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE} bytes",
+                self.label,
+                data.len(),
+            );
+            let new_capacity = data
+                .len()
+                .next_power_of_two()
+                .min(MAX_INSTANCE_BUFFER_SIZE / element_size);
+            log::debug!(
+                "Updating {} buffer size from {} to {}",
+                self.label,
+                self.capacity,
+                new_capacity
+            );
+            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_capacity)?;
+            let view = create_buffer_view(device, &buffer)?;
+            self.buffer = buffer;
+            self.view = view;
+            self.capacity = new_capacity;
+        }
+        update_buffer(device_context, &self.buffer, data)
+    }
+}
+
 struct PipelineState<T> {
     label: &'static str,
     vertex: ID3D11VertexShader,
@@ -2327,52 +2059,6 @@ impl<T> PipelineState<T> {
             self.buffer_size = new_buffer_size;
         }
         update_buffer(device_context, &self.buffer, data)
-    }
-
-    fn draw(
-        &self,
-        device_context: &ID3D11DeviceContext,
-        topology: D3D_PRIMITIVE_TOPOLOGY,
-        vertex_count: u32,
-        instance_count: u32,
-    ) -> Result<()> {
-        set_pipeline_state(
-            device_context,
-            slice::from_ref(&self.view),
-            topology,
-            &self.vertex,
-            &self.fragment,
-            &self.blend_state,
-        );
-        unsafe {
-            device_context.DrawInstanced(vertex_count, instance_count, 0, 0);
-        }
-        Ok(())
-    }
-
-    fn draw_with_texture(
-        &self,
-        device_context: &ID3D11DeviceContext,
-        texture: &[Option<ID3D11ShaderResourceView>],
-        sampler: &[Option<ID3D11SamplerState>],
-        instance_count: u32,
-    ) -> Result<()> {
-        set_pipeline_state(
-            device_context,
-            slice::from_ref(&self.view),
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-            &self.vertex,
-            &self.fragment,
-            &self.blend_state,
-        );
-        unsafe {
-            device_context.PSSetSamplers(0, Some(sampler));
-            device_context.VSSetShaderResources(0, Some(texture));
-            device_context.PSSetShaderResources(0, Some(texture));
-
-            device_context.DrawInstanced(4, instance_count, 0, 0);
-        }
-        Ok(())
     }
 
     fn draw_range(
@@ -2598,23 +2284,6 @@ impl OpaqueQuadPipeline {
     }
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct PathRasterizationSprite {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
-    rounded_clip: u32,
-    clip_padding: u32,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct PathSprite {
-    bounds: Bounds<ScaledPixels>,
-}
-
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -2791,107 +2460,6 @@ fn create_depth_stencil_texture_and_view(
     Ok((texture, view))
 }
 
-#[inline]
-fn create_path_intermediate_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    Option<ID3D11RenderTargetView>,
-)> {
-    let texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-
-    let mut shader_resource_view = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
-    let mut render_target_view = None;
-    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))? };
-
-    Ok((texture, Some(shader_resource_view.unwrap()), render_target_view))
-}
-
-/// Single-sample tile the MSAA tile resolves into before being region-copied
-/// to its window position (`ResolveSubresource` has no partial form).
-#[inline]
-fn create_path_intermediate_resolve_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<ID3D11Texture2D> {
-    let texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output
-    };
-    texture.context("Creating path intermediate resolve texture")
-}
-
-#[inline]
-fn create_path_intermediate_msaa_texture_and_view(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
-    let msaa_texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: PATH_MULTISAMPLE_COUNT,
-                Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN.0 as u32,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-    let mut msaa_view = None;
-    unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
-    Ok((msaa_texture, Some(msaa_view.unwrap())))
-}
-
 /// Private commit of this process formatted for the `[directx-mem]` log
 /// lines, or `"?"` when the counter read fails. Commit rather than working
 /// set because the GPU sysmem shadows these lines exist to watch are
@@ -3066,8 +2634,9 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
     }
 }
 
+/// Source-over for a source that is already premultiplied.
 #[inline]
-fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+fn create_premultiplied_over_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
     desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -3077,29 +2646,9 @@ fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-    unsafe {
-        let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
-        Ok(state.unwrap())
-    }
-}
-
-#[inline]
-fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    let mut desc = D3D11_BLEND_DESC::default();
-    desc.RenderTarget[0].BlendEnable = true.into();
-    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-    unsafe {
-        let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
-        Ok(state.unwrap())
-    }
+    let mut state = None;
+    unsafe { device.CreateBlendState(&desc, Some(&mut state))? };
+    state.context("Creating premultiplied over blend state")
 }
 
 #[inline]
@@ -3142,13 +2691,18 @@ fn create_buffer(
     element_size: usize,
     buffer_size: usize,
 ) -> Result<ID3D11Buffer> {
+    let byte_width = element_size
+        .checked_mul(buffer_size)
+        .and_then(|size| u32::try_from(size).ok())
+        .context("structured buffer size overflows u32")?;
     let desc = D3D11_BUFFER_DESC {
-        ByteWidth: (element_size * buffer_size) as u32,
+        ByteWidth: byte_width,
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
         MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
-        StructureByteStride: element_size as u32,
+        StructureByteStride: u32::try_from(element_size)
+            .context("structured buffer stride overflows u32")?,
     };
     let mut buffer = None;
     unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
@@ -3252,8 +2806,7 @@ pub(crate) mod shader_resources {
         OpaqueQuad,
         Shadow,
         Underline,
-        PathRasterization,
-        PathSprite,
+        PathTile,
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
@@ -3316,13 +2869,9 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => UNDERLINE_VERTEX_BYTES,
                     ShaderTarget::Fragment => UNDERLINE_FRAGMENT_BYTES,
                 },
-                ShaderModule::PathRasterization => match target {
-                    ShaderTarget::Vertex => PATH_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_RASTERIZATION_FRAGMENT_BYTES,
-                },
-                ShaderModule::PathSprite => match target {
-                    ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_SPRITE_FRAGMENT_BYTES,
+                ShaderModule::PathTile => match target {
+                    ShaderTarget::Vertex => PATH_TILE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PATH_TILE_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -3420,8 +2969,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::OpaqueQuad => "opaque_quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",
-                ShaderModule::PathRasterization => "path_rasterization",
-                ShaderModule::PathSprite => "path_sprite",
+                ShaderModule::PathTile => "path_tile",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
@@ -4070,7 +3618,7 @@ mod rendered_pixel_tests {
                     |_, _, _| (),
                     move |_, _, window, _cx| {
                         // A left-to-right black-to-white gradient across a
-                        // rectangle spanning several 512px raster tiles.
+                        // rectangle spanning many path tiles.
                         let mut builder = gpui::PathBuilder::fill();
                         builder.move_to(point(px(100.), px(100.)));
                         builder.line_to(point(px(1100.), px(100.)));
@@ -4094,35 +3642,15 @@ mod rendered_pixel_tests {
         }
     }
 
-    /// The tile pass rasterizes each 512px tile through a viewport whose
-    /// origin is shifted to the tile, which makes `SV_Position` tile-local in
-    /// the fragment stage. A fill authored against window-space bounds (linear
-    /// gradients, stripe and checkerboard patterns) must still be evaluated at
-    /// the window-space position, or it restarts at every tile seam.
+    /// A path is drawn as many small tiles, each shaded on its own. A fill
+    /// authored against the path's bounds (linear gradients, stripe and
+    /// checkerboard patterns) must be evaluated against those bounds in every
+    /// tile, or it restarts at each tile seam.
     #[test]
-    fn path_gradient_fills_are_continuous_across_raster_tiles() {
-        if DirectXDevices::new().log_err().is_none() {
-            eprintln!("SKIPPED: no D3D11 adapter");
-            return;
-        }
-        let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
-            eprintln!("SKIPPED: no DirectWrite");
+    fn path_gradient_fills_are_continuous_across_tiles() {
+        let Some(mut cx) = path_test_context() else {
             return;
         };
-        if DirectXHeadlessRenderer::new().is_none() {
-            eprintln!("SKIPPED: no headless renderer");
-            return;
-        }
-
-        let mut cx = TestAppContext::build_with_platform(
-            TestDispatcher::new(0),
-            None,
-            Arc::new(text_system),
-            Some(Box::new(|| {
-                Ok(DirectXHeadlessRenderer::new()
-                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
-            })),
-        );
 
         let window = cx.add_window(move |_, _| GradientPathView);
         let image = cx
@@ -4148,8 +3676,8 @@ mod rendered_pixel_tests {
 
         // Left to right along the rectangle's middle row the gradient must
         // climb monotonically (a few levels of dither aside) and cover most
-        // of the range; a fill evaluated at tile-local positions restarts
-        // from black at every 512-multiple seam instead.
+        // of the range; a fill evaluated against each tile instead restarts
+        // from black at every tile seam.
         let y = device(400.0);
         let first = brightness(device(110.0), y);
         let last = brightness(device(1090.0), y);
@@ -4178,9 +3706,9 @@ mod rendered_pixel_tests {
                 canvas(
                     |_, _, _| (),
                     move |_, _, window, _cx| {
-                        // A filled rectangle spanning several 512px raster
-                        // tiles in both axes, so every seam between tiles runs
-                        // through its interior.
+                        // A filled rectangle large enough to span many path
+                        // tiles in both axes, so tile seams run through its
+                        // interior.
                         let mut builder = gpui::PathBuilder::fill();
                         builder.move_to(point(px(100.), px(100.)));
                         builder.line_to(point(px(1100.), px(100.)));
@@ -4190,8 +3718,7 @@ mod rendered_pixel_tests {
                         if let Ok(path) = builder.build() {
                             window.paint_path(path, hsla(0., 0., 1., 1.));
                         }
-                        // A second path in a tile the rectangle never touches,
-                        // in the same batch — the far-tile case.
+                        // A second path far from the first, in the same batch.
                         let mut builder = gpui::PathBuilder::fill();
                         builder.move_to(point(px(20.), px(730.)));
                         builder.line_to(point(px(80.), px(730.)));
@@ -4207,27 +3734,20 @@ mod rendered_pixel_tests {
         }
     }
 
-    /// Paths rasterize through a fixed 512px MSAA tile that is resolved and
-    /// region-copied per touched tile (see `PATH_RASTER_TILE_SIZE`). This
-    /// renders a filled rectangle whose interior crosses every tile seam of a
-    /// 1200x800 window plus a far-tile triangle, and asserts full coverage
-    /// inside, emptiness outside, and no seam artifacts along tile boundaries.
-    #[test]
-    fn paths_render_seamlessly_across_raster_tiles() {
+    fn path_test_context() -> Option<TestAppContext> {
         if DirectXDevices::new().log_err().is_none() {
             eprintln!("SKIPPED: no D3D11 adapter");
-            return;
+            return None;
         }
         let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
             eprintln!("SKIPPED: no DirectWrite");
-            return;
+            return None;
         };
         if DirectXHeadlessRenderer::new().is_none() {
             eprintln!("SKIPPED: no headless renderer");
-            return;
+            return None;
         }
-
-        let mut cx = TestAppContext::build_with_platform(
+        Some(TestAppContext::build_with_platform(
             TestDispatcher::new(0),
             None,
             Arc::new(text_system),
@@ -4235,7 +3755,17 @@ mod rendered_pixel_tests {
                 Ok(DirectXHeadlessRenderer::new()
                     .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
             })),
-        );
+        ))
+    }
+
+    /// A filled path lights every pixel inside it, including along the seams
+    /// between its tiles, and nothing outside it; a second path elsewhere in
+    /// the same batch lands too.
+    #[test]
+    fn filled_paths_cover_their_interior_and_nothing_else() {
+        let Some(mut cx) = path_test_context() else {
+            return;
+        };
 
         let window = cx.add_window(move |_, _| PathView);
         let image = cx
@@ -4248,7 +3778,7 @@ mod rendered_pixel_tests {
             .expect("rendering the scene should succeed");
 
         if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
-            let path = std::path::Path::new(&directory).join("path-tiles.png");
+            let path = std::path::Path::new(&directory).join("path-fill.png");
             image.save(&path).log_err();
         }
 
@@ -4260,66 +3790,46 @@ mod rendered_pixel_tests {
             let pixel = image.get_pixel(x, y);
             pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > 380
         };
-        // Interior: every device pixel well inside the rectangle must be lit.
-        // The dense scan crosses every 512-multiple tile seam, so a tile that
-        // failed to rasterize, resolved to the wrong place, or was skipped by
-        // the occupancy grid shows up as a 512-aligned hole or dark seam.
+        // Every device pixel row and column inside the rectangle, so a
+        // dropped tile or a gap between two tiles shows up as a dark pixel.
         let mut dark_interior = 0u32;
-        for y in (device(102.0)..device(698.0)).step_by(3) {
+        for y in device(102.0)..device(698.0) {
             for x in (device(102.0)..device(1098.0)).step_by(3) {
                 if !lit(x, y) {
                     dark_interior += 1;
                 }
             }
         }
+        for x in device(102.0)..device(1098.0) {
+            if !lit(x, device(400.0)) {
+                dark_interior += 1;
+            }
+        }
         assert_eq!(
             dark_interior, 0,
-            "dark pixels inside the filled rectangle (tile hole or seam)"
+            "dark pixels inside the filled rectangle (a missing tile or a seam)"
         );
-        // Tile seams run at device-pixel multiples of 512; probe the columns
-        // and rows around every seam the rectangle's interior crosses.
-        let interior_x = device(105.0)..device(1095.0);
-        let interior_y = device(105.0)..device(695.0);
-        let mut seam = 512u32;
-        while seam < image.width() {
-            if interior_x.contains(&seam) {
-                for probe in seam - 2..=seam + 2 {
-                    assert!(lit(probe, device(400.0)), "seam column {probe} is dark");
-                }
-            }
-            if interior_y.contains(&seam) {
-                for probe in seam - 2..=seam + 2 {
-                    assert!(lit(device(600.0), probe), "seam row {probe} is dark");
-                }
-            }
-            seam += 512;
-        }
-        // Far tile: the triangle near (20..80, 730..790) landed.
         assert!(
             lit(device(30.0), device(740.0)),
-            "far-tile triangle did not render"
+            "the second path did not render"
         );
-        // Outside: no ink beyond the shapes (a tile copied to the wrong
-        // offset would smear ink into these).
         for (x, y) in [
             (device(50.0), device(50.0)),
             (device(1150.0), device(100.0)),
             (device(1150.0), device(750.0)),
             (device(600.0), device(750.0)),
             (device(97.0), device(97.0)),
+            (device(70.0), device(780.0)),
         ] {
             assert!(!lit(x, y), "unexpected ink at ({x}, {y})");
         }
     }
 
-    struct GhostView {
-        second_frame: std::rc::Rc<std::cell::Cell<bool>>,
-    }
+    struct OverlappingPathsView;
 
-    impl Render for GhostView {
+    impl Render for OverlappingPathsView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let second_frame = self.second_frame.get();
-            div().size_full().child(
+            div().size_full().bg(hsla(0., 0., 0., 1.)).child(
                 canvas(
                     |_, _, _| (),
                     move |_, _, window, _cx| {
@@ -4332,24 +3842,11 @@ mod rendered_pixel_tests {
                             builder.close();
                             builder.build()
                         };
-                        if second_frame {
-                            // Two OVERLAPPING squares (the bounds tree gives the
-                            // second a higher draw order, so the batch mixes
-                            // orders and the sprite pass samples one spanning
-                            // rect) plus a far square that stretches that rect
-                            // across the tile where frame one's ink was left.
-                            for path in [
-                                square(100., 100., 80.),
-                                square(140., 140., 80.),
-                                square(1000., 700., 50.),
-                            ]
+                        for path in [square(20., 20., 60.), square(50., 50., 60.)]
                             .into_iter()
                             .flatten()
-                            {
-                                window.paint_path(path, hsla(0., 0., 1., 1.));
-                            }
-                        } else if let Ok(path) = square(580., 480., 40.) {
-                            window.paint_path(path, hsla(0., 0., 1., 1.));
+                        {
+                            window.paint_path(path, hsla(0., 0., 1., 0.5));
                         }
                     },
                 )
@@ -4358,95 +3855,46 @@ mod rendered_pixel_tests {
         }
     }
 
-    /// A mixed-draw-order path batch is sampled from the intermediate through
-    /// one spanning rect, which can cross raster tiles the batch never
-    /// rewrites. Ink a previous frame left in those tiles must not be
-    /// re-composited: frame one draws a lone square, frame two draws a
-    /// mixed-order batch whose spanning rect covers the (now path-free) spot
-    /// where that square was, and the spot must render dark.
+    /// Two translucent paths that overlap: each pixel of a path is blended
+    /// exactly once, so where one path lies alone it shows at half strength
+    /// over the black background, and where they overlap it is the second
+    /// composited over the first.
     #[test]
-    fn stale_path_ink_does_not_ghost_through_spanning_rect() {
-        if DirectXDevices::new().log_err().is_none() {
-            eprintln!("SKIPPED: no D3D11 adapter");
-            return;
-        }
-        let Some(text_system) = DirectWriteTextSystem::new().log_err() else {
-            eprintln!("SKIPPED: no DirectWrite");
+    fn overlapping_translucent_paths_composite_once_each() {
+        let Some(mut cx) = path_test_context() else {
             return;
         };
-        if DirectXHeadlessRenderer::new().is_none() {
-            eprintln!("SKIPPED: no headless renderer");
-            return;
-        }
 
-        let mut cx = TestAppContext::build_with_platform(
-            TestDispatcher::new(0),
-            None,
-            Arc::new(text_system),
-            Some(Box::new(|| {
-                Ok(DirectXHeadlessRenderer::new()
-                    .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
-            })),
-        );
-
-        let second_frame = std::rc::Rc::new(std::cell::Cell::new(false));
-        let window = cx.add_window({
-            let second_frame = second_frame.clone();
-            move |_, _| GhostView { second_frame }
-        });
-
-        let first_image = cx
+        let window = cx.add_window(move |_, _| OverlappingPathsView);
+        let image = cx
             .update_window(window.into(), |_, window, cx| {
-                window.resize(size(px(1200.), px(800.)));
+                window.resize(size(px(128.), px(128.)));
                 window.draw(cx).clear(cx);
                 window.render_to_image()
             })
             .unwrap()
-            .expect("rendering the first frame should succeed");
-
-        second_frame.set(true);
-        let second_image = cx
-            .update_window(window.into(), |_, window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-                window.render_to_image()
-            })
-            .unwrap()
-            .expect("rendering the second frame should succeed");
+            .expect("rendering the scene should succeed");
 
         if let Ok(directory) = std::env::var("GPUI_DUMP_RENDERED_TEXT") {
-            let directory = std::path::Path::new(&directory);
-            first_image.save(&directory.join("path-ghost-1.png")).log_err();
-            second_image.save(&directory.join("path-ghost-2.png")).log_err();
+            let path = std::path::Path::new(&directory).join("path-overlap.png");
+            image.save(&path).log_err();
         }
 
-        let scale = first_image.width() as f32 / 1200.0;
+        let scale = image.width() as f32 / 128.0;
         let device = |logical: f32| (logical * scale).round() as u32;
-        let lit = |image: &image::RgbaImage, x: u32, y: u32| {
-            let pixel = image.get_pixel(x, y);
-            pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > 380
+        let expect_gray = |x: f32, y: f32, expected: f32, what: &str| {
+            let pixel = image.get_pixel(device(x), device(y));
+            let expected = (expected * 255.0).round() as i32;
+            assert!(
+                (0..3).all(|channel| (pixel[channel] as i32 - expected).abs() <= 3),
+                "{what}: expected gray {expected}, got {pixel:?} at ({x}, {y})"
+            );
         };
-
-        // Frame one: the lone square landed.
-        assert!(
-            lit(&first_image, device(600.0), device(500.0)),
-            "frame one's square did not render"
-        );
-        // Frame two: its own paths landed...
-        assert!(
-            lit(&second_image, device(160.0), device(160.0)),
-            "the overlapping pair did not render"
-        );
-        assert!(
-            lit(&second_image, device(1025.0), device(725.0)),
-            "the far square did not render"
-        );
-        // ...and frame one's square is gone, not ghosting through the
-        // spanning rect from a raster tile this batch never rewrote.
-        assert!(
-            !lit(&second_image, device(600.0), device(500.0)),
-            "stale path ink from the previous frame ghosted back"
-        );
+        expect_gray(30., 30., 0.5, "the first path alone");
+        expect_gray(100., 100., 0.5, "the second path alone");
+        expect_gray(65., 65., 0.75, "the overlap");
+        expect_gray(10., 10., 0.0, "outside both paths");
+        expect_gray(100., 30., 0.0, "outside both paths");
     }
 }
 

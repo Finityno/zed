@@ -47,7 +47,6 @@ mod apple_build {
             "RoundedClipNode".into(),
             "Uniforms".into(),
             "AtlasTile".into(),
-            "GlobalInputIndex".into(),
             "PathTileInputIndex".into(),
             "PathTile".into(),
             "PathCurve".into(),
