@@ -315,18 +315,22 @@ fn insert_primitives(scene: &mut Scene, rectangles: &[Rectangle]) {
                 border_color: Default::default(),
                 corner_radii: Default::default(),
                 border_widths: Default::default(),
+                rounded_clip: 0,
+                clip_padding: 0,
             }),
             Kind::Shadow => scene.insert_primitive(gpui::Shadow {
                 order: 0,
                 blur_radius: gpui::ScaledPixels(6.),
-                bounds: bounds.dilate(gpui::ScaledPixels(18.)),
-                corner_radii: Corners::default(),
+                bounds,
+                corner_radii: Corners::all(gpui::ScaledPixels(4.)),
                 content_mask,
                 color: rectangle.color,
-                shape_bounds: bounds,
-                shape_corner_radii: Corners::all(gpui::ScaledPixels(4.)),
-                inset: false.into(),
+                element_bounds: bounds,
+                element_corner_radii: Corners::all(gpui::ScaledPixels(4.)),
+                inset: 0,
                 pad: 0,
+                rounded_clip: 0,
+                clip_padding: 0,
             }),
             Kind::Underline => scene.insert_primitive(gpui::Underline {
                 order: 0,
@@ -336,6 +340,8 @@ fn insert_primitives(scene: &mut Scene, rectangles: &[Rectangle]) {
                 color: rectangle.color,
                 thickness: bounds.size.height.min(gpui::ScaledPixels(4.)),
                 wavy: Default::default(),
+                rounded_clip: 0,
+                clip_padding: 0,
             }),
             Kind::Path { painted, .. } => scene.insert_primitive(painted.clone()),
             Kind::Text(text) => {
@@ -345,12 +351,15 @@ fn insert_primitives(scene: &mut Scene, rectangles: &[Rectangle]) {
                         + point(glyph_size * (glyph as f32 * 0.6), gpui::ScaledPixels(0.));
                     scene.insert_primitive(gpui::MonochromeSprite {
                         order: 0,
-                        animation: gpui::SpriteAnimationId::NONE,
+                        pad: 0,
                         tile: glyph_tile(index + glyph),
                         bounds: Bounds::new(origin, size(glyph_size * 0.6, glyph_size)),
                         content_mask,
                         color: rectangle.color,
+                        effect: Default::default(),
                         transformation: TransformationMatrix::unit(),
+                        rounded_clip: 0,
+                        clip_padding: 0,
                     });
                 }
             }

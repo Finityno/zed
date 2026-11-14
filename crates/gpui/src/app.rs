@@ -3498,7 +3498,14 @@ impl App {
                     if window.idle_capacity_reclaim.is_some() {
                         cx.spawn(async move |cx| {
                             cx.background_executor().timer(SHRINK_AFTER_DURATION).await;
-                            cx.update(|cx| {
+                            // Nothing is left to release once the app is
+                            // gone, which it can be when the timer ends: it
+                            // quit, or a benchmark tore it down and cancelled
+                            // its timers.
+                            let Some(app) = cx.app.upgrade() else {
+                                return;
+                            };
+                            app.borrow_mut().update(|cx| {
                                 let now = cx.background_executor().now();
                                 cx.element_arena.borrow_mut().release_idle_chunks(now);
                             });
