@@ -110,6 +110,14 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
+    #[cfg(feature = "bench-support")]
+    pub(crate) fn take_gpu_stats(&self) -> anyhow::Result<crate::GpuStats> {
+        match self.0.lock().renderer.as_mut() {
+            Some(renderer) => renderer.take_gpu_stats(),
+            None => Err(crate::GpuStatsUnsupported.into()),
+        }
+    }
+
     /// Makes `TestWindow`s created afterwards on this thread report subpixel text rendering as
     /// supported, the way a Windows window does, so a test can drive the `SubpixelSprite` glyph
     /// pipeline rather than the grayscale one. Applies to windows created after the call.

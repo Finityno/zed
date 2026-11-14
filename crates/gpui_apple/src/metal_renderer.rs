@@ -2423,7 +2423,11 @@ impl MetalRenderer {
     /// headless benchmark rendering, where the produced pixels are never
     /// inspected.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
-    pub fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
+    pub fn render_scene(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<MetalCommandBuffer> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
@@ -2460,7 +2464,7 @@ impl MetalRenderer {
             // Commit without waiting, mirroring presentation to a real window where
             // the CPU doesn't block on the GPU.
             command_buffer.commit();
-            Ok(())
+            Ok(command_buffer)
         })
     }
 
@@ -4185,6 +4189,43 @@ pub struct SurfaceBounds {
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 pub struct MetalHeadlessRenderer {
     renderer: MetalRenderer,
+    /// Frames submitted by `render_scene` whose GPU time hasn't been read yet,
+    /// in submission order.
+    #[cfg(feature = "bench-support")]
+    pending_frames: std::collections::VecDeque<MetalCommandBuffer>,
+    #[cfg(feature = "bench-support")]
+    gpu_frame_times: Vec<Duration>,
+}
+
+#[cfg(feature = "bench-support")]
+impl MetalHeadlessRenderer {
+    /// Reads the GPU time of each pending frame that has finished, so the
+    /// pending queue doesn't keep growing across a long measurement.
+    fn collect_completed_frames(&mut self) -> Result<()> {
+        while let Some(command_buffer) = self.pending_frames.front() {
+            match command_buffer.status() {
+                objc2_metal::MTLCommandBufferStatus::Completed => {
+                    let start = command_buffer.GPUStartTime();
+                    let end = command_buffer.GPUEndTime();
+                    if end >= start {
+                        self.gpu_frame_times
+                            .push(Duration::from_secs_f64(end - start));
+                    }
+                }
+                objc2_metal::MTLCommandBufferStatus::Error => {
+                    let error = command_buffer
+                        .error()
+                        .map(|error| error.to_string())
+                        .unwrap_or_default();
+                    self.pending_frames.pop_front();
+                    anyhow::bail!("Metal command buffer failed: {error}");
+                }
+                _ => break,
+            }
+            self.pending_frames.pop_front();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -4192,7 +4233,13 @@ impl MetalHeadlessRenderer {
     pub fn new() -> Result<Self> {
         let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
         let renderer = MetalRenderer::new_headless(instance_buffer_pool)?;
-        Ok(Self { renderer })
+        Ok(Self {
+            renderer,
+            #[cfg(feature = "bench-support")]
+            pending_frames: std::collections::VecDeque::new(),
+            #[cfg(feature = "bench-support")]
+            gpu_frame_times: Vec::new(),
+        })
     }
 }
 
@@ -4207,11 +4254,67 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
     }
 
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
-        self.renderer.render_scene(scene, size)
+        let command_buffer = self.renderer.render_scene(scene, size)?;
+        #[cfg(feature = "bench-support")]
+        {
+            self.pending_frames.push_back(command_buffer);
+            self.collect_completed_frames()?;
+        }
+        #[cfg(not(feature = "bench-support"))]
+        drop(command_buffer);
+        Ok(())
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+
+    #[cfg(feature = "bench-support")]
+    fn take_gpu_stats(&mut self) -> Result<gpui::GpuStats> {
+        for command_buffer in &self.pending_frames {
+            command_buffer.waitUntilCompleted();
+        }
+        self.collect_completed_frames()?;
+        Ok(gpui::GpuStats {
+            frame_times: mem::take(&mut self.gpu_frame_times),
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(all(test, feature = "bench-support"))]
+mod gpu_stats_tests {
+    use super::MetalHeadlessRenderer;
+    use gpui::{
+        Bounds, ContentMask, DevicePixels, PlatformHeadlessRenderer as _, Point, ScaledPixels,
+        Scene, size,
+    };
+
+    #[test]
+    fn headless_renderer_times_each_rendered_frame_on_the_gpu() -> anyhow::Result<()> {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(32.0), ScaledPixels(32.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: gpui::red().into(),
+            ..Default::default()
+        });
+        scene.finish();
+
+        let mut renderer = MetalHeadlessRenderer::new()?;
+        for _ in 0..3 {
+            renderer.render_scene(&scene, size(DevicePixels(32), DevicePixels(32)))?;
+        }
+        // A frame read back is not one the benchmark submitted.
+        renderer.render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32)))?;
+
+        assert_eq!(renderer.take_gpu_stats()?.frame_times.len(), 3);
+        assert!(renderer.take_gpu_stats()?.frame_times.is_empty());
+        Ok(())
     }
 }
 /// The ordinary blend must be premultiplied-over in alpha as well as colour.

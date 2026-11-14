@@ -15,9 +15,10 @@ use hdrhistogram::Histogram;
 
 use crate::{
     AnyView, AnyWindowHandle, App, AppCell, AppContext, BackgroundExecutor, Bounds, Context, Empty,
-    Entity, EntityId, Focusable, ForegroundExecutor, Global, Pixels, Platform,
-    PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Size, Task, TestPlatform,
-    ThreadedDispatcher, VisualContext, Window, WindowBounds, WindowHandle, WindowOptions,
+    Entity, EntityId, Focusable, ForegroundExecutor, Global, GpuStats, GpuStatsUnsupported, Pixels,
+    Platform, PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Size, Task,
+    TestPlatform, ThreadedDispatcher, VisualContext, Window, WindowBounds, WindowHandle,
+    WindowOptions,
     app::GpuiBorrow,
     profiler::{
         self, FrameEvent, FrameTimingCollector,
@@ -184,6 +185,23 @@ impl BenchReport {
         &self.metrics
     }
 
+    fn record_gpu_stats(&self, stats: GpuStats) {
+        let mut snapshot = self.frame_snapshot.borrow_mut();
+        // `.ok()` on `record`: this operation is infallible (the histogram auto-resizes).
+        for frame_time in stats.frame_times {
+            snapshot
+                .gpu_frame_time
+                .record(frame_time.as_nanos() as u64)
+                .ok();
+        }
+        for invocations in stats.vertex_shader_invocations {
+            snapshot.gpu_vertex_invocations.record(invocations);
+        }
+        for invocations in stats.fragment_shader_invocations {
+            snapshot.gpu_fragment_invocations.record(invocations);
+        }
+    }
+
     fn record_frame_timings<'i>(&self, events: impl IntoIterator<Item = &'i FrameEvent>) {
         let mut snapshot = self.frame_snapshot.borrow_mut();
         // `.ok()` on `record`: this operation is infallible (the histograms auto-resize).
@@ -304,6 +322,24 @@ impl BenchReport {
         self.print_histogram("window dirty-to-draw", &frame_snapshot.dirty_to_draw);
         self.print_histogram("window draw", &frame_snapshot.draw);
         self.print_histogram("window present interval", &frame_snapshot.present_interval);
+        self.print_histogram("GPU frame time", &frame_snapshot.gpu_frame_time);
+        for (name, counts) in [
+            (
+                "GPU vertex shader invocations",
+                &frame_snapshot.gpu_vertex_invocations,
+            ),
+            (
+                "GPU fragment shader invocations",
+                &frame_snapshot.gpu_fragment_invocations,
+            ),
+        ] {
+            if let Some(mean) = counts.mean() {
+                eprintln!(
+                    "  {name} per frame: mean {mean:.1}, min {}, max {}",
+                    counts.min, counts.max
+                );
+            }
+        }
         if !frame_snapshot.invalidations_per_frame.is_empty() {
             eprintln!(
                 "  invalidations per frame: mean {:.2}, max {}",
@@ -376,6 +412,9 @@ struct WindowFrameSnapshot {
     dirty_to_draw: Histogram<u64>,
     draw: Histogram<u64>,
     present_interval: Histogram<u64>,
+    gpu_frame_time: Histogram<u64>,
+    gpu_vertex_invocations: ExactCounts,
+    gpu_fragment_invocations: ExactCounts,
     invalidations_per_frame: Histogram<u64>,
     foreground_work: DurationHistogram,
 }
@@ -386,6 +425,9 @@ impl WindowFrameSnapshot {
             dirty_to_draw: Histogram::new(3).expect("3 significant digits is valid"),
             draw: Histogram::new(3).expect("3 significant digits is valid"),
             present_interval: Histogram::new(3).expect("3 significant digits is valid"),
+            gpu_frame_time: Histogram::new(3).expect("3 significant digits is valid"),
+            gpu_vertex_invocations: ExactCounts::default(),
+            gpu_fragment_invocations: ExactCounts::default(),
             invalidations_per_frame: Histogram::new(3).expect("3 significant digits is valid"),
             foreground_work: DurationHistogram::new(),
         }
@@ -395,7 +437,37 @@ impl WindowFrameSnapshot {
         self.dirty_to_draw.is_empty()
             && self.draw.is_empty()
             && self.present_interval.is_empty()
+            && self.gpu_frame_time.is_empty()
+            && self.gpu_vertex_invocations.samples == 0
+            && self.gpu_fragment_invocations.samples == 0
             && self.foreground_work.histogram.is_empty()
+    }
+}
+
+/// Exact statistics for deterministic per-frame counts, which a histogram's
+/// bucketing (3 significant digits) would blur.
+#[derive(Default)]
+struct ExactCounts {
+    total: u128,
+    samples: u64,
+    min: u64,
+    max: u64,
+}
+
+impl ExactCounts {
+    fn record(&mut self, count: u64) {
+        self.min = if self.samples == 0 {
+            count
+        } else {
+            self.min.min(count)
+        };
+        self.max = self.max.max(count);
+        self.total += u128::from(count);
+        self.samples += 1;
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.samples > 0).then(|| self.total as f64 / self.samples as f64)
     }
 }
 
@@ -734,6 +806,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         // the measured iterations.
         self.settle();
         self.dispatch_pending_frames(|| true);
+        self.take_gpu_stats();
         let mut collector = TraceScope::start(self.foreground_journal_collector());
         let report = self.report.clone();
         self.report.metrics.discard_pending();
@@ -752,6 +825,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         self.report.record_frame_timings(events.frame_events.iter());
         self.report
             .record_foreground_events(events.foreground_events());
+        self.record_gpu_stats();
         self.replace_bencher(bencher);
     }
 
@@ -812,9 +886,13 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
                 // dropped; settling here releases their entities before the
                 // next setup, so per-iteration state cannot accumulate
                 // across a measurement.
+                // Records the previous measured iteration's GPU work outside timing,
+                // then discards GPU work from this iteration's setup.
+                setup_context.record_gpu_stats();
                 setup_context.settle();
                 let input = setup(&mut setup_context);
                 setup_context.dispatch_pending_frames(|| true);
+                setup_context.take_gpu_stats();
                 MeasuredTaskInput {
                     input,
                     trace_scope: Some(TraceScope::start(
@@ -848,6 +926,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
             criterion::BatchSize::PerIteration,
         );
         report.metrics.record_sample(iterations.get());
+        self.record_gpu_stats();
         self.replace_bencher(bencher);
     }
 
@@ -881,6 +960,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         self.settle();
         let dispatcher = self.background_executor.dispatcher().clone();
         self.dispatch_pending_frames(|| true);
+        self.take_gpu_stats();
         let mut collector = TraceScope::start(self.foreground_journal_collector());
         let report = self.report.clone();
         self.report.metrics.discard_pending();
@@ -914,6 +994,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         self.report.record_frame_timings(events.frame_events.iter());
         self.report
             .record_foreground_events(events.foreground_events());
+        self.record_gpu_stats();
         self.replace_bencher(bencher);
     }
 
@@ -961,9 +1042,13 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
 
         bencher.iter_batched_ref(
             || {
+                // Records the previous measured iteration's GPU work outside timing,
+                // then discards GPU work from this iteration's setup.
+                setup_context.record_gpu_stats();
                 setup_context.settle();
                 let input = setup(&mut setup_context);
                 setup_context.dispatch_pending_frames(|| true);
+                setup_context.take_gpu_stats();
                 MeasuredTaskInput {
                     input,
                     trace_scope: Some(TraceScope::start(
@@ -1044,7 +1129,35 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
             criterion::BatchSize::PerIteration,
         );
         report.metrics.record_sample(iterations.get());
+        self.record_gpu_stats();
         self.replace_bencher(bencher);
+    }
+
+    /// Waits for GPU work submitted by every open window and returns each
+    /// window's GPU statistics for frames submitted since the last call. Windows
+    /// whose renderer can't measure GPU work are skipped.
+    fn take_gpu_stats(&self) -> Vec<GpuStats> {
+        let windows: Vec<_> = self
+            .app
+            .borrow_mut()
+            .windows
+            .values_mut()
+            .filter_map(|window| window.as_deref_mut()?.platform_window.as_test().cloned())
+            .collect();
+        windows
+            .iter()
+            .filter_map(|window| match window.take_gpu_stats() {
+                Ok(stats) => Some(stats),
+                Err(error) if error.is::<GpuStatsUnsupported>() => None,
+                Err(error) => panic!("failed to wait for benchmark GPU work: {error:#}"),
+            })
+            .collect()
+    }
+
+    fn record_gpu_stats(&self) {
+        for stats in self.take_gpu_stats() {
+            self.report.record_gpu_stats(stats);
+        }
     }
 
     fn dispatch_pending_frames(&self, mut should_continue: impl FnMut() -> bool) -> bool {
