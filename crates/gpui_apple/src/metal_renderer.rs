@@ -175,10 +175,6 @@ pub fn new_renderer(
     MetalRenderer::new(context, transparent, use_display_p3)
 }
 
-pub fn new_overlay_renderer(context: self::Context, base: &Renderer) -> Result<Renderer> {
-    base.new_sharing_atlas(context, true)
-}
-
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<InstanceBuffer>,
@@ -340,9 +336,6 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
-    /// Whether the layer renders in Display P3; an overlay plane's layer
-    /// matches its window's.
-    use_display_p3: bool,
     /// The size the window wants its drawables at, kept while
     /// [`Self::release_drawables`] has them shrunk.
     drawable_size: Size<DevicePixels>,
@@ -423,16 +416,6 @@ pub struct MetalRenderer {
     /// updates and are rebuilt by the next `render_frame` without being
     /// counted as a stale-texture heal.
     intermediate_textures_released: bool,
-    /// An overlay renderer draws strictly after its window's base renderer
-    /// and never concurrently with it, so it borrows the base renderer's
-    /// intermediate textures for each draw ([`Self::take_intermediates`] /
-    /// [`Self::lend_intermediates`]) instead of allocating its own copies,
-    /// which would double the per-window drawable-sized memory.
-    borrows_intermediates: bool,
-    /// An overlay renderer shares the base renderer's atlas and draws in the
-    /// same present, whose tiles the base draw has already marked (see
-    /// [`Self::note_scene_tiles`]); it must not mark or age the atlas again.
-    shares_atlas_frame: bool,
     /// The drawable presented last and the scene content it shows, so a
     /// present that only advances time animations can copy it and draw just
     /// what moved (see [`Scene::time_animation_damage`]).
@@ -547,15 +530,6 @@ fn gaussian_taps(sigma: f32) -> Vec<[f32; 2]> {
     taps
 }
 
-/// The drawable-sized textures a frame renders through, moved between a
-/// window's base and overlay renderer by [`MetalRenderer::take_intermediates`].
-pub struct IntermediateTextures {
-    depth: Option<MetalTexture>,
-    backdrop_scratch: Option<BackdropScratch>,
-    backdrop_idle_frames: u32,
-    backdrop_oversized_uses: u32,
-}
-
 /// A new 2D texture descriptor. The caller keeps both dimensions positive,
 /// which is all Metal asks of them.
 fn texture_descriptor(
@@ -596,16 +570,7 @@ impl MetalRenderer {
     ) -> Result<Self> {
         let device = Self::create_device()?;
         let layer = Self::new_layer(&device, transparent, use_display_p3);
-        let mut renderer = Self::new_internal(
-            device,
-            Some(layer),
-            !transparent,
-            instance_buffer_pool,
-            None,
-            None,
-        )?;
-        renderer.use_display_p3 = use_display_p3;
-        Ok(renderer)
+        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
     }
 
     /// Creates a renderer for a CAMetalLayer owned by a platform view, such as
@@ -619,14 +584,8 @@ impl MetalRenderer {
         let device = Self::create_device()?;
         let layer = layer.retain();
         Self::configure_layer(&layer, &device, transparent, false);
-        let mut renderer = Self::new_internal(
-            device,
-            Some(layer),
-            !transparent,
-            instance_buffer_pool,
-            None,
-            None,
-        )?;
+        let mut renderer =
+            Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)?;
         // The UIKit window drops the present's outcome, so a deferred present
         // would never be retried; it asks for drawables on the presenting
         // thread and waits, as before.
@@ -705,68 +664,11 @@ impl MetalRenderer {
         );
     }
 
-    fn new_sharing_atlas(
-        &self,
-        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-        transparent: bool,
-    ) -> Result<Self> {
-        let device = self.device.clone();
-        let layer = Self::new_layer(&device, transparent, self.use_display_p3);
-        let mut renderer = Self::new_internal(
-            device,
-            Some(layer),
-            !transparent,
-            instance_buffer_pool,
-            Some(self.sprite_atlas.clone()),
-            Some(self.command_queue.clone()),
-        )?;
-        renderer.use_display_p3 = self.use_display_p3;
-        renderer.borrows_intermediates = true;
-        renderer.shares_atlas_frame = true;
-        Ok(renderer)
-    }
-
-    /// Records the sprite tiles `scene` references as used in the frame about
-    /// to be drawn, without advancing the atlas or retiring anything. A
-    /// layered window calls this for its overlay scene before drawing the
-    /// base scene, so the base draw's retirement has seen every tile the
-    /// present as a whole still needs.
-    pub fn note_scene_tiles(&self, scene: &Scene) {
-        self.sprite_atlas.note_scene_tiles(scene);
-    }
-
-    /// Moves the drawable-sized intermediate textures out of this renderer so
-    /// another renderer for the same drawable size can draw with them; pair
-    /// with [`Self::lend_intermediates`] to hand them on and back. A frame
-    /// that used them keeps its own references from its command buffer, so
-    /// moving the handles never affects an in-flight draw.
-    pub fn take_intermediates(&mut self) -> IntermediateTextures {
-        let intermediates = IntermediateTextures {
-            depth: self.depth_texture.take(),
-            backdrop_scratch: self.backdrop_scratch.take(),
-            backdrop_idle_frames: self.backdrop_idle_frames,
-            backdrop_oversized_uses: self.backdrop_oversized_uses,
-        };
-        self.publish_depth_memory();
-        intermediates
-    }
-
-    /// Installs intermediate textures taken from another renderer; see
-    /// [`Self::take_intermediates`].
-    pub fn lend_intermediates(&mut self, intermediates: IntermediateTextures) {
-        self.depth_texture = intermediates.depth;
-        self.backdrop_scratch = intermediates.backdrop_scratch;
-        self.backdrop_idle_frames = intermediates.backdrop_idle_frames;
-        self.backdrop_oversized_uses = intermediates.backdrop_oversized_uses;
-        self.publish_depth_memory();
-    }
-
     /// Reports the intermediate textures this renderer holds right now: the
-    /// depth attachment and the backdrop blur scratch. Called at the end of every frame and wherever the textures
-    /// change hands or go away, so a hidden window's release and a
-    /// base-to-overlay hand-off are seen without a draw. The gauges are
-    /// device memory, so a memoryless attachment (tile memory on Apple GPUs)
-    /// contributes nothing.
+    /// depth attachment and the backdrop blur scratch. Called at the end of
+    /// every frame and wherever the textures go away, so a hidden window's
+    /// release is seen without a draw. The gauges are device memory, so a
+    /// memoryless attachment (tile memory on Apple GPUs) contributes nothing.
     fn publish_depth_memory(&mut self) {
         let depth = self
             .depth_texture
@@ -790,7 +692,7 @@ impl MetalRenderer {
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Result<Self> {
         let device = Self::create_device()?;
-        Self::new_internal(device, None, true, instance_buffer_pool, None, None)
+        Self::new_internal(device, None, true, instance_buffer_pool)
     }
 
     #[cfg(target_os = "macos")]
@@ -827,8 +729,6 @@ impl MetalRenderer {
         layer: Option<Retained<CAMetalLayer>>,
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-        shared_sprite_atlas: Option<Arc<MetalAtlas>>,
-        shared_command_queue: Option<MetalCommandQueue>,
     ) -> Result<Self> {
         #[cfg(feature = "runtime_shaders")]
         let library = device
@@ -994,26 +894,13 @@ impl MetalRenderer {
         let depth_write_state = build_depth_stencil_state(&device, true)?;
         let depth_test_state = build_depth_stencil_state(&device, false)?;
 
-        // A renderer that borrows another's intermediate textures must also
-        // queue behind its command buffers: Metal orders command buffers
-        // within one queue, not across queues.
-        let command_queue = match shared_command_queue {
-            Some(command_queue) => command_queue,
-            None => device.newCommandQueue().context("creating command queue")?,
-        };
-        let sprite_atlas = match shared_sprite_atlas {
-            Some(sprite_atlas) => sprite_atlas,
-            None => {
-                let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
-                #[expect(
-                    clippy::arc_with_non_send_sync,
-                    reason = "PlatformWindow::sprite_atlas requires Arc, not Send or Sync"
-                )]
-                let sprite_atlas =
-                    Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
-                sprite_atlas
-            }
-        };
+        let command_queue = device.newCommandQueue().context("creating command queue")?;
+        let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "PlatformWindow::sprite_atlas requires Arc, not Send or Sync"
+        )]
+        let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
         let mut cache = ptr::null_mut();
         // SAFETY: The output pointer is writable and both optional attribute dictionaries are absent.
         let status = unsafe {
@@ -1039,7 +926,6 @@ impl MetalRenderer {
             },
             layer,
             presents_with_transaction: false,
-            use_display_p3: false,
             drawable_size: Size::default(),
             drawables_released: false,
             is_apple_gpu,
@@ -1076,8 +962,6 @@ impl MetalRenderer {
             depth_texture: None,
             stale_texture_heals: 0,
             intermediate_textures_released: false,
-            borrows_intermediates: false,
-            shares_atlas_frame: false,
             presented_frame: None,
             damage_rects: Vec::new(),
             full_presents: 0,
@@ -1237,9 +1121,6 @@ impl MetalRenderer {
         // A window the compositor is not showing may not keep what it last
         // showed, so the next present must not copy from it.
         self.presented_frame = None;
-        if self.borrows_intermediates {
-            return;
-        }
         self.intermediate_textures_released = true;
         self.depth_texture = None;
         self.backdrop_scratch = None;
@@ -1250,18 +1131,9 @@ impl MetalRenderer {
         // A resize while occluded (display change, restore geometry) must not
         // rebuild what release_intermediate_textures dropped; the first draw
         // after the window is visible again does that.
-        if self.intermediate_textures_released || self.borrows_intermediates {
+        if self.intermediate_textures_released {
             return Ok(());
         }
-        self.recreate_intermediate_textures(size)
-    }
-
-    /// The creation half of [`Self::update_intermediate_textures`], without
-    /// its guards. The render-time heal calls this on a borrowing overlay
-    /// renderer as well: a lent texture that does not match the drawable is
-    /// exactly the case the heal exists for, and the fresh textures travel
-    /// back to the base renderer with the rest when the draw hands them over.
-    fn recreate_intermediate_textures(&mut self, size: Size<DevicePixels>) -> Result<()> {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -1299,12 +1171,10 @@ impl MetalRenderer {
     }
 
     /// Counts a drawn frame against the backdrop blur scratch and drops it
-    /// once enough frames have gone by without a blur in either of the
-    /// window's planes. In-flight command buffers hold their own references.
+    /// once enough frames have gone by without a blur. In-flight command
+    /// buffers hold their own references.
     fn retire_idle_backdrop_scratch(&mut self) {
-        // Borrowed scratch is aged by its owner once per present; a blur on
-        // the overlay plane resets the count it hands back.
-        if self.borrows_intermediates || self.backdrop_scratch.is_none() {
+        if self.backdrop_scratch.is_none() {
             return;
         }
         self.backdrop_idle_frames = self.backdrop_idle_frames.saturating_add(1);
@@ -1555,18 +1425,9 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    #[cfg(test)]
     fn can_draw(&self) -> bool {
         self.unfinished_submissions.load(Ordering::Relaxed) < MAX_UNFINISHED_SUBMISSIONS
-    }
-
-    pub fn submission_queue_full_outcome(&mut self) -> Option<PresentOutcome> {
-        if self.can_draw() {
-            return None;
-        }
-        // Lost completion callbacks must not cause perpetual refresh retries.
-        // Dropping the owed frame ends retries without forgetting permits for
-        // resources Metal may still retain.
-        Some(self.deferred_present_outcome(true))
     }
 
     pub fn draw(&mut self, scene: &Scene) -> PresentReport {
@@ -1935,14 +1796,18 @@ impl MetalRenderer {
     /// window was resized while a present was deferred) is released and asked
     /// for again once.
     ///
-    /// A present the layer cannot make wait (`may_wait` false, see
-    /// [`Self::drawable_may_wait`]) asks on the presenting thread instead,
-    /// unless an earlier request is still out: handing the request to the
-    /// acquire thread and sleeping until it answers costs a steady window
-    /// about 100 µs of main-thread time and 70 µs of CPU per present, and
-    /// asking for the next frame's drawable ahead of time instead would hold
-    /// one while the compositor still holds the other two, making the layer
-    /// allocate its third.
+    /// A present the layer cannot make wait asks on the presenting thread
+    /// instead, unless an earlier request is still out. `may_wait` is false
+    /// only while no drawable the layer presented is still waiting to be
+    /// displayed and that count is known to be exact: the compositor then
+    /// holds at most the drawable on screen, so the layer has one to give at
+    /// once. Every present hang of a second or more in the field was made
+    /// with a drawable in flight or with the count overstated. Handing the
+    /// request to the acquire thread and sleeping until it answers costs a
+    /// steady window about 100 µs of main-thread time and 70 µs of CPU per
+    /// present, and asking for the next frame's drawable ahead of time
+    /// instead would hold one while the compositor still holds the other two,
+    /// making the layer allocate its third.
     ///
     /// Only for a detached layer: a display link hands out its own.
     fn acquire_drawable(
@@ -2008,45 +1873,6 @@ impl MetalRenderer {
         (size.width.0 > 0 && size.height.0 > 0).then_some(size)
     }
 
-    /// Whether this layer's drawable is ready at the size the layer has, or
-    /// the present would not ask the acquire thread for one at all.
-    fn drawable_ready_at_current_size(&self, asked: Option<bool>) -> bool {
-        let (Some(_), Some(acquirer), Some(viewport_size)) =
-            (asked, &self.drawable_acquirer, self.layer_viewport_size())
-        else {
-            return true;
-        };
-        acquirer.ready_fits(|drawable| drawable_matches(drawable, viewport_size))
-    }
-
-    /// Whether the layer may make a present wait for a drawable: false only
-    /// while no drawable it presented is still waiting to be displayed and
-    /// that count is known to be exact. The compositor then holds at most
-    /// the drawable on screen, so the layer has one to give at once.
-    /// Every present hang of a second or more in the field was made with a
-    /// drawable in flight or with the count overstated.
-    fn drawable_may_wait(&mut self) -> bool {
-        let Some(layer) = self.layer.clone() else {
-            return false;
-        };
-        let (in_flight, overstated) = self.read_drawables_in_flight(&layer);
-        in_flight > 0 || overstated
-    }
-
-    /// [`Self::request_drawable`] for a present the layer may make wait; one
-    /// it cannot asks on the presenting thread (see
-    /// [`Self::acquire_drawable`]), unless a request is already out.
-    fn request_drawable_if_it_may_wait(&mut self) -> Option<bool> {
-        let idle = self
-            .drawable_acquirer
-            .as_ref()
-            .is_none_or(DrawableAcquirer::is_idle);
-        if idle && !self.drawable_may_wait() {
-            return None;
-        }
-        self.request_drawable()
-    }
-
     /// Whether the drawable [`Self::request_drawable`] asked for is ready,
     /// waiting for it as [`Self::acquire_drawable`] describes.
     fn wait_for_drawable(&mut self, asked: Option<bool>, deadline: Instant) -> bool {
@@ -2063,42 +1889,6 @@ impl MetalRenderer {
             return true;
         }
         acquirer.wait(Some(if asked { deadline } else { Instant::now() }))
-    }
-
-    /// Gets both of a layered window's drawables ready before either layer
-    /// presents, so the two planes never land on different frames: an
-    /// overlay that deferred after its base landed would not be retried.
-    /// Both are asked for before either is waited on, so the two waits
-    /// overlap. Returns whether both came back at the size their layer has
-    /// now; a drawable that did is kept for the retry when the other did not.
-    /// A plane a display link drives already holds its drawable.
-    ///
-    /// A drawable that came back at an earlier size (the window was resized
-    /// while a present was deferred) is released and asked for again once,
-    /// within the same wait: accepting it would let the base present and
-    /// leave the overlay to reject it and defer, and that deferral is never
-    /// retried, since the present reports the base's outcome.
-    pub fn ready_layered_drawables(base: &mut Self, overlay: &mut Self) -> bool {
-        let deadline = Instant::now() + base.drawable_wait;
-        let mut retried = false;
-        loop {
-            let base_asked = base.request_drawable_if_it_may_wait();
-            let overlay_asked = overlay.request_drawable_if_it_may_wait();
-            let came_back = base.wait_for_drawable(base_asked, deadline)
-                && overlay.wait_for_drawable(overlay_asked, deadline);
-            if !came_back {
-                return false;
-            }
-            if base.drawable_ready_at_current_size(base_asked)
-                && overlay.drawable_ready_at_current_size(overlay_asked)
-            {
-                return true;
-            }
-            if retried {
-                return false;
-            }
-            retried = true;
-        }
     }
 
     /// What a present that got no drawable reports. The frame stays owed
@@ -2283,7 +2073,7 @@ impl MetalRenderer {
                     self.stale_texture_heals,
                 );
             }
-            self.recreate_intermediate_textures(viewport_size)?;
+            self.update_intermediate_textures(viewport_size)?;
         }
 
         let mut writer = InstanceBufferWriter::new(
@@ -2333,12 +2123,10 @@ impl MetalRenderer {
         // Every present goes through here, so this is where a frame's sprite
         // tiles count as used; it also retires tiles idle for too long. Only
         // once the frame has actually been encoded: a frame that failed above
-        // drew nothing, so it must not age the atlas. An overlay renderer's
-        // scene was marked by its window's base draw and belongs to the same
-        // present, so it neither marks nor advances (see `note_scene_tiles`).
-        // An attribution render draws the frame on screen again; counting it
-        // would age the atlas faster than the window presents.
-        if !self.shares_atlas_frame && !self.attributing {
+        // drew nothing, so it must not age the atlas. An attribution render
+        // draws the frame on screen again; counting it would age the atlas
+        // faster than the window presents.
+        if !self.attributing {
             self.sprite_atlas.on_frame_drawn(scene);
         }
         self.publish_depth_memory();
@@ -3821,12 +3609,12 @@ fn build_pipeline_state(
         // The ordinary "over" blend. The shaders emit straight colour, so
         // `rgb = src * a + dst * (1 - a)` with `alpha = a + dst_a * (1 - a)` is
         // exactly premultiplied-over against the premultiplied drawable. The
-        // alpha term only shows on a target that is not already opaque — the
-        // transparent overlay layer above a native view, or a glass window's
-        // translucent surfaces — where an additive destination factor let a
-        // translucent surface over its own shadow saturate to alpha 1 while
-        // its colour still carried only the surface's share: the surface over
-        // black rather than over the page.
+        // alpha term only shows on a target that is not already opaque — a
+        // layer that lets a native view beneath it show through, or a glass
+        // window's translucent surfaces — where an additive destination
+        // factor let a translucent surface over its own shadow saturate to
+        // alpha 1 while its colour still carried only the surface's share:
+        // the surface over black rather than over the page.
         MTLBlendFactor::One,
         MTLBlendFactor::OneMinusSourceAlpha,
     )
@@ -4406,12 +4194,11 @@ mod gpu_stats_tests {
     }
 }
 /// The ordinary blend must be premultiplied-over in alpha as well as colour.
-/// Over a transparent target (the overlay layer above a native view, a glass
-/// window's translucent surfaces) an additive destination alpha saturates the
-/// alpha of stacked translucent primitives while their colour still carries
-/// only their own share, so the composited pixel reads as the top surface over
-/// black — a popup on the overlay plane darker and less see-through than the
-/// same popup on the base plane.
+/// Over a transparent target (a layer showing a native view beneath it, a
+/// glass window's translucent surfaces) an additive destination alpha
+/// saturates the alpha of stacked translucent primitives while their colour
+/// still carries only their own share, so the composited pixel reads as the
+/// top surface over black, darker and less see-through than intended.
 #[cfg(test)]
 mod alpha_blend_tests {
     use super::{InstanceBufferPool, MetalRenderer};
@@ -4659,26 +4446,6 @@ mod submission_retention_tests {
         drop(submissions);
         assert!(renderer.can_draw());
     }
-
-    #[test]
-    fn layered_preflight_bounds_retries_without_retiring_unfinished_submissions() {
-        if objc2_metal::MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
-        let mut renderer =
-            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false, false).expect("creating a Metal renderer");
-        let submissions: Vec<_> = (0..MAX_UNFINISHED_SUBMISSIONS)
-            .map(|_| InFlightSubmission::try_acquire(&renderer.unfinished_submissions))
-            .collect();
-        for _ in 0..super::MAX_CONSECUTIVE_DEFERRED_PRESENTS {
-            assert_eq!(renderer.submission_queue_full_outcome(), Some(PresentOutcome::Deferred));
-        }
-        assert_eq!(renderer.submission_queue_full_outcome(), Some(PresentOutcome::Dropped));
-        assert!(!renderer.can_draw());
-        drop(submissions);
-        assert_eq!(renderer.submission_queue_full_outcome(), None);
-        assert!(renderer.can_draw());
-    }
 }
 
 #[cfg(test)]
@@ -4774,22 +4541,21 @@ mod render_memory_tests {
     }
 
     /// A renderer reports the depth attachment it holds, follows it as it is
-    /// released and as it is lent to an overlay renderer and back, and the
-    /// process-wide gauge carries at least what it reports.
+    /// released, and the process-wide gauge carries at least what it reports.
     #[test]
-    fn depth_attachments_are_reported_by_whichever_renderer_holds_them() {
+    fn a_renderer_reports_the_depth_attachment_it_holds() {
         let gauge = RenderMemoryGauge::DepthTextures;
         let full_screen = gpui::size(DevicePixels(3456), DevicePixels(2168));
-        let mut base = headless();
-        assert_eq!(base.render_memory.published(gauge), 0);
+        let mut renderer = headless();
+        assert_eq!(renderer.render_memory.published(gauge), 0);
 
-        base.update_drawable_size(full_screen);
-        base.publish_depth_memory();
-        let held = base
+        renderer.update_drawable_size(full_screen);
+        renderer.publish_depth_memory();
+        let held = renderer
             .depth_texture
             .as_ref()
             .map_or(0, |texture| texture.allocatedSize() as u64);
-        if !base.is_apple_gpu {
+        if !renderer.is_apple_gpu {
             // A private texture: two bytes per pixel, never tile memory.
             assert!(
                 held >= 3456 * 2168 * 2,
@@ -4801,23 +4567,14 @@ mod render_memory_tests {
             full_screen.width.0,
             full_screen.height.0,
             held,
-            base.depth_texture.as_ref().map(|texture| texture.storageMode()),
+            renderer.depth_texture.as_ref().map(|texture| texture.storageMode()),
         );
-        assert_eq!(base.render_memory.published(gauge), held);
+        assert_eq!(renderer.render_memory.published(gauge), held);
         assert!(gpui::render_memory_gauges().depth_texture_bytes >= held);
 
-        // Lent to an overlay renderer, the bytes move with the textures.
-        let mut overlay = headless();
-        overlay.lend_intermediates(base.take_intermediates());
-        assert_eq!(base.render_memory.published(gauge), 0);
-        assert_eq!(overlay.render_memory.published(gauge), held);
-        base.lend_intermediates(overlay.take_intermediates());
-        assert_eq!(base.render_memory.published(gauge), held);
-        assert_eq!(overlay.render_memory.published(gauge), 0);
-
         // A hidden window's release is seen without a draw.
-        base.release_intermediate_textures();
-        assert_eq!(base.render_memory.published(gauge), 0);
+        renderer.release_intermediate_textures();
+        assert_eq!(renderer.render_memory.published(gauge), 0);
     }
 }
 
@@ -5058,46 +4815,6 @@ mod stale_texture_healing_tests {
         assert_eq!(
             renderer.stale_texture_heals, heals_before,
             "a rebuild after release is not a stale-texture heal"
-        );
-    }
-
-    /// An overlay renderer never allocates drawable-sized intermediates of
-    /// its own: it draws with the base renderer's, handed over per draw.
-    #[test]
-    fn borrowing_renderer_draws_with_lent_intermediates_and_allocates_none() {
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut base = MetalRenderer::new_headless(pool.clone()).expect("creating a headless Metal renderer");
-        let mut overlay = MetalRenderer::new_headless(pool).expect("creating a headless Metal renderer");
-        overlay.borrows_intermediates = true;
-        let size = gpui::size(DevicePixels(64), DevicePixels(64));
-
-        overlay.update_drawable_size(size);
-        assert!(
-            overlay.depth_texture.is_none(),
-            "a borrowing renderer must not allocate on resize"
-        );
-        overlay.release_intermediate_textures();
-        assert!(!overlay.intermediate_textures_released);
-
-        base.render_scene_to_image(&solid_quad_scene(32.), size)
-            .expect("base render succeeds");
-        let base_depth = base.depth_texture.clone().expect("base owns a depth texture");
-
-        overlay.lend_intermediates(base.take_intermediates());
-        assert!(base.depth_texture.is_none());
-        let image = overlay
-            .render_scene_to_image(&solid_quad_scene(32.), size)
-            .expect("overlay render succeeds with lent textures");
-        let center = image.get_pixel(16, 16);
-        assert!(center[0] > 200 && center[1] < 60 && center[2] < 60, "got {center:?}");
-        base.lend_intermediates(overlay.take_intermediates());
-
-        assert!(overlay.depth_texture.is_none());
-        let returned = base.depth_texture.as_ref().expect("textures returned to base");
-        assert_eq!(
-            objc2::rc::Retained::as_ptr(returned),
-            objc2::rc::Retained::as_ptr(&base_depth),
-            "the same depth texture must come back, not a fresh allocation"
         );
     }
 
@@ -5513,82 +5230,6 @@ mod present_report_tests {
         assert_eq!(report.outcome, PresentOutcome::Presented);
     }
 
-    /// A layered window's planes defer together: when one plane's drawable
-    /// does not come back, neither presents, and the other's drawable is kept
-    /// for the retry rather than asked for again.
-    #[test]
-    fn layered_drawables_are_ready_only_when_both_planes_have_one() {
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut base = MetalRenderer::new(pool.clone(), false, false).expect("creating a Metal renderer");
-        let mut overlay = base
-            .new_sharing_atlas(pool, true)
-            .expect("creating an overlay renderer");
-        for renderer in [&mut base, &mut overlay] {
-            renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
-        }
-        base.drawable_wait = DRAWABLE_WAIT;
-        mark_drawable_in_flight(&mut base);
-        mark_drawable_in_flight(&mut overlay);
-        gate(&overlay).close();
-
-        assert!(!MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
-        assert_eq!(base.request_drawable(), Some(false), "the base's drawable is kept");
-
-        gate(&overlay).open();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay) {
-            assert!(Instant::now() < deadline, "the overlay's drawable came back");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(base.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
-        assert_eq!(overlay.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
-    }
-
-    /// An overlay drawable that came back at a size the window no longer has
-    /// is released and asked for again before either plane presents, so the
-    /// base cannot land while the overlay rejects its drawable and defers.
-    #[test]
-    fn layered_drawables_from_before_a_resize_are_asked_for_again() {
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut base = MetalRenderer::new(pool.clone(), false, false).expect("creating a Metal renderer");
-        let mut overlay = base
-            .new_sharing_atlas(pool, true)
-            .expect("creating an overlay renderer");
-        for renderer in [&mut base, &mut overlay] {
-            renderer.update_drawable_size(gpui::size(DevicePixels(64), DevicePixels(64)));
-        }
-        mark_drawable_in_flight(&mut base);
-        mark_drawable_in_flight(&mut overlay);
-        // Primed with the tests' long wait: allocating the first drawables on
-        // a busy machine can take longer than a refresh.
-        assert!(MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
-        base.drawable_wait = DRAWABLE_WAIT;
-
-        for renderer in [&mut base, &mut overlay] {
-            renderer.update_drawable_size(gpui::size(DevicePixels(96), DevicePixels(96)));
-        }
-        gate(&overlay).close();
-        assert!(
-            !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay),
-            "the overlay's 64-pixel drawable is not ready for a 96-pixel present"
-        );
-        let resized = gpui::size(DevicePixels(96), DevicePixels(96));
-        let overlay_acquirer = overlay.drawable_acquirer.as_ref().expect("an overlay acquirer");
-        assert!(
-            !overlay_acquirer.ready_fits(|drawable| super::drawable_matches(drawable, resized)),
-            "the stale drawable was released, not kept"
-        );
-
-        gate(&overlay).open();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !MetalRenderer::ready_layered_drawables(&mut base, &mut overlay) {
-            assert!(Instant::now() < deadline, "the overlay's new drawable came back");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(base.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
-        assert_eq!(overlay.draw(&solid_quad_scene(32.)).outcome, PresentOutcome::Presented);
-    }
-
     #[test]
     fn a_headless_renderer_reports_a_dropped_present() {
         let mut renderer =
@@ -5884,45 +5525,6 @@ mod tests {
             .context("a window renderer asks off the main thread")?;
         assert!(acquirer.is_idle(), "nothing was asked of the layer");
         assert_eq!(renderer.request_drawable(), None);
-        Ok(())
-    }
-
-    /// A layered window's base plane a display link drives holds its
-    /// drawable already, so only the overlay's is asked for.
-    #[test]
-    fn layered_drawables_with_a_display_link_ask_only_for_the_overlay() -> Result<()> {
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut base = MetalRenderer::new(pool.clone(), false, false)?;
-        let mut overlay = base.new_sharing_atlas(pool, true)?;
-        let drawable_size = size(DevicePixels(64), DevicePixels(64));
-        base.update_drawable_size(drawable_size);
-        overlay.update_drawable_size(drawable_size);
-        let drawable = base
-            .layer()
-            .and_then(|layer| layer.nextDrawable())
-            .context("window renderer must supply a drawable")?;
-        base.set_display_link_attached(true);
-        base.set_frame_drawable(Some(drawable));
-        // Both layers have a drawable in flight, so both may make a present wait.
-        base.drawables_in_flight.store(1, std::sync::atomic::Ordering::Relaxed);
-        overlay
-            .drawables_in_flight
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-
-        assert!(MetalRenderer::ready_layered_drawables(&mut base, &mut overlay));
-        let base_acquirer = base
-            .drawable_acquirer
-            .as_ref()
-            .context("a window renderer asks off the main thread")?;
-        assert!(base_acquirer.is_idle(), "the base layer was not asked");
-        assert_eq!(
-            base.draw(&Scene::default()).outcome,
-            PresentOutcome::Presented
-        );
-        assert_eq!(
-            overlay.draw(&Scene::default()).outcome,
-            PresentOutcome::Presented
-        );
         Ok(())
     }
 }
@@ -6397,41 +5999,6 @@ mod backdrop_blur_memory_tests {
                 .published(gpui::RenderMemoryGauge::BackdropTextures),
             0
         );
-    }
-
-    /// The overlay plane frosts through the base renderer's scratch, handed
-    /// over with the other intermediates, and a blur there keeps the base
-    /// renderer from retiring it.
-    #[test]
-    fn the_scratch_travels_with_the_lent_intermediates() {
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut base = MetalRenderer::new_headless(pool.clone()).expect("creating a headless Metal renderer");
-        let size = gpui::size(DevicePixels(640), DevicePixels(480));
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(rect(0., 0., 640., 480.), gpui::hsla(0.5, 0.5, 0.5, 1.)));
-        scene.insert_backdrop_blur(BackdropBlur {
-            order: 0,
-            blur_radius: ScaledPixels(16.),
-            saturation: 1.,
-            opacity: 1.,
-            bounds: rect(20., 20., 200., 100.),
-            content_mask: ContentMask { bounds: rect(20., 20., 200., 100.) },
-            corner_radii: Corners::default(),
-        });
-        scene.finish();
-        base.render_scene(&scene, size).expect("headless render succeeds");
-        base.backdrop_idle_frames = 50;
-        let intermediates = base.take_intermediates();
-        assert!(base.backdrop_scratch.is_none());
-        let mut overlay = MetalRenderer::new_headless(pool).expect("creating a headless Metal renderer");
-        overlay.borrows_intermediates = true;
-        overlay.lend_intermediates(intermediates);
-        assert!(overlay.backdrop_scratch.is_some());
-        overlay.render_scene(&scene, size).expect("headless render succeeds");
-        assert_eq!(overlay.backdrop_idle_frames, 0, "a blur on the overlay plane counts as use");
-        base.lend_intermediates(overlay.take_intermediates());
-        assert!(base.backdrop_scratch.is_some());
-        assert_eq!(base.backdrop_idle_frames, 0);
     }
 
     #[test]

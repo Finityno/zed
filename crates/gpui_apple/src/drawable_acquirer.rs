@@ -150,20 +150,6 @@ impl DrawableAcquirer {
         state.requested.is_none() && state.ready.is_none()
     }
 
-    /// Whether an answer is waiting that a present can take: a drawable that
-    /// `fits`, or none at all from a faulted layer, which the present reports
-    /// as it always has.
-    pub(crate) fn ready_fits(
-        &self,
-        fits: impl Fn(&ProtocolObject<dyn CAMetalDrawable>) -> bool,
-    ) -> bool {
-        match &self.shared.state.lock().ready {
-            Some(Some(drawable)) => fits(&drawable.0),
-            Some(None) => true,
-            None => false,
-        }
-    }
-
     /// Releases a drawable that came back and is waiting, unless it `fits`.
     pub(crate) fn release_ready_unless(
         &self,

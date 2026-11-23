@@ -49,12 +49,6 @@ impl MetalAtlas {
         lock.retire_unused(ATLAS_TILE_MAX_IDLE_FRAMES);
     }
 
-    /// Marks `scene`'s tiles as used in the current frame without advancing
-    /// it; see [`crate::metal_renderer::MetalRenderer::note_scene_tiles`].
-    pub fn note_scene_tiles(&self, scene: &Scene) {
-        self.0.lock().mark_scene_tiles(scene);
-    }
-
     /// Device bytes the atlas's textures hold, as (monochrome, polychrome).
     /// Read by the renderer's GPU stats logging.
     pub(crate) fn allocated_bytes(&self) -> (u64, u64) {
