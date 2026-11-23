@@ -12,7 +12,7 @@ use gpui::{
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keymap,
     Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, NativeMenuItem, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PresentOutcome, PresentReport,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PresentReport,
     PromptButton, PromptLevel, RequestFrameOptions, Rgba, SharedString, Size, SystemWindowTab, Task,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowGlassStyle, WindowKind, WindowParams, WindowVisibility, point, px, size,
@@ -74,24 +74,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod native_view_backdrops;
 mod native_views;
 
 const WINDOW_STATE_IVAR: &CStr = c"windowState";
-const OVERLAY_INPUT_IVAR: &CStr = c"overlayInputRegions";
-
-/// Where the overlay plane on screen takes pointer input, in the overlay
-/// view's flipped coordinates; shared with the view, which answers AppKit's
-/// hit tests from it.
-type OverlayHitRegions = Mutex<Vec<Bounds<Pixels>>>;
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
 static mut WINDOW_CLASS: *const AnyClass = ptr::null();
 static mut PANEL_CLASS: *const AnyClass = ptr::null();
 static mut VIEW_CLASS: *const AnyClass = ptr::null();
-static mut OVERLAY_VIEW_CLASS: *const AnyClass = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const AnyClass = ptr::null();
-static mut OVERLAY_BACKDROP_VIEW_CLASS: *const AnyClass = ptr::null();
 static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const AnyClass = ptr::null();
 static mut WINDOW_STATE_UNARCHIVER_CLASS: *const AnyClass = ptr::null();
 static mut CONTEXT_MENU_TARGET_CLASS: *const AnyClass = ptr::null();
@@ -115,39 +108,6 @@ unsafe fn ivar_slot(object: &AnyObject, name: &CStr) -> *mut *mut c_void {
             .instance_variable(name)
             .expect("GPUI instance variable")
             .load_ptr::<*mut c_void>(object)
-    }
-}
-
-/// Takes the point only over an overlay-plane hitbox. Anywhere else the
-/// overlay is transparent to input, so a native child beneath it (a
-/// WKWebView) keeps taking clicks while a popover, tooltip or toast is open
-/// elsewhere in the window.
-extern "C" fn overlay_hit_test(this: &AnyObject, _: Sel, location: NSPoint) -> *mut AnyObject {
-    let regions = unsafe { &*(*ivar_slot(this, OVERLAY_INPUT_IVAR) as *const OverlayHitRegions) };
-    // `hitTest:` gets the point in the superview's coordinates.
-    let (local, height) = unsafe {
-        let superview: *mut AnyObject = msg_send![this, superview];
-        let local: NSPoint = msg_send![this, convertPoint: location, fromView: superview];
-        let bounds: NSRect = msg_send![this, bounds];
-        (local, bounds.size.height)
-    };
-    let position = point(px(local.x as f32), px((height - local.y) as f32));
-    if regions
-        .lock()
-        .iter()
-        .any(|region| region.contains(&position))
-    {
-        ptr::from_ref(this).cast_mut()
-    } else {
-        ptr::null_mut()
-    }
-}
-
-extern "C" fn handle_overlay_event(this: &AnyObject, selector: Sel, native_event: *mut AnyObject) {
-    let window_state = unsafe { get_window_state(this) };
-    let native_view = window_state.lock().native_view;
-    unsafe {
-        handle_view_event(native_view.as_ref(), selector, native_event);
     }
 }
 
@@ -347,50 +307,6 @@ unsafe fn build_classes() {
             native_views::add_view_methods(&mut decl);
             decl.register()
         };
-        OVERLAY_VIEW_CLASS = {
-            let mut decl = ClassBuilder::new(c"GPUIOverlayView", class!(NSView)).unwrap();
-            decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
-            decl.add_ivar::<*mut c_void>(OVERLAY_INPUT_IVAR);
-            decl.add_method(
-                sel!(dealloc),
-                dealloc_overlay_view as extern "C" fn(_, Sel),
-            );
-            decl.add_method(
-                sel!(hitTest:),
-                overlay_hit_test as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
-            );
-            // Same answer as the base view: while the overlay holds content
-            // (a popover left open when the user switched apps) it is the
-            // view AppKit asks, and NSView's default Bool::NO would activate the
-            // window and swallow that first click instead of delivering it.
-            decl.add_method(
-                sel!(acceptsFirstMouse:),
-                accepts_first_mouse as extern "C" fn(_, Sel, *mut AnyObject) -> Bool,
-            );
-            for selector in [
-                sel!(mouseDown:),
-                sel!(mouseUp:),
-                sel!(rightMouseDown:),
-                sel!(rightMouseUp:),
-                sel!(otherMouseDown:),
-                sel!(otherMouseUp:),
-                sel!(mouseMoved:),
-                sel!(mouseExited:),
-                sel!(mouseDragged:),
-                sel!(rightMouseDragged:),
-                sel!(otherMouseDragged:),
-                sel!(scrollWheel:),
-                sel!(magnifyWithEvent:),
-                sel!(swipeWithEvent:),
-                sel!(pressureChangeWithEvent:),
-            ] {
-                decl.add_method(
-                    selector,
-                    handle_overlay_event as extern "C" fn(_, Sel, *mut AnyObject),
-                );
-            }
-            decl.register()
-        };
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassBuilder::new(c"BlurredView", class!(NSVisualEffectView)).unwrap();
             decl.add_method(
@@ -400,18 +316,6 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(updateLayer),
                 blurred_view_update_layer as extern "C" fn(_, Sel),
-            );
-            decl.register()
-        };
-        OVERLAY_BACKDROP_VIEW_CLASS = {
-            let mut decl = ClassBuilder::new(c"GPUIOverlayBackdropView", class!(NSView)).unwrap();
-            decl.add_method(
-                sel!(makeBackingLayer),
-                overlay_backdrop_backing_layer as extern "C" fn(_, Sel) -> *mut AnyObject,
-            );
-            decl.add_method(
-                sel!(hitTest:),
-                overlay_backdrop_hit_test as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
             );
             decl.register()
         };
@@ -848,12 +752,6 @@ struct MacWindowState {
     background_executor: BackgroundExecutor,
     native_window: *mut AnyObject,
     native_view: NonNull<AnyObject>,
-    overlay_view: Option<NonNull<AnyObject>>,
-    overlay_backdrops: Vec<OverlayBackdrop>,
-    overlay_input_regions: Arc<OverlayHitRegions>,
-    /// The overlay input regions of the frame drawn last, which take effect
-    /// once that frame presents.
-    pending_overlay_hit_regions: Vec<Bounds<Pixels>>,
     blurred_view: Option<*mut AnyObject>,
     // Requested glass backdrop tint; applied to `blurred_view` when it is an
     // `NSGlassEffectView`, remembered here so recreations reapply it.
@@ -889,11 +787,6 @@ struct MacWindowState {
     /// this window keeps drawing unlike a visible window's.
     _hidden_rendering_activity: Option<gpui::ActivityGuard>,
     renderer: renderer::Renderer,
-    overlay_renderer: Option<renderer::Renderer>,
-    /// The layered present's two halves; see `draw_layered`.
-    base_scene: gpui::Scene,
-    overlay_scene: gpui::Scene,
-    renderer_context: renderer::Context,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -957,6 +850,7 @@ struct MacWindowState {
     /// newer invocation can tell it was superseded and skip presenting.
     context_menu_generation: u64,
     native_views: native_views::NativeViews,
+    native_view_backdrops: native_view_backdrops::Backdrops,
 }
 
 /// Everything a presented native context menu keeps alive: the `NSMenu`, its
@@ -1022,9 +916,6 @@ impl Drop for ActiveContextMenu {
 impl MacWindowState {
     fn set_presents_with_transaction(&mut self, enabled: bool) {
         self.renderer.set_presents_with_transaction(enabled);
-        if let Some(renderer) = self.overlay_renderer.as_mut() {
-            renderer.set_presents_with_transaction(enabled);
-        }
     }
 
     fn move_traffic_light(&mut self) {
@@ -1203,9 +1094,6 @@ impl MacWindowState {
             return;
         }
         self.renderer.release_intermediate_textures();
-        if let Some(renderer) = self.overlay_renderer.as_mut() {
-            renderer.release_intermediate_textures();
-        }
     }
 
     /// `window_state` is the handle this state lives in; a Metal display
@@ -1538,10 +1426,6 @@ impl MacWindow {
                 background_executor,
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
-                overlay_view: None,
-                overlay_backdrops: Vec::new(),
-                overlay_input_regions: Arc::new(Mutex::new(Vec::new())),
-                pending_overlay_hit_regions: Vec::new(),
                 blurred_view: None,
                 glass_tint: None,
                 glass_style: WindowGlassStyle::Regular,
@@ -1564,10 +1448,6 @@ impl MacWindow {
                     )
                 }),
                 renderer,
-                overlay_renderer: None,
-                base_scene: gpui::Scene::default(),
-                overlay_scene: gpui::Scene::default(),
-                renderer_context,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1617,6 +1497,7 @@ impl MacWindow {
                 active_context_menu: None,
                 context_menu_generation: 0,
                 native_views: native_views::NativeViews::default(),
+                native_view_backdrops: native_view_backdrops::Backdrops::default(),
             }));
             let mut window = Self(state, marker, metal_frames);
 
@@ -1867,112 +1748,6 @@ impl MacWindow {
     }
 }
 
-impl MacWindow {
-    /// Presents `scene` on the window's layer, or on its base and overlay
-    /// layers while a scene overlay is enabled.
-    fn present_layered(&self, scene: &gpui::Scene, overlay_start: usize) -> PresentReport {
-        let mut this = self.0.lock();
-        if this.overlay_renderer.is_none() {
-            // Every present comes through here (gpui core never calls `draw`),
-            // so the occluded-window release has to happen on this branch too
-            // or a window without an overlay keeps the intermediates a stray
-            // draw rebuilt while it was hidden.
-            let report = this.renderer.draw(scene);
-            this.release_intermediates_if_occluded();
-            return report;
-        }
-
-        // Both planes must have capacity before either is presented. Once
-        // drawing starts, only completion callbacks can change these counts,
-        // and they only return capacity.
-        if let Some(outcome) = this.renderer.submission_queue_full_outcome()
-            .or_else(|| this.overlay_renderer.as_mut()
-                .and_then(|renderer| renderer.submission_queue_full_outcome()))
-        {
-            this.release_intermediates_if_occluded();
-            return PresentReport {
-                outcome,
-                breakdown: gpui::PresentBreakdown {
-                    layers: 2,
-                    ..Default::default()
-                },
-            };
-        }
-        let this = &mut *this;
-        // Both planes must have a drawable before either is presented too,
-        // for the same reason; neither is waited on for longer than one
-        // plane alone would be.
-        let acquire_start = Instant::now();
-        if let Some(overlay_renderer) = this.overlay_renderer.as_mut()
-            && !renderer::Renderer::ready_layered_drawables(&mut this.renderer, overlay_renderer)
-        {
-            this.release_intermediates_if_occluded();
-            return PresentReport {
-                outcome: PresentOutcome::Deferred,
-                breakdown: gpui::PresentBreakdown {
-                    acquire: acquire_start.elapsed(),
-                    layers: 2,
-                    ..Default::default()
-                },
-            };
-        }
-        let acquire_duration = acquire_start.elapsed();
-        let split_start = Instant::now();
-        // The two halves are kept across presents so their vectors hold
-        // their capacity, instead of being allocated and freed per frame for
-        // as long as the overlay exists.
-        scene.split_planes_into(overlay_start, &mut this.base_scene, &mut this.overlay_scene);
-
-        this.renderer.note_scene_tiles(&this.overlay_scene);
-        let split_duration = split_start.elapsed();
-        let mut report = this.renderer.draw(&this.base_scene);
-        report.breakdown.acquire += acquire_duration;
-        report.breakdown.encode += split_duration;
-        if report.outcome != PresentOutcome::Presented {
-            // Presenting the overlay over a base that did not land would put
-            // the two planes on different frames. A deferred base is retried
-            // and the retry presents both; a dropped one leaves both on the
-            // frame before, as a window without an overlay is left. Input
-            // keeps following the overlay that is still on screen.
-            this.release_intermediates_if_occluded();
-            return report;
-        }
-        // The overlay draws with the base renderer's drawable-sized
-        // intermediates rather than a second set of its own.
-        let intermediates = this.renderer.take_intermediates();
-        let overlay_renderer = this
-            .overlay_renderer
-            .as_mut()
-            .expect("overlay renderer checked above");
-        overlay_renderer.lend_intermediates(intermediates);
-        let overlay_report = overlay_renderer.draw(&this.overlay_scene);
-        let intermediates = overlay_renderer.take_intermediates();
-        this.renderer.lend_intermediates(intermediates);
-        // Input follows the overlay on screen: an overlay that did not
-        // present leaves the previous frame's there, and its regions with it.
-        if overlay_report.outcome == PresentOutcome::Presented {
-            let mut regions = this.overlay_input_regions.lock();
-            regions.clear();
-            regions.extend_from_slice(&this.pending_overlay_hit_regions);
-        }
-        this.release_intermediates_if_occluded();
-        this.sync_overlay_backdrops();
-
-        report.breakdown.accumulate(overlay_report.breakdown);
-        // The base layer holds the window's content, so the present's
-        // outcome is the base's. An overlay layer whose drawable size is
-        // still zero drops every frame, and reporting that as the frame's
-        // outcome would count every frame as lost while the content was
-        // reaching the screen. An overlay that defers after the base landed
-        // is not retried: its plane keeps the previous frame until the window
-        // next presents. Its drawable was ready before the base drew, so it
-        // defers only when that drawable came back at a size the layer no
-        // longer has and the one asked for in its place did not come in time.
-        report.breakdown.overlay_outcome = Some(overlay_report.outcome);
-        report
-    }
-}
-
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
@@ -1987,7 +1762,7 @@ impl Drop for MacWindow {
         // renderer's command queue are actually released with the window.
         drop(this.accesskit_adapter.take());
         this.renderer.destroy();
-        this.remove_overlay_backdrops();
+        this.native_view_backdrops.remove_all();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
@@ -3007,14 +2782,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw(&self, scene: &gpui::Scene) {
-        let mut this = self.0.lock();
-        let native_view_layout = native_views::plan_layout(&this, scene);
-        native_views::update_background(&mut this, scene);
-        native_views::scene_drawn(&mut this, scene);
-        this.renderer.draw(scene);
-        this.release_intermediates_if_occluded();
-        drop(this);
-        native_views::apply_layout(&self.0, native_view_layout);
+        self.draw_layered(scene, scene.len());
     }
 
     unsafe fn attach_native_view(
@@ -3046,124 +2814,23 @@ impl PlatformWindow for MacWindow {
         self.0.lock().native_views.key_down_before_callback = Some(callback);
     }
 
-    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) -> PresentReport {
-        let native_view_layout = {
-            let mut this = self.0.lock();
-            let layout = native_views::plan_layout(&this, scene);
-            native_views::update_background(&mut this, scene);
-            native_views::scene_drawn(&mut this, scene);
-            layout
-        };
-        let report = self.present_layered(scene, overlay_start);
+    fn draw_layered(&self, scene: &gpui::Scene, _overlay_start: usize) -> PresentReport {
+        let mut this = self.0.lock();
+        let native_view_layout = native_views::plan_layout(&this, scene);
+        let backdrops = native_view_backdrops::plan(&this, scene);
+        native_views::update_background(&mut this, scene);
+        native_views::scene_drawn(&mut this, scene);
+        // Every present comes through here (gpui core never calls `draw`),
+        // so the occluded-window release has to happen here too, or a window
+        // keeps the intermediates a stray draw rebuilt while it was hidden.
+        let report = this.renderer.draw(scene);
+        this.release_intermediates_if_occluded();
+        drop(this);
         // After the present, with the window state unlocked: AppKit calls
         // back into the window as a view's frame or first responder changes.
         native_views::apply_layout(&self.0, native_view_layout);
+        native_view_backdrops::apply(&self.0, backdrops);
         report
-    }
-
-    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
-        let window_state = self.0.clone();
-        let mut this = self.0.lock();
-        if this.overlay_renderer.is_some() {
-            // A native child view created after the overlay (e.g. a lazily
-            // built WKWebView) lands above it in AppKit's subview order.
-            // Re-adding the overlay on repeat calls restores it to the top.
-            if let Some(overlay_view) = this.overlay_view {
-                unsafe {
-                    let native_view = this.native_view.as_ptr();
-                    let overlay_view = overlay_view.as_ptr();
-                    let _: *mut AnyObject = msg_send![overlay_view, retain];
-                    let _: () = msg_send![overlay_view, removeFromSuperview];
-                    let _: () = msg_send![native_view, addSubview: overlay_view];
-                    let _: () = msg_send![overlay_view, release];
-                    // The backdrop views belong between the native children
-                    // and the overlay, so they follow it above the new child.
-                    for backdrop in &this.overlay_backdrops {
-                        let _: () = msg_send![
-                            native_view,
-                            addSubview: backdrop.view.as_ptr(),
-                            positioned: NSWindowOrderingMode::Below,
-                            relativeTo: overlay_view
-                        ];
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        // Made before the view, whose ivars take references that a failure
-        // after them would leak.
-        let mut overlay_renderer =
-            renderer::new_overlay_renderer(this.renderer_context.clone(), &this.renderer)?;
-
-        unsafe {
-            let native_view = this.native_view.as_ptr();
-            let frame: NSRect = msg_send![native_view, bounds];
-            let overlay_view: *mut AnyObject = msg_send![OVERLAY_VIEW_CLASS, alloc];
-            let overlay_view: *mut AnyObject = msg_send![overlay_view, initWithFrame: frame];
-            anyhow::ensure!(
-                !overlay_view.is_null(),
-                "failed to create GPUI overlay NSView"
-            );
-            *ivar_slot(&*overlay_view, WINDOW_STATE_IVAR) =
-                Arc::into_raw(window_state).cast_mut().cast::<c_void>();
-            *ivar_slot(&*overlay_view, OVERLAY_INPUT_IVAR) =
-                Arc::into_raw(this.overlay_input_regions.clone()).cast_mut().cast::<c_void>();
-
-            let scale_factor = this.scale_factor();
-            overlay_renderer
-                .update_drawable_size(this.content_size().to_device_pixels(scale_factor));
-            let overlay_layer = overlay_renderer.layer_ptr().cast::<AnyObject>();
-            if !overlay_layer.is_null() {
-                let _: () = msg_send![overlay_layer, setContentsScale: scale_factor as f64];
-            }
-
-            let _: () = msg_send![overlay_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
-            let _: () = msg_send![overlay_view, setWantsLayer: Bool::YES];
-            let _: () = msg_send![overlay_view, setLayer: overlay_layer];
-            let _: () = msg_send![
-                overlay_view,
-                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize
-            ];
-
-            // wry has already inserted WKWebView by the time this API is called.
-            // Adding the overlay last places it above the WebView in AppKit's
-            // back-to-front subview order.
-            let overlay_view: *mut AnyObject = msg_send![overlay_view, autorelease];
-            let _: () = msg_send![native_view, addSubview: overlay_view];
-            this.overlay_view = NonNull::new(overlay_view);
-            this.overlay_renderer = Some(overlay_renderer);
-        }
-
-        Ok(())
-    }
-
-    fn set_overlay_hit_regions(&self, regions: &[Bounds<Pixels>]) {
-        let mut this = self.0.lock();
-        this.pending_overlay_hit_regions.clear();
-        this.pending_overlay_hit_regions.extend_from_slice(regions);
-    }
-
-    fn disable_scene_overlay(&self) {
-        let mut this = self.0.lock();
-        let Some(overlay_view) = this.overlay_view.take() else {
-            return;
-        };
-        // The overlay must stop claiming input before the view goes: a hit
-        // test racing the removal would otherwise route a click into a view
-        // that is being torn down.
-        this.overlay_input_regions.lock().clear();
-        this.remove_overlay_backdrops();
-        // The superview held the only strong reference (the view was added
-        // autoreleased), so removing it deallocates the view, which drops the
-        // window-state and input-flag references its ivars carried.
-        unsafe {
-            let _: () = msg_send![overlay_view.as_ptr(), removeFromSuperview];
-        }
-        // Dropping the renderer releases the overlay's CAMetalLayer and its
-        // drawables. Its borrowed intermediates were handed back to the base
-        // renderer at the end of the last layered draw, so nothing is lost.
-        this.overlay_renderer = None;
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3710,155 +3377,6 @@ fn add_mouse_tracking_area(native_view: &NSView) {
     native_view.addTrackingArea(&tracking_area);
 }
 
-extern "C" fn dealloc_overlay_view(this: &AnyObject, _: Sel) {
-    unsafe {
-        drop_window_state(this);
-        let raw: *mut c_void = *ivar_slot(this, OVERLAY_INPUT_IVAR);
-        drop(Arc::from_raw(raw as *const OverlayHitRegions));
-        let _: () = msg_send![super(this, class!(NSView)), dealloc];
-    }
-}
-
-// A backdrop layer samples the window's composited layer tree live, so it
-// sees a WKWebView child the Metal planes cannot. A within-window
-// NSVisualEffectView would not do: its materials may blur a cached image of
-// the window, which never includes a layer-hosted WebKit view.
-extern "C" fn overlay_backdrop_backing_layer(_: &AnyObject, _: Sel) -> *mut AnyObject {
-    unsafe {
-        let layer: *mut AnyObject = msg_send![class!(CABackdropLayer), layer];
-        let _: () = msg_send![layer, setAllowsInPlaceFiltering: Bool::NO];
-        // Sampling at half resolution halves the blur's cost and is
-        // indistinguishable under a gaussian this wide.
-        let _: () = msg_send![layer, setScale: 0.5f64];
-        layer
-    }
-}
-
-extern "C" fn overlay_backdrop_hit_test(_: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
-    ptr::null_mut()
-}
-
-/// The native blur under one frosted surface on the overlay plane, and the
-/// filter settings last applied to it.
-struct OverlayBackdrop {
-    view: NonNull<AnyObject>,
-    blur_radius: f64,
-    saturation: f64,
-}
-
-impl MacWindowState {
-    /// Places a native backdrop view under every backdrop blur on the overlay
-    /// plane. The overlay's Metal target holds only overlay content, so its
-    /// own blur pass has nothing of the page or the base plane beneath a
-    /// popover to sample; these views sit between the native children and the
-    /// overlay view and blur both from the compositor's layer tree instead.
-    fn sync_overlay_backdrops(&mut self) {
-        let Some(overlay_view) = self.overlay_view else {
-            self.remove_overlay_backdrops();
-            return;
-        };
-        let blur_count = self.overlay_scene.backdrop_blurs.len();
-        if blur_count == 0 && self.overlay_backdrops.is_empty() {
-            return;
-        }
-        let scale = self.scale_factor() as f64;
-        let view_height = f64::from(f32::from(self.content_size().height));
-        // No explicit CATransaction here: this runs with the window state
-        // locked, and committing an outermost transaction flushes AppKit's
-        // display cycle synchronously, whose tracking-area update calls
-        // `resetCursorRects` and blocks on that same lock. The views'
-        // backing layers are AppKit's, which already suppresses implicit
-        // animations on them.
-        unsafe {
-            while self.overlay_backdrops.len() > blur_count {
-                if let Some(backdrop) = self.overlay_backdrops.pop() {
-                    backdrop.remove();
-                }
-            }
-            let native_view = self.native_view.as_ptr();
-            for index in 0..blur_count {
-                let blur = self.overlay_scene.backdrop_blurs[index];
-                if index == self.overlay_backdrops.len() {
-                    let view: *mut AnyObject = msg_send![OVERLAY_BACKDROP_VIEW_CLASS, alloc];
-                    let view: *mut AnyObject = msg_send![view, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))];
-                    let Some(view) = NonNull::new(view) else {
-                        break;
-                    };
-                    let _: () = msg_send![view.as_ptr(), setWantsLayer: Bool::YES];
-                    let _: () = msg_send![
-                        native_view,
-                        addSubview: view.as_ptr(),
-                        positioned: NSWindowOrderingMode::Below,
-                        relativeTo: overlay_view.as_ptr()
-                    ];
-                    self.overlay_backdrops.push(OverlayBackdrop {
-                        view,
-                        blur_radius: -1.,
-                        saturation: -1.,
-                    });
-                }
-                let backdrop = &mut self.overlay_backdrops[index];
-                let view = backdrop.view.as_ptr();
-                let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
-                let x = f64::from(bounds.origin.x.0) / scale;
-                let width = (f64::from(bounds.size.width.0) / scale).max(0.);
-                let height = (f64::from(bounds.size.height.0) / scale).max(0.);
-                let y = view_height - f64::from(bounds.origin.y.0) / scale - height;
-                let _: () = msg_send![view, setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))];
-                let _: () = msg_send![view, setAlphaValue: f64::from(blur.opacity.clamp(0., 1.))];
-
-                let layer: *mut AnyObject = msg_send![view, layer];
-                if layer.is_null() {
-                    continue;
-                }
-                let _: () = msg_send![layer, setCornerRadius: f64::from(blur.corner_radii.top_left.0) / scale];
-                let _: () = msg_send![layer, setMasksToBounds: Bool::YES];
-                let blur_radius = f64::from(blur.blur_radius.0) / scale;
-                let saturation = f64::from(blur.saturation);
-                if backdrop.blur_radius != blur_radius || backdrop.saturation != saturation {
-                    backdrop.blur_radius = blur_radius;
-                    backdrop.saturation = saturation;
-                    // The render server copies the filters it is given, so
-                    // changing a value means handing it a new array.
-                    let gaussian: *mut AnyObject =
-                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
-                    let radius_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
-                    let _: () = msg_send![gaussian, setValue: radius_value, forKey: ns_string("inputRadius")];
-                    // Clamp at the view's edges rather than fading to
-                    // transparent, as the Metal pass clamps at its copy's.
-                    let yes: *mut AnyObject = msg_send![class!(NSNumber), numberWithBool: Bool::YES];
-                    let _: () = msg_send![gaussian, setValue: yes, forKey: ns_string("inputNormalizeEdges")];
-                    let saturate: *mut AnyObject =
-                        msg_send![class!(CAFilter), filterWithType: ns_string("colorSaturate")];
-                    let amount: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: saturation];
-                    let _: () = msg_send![saturate, setValue: amount, forKey: ns_string("inputAmount")];
-                    let filters: *mut AnyObject =
-                        msg_send![class!(NSArray), arrayWithObjects: [gaussian, saturate].as_ptr(), count: 2usize];
-                    let _: () = msg_send![layer, setFilters: filters];
-                }
-            }
-        }
-    }
-
-    fn remove_overlay_backdrops(&mut self) {
-        for backdrop in self.overlay_backdrops.drain(..) {
-            backdrop.remove();
-        }
-    }
-}
-
-impl OverlayBackdrop {
-    /// Takes the view out of the window and gives up the reference its
-    /// `alloc` returned, which this struct held alongside the superview's.
-    fn remove(self) {
-        unsafe {
-            let view = self.view.as_ptr();
-            let _: () = msg_send![view, removeFromSuperview];
-            let _: () = msg_send![view, release];
-        }
-    }
-}
-
 /// # Safety
 ///
 /// Must be called on the AppKit main thread.
@@ -4374,9 +3892,6 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
         .contains(NSWindowOcclusionState::Visible)
     {
         lock.renderer.restore_drawables();
-        if let Some(renderer) = lock.overlay_renderer.as_mut() {
-            renderer.restore_drawables();
-        }
         lock.move_traffic_light();
         lock.start_display_link(&window_state);
     } else if lock.render_while_hidden {
@@ -4393,11 +3908,6 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
         lock.renderer.release_intermediate_textures();
         lock.renderer.forget_drawables_in_flight();
         lock.renderer.release_drawables();
-        if let Some(renderer) = lock.overlay_renderer.as_mut() {
-            renderer.release_intermediate_textures();
-            renderer.forget_drawables_in_flight();
-            renderer.release_drawables();
-        }
     }
     drop(lock);
     // The only visibility source: AppKit posts this for covering, minimizing,
@@ -4499,15 +4009,6 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     }
 
     lock.renderer.update_drawable_size(drawable_size);
-    if let Some(renderer) = lock.overlay_renderer.as_mut() {
-        let overlay_layer = renderer.layer_ptr().cast::<AnyObject>();
-        if !overlay_layer.is_null() {
-            unsafe {
-                let _: () = msg_send![overlay_layer, setContentsScale: scale_factor as f64];
-            }
-        }
-        renderer.update_drawable_size(drawable_size);
-    }
 
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();
@@ -4760,9 +4261,6 @@ extern "C" fn set_frame_size(this: &AnyObject, _: Sel, size: NSSize) {
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
     lock.renderer.update_drawable_size(drawable_size);
-    if let Some(renderer) = lock.overlay_renderer.as_mut() {
-        renderer.update_drawable_size(drawable_size);
-    }
 
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();

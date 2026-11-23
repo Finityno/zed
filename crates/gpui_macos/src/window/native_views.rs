@@ -456,6 +456,7 @@ pub(super) fn apply_layout(window_state: &Arc<Mutex<MacWindowState>>, layout: La
                 gpui_view: lock.native_view.as_ptr().cast_const().cast(),
                 front_to_back,
                 attached,
+                backdrops: lock.native_view_backdrops.views().collect(),
                 current,
             }
         });
@@ -483,8 +484,10 @@ pub(super) fn apply_layout(window_state: &Arc<Mutex<MacWindowState>>, layout: La
             }
         }
     }
+    // One shown view needs no sorting among native views, but a view shown
+    // for the first time was added in front of any backdrop already there.
     if let Some(mut stacking) = stacking
-        && stacking.front_to_back.len() > 1
+        && (stacking.front_to_back.len() > 1 || !stacking.backdrops.is_empty())
     {
         // SAFETY: The GPUI view is live and in the content view, the comparison
         // function only reads `stacking`, which outlives the call, and sorting
@@ -514,6 +517,9 @@ struct Stacking {
     /// The containers of the views the scene shows, starting with the one painted last.
     front_to_back: Vec<*const NSView>,
     attached: Vec<*const NSView>,
+    /// The views that frost a native view beneath a blur painted over it,
+    /// which belong in front of every native view.
+    backdrops: Vec<*const NSView>,
     /// The subviews as they are ordered now, from the back. Those that aren't
     /// native views keep their places among themselves and their side of the
     /// GPUI view.
@@ -525,7 +531,9 @@ impl Stacking {
     fn rank(&self, view: *const NSView) -> (u8, usize) {
         let place = |view| self.current.iter().position(|current| *current == view);
         if view == self.gpui_view {
-            (3, 0)
+            (4, 0)
+        } else if self.backdrops.contains(&view) {
+            (3, place(view).unwrap_or_default())
         } else if let Some(index) = self.front_to_back.iter().position(|shown| *shown == view) {
             // Shown views sit above hidden ones, in the scene's order.
             (2, self.front_to_back.len() - index)
@@ -533,7 +541,7 @@ impl Stacking {
             (1, 0)
         } else if place(view) > place(self.gpui_view) {
             // A view the app put in front of GPUI's content stays there.
-            (4, place(view).unwrap_or_default())
+            (5, place(view).unwrap_or_default())
         } else {
             // Other views, such as the blur behind a translucent window, stay
             // at the back.
@@ -1576,15 +1584,16 @@ mod tests {
     #[test]
     fn stacking_puts_shown_views_between_the_gpui_view_and_everything_else() {
         // The views are only compared by address.
-        let views = [0u8; 6];
-        let [gpui_view, front, back, hidden, behind, above] =
-            [0, 1, 2, 3, 4, 5].map(|index| NonNull::from(&views[index]).cast::<NSView>());
+        let views = [0u8; 7];
+        let [gpui_view, front, back, hidden, behind, above, backdrop] =
+            [0, 1, 2, 3, 4, 5, 6].map(|index| NonNull::from(&views[index]).cast::<NSView>());
         // AppKit draws later subviews in front, and sorts ascending.
-        let mut back_to_front = [front, behind, gpui_view, hidden, above, back];
+        let mut back_to_front = [front, backdrop, behind, gpui_view, hidden, above, back];
         let mut stacking = Stacking {
             gpui_view: gpui_view.as_ptr(),
             front_to_back: vec![front.as_ptr(), back.as_ptr()],
             attached: vec![hidden.as_ptr(), back.as_ptr(), front.as_ptr()],
+            backdrops: vec![backdrop.as_ptr()],
             current: back_to_front
                 .iter()
                 .map(|view| view.as_ptr().cast_const())
@@ -1600,10 +1609,11 @@ mod tests {
                 NSComparisonResult::Descending => std::cmp::Ordering::Greater,
             }
         });
-        // Views that aren't native views stay on their side of the GPUI view.
+        // Views that aren't native views stay on their side of the GPUI view,
+        // and a backdrop goes between the native views and the GPUI view.
         assert_eq!(
             back_to_front,
-            [behind, hidden, back, front, gpui_view, above]
+            [behind, hidden, back, front, backdrop, gpui_view, above]
         );
     }
 

@@ -152,9 +152,9 @@ best starting point for new applications:
   `close` closes the window and returns to headless mode.
 - `layer_shell` demonstrates Linux layer-shell windows.
 - `list_example` demonstrates bottom-aligned list state and scrollbar behavior.
-- `native_webview` demonstrates the macOS native-surface overlay API with a
-  directly hosted `WKWebView`, without depending on wry. It also demonstrates
-  click-anywhere overlay dismissal and native-focus handoff back to GPUI.
+- `native_view` composites a `WKWebView` into a window with GPUI content
+  drawn under and over it, and `native_view_appkit_field` does the same with
+  an AppKit text field. macOS only.
 - `ownership_post` supports the ownership and data-flow documentation.
 - `paths_bench` is a path rendering benchmark.
 - `tree` renders a deep tree of nested elements.
