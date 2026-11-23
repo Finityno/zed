@@ -1244,6 +1244,30 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.close.set(Some(callback));
     }
 
+    /// On Windows `view` is the `IDCompositionVisual` of a native surface this
+    /// window created with `create_native_surface`, as its `platform_handle`
+    /// hands it out. Returns `None` when DirectComposition is disabled, when
+    /// `view` is not one of this window's portals, or when a native view is
+    /// already attached to it.
+    ///
+    /// While attached, GPUI places the portal from every drawn scene: at the
+    /// native view's bounds clipped to its content mask, or hidden when the
+    /// scene does not show it, committed with that frame's present. The
+    /// portal's own `set_bounds` and `set_visible` are ignored meanwhile.
+    /// Dropping the attachment detaches the portal and hides it.
+    ///
+    /// Focus, hit testing and key routing keep the trait's defaults:
+    /// composition-hosted content gets no window input of its own, so the
+    /// embedder forwards pointer input from its own hitbox and follows the
+    /// native view's focus handle.
+    unsafe fn attach_native_view(
+        &self,
+        id: NativeViewId,
+        view: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        self.state.renderer.borrow_mut().attach_native_view(id, view)
+    }
+
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
         self.0
             .state
@@ -1277,13 +1301,13 @@ impl PlatformWindow for WindowsWindow {
             .render_to_image(scene, self.effective_clear_color())
     }
 
-    fn draw_layered(&self, scene: &Scene, overlay_start: usize) -> PresentReport {
+    /// The whole scene goes to the one swap chain: native surfaces sit beneath
+    /// it and show through the holes the renderer erases where their native
+    /// views are, so there is no plane above them to split off.
+    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) -> PresentReport {
         let clear_color = self.effective_clear_color();
         let mut renderer = self.state.renderer.borrow_mut();
-        let outcome = match renderer
-            .draw_layered(scene, overlay_start, clear_color)
-            .log_err()
-        {
+        let outcome = match renderer.draw(scene, clear_color).log_err() {
             // A renderer recovering a lost device skips the frame and still
             // reports success; the recovery forces a render of its own.
             Some(()) if renderer.skipping_draws() => PresentOutcome::Dropped,
@@ -1294,14 +1318,6 @@ impl PlatformWindow for WindowsWindow {
             outcome,
             breakdown: PresentBreakdown::default(),
         }
-    }
-
-    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
-        self.state.renderer.borrow_mut().enable_scene_overlay()
-    }
-
-    fn disable_scene_overlay(&self) {
-        self.state.renderer.borrow_mut().disable_scene_overlay();
     }
 
     fn create_native_surface(&self) -> anyhow::Result<Rc<dyn PlatformNativeSurface>> {

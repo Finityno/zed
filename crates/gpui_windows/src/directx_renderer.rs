@@ -1,7 +1,10 @@
 use std::{
+    any::Any,
     cell::Cell,
+    ffi::c_void,
     ops::Range,
-    rc::Rc,
+    ptr::NonNull,
+    rc::{Rc, Weak},
     slice,
     sync::{Arc, OnceLock},
 };
@@ -53,16 +56,6 @@ pub(crate) struct DirectXRenderer {
     atlas: Arc<DirectXAtlas>,
     devices: Option<DirectXRendererDevices>,
     resources: Option<DirectXResources>,
-    overlay_resources: Option<OverlayResources>,
-    /// The plane the frame in progress is drawing into: the base swap chain,
-    /// or the overlay while `draw_layered` encodes the overlay scene. Anything
-    /// that rebinds render targets mid-scene (a backdrop blur) must come back
-    /// to that plane's target, not always the base plane's.
-    ///
-    /// The plane, never its render target view: a view kept here across
-    /// frames is an outstanding reference to a swap chain back buffer, and
-    /// `ResizeBuffers` refuses while one exists.
-    active_plane: ScenePlane,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
@@ -78,10 +71,10 @@ pub(crate) struct DirectXRenderer {
     /// skipped as unchanged.
     resize_failed: bool,
     /// What a device-lost recovery in progress rebuilds: whether
-    /// DirectComposition was off and whether the overlay was on, taken by
-    /// its first attempt from the resources it then releases. An attempt
-    /// that fails has released them, so a retry reads them from here.
-    recovering_composition: Option<(bool, bool)>,
+    /// DirectComposition was off, taken by its first attempt from the
+    /// resources it then releases. An attempt that fails has released them,
+    /// so a retry reads it from here.
+    recovering_composition: Option<bool>,
 
     /// Render into an owned offscreen texture rather than the swap chain, so frames can be
     /// read back. Preserved across device-lost recovery.
@@ -134,21 +127,6 @@ struct DirectXResources {
     headless: bool,
 }
 
-/// One of the two surfaces a layered frame is encoded into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScenePlane {
-    /// The base swap chain, beneath every native surface.
-    Base,
-    /// The transparent swap chain above them ([`OverlayResources`]).
-    Overlay,
-}
-
-struct OverlayResources {
-    swap_chain: IDXGISwapChain1,
-    render_target: Option<ID3D11Texture2D>,
-    render_target_view: Option<ID3D11RenderTargetView>,
-}
-
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
@@ -163,6 +141,17 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    /// Erases a native view's rect: blending is off, so its transparent
+    /// output replaces what was drawn beneath the view.
+    native_views: PipelineState<NativeViewInstance>,
+}
+
+/// `NativeView` in shaders.hlsl.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct NativeViewInstance {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
 }
 
 #[derive(Default)]
@@ -172,10 +161,7 @@ struct FrameScratch {
     path_paints: Vec<PathPaint>,
     path_curves: Vec<PathCurve>,
     path_tiles: Vec<PathTile>,
-    /// The layered present's two halves, kept so their vectors hold their
-    /// capacity across frames instead of being allocated per present.
-    base_scene: Scene,
-    overlay_scene: Scene,
+    native_views: Vec<NativeViewInstance>,
 }
 
 struct DirectXGlobalElements {
@@ -208,8 +194,14 @@ struct DirectComposition {
     #[allow(dead_code)]
     root_visual: IDCompositionVisual,
     base_visual: IDCompositionVisual,
+    /// Beneath `base_visual`: native surfaces show through the holes the
+    /// renderer erases in the scene where their native views are.
     portal_container: IDCompositionVisual,
-    overlay_visual: IDCompositionVisual,
+    /// Every portal created under this tree that may still be alive, so an
+    /// attached one can be found from its visual and placed from each scene.
+    portals: Vec<Weak<DirectCompositionPortal>>,
+    /// The attached native views the last placed scene showed, back to front.
+    stacking: Vec<NativeViewId>,
 }
 
 struct DirectCompositionPortal {
@@ -217,11 +209,78 @@ struct DirectCompositionPortal {
     container: IDCompositionVisual,
     visual: IDCompositionVisual,
     clip: IDCompositionRectangleClip,
-    visible: Cell<bool>,
-    /// The bounds last committed. Prepaint places every portal each frame,
-    /// and a DirectComposition commit for bounds that did not change is work
-    /// the compositor does for nothing.
-    bounds: Cell<Option<Bounds<DevicePixels>>>,
+    /// Whether `visual` is a child of `container`, which is what shows it.
+    in_container: Cell<bool>,
+    control: Cell<PortalControl>,
+}
+
+/// Who places a portal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PortalControl {
+    /// The host, through [`PlatformNativeSurface::set_bounds`] and
+    /// [`PlatformNativeSurface::set_visible`].
+    Host {
+        /// The bounds last committed. Prepaint places every portal each
+        /// frame, and a DirectComposition commit for bounds that did not
+        /// change is work the compositor does for nothing.
+        bounds: Option<Bounds<DevicePixels>>,
+    },
+    /// GPUI, from every drawn scene, while a native view is attached to it.
+    Attached {
+        id: NativeViewId,
+        placement: AppliedPlacement,
+    },
+}
+
+/// What the visual tree holds for an attached portal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AppliedPlacement {
+    /// A change was not committed, so the next scene places it again.
+    Unknown,
+    Hidden,
+    Shown(PortalPlacement),
+}
+
+/// Where an attached portal shows, in device pixels from the top left of the
+/// window's client area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PortalPlacement {
+    /// The whole view, where its content is laid out.
+    bounds: Bounds<DevicePixels>,
+    /// The part of `bounds` its content mask leaves visible.
+    visible: Bounds<DevicePixels>,
+}
+
+impl PortalPlacement {
+    /// Returns `None` when the content mask leaves none of the view visible.
+    fn new(bounds: Bounds<ScaledPixels>, content_mask: Bounds<ScaledPixels>) -> Option<Self> {
+        // Edges are rounded on their own, as the rasterizer covers the pixels
+        // whose centres the hole's edges enclose.
+        let to_device = |bounds: Bounds<ScaledPixels>| {
+            let left = bounds.origin.x.0.round() as i32;
+            let top = bounds.origin.y.0.round() as i32;
+            let right = (bounds.origin.x.0 + bounds.size.width.0).round() as i32;
+            let bottom = (bounds.origin.y.0 + bounds.size.height.0).round() as i32;
+            Bounds {
+                origin: point(DevicePixels(left), DevicePixels(top)),
+                size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
+            }
+        };
+        let visible = to_device(bounds.intersect(&content_mask));
+        if visible.size.width.0 <= 0 || visible.size.height.0 <= 0 {
+            return None;
+        }
+        Some(Self {
+            bounds: to_device(bounds),
+            visible,
+        })
+    }
+}
+
+/// Keeps a native view attached to its portal. Dropping it hands the portal
+/// back to its host, hidden.
+struct PortalAttachment {
+    portal: Weak<DirectCompositionPortal>,
 }
 
 impl DirectXRendererDevices {
@@ -293,8 +352,6 @@ impl DirectXRenderer {
             atlas,
             devices: Some(devices),
             resources: Some(resources),
-            overlay_resources: None,
-            active_plane: ScenePlane::Base,
             globals,
             pipelines,
             direct_composition,
@@ -351,11 +408,6 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition: None,
-            // Overlays exist to compose native child views under the window's DirectComposition
-            // tree, which a headless renderer has no window for. Rendering to an owned texture
-            // never needs one.
-            overlay_resources: None,
-            active_plane: ScenePlane::Base,
             font_info: Self::get_font_info(),
             frame_scratch: FrameScratch::default(),
             width: 1,
@@ -437,29 +489,9 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    /// The render target view of `plane`, while that plane has a surface.
-    fn plane_render_target_view(
-        &self,
-        plane: ScenePlane,
-    ) -> Result<&Option<ID3D11RenderTargetView>> {
-        match plane {
-            ScenePlane::Base => Ok(&self
-                .resources
-                .as_ref()
-                .context("resources missing")?
-                .render_target_view),
-            ScenePlane::Overlay => Ok(&self
-                .overlay_resources
-                .as_ref()
-                .context("overlay resources missing")?
-                .render_target_view),
-        }
-    }
-
-    fn pre_draw(&mut self, plane: ScenePlane, clear_color: &[f32; 4]) -> Result<()> {
-        self.active_plane = plane;
-        let render_target_view = self.plane_render_target_view(plane)?;
-        let resources = self.resources.as_ref().expect("resources missing");
+    fn pre_draw(&mut self, clear_color: &[f32; 4]) -> Result<()> {
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target_view = &resources.render_target_view;
         let device_context = &self
             .devices
             .as_ref()
@@ -541,9 +573,9 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let (disable_direct_composition, overlay_enabled) = *self
+        let disable_direct_composition = *self
             .recovering_composition
-            .get_or_insert((self.direct_composition.is_none(), self.overlay_resources.is_some()));
+            .get_or_insert(self.direct_composition.is_none());
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -558,7 +590,6 @@ impl DirectXRenderer {
             self.rounded_clip_buffer.take();
             self.rounded_clip_view.take();
             self.rounded_clip_capacity = 0;
-            self.overlay_resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -597,16 +628,6 @@ impl DirectXRenderer {
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
-        let overlay_resources = if overlay_enabled {
-            let overlay = OverlayResources::new(&devices, self.width, self.height)?;
-            direct_composition
-                .as_ref()
-                .context("DirectComposition missing for overlay")?
-                .set_overlay_swap_chain(&overlay.swap_chain)?;
-            Some(overlay)
-        } else {
-            None
-        };
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
@@ -619,7 +640,6 @@ impl DirectXRenderer {
         }
         self.devices = Some(devices);
         self.resources = Some(resources);
-        self.overlay_resources = overlay_resources;
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
@@ -692,7 +712,17 @@ impl DirectXRenderer {
         self.render(scene, clear_color)?;
         self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
         self.atlas.on_frame_drawn(scene);
-        self.present()
+        let placed = self
+            .direct_composition
+            .as_mut()
+            .is_some_and(|composition| composition.place_native_views(scene));
+        let presented = self.present();
+        // Committed right after the present, so the compositor takes the
+        // moved portals and the frame with their holes moved together.
+        if placed && let Some(composition) = self.direct_composition.as_mut() {
+            composition.commit_native_view_placement();
+        }
+        presented
     }
 
     /// Clear the base render target to `clear_color` and encode every
@@ -701,129 +731,29 @@ impl DirectXRenderer {
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
     /// instead), so the two cannot drift.
     fn render(&mut self, scene: &Scene, clear_color: [f32; 4]) -> Result<()> {
-        self.pre_draw(ScenePlane::Base, &clear_color)?;
+        self.pre_draw(&clear_color)?;
         self.draw_scene(scene)
     }
 
-    pub(crate) fn draw_layered(
-        &mut self,
-        scene: &Scene,
-        overlay_start: usize,
-        clear_color: [f32; 4],
-    ) -> Result<()> {
-        if self.overlay_resources.is_none() {
-            return self.draw(scene, clear_color);
-        }
-        if self.skip_draws || self.quiesce_if_device_lost() || !self.can_draw() {
-            return Ok(());
-        }
-        let result = self.draw_layered_inner(scene, overlay_start, clear_color);
-        self.absorb_device_lost(result)
-    }
-
-    fn draw_layered_inner(
-        &mut self,
-        scene: &Scene,
-        overlay_start: usize,
-        clear_color: [f32; 4],
-    ) -> Result<()> {
-        // Taken out of the scratch for the draw, since drawing needs the
-        // renderer mutably, and put back afterwards whatever happened.
-        let mut base_scene = std::mem::take(&mut self.frame_scratch.base_scene);
-        let mut overlay_scene = std::mem::take(&mut self.frame_scratch.overlay_scene);
-        // Replaying copies primitives as they were painted, so each plane is
-        // also moved to now: a shimmer, a pulse or a turning spinner drawn
-        // through the split would otherwise stand still.
-        scene.split_planes_into(overlay_start, &mut base_scene, &mut overlay_scene);
-        let result = self.draw_layered_scenes(scene, &base_scene, &overlay_scene, clear_color);
-        self.frame_scratch.base_scene = base_scene;
-        self.frame_scratch.overlay_scene = overlay_scene;
-        result
-    }
-
-    fn draw_layered_scenes(
-        &mut self,
-        scene: &Scene,
-        base_scene: &Scene,
-        overlay_scene: &Scene,
-        clear_color: [f32; 4],
-    ) -> Result<()> {
-        self.pre_draw(ScenePlane::Base, &clear_color)?;
-        self.draw_scene(base_scene)?;
-
-        self.pre_draw(ScenePlane::Overlay, &[0.0; 4])?;
-        self.draw_scene(overlay_scene)?;
-        self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
-        // Both planes are replays of `scene`, so marking it covers every tile
-        // this present draws, before anything idle is retired.
-        self.atlas.on_frame_drawn(scene);
-
-        count(Count::Present);
-        count(Count::Present);
-        unsafe {
-            self.resources
-                .as_ref()
-                .context("resources missing")?
-                .swap_chain
-                .Present(0, DXGI_PRESENT(0))
-                .ok()
-                .context("presenting base swap chain")?;
-            self.overlay_resources
-                .as_ref()
-                .context("overlay resources missing")?
-                .swap_chain
-                .Present(0, DXGI_PRESENT(0))
-                .ok()
-                .context("presenting overlay swap chain")?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn enable_scene_overlay(&mut self) -> Result<()> {
-        if self.overlay_resources.is_some() {
-            return Ok(());
-        }
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let overlay = OverlayResources::new(devices, self.width, self.height)?;
-        self.direct_composition
-            .as_ref()
-            .context("DirectComposition is disabled")?
-            .set_overlay_swap_chain(&overlay.swap_chain)?;
-        self.overlay_resources = Some(overlay);
-        Ok(())
-    }
-
-    /// Detaches and drops the overlay swap chain, so the next draw renders the
-    /// whole scene into the base swap chain again. Portals already created by
-    /// [`Self::create_native_surface`] keep their visuals; the caller disables
-    /// the overlay only once the last of them is gone.
-    pub(crate) fn disable_scene_overlay(&mut self) {
-        let Some(overlay) = self.overlay_resources.take() else {
-            return;
-        };
-        if let Some(composition) = self.direct_composition.as_ref() {
-            composition
-                .clear_overlay_swap_chain()
-                .context("detaching the overlay swap chain from its visual")
-                .log_err();
-        }
-        // The visual no longer references the swap chain, so dropping it here
-        // is the last release; flush so the buffers actually retire instead of
-        // lingering until some later implicit flush (see `recreate_resources`).
-        drop(overlay);
-        if let Some(devices) = self.devices.as_ref() {
-            unsafe { devices.device_context.Flush() };
-        }
-    }
-
     pub(crate) fn create_native_surface(&mut self) -> Result<Rc<dyn PlatformNativeSurface>> {
-        self.enable_scene_overlay()?;
-        Ok(Rc::new(
-            self.direct_composition
-                .as_ref()
-                .context("DirectComposition is disabled")?
-                .create_portal()?,
-        ))
+        let portal = self
+            .direct_composition
+            .as_mut()
+            .context("DirectComposition is disabled")?
+            .create_portal()?;
+        Ok(portal)
+    }
+
+    /// Hands the portal whose visual is `view` to GPUI, which places it from
+    /// every drawn scene from now on. `None` when DirectComposition is off,
+    /// `view` is not a portal this renderer's tree holds, or a native view is
+    /// already attached to it.
+    pub(crate) fn attach_native_view(
+        &mut self,
+        id: NativeViewId,
+        view: NonNull<c_void>,
+    ) -> Option<Box<dyn Any>> {
+        self.direct_composition.as_mut()?.attach_native_view(id, view)
     }
 
     fn upload_rounded_clips(&mut self, scene: &Scene) -> Result<()> {
@@ -884,14 +814,48 @@ impl DirectXRenderer {
         let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
         let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
-        for batch in scene.batches() {
-            let batch_order = scene.batch_order(&batch);
-            while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+        let mut pending_native_views = scene.native_views.iter().enumerate().peekable();
+        // The pass after the last batch is for a blur or a native view above
+        // everything else: the one still frosts what is beneath it, and the
+        // other still shows through.
+        for batch in scene.batches().map(Some).chain(std::iter::once(None)) {
+            let batch_order = batch
+                .as_ref()
+                .map_or(DrawOrder::MAX, |batch| scene.batch_order(batch));
+            loop {
+                // Blurs and native views at or beneath this batch run before
+                // it, in their own order: a blur painted over a view samples
+                // the view's opening, and a view painted over a blur erases
+                // its frost.
+                let next_view_order = pending_native_views
+                    .peek()
+                    .map(|(_, native_view)| native_view.order)
+                    .filter(|order| *order <= batch_order);
+                let blur = match next_view_order {
+                    Some(view_order) => pending_blurs.next_if(|blur| blur.order < view_order),
+                    None => pending_blurs.next_if(|blur| blur.order <= batch_order),
+                };
+                if let Some(blur) = blur {
+                    let _annotation = annotation.as_ref().map(|annotation| {
+                        Annotation::new(annotation, HSTRING::from("backdrop blur"))
+                    });
+                    self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
+                    continue;
+                }
+                let Some((index, _)) = pending_native_views
+                    .next_if(|(_, native_view)| native_view.order <= batch_order)
+                else {
+                    break;
+                };
                 let _annotation = annotation
                     .as_ref()
-                    .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
-                self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
+                    .map(|annotation| Annotation::new(annotation, HSTRING::from("native view")));
+                self.draw_native_view(index, quad_depth(quad_cursor))
+                    .context("erasing a native view's rect")?;
             }
+            let Some(batch) = batch else {
+                break;
+            };
 
             let _annotation = annotation
                 .as_ref()
@@ -950,13 +914,6 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        // A blur above everything else still frosts what is beneath it.
-        for blur in pending_blurs {
-            let _annotation = annotation
-                .as_ref()
-                .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
-            self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
-        }
 
         self.pipelines.opaque_quad_pipeline.disable_depth(
             &self
@@ -966,9 +923,27 @@ impl DirectXRenderer {
                 .device_context,
         );
 
-        // Presenting is the caller's job: `draw_layered` renders the base and
-        // overlay scenes through here before presenting either swap chain.
         Ok(())
+    }
+
+    /// Erases the rect of the scene's native view at `index`, so the portal
+    /// beneath the swap chain shows through it. Drawn depth-tested at
+    /// `depth`, the depth of the quads painted so far, an opaque quad painted
+    /// over the view and already drawn by the depth prepass keeps its pixels.
+    fn draw_native_view(&mut self, index: usize, depth: f32) -> Result<()> {
+        self.set_viewport_depth_range(depth, depth)?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.pipelines.native_views.draw_range(
+            &devices.device_context,
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            4,
+            u32::try_from(index).context("native view index overflows u32")?,
+            1,
+            None,
+        )
     }
 
     /// Render `scene` to an offscreen CPU image **without presenting** so
@@ -1137,21 +1112,14 @@ impl DirectXRenderer {
         self.device_is_lost()
     }
 
-    /// Whether every plane the next frame draws into has a render target. A
-    /// failed resize leaves a swap chain without one until it is retried.
+    /// Whether the swap chain has a render target for the next frame. A
+    /// failed resize leaves it without one until it is retried.
     fn can_draw(&self) -> bool {
-        if self.resize_failed {
-            return false;
-        }
-        let base = self
-            .resources
-            .as_ref()
-            .is_some_and(|resources| resources.render_target_view.is_some());
-        let overlay = self
-            .overlay_resources
-            .as_ref()
-            .is_none_or(|overlay| overlay.render_target_view.is_some());
-        base && overlay
+        !self.resize_failed
+            && self
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.render_target_view.is_some())
     }
 
     fn resize_buffers(&mut self, width: u32, height: u32) -> Result<()> {
@@ -1187,10 +1155,6 @@ impl DirectXRenderer {
             self.resize_count,
             private_commit_label(),
         );
-
-        if let Some(overlay) = self.overlay_resources.as_mut() {
-            overlay.resize(devices, width, height)?;
-        }
 
         unsafe {
             devices.device_context.OMSetRenderTargets(
@@ -1292,6 +1256,22 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.polychrome_sprites,
+            )?;
+        }
+
+        if !scene.native_views.is_empty() {
+            let native_views = &mut self.frame_scratch.native_views;
+            native_views.clear();
+            native_views.extend(scene.native_views.iter().map(|native_view| {
+                NativeViewInstance {
+                    bounds: native_view.bounds,
+                    content_mask: native_view.content_mask.bounds,
+                }
+            }));
+            self.pipelines.native_views.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                native_views,
             )?;
         }
 
@@ -1557,8 +1537,8 @@ impl DirectXRenderer {
     }
 
     /// Whether draws are being skipped while a lost device is recovered or a
-    /// failed resize waits to be retried. `draw` and `draw_layered` return
-    /// `Ok` without presenting then, both when the renderer was already
+    /// failed resize waits to be retried. `draw` returns `Ok` without
+    /// presenting then, both when the renderer was already
     /// parked and when the device went away mid-frame, so after a successful
     /// draw this says nothing was shown.
     pub(crate) fn skipping_draws(&self) -> bool {
@@ -1685,6 +1665,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let native_views = PipelineState::new(
+            device,
+            "native_view_pipeline",
+            ShaderModule::NativeView,
+            4,
+            create_opaque_blend_state(device)?,
+        )?;
         let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
 
         Ok(Self {
@@ -1699,6 +1686,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            native_views,
         })
     }
 }
@@ -1710,12 +1698,10 @@ impl DirectComposition {
         let root_visual = unsafe { comp_device.CreateVisual() }?;
         let base_visual = unsafe { comp_device.CreateVisual() }?;
         let portal_container = unsafe { comp_device.CreateVisual() }?;
-        let overlay_visual = unsafe { comp_device.CreateVisual() }?;
 
         unsafe {
             root_visual.AddVisual(&base_visual, false, None)?;
-            root_visual.AddVisual(&portal_container, true, &base_visual)?;
-            root_visual.AddVisual(&overlay_visual, true, &portal_container)?;
+            root_visual.AddVisual(&portal_container, false, &base_visual)?;
             comp_target.SetRoot(&root_visual)?;
             comp_device.Commit()?;
         }
@@ -1726,7 +1712,8 @@ impl DirectComposition {
             root_visual,
             base_visual,
             portal_container,
-            overlay_visual,
+            portals: Vec::new(),
+            stacking: Vec::new(),
         })
     }
 
@@ -1738,24 +1725,7 @@ impl DirectComposition {
         Ok(())
     }
 
-    pub fn set_overlay_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
-        unsafe {
-            self.overlay_visual.SetContent(swap_chain)?;
-            self.comp_device.Commit()?;
-        }
-        Ok(())
-    }
-
-    pub fn clear_overlay_swap_chain(&self) -> Result<()> {
-        unsafe {
-            self.overlay_visual
-                .SetContent(None::<&windows::core::IUnknown>)?;
-            self.comp_device.Commit()?;
-        }
-        Ok(())
-    }
-
-    fn create_portal(&self) -> Result<DirectCompositionPortal> {
+    fn create_portal(&mut self) -> Result<Rc<DirectCompositionPortal>> {
         let visual = unsafe { self.comp_device.CreateVisual() }?;
         let clip = unsafe { self.comp_device.CreateRectangleClip() }?;
         unsafe {
@@ -1763,20 +1733,194 @@ impl DirectComposition {
             self.portal_container.AddVisual(&visual, true, None)?;
             self.comp_device.Commit()?;
         }
-        Ok(DirectCompositionPortal {
+        let portal = Rc::new(DirectCompositionPortal {
             comp_device: self.comp_device.clone(),
             container: self.portal_container.clone(),
             visual,
             clip,
-            visible: Cell::new(true),
-            bounds: Cell::new(None),
-        })
+            in_container: Cell::new(true),
+            control: Cell::new(PortalControl::Host { bounds: None }),
+        });
+        self.portals.retain(|portal| portal.strong_count() > 0);
+        self.portals.push(Rc::downgrade(&portal));
+        Ok(portal)
+    }
+
+    fn attach_native_view(
+        &mut self,
+        id: NativeViewId,
+        view: NonNull<c_void>,
+    ) -> Option<Box<dyn Any>> {
+        self.portals.retain(|portal| portal.strong_count() > 0);
+        let portal = self
+            .portals
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|portal| portal.visual.as_raw() == view.as_ptr())?;
+        if !matches!(portal.control.get(), PortalControl::Host { .. }) {
+            return None;
+        }
+        // Hidden until a drawn scene shows the view.
+        let placement = match portal.hide().and_then(|()| portal.commit()) {
+            Ok(()) => AppliedPlacement::Hidden,
+            Err(error) => {
+                log::error!("hiding a portal a native view was attached to: {error:#}");
+                AppliedPlacement::Unknown
+            }
+        };
+        portal.control.set(PortalControl::Attached { id, placement });
+        Some(Box::new(PortalAttachment {
+            portal: Rc::downgrade(&portal),
+        }))
+    }
+
+    /// Places every attached portal where `scene` shows its native view,
+    /// clipped to the view's content mask, and hides the others, without
+    /// committing. Returns whether anything changed, which the caller commits
+    /// with [`Self::commit_native_view_placement`].
+    fn place_native_views(&mut self, scene: &Scene) -> bool {
+        self.portals.retain(|portal| portal.strong_count() > 0);
+        if self.portals.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut attached = Vec::new();
+        for portal in self.portals.iter().filter_map(Weak::upgrade) {
+            let PortalControl::Attached { id, placement } = portal.control.get() else {
+                continue;
+            };
+            let wanted = scene
+                .native_views
+                .iter()
+                .find(|native_view| native_view.id == id)
+                .and_then(|native_view| {
+                    PortalPlacement::new(native_view.bounds, native_view.content_mask.bounds)
+                });
+            let wanted_placement = match wanted {
+                Some(wanted) => AppliedPlacement::Shown(wanted),
+                None => AppliedPlacement::Hidden,
+            };
+            if placement != wanted_placement {
+                changed = true;
+                let result = match wanted {
+                    Some(wanted) => portal.place(wanted).and_then(|()| portal.show()),
+                    None => portal.hide(),
+                };
+                let placement = match result {
+                    Ok(()) => wanted_placement,
+                    Err(error) => {
+                        log::error!("placing a native view's portal: {error:#}");
+                        AppliedPlacement::Unknown
+                    }
+                };
+                portal.control.set(PortalControl::Attached { id, placement });
+            }
+            attached.push((id, portal));
+        }
+
+        // The scene's native views are in draw order, so the ones painted
+        // later, which belong in front, come last.
+        let stacking: Vec<NativeViewId> = scene
+            .native_views
+            .iter()
+            .map(|native_view| native_view.id)
+            .filter(|id| {
+                attached.iter().any(|(attached_id, portal)| {
+                    attached_id == id && portal.in_container.get()
+                })
+            })
+            .collect();
+        if stacking != self.stacking {
+            changed = true;
+            for id in &stacking {
+                if let Some((_, portal)) = attached.iter().find(|(attached_id, _)| attached_id == id)
+                {
+                    portal
+                        .raise()
+                        .context("stacking a native view's portal")
+                        .log_err();
+                }
+            }
+            self.stacking = stacking;
+        }
+        changed
+    }
+
+    /// Commits what [`Self::place_native_views`] changed. A failed commit
+    /// leaves the tree unknown, so the next scene places every portal again.
+    fn commit_native_view_placement(&mut self) {
+        let Err(error) = (unsafe { self.comp_device.Commit() }) else {
+            return;
+        };
+        log::error!("committing native view placement: {error}");
+        self.stacking.clear();
+        for portal in self.portals.iter().filter_map(Weak::upgrade) {
+            if let PortalControl::Attached { id, .. } = portal.control.get() {
+                portal.control.set(PortalControl::Attached {
+                    id,
+                    placement: AppliedPlacement::Unknown,
+                });
+            }
+        }
     }
 }
 
+impl DirectCompositionPortal {
+    fn commit(&self) -> Result<()> {
+        unsafe { self.comp_device.Commit() }?;
+        Ok(())
+    }
+
+    fn show(&self) -> Result<()> {
+        if !self.in_container.get() {
+            unsafe { self.container.AddVisual(&self.visual, true, None) }?;
+            self.in_container.set(true);
+        }
+        Ok(())
+    }
+
+    fn hide(&self) -> Result<()> {
+        if self.in_container.get() {
+            unsafe { self.container.RemoveVisual(&self.visual) }?;
+            self.in_container.set(false);
+        }
+        Ok(())
+    }
+
+    /// Moves the portal above its siblings.
+    fn raise(&self) -> Result<()> {
+        self.hide()?;
+        self.show()
+    }
+
+    /// Lays the content out at `placement.bounds` and clips it to
+    /// `placement.visible`. The clip is in the visual's own coordinates, after
+    /// its offset, so clipping never moves the content.
+    fn place(&self, placement: PortalPlacement) -> Result<()> {
+        let PortalPlacement { bounds, visible } = placement;
+        let left = (visible.origin.x.0 - bounds.origin.x.0) as f32;
+        let top = (visible.origin.y.0 - bounds.origin.y.0) as f32;
+        unsafe {
+            self.visual.SetOffsetX2(bounds.origin.x.0 as f32)?;
+            self.visual.SetOffsetY2(bounds.origin.y.0 as f32)?;
+            self.clip.SetLeft2(left)?;
+            self.clip.SetTop2(top)?;
+            self.clip.SetRight2(left + visible.size.width.0 as f32)?;
+            self.clip.SetBottom2(top + visible.size.height.0 as f32)?;
+        }
+        Ok(())
+    }
+}
+
+/// While a native view is attached to the portal
+/// ([`DirectXRenderer::attach_native_view`]), GPUI places it from every drawn
+/// scene, and calls to `set_bounds` and `set_visible` are ignored.
 impl PlatformNativeSurface for DirectCompositionPortal {
     fn set_bounds(&self, bounds: Bounds<DevicePixels>) -> Result<()> {
-        if self.bounds.get() == Some(bounds) {
+        let PortalControl::Host { bounds: committed } = self.control.get() else {
+            return Ok(());
+        };
+        if committed == Some(bounds) {
             return Ok(());
         }
         let x = bounds.origin.x.0 as f32;
@@ -1794,23 +1938,24 @@ impl PlatformNativeSurface for DirectCompositionPortal {
         }
         // Recorded only once committed, so bounds that failed to apply are
         // tried again by the next frame.
-        self.bounds.set(Some(bounds));
+        self.control.set(PortalControl::Host {
+            bounds: Some(bounds),
+        });
         Ok(())
     }
 
     fn set_visible(&self, visible: bool) -> Result<()> {
-        if self.visible.get() != visible {
-            unsafe {
-                if visible {
-                    self.container.AddVisual(&self.visual, true, None)?;
-                } else {
-                    self.container.RemoveVisual(&self.visual)?;
-                }
-                self.comp_device.Commit()?;
-            }
-            self.visible.set(visible);
+        if !matches!(self.control.get(), PortalControl::Host { .. })
+            || self.in_container.get() == visible
+        {
+            return Ok(());
         }
-        Ok(())
+        if visible {
+            self.show()?;
+        } else {
+            self.hide()?;
+        }
+        self.commit()
     }
 
     fn platform_handle(&self) -> Box<dyn std::any::Any> {
@@ -1833,47 +1978,17 @@ impl Drop for DirectCompositionPortal {
     }
 }
 
-impl OverlayResources {
-    fn new(devices: &DirectXRendererDevices, width: u32, height: u32) -> Result<Self> {
-        let swap_chain = create_swap_chain_for_composition(
-            &devices.dxgi_factory,
-            &devices.device,
-            width,
-            height,
-        )?;
-        // Never headless: an overlay always has a real composition swap chain to draw into, so
-        // its render target comes from that swap chain's buffer rather than an owned texture.
-        let (render_target, render_target_view) =
-            create_render_target_and_its_view(&swap_chain, &devices.device, width, height, false)?;
-        Ok(Self {
-            swap_chain,
-            render_target: Some(render_target),
-            render_target_view,
-        })
-    }
-
-    fn resize(&mut self, devices: &DirectXRendererDevices, width: u32, height: u32) -> Result<()> {
-        self.render_target.take();
-        self.render_target_view.take();
-        unsafe {
-            self.swap_chain.ResizeBuffers(
-                BUFFER_COUNT as u32,
-                width,
-                height,
-                RENDER_TARGET_FORMAT,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            )?;
-        }
-        let (render_target, render_target_view) = create_render_target_and_its_view(
-            &self.swap_chain,
-            &devices.device,
-            width,
-            height,
-            false,
-        )?;
-        self.render_target = Some(render_target);
-        self.render_target_view = render_target_view;
-        Ok(())
+impl Drop for PortalAttachment {
+    fn drop(&mut self) {
+        let Some(portal) = self.portal.upgrade() else {
+            return;
+        };
+        portal.control.set(PortalControl::Host { bounds: None });
+        portal
+            .hide()
+            .and_then(|()| portal.commit())
+            .context("hiding a portal its native view was detached from")
+            .log_err();
     }
 }
 
@@ -2518,14 +2633,13 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
 /// The ordinary "over" blend. The shaders emit straight (non-premultiplied)
 /// colour, so `rgb = src * a + dst * (1 - a)` and `alpha = a + dst_a * (1 - a)`
 /// together are exactly premultiplied-over against the premultiplied render
-/// target the composition swap chains are declared as. The alpha term matters
-/// on any target that is not already opaque: the transparent overlay plane
-/// above a native surface, and a Mica or blurred window's translucent
-/// surfaces. With an additive `DestBlendAlpha = ONE` a translucent surface over
-/// its own shadow saturated to alpha 1 while its colour still carried only the
-/// surface's share, so the composited pixel was the surface over black instead
-/// of the surface over the page — popups on the overlay plane rendered darker
-/// and less see-through than the same popups on the base plane.
+/// target the composition swap chain is declared as. The alpha term matters
+/// on any target that is not already opaque: the hole erased above a native
+/// view, and a Mica or blurred window's translucent surfaces. With an
+/// additive `DestBlendAlpha = ONE` a translucent surface over its own shadow
+/// saturated to alpha 1 while its colour still carried only the surface's
+/// share, so the composited pixel was the surface over black instead of the
+/// surface over what lies beneath the window's content.
 #[inline]
 fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
@@ -2632,23 +2746,6 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
         device.CreateBlendState(&desc, Some(&mut state))?;
         Ok(state.unwrap())
     }
-}
-
-/// Source-over for a source that is already premultiplied.
-#[inline]
-fn create_premultiplied_over_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    let mut desc = D3D11_BLEND_DESC::default();
-    desc.RenderTarget[0].BlendEnable = true.into();
-    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-    let mut state = None;
-    unsafe { device.CreateBlendState(&desc, Some(&mut state))? };
-    state.context("Creating premultiplied over blend state")
 }
 
 #[inline]
@@ -2812,6 +2909,7 @@ pub(crate) mod shader_resources {
         PolychromeSprite,
         BackdropBlurPass,
         BackdropBlur,
+        NativeView,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2892,6 +2990,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::BackdropBlur => match target {
                     ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
                     ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
+                },
+                ShaderModule::NativeView => match target {
+                    ShaderTarget::Vertex => NATIVE_VIEW_VERTEX_BYTES,
+                    ShaderTarget::Fragment => NATIVE_VIEW_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -2975,6 +3077,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::BackdropBlurPass => "backdrop_blur_pass",
                 ShaderModule::BackdropBlur => "backdrop_blur",
+                ShaderModule::NativeView => "native_view",
             }
         }
     }
@@ -3316,6 +3419,136 @@ mod swap_chain_tests {
     }
 }
 
+/// A native view sits beneath the swap chain and shows through the rect the
+/// scene names: what was painted before it is erased there, down to a
+/// transparent pixel, and what was painted after it covers it, including an
+/// opaque quad the depth prepass drew before the rect was erased.
+#[cfg(test)]
+mod native_view_tests {
+    use super::{DirectXRenderer, PortalPlacement};
+    use crate::DirectXDevices;
+    use gpui::{
+        Background, Bounds, ContentMask, Corners, DevicePixels, Edges, HitboxId, Hsla,
+        NativeViewId, PaintNativeView, Point, Quad, ScaledPixels, Scene,
+    };
+    use gpui_util::ResultExt as _;
+
+    const EXTENT: f32 = 64.;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(color),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    #[test]
+    fn a_native_view_shows_through_what_was_painted_before_it_only() {
+        let Some(devices) = DirectXDevices::new().log_err() else {
+            eprintln!("SKIPPED: no D3D11 adapter");
+            return;
+        };
+        let Some(mut renderer) = DirectXRenderer::new_windowless(&devices, true).log_err() else {
+            eprintln!("SKIPPED: no headless renderer");
+            return;
+        };
+
+        let view = rect(0., 0., EXTENT / 2., EXTENT);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., EXTENT, EXTENT), gpui::red()));
+        scene.insert_native_view(PaintNativeView {
+            order: 0,
+            id: NativeViewId::for_test(1),
+            hitbox_id: HitboxId::placeholder(),
+            bounds: view,
+            content_mask: ContentMask { bounds: view },
+            background: Hsla::transparent_black(),
+        });
+        // An opaque quad over the top of the view, and a translucent one over
+        // its middle.
+        scene.insert_primitive(quad(rect(0., 0., EXTENT / 2., 16.), gpui::blue()));
+        scene.insert_primitive(quad(
+            rect(0., 24., EXTENT / 2., 16.),
+            Hsla::white().opacity(0.5),
+        ));
+        scene.finish();
+        assert_eq!(
+            scene.opaque_quad_indices.len(),
+            2,
+            "both opaque quads take the depth prepass, which is what this checks the view against"
+        );
+
+        renderer
+            .resize(gpui::size(DevicePixels(EXTENT as i32), DevicePixels(EXTENT as i32)))
+            .expect("resizing the headless target succeeds");
+        let image = renderer
+            .render_to_image(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("headless render succeeds");
+        let beside = image.get_pixel(48, 32);
+        let opening = image.get_pixel(16, 52);
+        let opaque_cover = image.get_pixel(16, 8);
+        let translucent_cover = image.get_pixel(16, 32);
+
+        assert!(
+            beside[0] > 200 && beside[2] < 60 && beside[3] == 255,
+            "beside the view the quad painted before it is intact, got {beside:?}"
+        );
+        assert_eq!(
+            opening.0,
+            [0, 0, 0, 0],
+            "the view's rect is erased to a transparent pixel"
+        );
+        assert!(
+            opaque_cover[2] > 200 && opaque_cover[0] < 60 && opaque_cover[3] == 255,
+            "an opaque quad painted after the view covers it, got {opaque_cover:?}"
+        );
+        // Half-transparent white over nothing: premultiplied 0.5 in every
+        // channel, with none of the red that was erased beneath it.
+        let half = (0.5 * 255.0f32).round() as i32;
+        assert!(
+            (0..4).all(|channel| (translucent_cover[channel] as i32 - half).abs() <= 2),
+            "a translucent quad painted after the view lets it show through, got {translucent_cover:?}"
+        );
+    }
+
+    /// The portal's content stays laid out at the view's bounds while the
+    /// content mask clips it, as the clip is relative to the content.
+    #[test]
+    fn a_clipped_portal_keeps_its_content_in_place() {
+        let device = |x: i32, y: i32, width: i32, height: i32| Bounds {
+            origin: gpui::point(DevicePixels(x), DevicePixels(y)),
+            size: gpui::size(DevicePixels(width), DevicePixels(height)),
+        };
+        let placement = PortalPlacement::new(rect(10., 20., 100., 50.), rect(0., 40., 60., 200.))
+            .expect("part of the view is visible");
+        assert_eq!(placement.bounds, device(10, 20, 100, 50));
+        assert_eq!(placement.visible, device(10, 40, 50, 30));
+        assert_eq!(
+            PortalPlacement::new(rect(10., 20., 100., 50.), rect(200., 0., 10., 10.)),
+            None,
+            "a view its content mask hides entirely is not shown"
+        );
+    }
+}
+
 /// Pixel-level verification through the real DirectX pipeline.
 ///
 /// Every other harness in this crate stops at the scene: they prove the right sprites, with the
@@ -3551,12 +3784,11 @@ mod rendered_pixel_tests {
     }
 
     /// The ordinary blend must be premultiplied-over in alpha as well as
-    /// colour. Over a transparent target (the overlay swap chain above a
-    /// composition-hosted WebView2, a Mica window's translucent surfaces) an
-    /// additive destination alpha saturates the alpha of stacked translucent
+    /// colour. Over a transparent target (the hole above a composition-hosted
+    /// WebView2, a Mica window's translucent surfaces) an additive
+    /// destination alpha saturates the alpha of stacked translucent
     /// primitives while their colour still carries only their own share, so
-    /// the composited pixel reads as the top surface over black — a popup on
-    /// the overlay plane darker and less see-through than on the base plane.
+    /// the composited pixel reads as the top surface over black.
     #[test]
     fn translucent_quads_over_a_transparent_target_composite_as_over() {
         if DirectXDevices::new().log_err().is_none() {

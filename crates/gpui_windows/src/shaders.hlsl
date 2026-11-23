@@ -1617,6 +1617,40 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     return rounded_clip_color(color, coverage);
 }
 
+/*
+**
+**              Native views
+**
+*/
+
+// Mirrors `NativeViewInstance` in directx_renderer.rs.
+struct NativeView {
+    Bounds bounds;
+    Bounds content_mask;
+};
+
+struct NativeViewFragmentInput {
+    float4 position: SV_Position;
+};
+
+StructuredBuffer<NativeView> native_views: register(t1);
+
+NativeViewFragmentInput native_view_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    NativeView native_view = native_views[batch_start_index + instance_id];
+    ClippedVertex vertex = clip_to_mask(unit_vertex, native_view.bounds, native_view.content_mask);
+    NativeViewFragmentInput output;
+    output.position = to_device_position_impl(vertex.position);
+    return output;
+}
+
+// Blending is off for this draw, so the transparent pixel replaces whatever
+// was drawn beneath the view and the native surface below the swap chain
+// shows through.
+float4 native_view_fragment(NativeViewFragmentInput input): SV_Target {
+    return float4(0., 0., 0., 0.);
+}
+
 struct RoundedClipNode {
     Bounds bounds;
     Corners corner_radii;

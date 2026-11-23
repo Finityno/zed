@@ -142,11 +142,6 @@ struct BackdropTextures {
     source: BackdropTexture,
     horizontal: BackdropTexture,
     blurred: BackdropTexture,
-    /// The overlay plane's own pixels under the region. On that plane
-    /// `source` holds the base plane with the overlay composited over it,
-    /// which is what the blur frosts, while the unblurred pixel the effect
-    /// mixes with is the overlay's own.
-    plane_copy: Option<BackdropTexture>,
 }
 
 impl BackdropTextures {
@@ -164,7 +159,6 @@ impl BackdropTextures {
                 height.div_ceil(downsample),
                 true,
             )?,
-            plane_copy: None,
         })
     }
 }
@@ -177,9 +171,6 @@ struct BackdropBlurPipeline {
     params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
     replace_blend_state: ID3D11BlendState,
-    /// Premultiplied source-over, for compositing the overlay plane's pixels
-    /// over the base plane's before blurring.
-    over_blend_state: ID3D11BlendState,
 }
 
 impl BackdropBlurPipeline {
@@ -225,7 +216,6 @@ impl BackdropBlurPipeline {
             params_buffer: create_constant_buffer::<BackdropBlurParams>(device)?,
             sampler,
             replace_blend_state: create_opaque_blend_state(device)?,
-            over_blend_state: create_premultiplied_over_blend_state(device)?,
         })
     }
 
@@ -308,7 +298,6 @@ impl BackdropBlurs {
         width: u32,
         height: u32,
         downsample: u32,
-        needs_plane_copy: bool,
     ) -> Result<(&BackdropBlurPipeline, &BackdropTextures)> {
         if self.pipeline.is_none() {
             self.pipeline = Some(BackdropBlurPipeline::new(device)?);
@@ -330,13 +319,6 @@ impl BackdropBlurs {
                 self.textures.push(textures);
             }
         }
-        let textures = self
-            .textures
-            .last_mut()
-            .context("backdrop blur textures missing")?;
-        if needs_plane_copy && textures.plane_copy.is_none() {
-            textures.plane_copy = Some(BackdropTexture::new(device, width, height, false)?);
-        }
         let pipeline = self
             .pipeline
             .as_ref()
@@ -351,11 +333,8 @@ impl BackdropBlurs {
 
 impl DirectXRenderer {
     /// Runs `blur` between two batches: copies the region it samples out of
-    /// the plane being drawn, blurs the copy, and paints the result back
-    /// inside the blur's rounded rect. On the overlay plane the region copied
-    /// is the base plane with the overlay drawn so far composited over it,
-    /// since the overlay's own target holds only what lies above the native
-    /// surfaces. A blur that is entirely clipped draws nothing.
+    /// the render target, blurs the copy, and paints the result back inside
+    /// the blur's rounded rect. A blur that is entirely clipped draws nothing.
     pub(super) fn draw_backdrop_blur(&mut self, blur: &BackdropBlur) -> Result<()> {
         let target_bounds = Bounds::new(
             point(ScaledPixels(0.), ScaledPixels(0.)),
@@ -398,34 +377,17 @@ impl DirectXRenderer {
         let downsample = ((sigma / 8.) as u32).clamp(1, 4);
         let blurred_width = width.div_ceil(downsample);
         let blurred_height = height.div_ceil(downsample);
-        let on_overlay = self.active_plane == ScenePlane::Overlay;
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
-        let (plane_render_target, plane_render_target_view) = match self.active_plane {
-            ScenePlane::Base => (&resources.render_target, &resources.render_target_view),
-            ScenePlane::Overlay => {
-                let overlay = self
-                    .overlay_resources
-                    .as_ref()
-                    .context("overlay resources missing")?;
-                (&overlay.render_target, &overlay.render_target_view)
-            }
-        };
-        let plane_render_target = plane_render_target
-            .as_ref()
-            .context("render target missing")?;
-        let base_render_target = resources
+        let render_target_view = &resources.render_target_view;
+        let render_target = resources
             .render_target
             .as_ref()
             .context("render target missing")?;
-        let (pipeline, textures) = self.backdrop_blurs.prepare(
-            &devices.device,
-            width,
-            height,
-            downsample,
-            on_overlay,
-        )?;
+        let (pipeline, textures) = self
+            .backdrop_blurs
+            .prepare(&devices.device, width, height, downsample)?;
         let device_context = &devices.device_context;
 
         let mut params = BackdropBlurParams {
@@ -467,32 +429,12 @@ impl DirectXRenderer {
                 0,
                 0,
                 0,
-                base_render_target,
+                render_target,
                 0,
                 Some(&region),
             );
         }
-        let original = if on_overlay {
-            let plane_copy = textures
-                .plane_copy
-                .as_ref()
-                .context("backdrop blur plane copy missing")?;
-            unsafe {
-                device_context.CopySubresourceRegion(
-                    &plane_copy.texture,
-                    0,
-                    0,
-                    0,
-                    0,
-                    plane_render_target,
-                    0,
-                    Some(&region),
-                );
-            }
-            plane_copy
-        } else {
-            &textures.source
-        };
+        let original = &textures.source;
 
         self.pipelines
             .opaque_quad_pipeline
@@ -507,20 +449,6 @@ impl DirectXRenderer {
         }
 
         let result = (|| {
-            if on_overlay {
-                // With no taps the pass shader reads each texel exactly once.
-                params.source_size = [original.width as f32, original.height as f32];
-                params.source_extent = [width as f32, height as f32];
-                pipeline.draw_pass(
-                    device_context,
-                    &textures.source,
-                    (width, height),
-                    original,
-                    &params,
-                    &pipeline.over_blend_state,
-                )?;
-            }
-
             params.center_weight = center_weight;
             params.tap_pair_count = tap_pair_count;
             params.source_size = [textures.source.width as f32, textures.source.height as f32];
@@ -566,7 +494,7 @@ impl DirectXRenderer {
             unsafe {
                 device_context.PSSetShaderResources(0, Some(&[None]));
                 device_context.OMSetRenderTargets(
-                    Some(slice::from_ref(plane_render_target_view)),
+                    Some(slice::from_ref(render_target_view)),
                     resources.depth_stencil_view.as_ref(),
                 );
                 device_context.PSSetShaderResources(0, Some(slice::from_ref(&original.view)));
@@ -580,14 +508,14 @@ impl DirectXRenderer {
             anyhow::Ok(())
         })();
 
-        // Whatever happened, the plane's target is bound again for the batches
+        // Whatever happened, the render target is bound again for the batches
         // that follow, and no scratch texture stays bound: a bound texture
         // would survive its release, and the next blur may render into it.
         unsafe {
             device_context.PSSetShaderResources(0, Some(&[None]));
             device_context.PSSetShaderResources(4, Some(&[None]));
             device_context.OMSetRenderTargets(
-                Some(slice::from_ref(plane_render_target_view)),
+                Some(slice::from_ref(render_target_view)),
                 resources.depth_stencil_view.as_ref(),
             );
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
