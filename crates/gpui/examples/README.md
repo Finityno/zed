@@ -154,7 +154,7 @@ best starting point for new applications:
 - `list_example` demonstrates bottom-aligned list state and scrollbar behavior.
 - `native_view` composites a `WKWebView` into a window with GPUI content
   drawn under and over it, and `native_view_appkit_field` does the same with
-  an AppKit text field. macOS only.
+  an AppKit text view. macOS only.
 - `ownership_post` supports the ownership and data-flow documentation.
 - `paths_bench` is a path rendering benchmark.
 - `tree` renders a deep tree of nested elements.

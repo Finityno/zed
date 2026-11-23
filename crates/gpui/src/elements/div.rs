@@ -2747,6 +2747,9 @@ impl Interactivity {
 
         if let Some(scroll_offset) = self.scroll_offset.as_ref() {
             let mut scroll_to_bottom = false;
+            // Where the handle had the element in the last frame, which is
+            // what tells a view that read it whether it moved or resized.
+            let mut bounds_before = bounds;
             if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                 {
                     let mut scroll_handle_state = scroll_handle.0.borrow_mut();
@@ -2754,7 +2757,7 @@ impl Interactivity {
                     // Scrolling to an item needs this frame's bounds and overflow.
                     // What the handle remembers is from the last frame, and is
                     // empty the first time the element is drawn.
-                    scroll_handle_state.bounds = bounds;
+                    bounds_before = mem::replace(&mut scroll_handle_state.bounds, bounds);
                     scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
                 }
                 scroll_handle.scroll_to_active_item();
@@ -2801,14 +2804,13 @@ impl Interactivity {
             // untracked case too, where there is no `ScrollHandle` to read from.
             let max_before = self.scroll_max.as_ref().map(|cell| cell.replace(scroll_max));
 
-            if let Some(mut scroll_handle_state) = tracked_scroll_handle {
+            if let Some(scroll_handle_state) = tracked_scroll_handle {
                 // Views that read the handle are built again only when what
                 // they read changed; see `ScrollHandleState::version`.
-                let changed = scroll_handle_state.bounds.size != bounds.size
+                let changed = bounds_before.size != bounds.size
                     || *scroll_offset != offset_before
                     || max_before != Some(scroll_max);
-                let moved = scroll_handle_state.bounds.origin != bounds.origin;
-                scroll_handle_state.bounds = bounds;
+                let moved = bounds_before.origin != bounds.origin;
                 scroll_handle_state.version.bump_if(changed);
                 scroll_handle_state.placement.bump_if(moved);
             }
@@ -6708,6 +6710,73 @@ mod tests {
 
         // Five 40px items in a 100px strip: the last one ends at 200px.
         assert_eq!(scroll_handle.offset().x, px(-100.));
+    }
+
+    #[gpui::test]
+    fn test_a_scroll_container_that_resizes_or_moves_tells_what_read_its_handle(
+        cx: &mut TestAppContext,
+    ) {
+        struct Frame {
+            scroll_handle: ScrollHandle,
+            left: Rc<Cell<Pixels>>,
+            width: Rc<Cell<Pixels>>,
+        }
+
+        impl Render for Frame {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .id("scroller")
+                        .ml(self.left.get())
+                        .h(px(20.))
+                        .w(self.width.get())
+                        .overflow_x_scroll()
+                        .track_scroll(&self.scroll_handle),
+                )
+            }
+        }
+
+        let scroll_handle = ScrollHandle::new();
+        let left = Rc::new(Cell::new(px(0.)));
+        let width = Rc::new(Cell::new(px(100.)));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (scroll_handle, left, width) =
+                    (scroll_handle.clone(), left.clone(), width.clone());
+                move |_, _| Frame {
+                    scroll_handle,
+                    left,
+                    width,
+                }
+            })
+            .into();
+        let mut draw = || {
+            cx.update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx)
+            })
+            .unwrap();
+            let state = scroll_handle.0.borrow();
+            (state.version.get(), state.placement.get())
+        };
+        draw();
+        let (version, placement) = draw();
+
+        // Nothing scrolls and the content still fits, so only the bounds
+        // the handle remembers from the last frame tell the two apart.
+        width.set(px(60.));
+        let (resized_version, resized_placement) = draw();
+        assert_ne!(resized_version, version);
+        assert_eq!(resized_placement, placement);
+
+        left.set(px(30.));
+        let (moved_version, moved_placement) = draw();
+        assert_eq!(moved_version, resized_version);
+        assert_ne!(moved_placement, resized_placement);
     }
 
     struct ContentSizedGrid;
