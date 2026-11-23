@@ -253,7 +253,7 @@ impl Element for NativeViewElement {
         let id = self.0.0.id;
         let bounds = window.snap_bounds(hitbox.bounds);
         let content_mask = window.snapped_content_mask();
-        window.next_frame.scene.insert_primitive(PaintNativeView {
+        window.next_frame.scene.insert_native_view(PaintNativeView {
             order: 0,
             id,
             hitbox_id: hitbox.id,
@@ -643,16 +643,18 @@ mod tests {
         cx.run_until_parked();
 
         // The view shows through its container's background, and the element
-        // painted after it covers it.
+        // painted after it covers it: the view is erased between the two.
         window
             .update(cx, |_, window, _| {
-                let labels = window
-                    .rendered_frame
-                    .scene
+                let scene = &window.rendered_frame.scene;
+                let labels = scene
                     .batches()
                     .map(|batch| batch.label())
                     .collect::<Vec<_>>();
-                assert_eq!(labels, ["quads (1)", "native views (1)", "quads (1)"]);
+                assert_eq!(labels, ["quads (1)", "quads (1)"]);
+                let view_order = scene.native_views[0].order;
+                assert!(scene.quads[0].order < view_order);
+                assert!(scene.quads[1].order > view_order);
             })
             .unwrap();
     }

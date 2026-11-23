@@ -13574,7 +13574,7 @@ mod tests {
                     window.paint_inset_shadows(bounds, Default::default(), &[shadow]);
                     let shadows = &window.next_frame.scene.shadows;
                     assert_eq!(shadows.len(), 1);
-                    let hole = shadows[0].shape_bounds;
+                    let hole = shadows[0].bounds;
                     let message = format!(
                         "scale={}, blur={blur_radius:?}, spread={spread_radius:?}, hole={hole:?}",
                         window.scale_factor()

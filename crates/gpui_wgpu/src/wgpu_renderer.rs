@@ -2141,8 +2141,6 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    // Native views are only composited by the Metal renderer.
-                    PrimitiveBatch::NativeViews(_) => {}
                 }
             }
 

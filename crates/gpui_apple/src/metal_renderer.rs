@@ -349,6 +349,10 @@ pub struct MetalRenderer {
     drawables_released: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
+    /// Whether the last scene drawn to the layer let native views show
+    /// through it. Those sit beneath the layer, so it can only be opaque, and
+    /// eligible for direct-to-display presentation, while none are showing.
+    shows_native_views: bool,
     command_queue: MetalCommandQueue,
     unfinished_submissions: Arc<AtomicU32>,
     path_tiles_pipeline_state: MetalPipelineState,
@@ -362,6 +366,9 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: MetalPipelineState,
     polychrome_sprites_pipeline_state: MetalPipelineState,
     surfaces_pipeline_state: MetalPipelineState,
+    /// Erases a native view's rect: blending is off, so its transparent
+    /// output replaces what was drawn beneath the view.
+    native_views_pipeline_state: MetalPipelineState,
     /// `None` where the device cannot build a dual-source blend: frosted
     /// surfaces then paint their tint over an unblurred backdrop.
     backdrop_blurs_pipeline_state: Option<MetalPipelineState>,
@@ -952,6 +959,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         )?;
+        let native_views_pipeline_state = build_opaque_quads_pipeline_state(
+            &device,
+            &library,
+            "native_views",
+            "native_view_vertex",
+            "native_view_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        )?;
         let backdrop_blurs_pipeline_state =
             build_backdrop_blur_pipeline_state(&device, &library, MTLPixelFormat::BGRA8Unorm)?;
         let backdrop_blur_downsample_pipeline_state = build_backdrop_blur_pass_pipeline_state(
@@ -1030,6 +1045,7 @@ impl MetalRenderer {
             is_apple_gpu,
             is_unified_memory,
             opaque,
+            shows_native_views: false,
             command_queue,
             unfinished_submissions: Arc::new(AtomicU32::new(0)),
             path_tiles_pipeline_state,
@@ -1041,6 +1057,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            native_views_pipeline_state,
             backdrop_blurs_pipeline_state,
             backdrop_blur_downsample_pipeline_state,
             backdrop_blur_horizontal_pipeline_state,
@@ -1530,7 +1547,7 @@ impl MetalRenderer {
         self.opaque = !transparent;
         self.presented_frame = None;
         if let Some(layer) = &self.layer {
-            layer.setOpaque(!transparent);
+            layer.setOpaque(self.opaque && !self.shows_native_views);
         }
     }
 
@@ -1592,6 +1609,11 @@ impl MetalRenderer {
             log::error!("draw() called on headless renderer - use render_scene_to_image() instead");
             return dropped(PresentBreakdown::default());
         };
+        let shows_native_views = !scene.native_views.is_empty();
+        if shows_native_views != self.shows_native_views {
+            self.shows_native_views = shows_native_views;
+            layer.setOpaque(self.opaque && !shows_native_views);
+        }
         // A frame drawn while the drawables are shrunk would present a single
         // pixel over what the window shows when it comes back; it stays owed
         // and is drawn once the size is restored.
@@ -2538,6 +2560,9 @@ impl MetalRenderer {
                 .iter()
                 .filter(|blur| scissor.is_none_or(|scissor| scissor_reaches_blur(&scissor, blur)))
                 .peekable();
+            // Erased inside every damaged rectangle they reach: the clear
+            // put the window's own colour back there.
+            let mut pending_native_views = 0..scene.native_views.len();
             let mut quad_cursor: u32 = 0;
             // Tiles are uploaded path by path in draw order, so each path
             // batch draws the tiles that follow the batches before it.
@@ -2559,9 +2584,42 @@ impl MetalRenderer {
             }
             command_encoder.setDepthStencilState(Some(&self.depth_test_state));
 
-            for batch in scene.batches() {
-                let batch_order = scene.batch_order(&batch);
-                while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+            // The pass after the last batch is for a blur or a native view
+            // above everything else: the one still frosts what is beneath
+            // it, and the other still shows through.
+            for batch in scene.batches().map(Some).chain(std::iter::once(None)) {
+                let batch_order = batch
+                    .as_ref()
+                    .map_or(u32::MAX, |batch| scene.batch_order(batch));
+                loop {
+                    // Blurs and native views at or beneath this batch run
+                    // before it, in their own order: a blur painted over a
+                    // view samples the view's opening, and a view painted
+                    // over a blur erases its frost.
+                    let next_view = scene
+                        .native_views
+                        .get(pending_native_views.start)
+                        .filter(|_| !pending_native_views.is_empty())
+                        .map(|native_view| native_view.order)
+                        .filter(|order| *order <= batch_order);
+                    let blur = match next_view {
+                        Some(view_order) => pending_blurs.next_if(|blur| blur.order < view_order),
+                        None => pending_blurs.next_if(|blur| blur.order <= batch_order),
+                    };
+                    let Some(blur) = blur else {
+                        if next_view.is_none() {
+                            break;
+                        }
+                        self.draw_native_views(
+                            pending_native_views.start..pending_native_views.start + 1,
+                            instances,
+                            viewport_size,
+                            quad_depth(quad_cursor) as f64,
+                            &command_encoder,
+                        );
+                        pending_native_views.start += 1;
+                        continue;
+                    };
                     if self.attribution_skips & ATTRIBUTED_BACKDROP_BLURS != 0 {
                         continue;
                     }
@@ -2581,6 +2639,9 @@ impl MetalRenderer {
                         command_encoder.setScissorRect(scissor);
                     }
                 }
+                let Some(batch) = batch else {
+                    break;
+                };
                 // Quads carry their own depth. Every other batch is flattened onto
                 // the depth of the quad cursor by collapsing the viewport's depth
                 // range onto a single value.
@@ -2687,25 +2748,6 @@ impl MetalRenderer {
                     }
                 }
             }
-            // A blur above everything else still frosts what is beneath it.
-            let skip_blurs = self.attribution_skips & ATTRIBUTED_BACKDROP_BLURS != 0;
-            for blur in pending_blurs.filter(|_| !skip_blurs) {
-                command_encoder = self.draw_backdrop_blur(
-                    blur,
-                    &command_buffer,
-                    command_encoder,
-                    texture,
-                    &depth_texture,
-                    store_depth,
-                    &instances.rounded_clips,
-                    writer,
-                    viewport_size,
-                    quad_depth(quad_cursor) as f64,
-                )?;
-                if let Some(scissor) = scissor {
-                    command_encoder.setScissorRect(scissor);
-                }
-            }
         }
 
         command_encoder.endEncoding();
@@ -2745,6 +2787,43 @@ impl MetalRenderer {
         }
 
         Ok(command_buffer)
+    }
+
+    /// Erases the rects of `native_views`, so the platform views beneath
+    /// the layer show through them. Drawn at `depth`, the depth of the quads
+    /// painted so far, an opaque quad painted over a view and already drawn by
+    /// the depth prepass keeps its pixels.
+    fn draw_native_views(
+        &self,
+        native_views: Range<usize>,
+        instances: &FrameInstances,
+        viewport_size: Size<DevicePixels>,
+        depth: f64,
+        command_encoder: &RenderEncoderRef,
+    ) {
+        if native_views.is_empty() {
+            return;
+        }
+        set_viewport(command_encoder, viewport_size, depth, depth);
+        command_encoder.setRenderPipelineState(&self.native_views_pipeline_state);
+        set_vertex_buffer(
+            command_encoder,
+            SurfaceInputIndex::Vertices as usize,
+            &self.unit_vertices,
+            0,
+        );
+        set_vertex_buffer(
+            command_encoder,
+            SurfaceInputIndex::Surfaces as usize,
+            &instances.native_views.buffer,
+            instances.native_views.offset,
+        );
+        set_vertex_value(
+            command_encoder,
+            SurfaceInputIndex::ViewportSize as usize,
+            &viewport_size,
+        );
+        draw_unit_instances(command_encoder, native_views);
     }
 
     fn draw_shadows(
@@ -3885,6 +3964,7 @@ struct FrameInstances {
     monochrome_sprites: BufferRegion,
     polychrome_sprites: BufferRegion,
     surfaces: BufferRegion,
+    native_views: BufferRegion,
     path_tiles: BufferRegion,
     path_curves: BufferRegion,
     path_paints: BufferRegion,
@@ -3937,6 +4017,14 @@ fn upload_frame_instances(
             content_mask: surface.content_mask,
             rounded_clip: surface.rounded_clip,
             clip_padding: 0,
+        }))?,
+        native_views: writer.write_iter(scene.native_views.iter().map(|native_view| {
+            SurfaceBounds {
+                bounds: native_view.bounds,
+                content_mask: native_view.content_mask,
+                rounded_clip: 0,
+                clip_padding: 0,
+            }
         }))?,
         path_tiles: writer.write(&path_tiles)?,
         path_curves: writer.write(&path_curves)?,
@@ -4396,6 +4484,113 @@ mod alpha_blend_tests {
         assert!(
             (0..3).all(|channel| (pixel[channel] as i32 - expected_color).abs() <= 2),
             "colour must be the white surface's premultiplied share, got {pixel:?}"
+        );
+    }
+}
+
+/// A native view sits beneath the layer and shows through the rect the scene
+/// names: what was painted before it is erased there, down to a transparent
+/// pixel, and what was painted after it covers it, including an opaque quad
+/// the depth prepass drew before the rect was erased.
+#[cfg(test)]
+mod native_view_tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{
+        Background, Bounds, ContentMask, Corners, DevicePixels, Edges, HitboxId, Hsla,
+        NativeViewId, PaintNativeView, Point, Quad, ScaledPixels, Scene,
+    };
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    const EXTENT: f32 = 64.;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            rounded_clip: 0,
+            clip_padding: 0,
+            order: 0,
+            border_style: Default::default(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(color),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    #[test]
+    fn a_native_view_shows_through_what_was_painted_before_it_only() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(
+            InstanceBufferPool::default(),
+        )))
+        .expect("creating a headless Metal renderer");
+
+        let view = rect(0., 0., EXTENT / 2., EXTENT);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., EXTENT, EXTENT), gpui::red()));
+        scene.insert_native_view(PaintNativeView {
+            order: 0,
+            id: NativeViewId::for_test(1),
+            hitbox_id: HitboxId::placeholder(),
+            bounds: view,
+            content_mask: ContentMask { bounds: view },
+            background: Hsla::transparent_black(),
+        });
+        // An opaque quad over the top of the view, and a translucent one over
+        // its middle.
+        scene.insert_primitive(quad(rect(0., 0., EXTENT / 2., 16.), gpui::blue()));
+        scene.insert_primitive(quad(
+            rect(0., 24., EXTENT / 2., 16.),
+            Hsla::white().opacity(0.5),
+        ));
+        scene.finish();
+        assert_eq!(
+            scene.opaque_quad_indices.len(),
+            2,
+            "both opaque quads take the depth prepass, which is what this checks the view against"
+        );
+
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                gpui::size(DevicePixels(EXTENT as i32), DevicePixels(EXTENT as i32)),
+            )
+            .expect("headless render succeeds");
+        let beside = image.get_pixel(48, 32);
+        let opening = image.get_pixel(16, 52);
+        let opaque_cover = image.get_pixel(16, 8);
+        let translucent_cover = image.get_pixel(16, 32);
+
+        assert!(
+            beside[0] > 200 && beside[2] < 60 && beside[3] == 255,
+            "beside the view the quad painted before it is intact, got {beside:?}"
+        );
+        assert_eq!(
+            opening.0,
+            [0, 0, 0, 0],
+            "the view's rect is erased to a transparent pixel"
+        );
+        assert!(
+            opaque_cover[2] > 200 && opaque_cover[0] < 60 && opaque_cover[3] == 255,
+            "an opaque quad painted after the view covers it, got {opaque_cover:?}"
+        );
+        // Half-transparent white over nothing: premultiplied 0.5 in every
+        // channel, with none of the red that was erased beneath it.
+        let half = (0.5 * 255.0f32).round() as i32;
+        assert!(
+            (0..4).all(|channel| (translucent_cover[channel] as i32 - half).abs() <= 2),
+            "a translucent quad painted after the view lets it show through, got {translucent_cover:?}"
         );
     }
 }

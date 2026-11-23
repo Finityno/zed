@@ -31,8 +31,7 @@ use std::{
     any::Any,
     ffi::c_void,
     ptr::{self, NonNull},
-    rc::{Rc, Weak},
-    sync::OnceLock,
+    sync::{Arc, OnceLock, Weak},
 };
 
 type HitTestCallback = Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>;
@@ -256,7 +255,7 @@ impl Drop for Attachment {
 /// `view` must point to a live `NSView` that is not in another view hierarchy,
 /// and this must be called on the main thread.
 pub(super) unsafe fn attach(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     id: NativeViewId,
     view: NonNull<c_void>,
 ) -> Option<Box<dyn Any>> {
@@ -287,7 +286,7 @@ pub(super) unsafe fn attach(
         placement: None,
     });
     Some(Box::new(Attachment {
-        window_state: Rc::downgrade(window_state),
+        window_state: Arc::downgrade(window_state),
         id,
     }))
 }
@@ -420,7 +419,7 @@ pub(super) fn plan_layout(state: &MacWindowState, scene: &Scene) -> Layout {
 
 /// Applies a planned layout. The window state must be unlocked, because AppKit
 /// calls back into it when a view's frame or first responder changes.
-pub(super) fn apply_layout(window_state: &Rc<Mutex<MacWindowState>>, layout: Layout) {
+pub(super) fn apply_layout(window_state: &Arc<Mutex<MacWindowState>>, layout: Layout) {
     if layout.placements.is_empty() && layout.stacking.is_none() {
         return;
     }
@@ -648,7 +647,7 @@ fn may_take_input(
 }
 
 /// Records the view GPUI has focused and gives it keyboard input.
-pub(super) fn set_focused(window_state: &Rc<Mutex<MacWindowState>>, id: Option<NativeViewId>) {
+pub(super) fn set_focused(window_state: &Arc<Mutex<MacWindowState>>, id: Option<NativeViewId>) {
     {
         let mut lock = window_state.lock();
         let views = &mut lock.native_views;
@@ -665,7 +664,7 @@ pub(super) fn set_focused(window_state: &Rc<Mutex<MacWindowState>>, id: Option<N
 /// A responder that is neither the window, the GPUI view, nor inside an
 /// attached view is left with keyboard input, such as a control the app or
 /// AppKit put in the titlebar. GPUI's focus says nothing about those.
-pub(super) fn reconcile_first_responder(window_state: &Rc<Mutex<MacWindowState>>) {
+pub(super) fn reconcile_first_responder(window_state: &Arc<Mutex<MacWindowState>>) {
     // The window is asked to move first responder, and reconciles again as it
     // does. This call sees to whatever those requests leave.
     if std::mem::replace(&mut window_state.lock().native_views.reconciling, true) {
@@ -684,7 +683,7 @@ pub(super) fn reconcile_first_responder(window_state: &Rc<Mutex<MacWindowState>>
 
 /// Asks the window to make the view GPUI has focused first responder, and
 /// returns whether there was anything to ask for.
-fn request_first_responder_for_focus(window_state: &Rc<Mutex<MacWindowState>>) -> bool {
+fn request_first_responder_for_focus(window_state: &Arc<Mutex<MacWindowState>>) -> bool {
     // SAFETY: The window and views are live, and this runs on the main thread. The
     // window state is unlocked for `makeFirstResponder:` because AppKit calls back
     // into it synchronously, and the target is retained in case that detaches it.
@@ -788,7 +787,7 @@ fn window_superclass(this: &AnyObject) -> &'static AnyClass {
 
 /// Asks GPUI which native view, if any, a point in window coordinates reaches.
 fn hit_test_native_view(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     position_in_window: NSPoint,
 ) -> Option<NativeViewId> {
     // AppKit can hit-test while the state is locked for another call into it.
@@ -942,7 +941,7 @@ extern "C" fn send_event(this: &AnyObject, _: Sel, event: *mut AnyObject) {
 /// `window` must be a live GPUI window, and the window state must be unlocked,
 /// because hit-testing calls back into the GPUI view.
 unsafe fn native_view_under_press(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     window: &AnyObject,
     position_in_window: NSPoint,
 ) -> Option<NativeViewId> {
@@ -968,7 +967,7 @@ unsafe fn native_view_under_press(
 
 /// Notes whether the pointer is over a native view, and has AppKit rebuild the
 /// GPUI view's cursor rectangles when that changes.
-fn update_pointer_over_view(window_state: &Rc<Mutex<MacWindowState>>, position_in_window: NSPoint) {
+fn update_pointer_over_view(window_state: &Arc<Mutex<MacWindowState>>, position_in_window: NSPoint) {
     let over_view = hit_test_native_view(window_state, position_in_window).is_some();
     let Some(mut lock) = window_state.try_lock() else {
         return;
@@ -1002,7 +1001,7 @@ pub(super) fn scene_drawn(state: &mut MacWindowState, scene: &Scene) {
 ///
 /// This runs after a frame, not as its scene is drawn, because finding what
 /// is under the pointer calls back into the window.
-pub(super) fn check_pointer_after_frame(window_state: &Rc<Mutex<MacWindowState>>) {
+pub(super) fn check_pointer_after_frame(window_state: &Arc<Mutex<MacWindowState>>) {
     let native_window = {
         let Some(mut lock) = window_state.try_lock() else {
             return;
@@ -1106,7 +1105,7 @@ extern "C" fn make_first_responder(this: &AnyObject, _: Sel, responder: *mut Any
 ///
 /// `window` must be a live GPUI window and `event` a live `NSEvent`.
 unsafe fn key_down_for_native_view(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     window: &AnyObject,
     event: *mut AnyObject,
 ) -> Option<KeyDownEvent> {
@@ -1146,7 +1145,7 @@ unsafe fn key_down_for_native_view(
 /// Records whether GPUI took the press of a key ahead of the native view,
 /// which decides where the key's release goes.
 fn note_key_taken_before_view(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     key_code: u16,
     taken: bool,
 ) {
@@ -1165,7 +1164,7 @@ fn note_key_taken_before_view(
 ///
 /// `window` must be a live GPUI window and `event` a live `NSEvent`.
 unsafe fn modifiers_changed_beside_view(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     window: &AnyObject,
     event: *mut AnyObject,
 ) -> Option<PlatformInput> {
@@ -1195,7 +1194,7 @@ unsafe fn modifiers_changed_beside_view(
 
 /// Offers GPUI a key press that a native view has not seen, and returns whether GPUI used it.
 fn offer_key_down_before_native_view(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     key_down: KeyDownEvent,
 ) -> bool {
     let Some(mut callback) = window_state
@@ -1215,12 +1214,12 @@ fn offer_key_down_before_native_view(
 ///
 /// This skips the input method handling a key press gets when the GPUI view
 /// has keyboard input, because the native view has already done its own.
-fn pass_key_down_to_gpui(window_state: &Rc<Mutex<MacWindowState>>, key_down: KeyDownEvent) -> bool {
+fn pass_key_down_to_gpui(window_state: &Arc<Mutex<MacWindowState>>, key_down: KeyDownEvent) -> bool {
     pass_input_to_gpui(window_state, PlatformInput::KeyDown(key_down))
 }
 
 /// Dispatches input in GPUI, and returns whether GPUI used it.
-fn pass_input_to_gpui(window_state: &Rc<Mutex<MacWindowState>>, input: PlatformInput) -> bool {
+fn pass_input_to_gpui(window_state: &Arc<Mutex<MacWindowState>>, input: PlatformInput) -> bool {
     let Some(mut callback) = window_state.lock().event_callback.take() else {
         return false;
     };
@@ -1286,7 +1285,7 @@ extern "C" fn window_perform_key_equivalent(
 ///
 /// `window` must be a live GPUI window.
 unsafe fn native_view_with_keyboard_input(
-    window_state: &Rc<Mutex<MacWindowState>>,
+    window_state: &Arc<Mutex<MacWindowState>>,
     window: &AnyObject,
 ) -> Option<Retained<NSView>> {
     let lock = window_state.try_lock()?;
@@ -1323,7 +1322,7 @@ extern "C" fn window_key_down(this: &AnyObject, _: Sel, event: *mut AnyObject) {
 }
 
 /// Whether the window is routing the current key equivalent itself.
-pub(super) fn is_routing_key_equivalent(window_state: &Rc<Mutex<MacWindowState>>) -> bool {
+pub(super) fn is_routing_key_equivalent(window_state: &Arc<Mutex<MacWindowState>>) -> bool {
     window_state
         .try_lock()
         .is_some_and(|lock| lock.native_views.routing_key_equivalent)
@@ -1346,7 +1345,7 @@ pub(super) fn gpui_view_is_focused(state: &MacWindowState) -> bool {
 
 /// Tells the accessibility adapter whether the GPUI view is first responder,
 /// which the window does not report correctly while that is changing.
-fn update_accessibility_focus(window_state: &Rc<Mutex<MacWindowState>>, is_first_responder: bool) {
+fn update_accessibility_focus(window_state: &Arc<Mutex<MacWindowState>>, is_first_responder: bool) {
     let events = {
         let Some(mut lock) = window_state.try_lock() else {
             return;

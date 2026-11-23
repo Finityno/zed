@@ -1867,6 +1867,112 @@ impl MacWindow {
     }
 }
 
+impl MacWindow {
+    /// Presents `scene` on the window's layer, or on its base and overlay
+    /// layers while a scene overlay is enabled.
+    fn present_layered(&self, scene: &gpui::Scene, overlay_start: usize) -> PresentReport {
+        let mut this = self.0.lock();
+        if this.overlay_renderer.is_none() {
+            // Every present comes through here (gpui core never calls `draw`),
+            // so the occluded-window release has to happen on this branch too
+            // or a window without an overlay keeps the intermediates a stray
+            // draw rebuilt while it was hidden.
+            let report = this.renderer.draw(scene);
+            this.release_intermediates_if_occluded();
+            return report;
+        }
+
+        // Both planes must have capacity before either is presented. Once
+        // drawing starts, only completion callbacks can change these counts,
+        // and they only return capacity.
+        if let Some(outcome) = this.renderer.submission_queue_full_outcome()
+            .or_else(|| this.overlay_renderer.as_mut()
+                .and_then(|renderer| renderer.submission_queue_full_outcome()))
+        {
+            this.release_intermediates_if_occluded();
+            return PresentReport {
+                outcome,
+                breakdown: gpui::PresentBreakdown {
+                    layers: 2,
+                    ..Default::default()
+                },
+            };
+        }
+        let this = &mut *this;
+        // Both planes must have a drawable before either is presented too,
+        // for the same reason; neither is waited on for longer than one
+        // plane alone would be.
+        let acquire_start = Instant::now();
+        if let Some(overlay_renderer) = this.overlay_renderer.as_mut()
+            && !renderer::Renderer::ready_layered_drawables(&mut this.renderer, overlay_renderer)
+        {
+            this.release_intermediates_if_occluded();
+            return PresentReport {
+                outcome: PresentOutcome::Deferred,
+                breakdown: gpui::PresentBreakdown {
+                    acquire: acquire_start.elapsed(),
+                    layers: 2,
+                    ..Default::default()
+                },
+            };
+        }
+        let acquire_duration = acquire_start.elapsed();
+        let split_start = Instant::now();
+        // The two halves are kept across presents so their vectors hold
+        // their capacity, instead of being allocated and freed per frame for
+        // as long as the overlay exists.
+        scene.split_planes_into(overlay_start, &mut this.base_scene, &mut this.overlay_scene);
+
+        this.renderer.note_scene_tiles(&this.overlay_scene);
+        let split_duration = split_start.elapsed();
+        let mut report = this.renderer.draw(&this.base_scene);
+        report.breakdown.acquire += acquire_duration;
+        report.breakdown.encode += split_duration;
+        if report.outcome != PresentOutcome::Presented {
+            // Presenting the overlay over a base that did not land would put
+            // the two planes on different frames. A deferred base is retried
+            // and the retry presents both; a dropped one leaves both on the
+            // frame before, as a window without an overlay is left. Input
+            // keeps following the overlay that is still on screen.
+            this.release_intermediates_if_occluded();
+            return report;
+        }
+        // The overlay draws with the base renderer's drawable-sized
+        // intermediates rather than a second set of its own.
+        let intermediates = this.renderer.take_intermediates();
+        let overlay_renderer = this
+            .overlay_renderer
+            .as_mut()
+            .expect("overlay renderer checked above");
+        overlay_renderer.lend_intermediates(intermediates);
+        let overlay_report = overlay_renderer.draw(&this.overlay_scene);
+        let intermediates = overlay_renderer.take_intermediates();
+        this.renderer.lend_intermediates(intermediates);
+        // Input follows the overlay on screen: an overlay that did not
+        // present leaves the previous frame's there, and its regions with it.
+        if overlay_report.outcome == PresentOutcome::Presented {
+            let mut regions = this.overlay_input_regions.lock();
+            regions.clear();
+            regions.extend_from_slice(&this.pending_overlay_hit_regions);
+        }
+        this.release_intermediates_if_occluded();
+        this.sync_overlay_backdrops();
+
+        report.breakdown.accumulate(overlay_report.breakdown);
+        // The base layer holds the window's content, so the present's
+        // outcome is the base's. An overlay layer whose drawable size is
+        // still zero drops every frame, and reporting that as the frame's
+        // outcome would count every frame as lost while the content was
+        // reaching the screen. An overlay that defers after the base landed
+        // is not retried: its plane keeps the previous frame until the window
+        // next presents. Its drawable was ready before the base drew, so it
+        // defers only when that drawable came back at a size the layer no
+        // longer has and the one asked for in its place did not come in time.
+        report.breakdown.overlay_outcome = Some(overlay_report.outcome);
+        report
+    }
+}
+
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
@@ -2941,104 +3047,17 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize) -> PresentReport {
-        let mut this = self.0.lock();
-        if this.overlay_renderer.is_none() {
-            // Every present comes through here (gpui core never calls `draw`),
-            // so the occluded-window release has to happen on this branch too
-            // or a window without an overlay keeps the intermediates a stray
-            // draw rebuilt while it was hidden.
-            let report = this.renderer.draw(scene);
-            this.release_intermediates_if_occluded();
-            return report;
-        }
-
-        // Both planes must have capacity before either is presented. Once
-        // drawing starts, only completion callbacks can change these counts,
-        // and they only return capacity.
-        if let Some(outcome) = this.renderer.submission_queue_full_outcome()
-            .or_else(|| this.overlay_renderer.as_mut()
-                .and_then(|renderer| renderer.submission_queue_full_outcome()))
-        {
-            this.release_intermediates_if_occluded();
-            return PresentReport {
-                outcome,
-                breakdown: gpui::PresentBreakdown {
-                    layers: 2,
-                    ..Default::default()
-                },
-            };
-        }
-        let this = &mut *this;
-        // Both planes must have a drawable before either is presented too,
-        // for the same reason; neither is waited on for longer than one
-        // plane alone would be.
-        let acquire_start = Instant::now();
-        if let Some(overlay_renderer) = this.overlay_renderer.as_mut()
-            && !renderer::Renderer::ready_layered_drawables(&mut this.renderer, overlay_renderer)
-        {
-            this.release_intermediates_if_occluded();
-            return PresentReport {
-                outcome: PresentOutcome::Deferred,
-                breakdown: gpui::PresentBreakdown {
-                    acquire: acquire_start.elapsed(),
-                    layers: 2,
-                    ..Default::default()
-                },
-            };
-        }
-        let acquire_duration = acquire_start.elapsed();
-        let split_start = Instant::now();
-        // The two halves are kept across presents so their vectors hold
-        // their capacity, instead of being allocated and freed per frame for
-        // as long as the overlay exists.
-        scene.split_planes_into(overlay_start, &mut this.base_scene, &mut this.overlay_scene);
-
-        this.renderer.note_scene_tiles(&this.overlay_scene);
-        let split_duration = split_start.elapsed();
-        let mut report = this.renderer.draw(&this.base_scene);
-        report.breakdown.acquire += acquire_duration;
-        report.breakdown.encode += split_duration;
-        if report.outcome != PresentOutcome::Presented {
-            // Presenting the overlay over a base that did not land would put
-            // the two planes on different frames. A deferred base is retried
-            // and the retry presents both; a dropped one leaves both on the
-            // frame before, as a window without an overlay is left. Input
-            // keeps following the overlay that is still on screen.
-            this.release_intermediates_if_occluded();
-            return report;
-        }
-        // The overlay draws with the base renderer's drawable-sized
-        // intermediates rather than a second set of its own.
-        let intermediates = this.renderer.take_intermediates();
-        let overlay_renderer = this
-            .overlay_renderer
-            .as_mut()
-            .expect("overlay renderer checked above");
-        overlay_renderer.lend_intermediates(intermediates);
-        let overlay_report = overlay_renderer.draw(&this.overlay_scene);
-        let intermediates = overlay_renderer.take_intermediates();
-        this.renderer.lend_intermediates(intermediates);
-        // Input follows the overlay on screen: an overlay that did not
-        // present leaves the previous frame's there, and its regions with it.
-        if overlay_report.outcome == PresentOutcome::Presented {
-            let mut regions = this.overlay_input_regions.lock();
-            regions.clear();
-            regions.extend_from_slice(&this.pending_overlay_hit_regions);
-        }
-        this.release_intermediates_if_occluded();
-        this.sync_overlay_backdrops();
-
-        report.breakdown.accumulate(overlay_report.breakdown);
-        // The base layer holds the window's content, so the present's
-        // outcome is the base's. An overlay layer whose drawable size is
-        // still zero drops every frame, and reporting that as the frame's
-        // outcome would count every frame as lost while the content was
-        // reaching the screen. An overlay that defers after the base landed
-        // is not retried: its plane keeps the previous frame until the window
-        // next presents. Its drawable was ready before the base drew, so it
-        // defers only when that drawable came back at a size the layer no
-        // longer has and the one asked for in its place did not come in time.
-        report.breakdown.overlay_outcome = Some(overlay_report.outcome);
+        let native_view_layout = {
+            let mut this = self.0.lock();
+            let layout = native_views::plan_layout(&this, scene);
+            native_views::update_background(&mut this, scene);
+            native_views::scene_drawn(&mut this, scene);
+            layout
+        };
+        let report = self.present_layered(scene, overlay_start);
+        // After the present, with the window state unlocked: AppKit calls
+        // back into the window as a view's frame or first responder changes.
+        native_views::apply_layout(&self.0, native_view_layout);
         report
     }
 
@@ -4873,7 +4892,6 @@ fn metal_frame(
     let used_drawable = lock.renderer.set_frame_drawable(None).is_none();
     drop(lock);
     metal_frames.end_frame(used_drawable);
-    drop(lock);
     native_views::check_pointer_after_frame(window_state);
 }
 

@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Path,
-    PathTiles, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, HitboxId,
+    Hsla, NativeViewId, Path, PathTiles, Pixels, Point, Radians, ScaledPixels, Size,
+    bounds_tree::BoundsTree, point,
     util::CapacityShrink,
 };
 use std::{fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice, sync::OnceLock};
@@ -129,6 +130,12 @@ pub struct Scene {
     /// of the primitive batches: a renderer ends its pass at each one's order
     /// to blur what is already in the framebuffer beneath it.
     pub backdrop_blurs: Vec<BackdropBlur>,
+    /// Where platform views show through, in draw order once `finish` has
+    /// run, each view once. Like backdrop blurs they are kept out of the
+    /// primitive batches: a renderer erases each one's rect when it reaches
+    /// its order, after everything painted before the view and before
+    /// everything painted after it.
+    pub native_views: Vec<PaintNativeView>,
     /// Rounded masks referenced by primitives, one-based so zero needs no mask.
     pub rounded_clips: Vec<RoundedClipNode>,
     pub(crate) current_rounded_clip: u32,
@@ -219,6 +226,7 @@ impl Scene {
         painted_monochrome_sprites.clear_vec(&mut self.painted_monochrome_sprites);
         painted_subpixel_sprites.clear_vec(&mut self.painted_subpixel_sprites);
         self.backdrop_blurs.clear();
+        self.native_views.clear();
         self.shimmer_animations.clear();
         self.rotation_animations.clear();
         self.rotating_monochrome_sprites.clear();
@@ -350,6 +358,7 @@ impl Scene {
             && self.polychrome_sprites.is_empty()
             && self.surfaces.is_empty()
             && self.backdrop_blurs.is_empty()
+            && self.native_views.is_empty()
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -456,6 +465,7 @@ impl Scene {
                 PaintOperation::SubpixelSprite(index) => (true, index),
                 PaintOperation::Primitive(_)
                 | PaintOperation::BackdropBlur(_)
+                | PaintOperation::NativeView(_)
                 | PaintOperation::StartLayer(_)
                 | PaintOperation::EndLayer => {
                     debug_assert!(false, "only glyph sprites are replayed");
@@ -548,6 +558,50 @@ impl Scene {
             .push(PaintOperation::BackdropBlur(blur));
     }
 
+    /// Records where a platform view shows through the scene.
+    ///
+    /// The view takes a draw order of its own, above everything painted so
+    /// far that it overlaps, even inside a layer: a layer's primitives share
+    /// one order and are drawn by kind, which would leave what the layer
+    /// painted before the view drawn over it. What the open layers paint
+    /// from here on has to cover the view, so each of them moves to a new
+    /// order above it.
+    pub fn insert_native_view(&mut self, mut native_view: PaintNativeView) {
+        let clipped_bounds = native_view
+            .bounds
+            .intersect(&native_view.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        native_view.order = self.primitive_bounds.insert(clipped_bounds);
+        if !self.layer_stack.is_empty() {
+            // The open layers' bounds, innermost first, from the operations
+            // that started them: every start not yet matched by an end.
+            let mut open_layers = Vec::with_capacity(self.layer_stack.len());
+            let mut closed = 0usize;
+            for operation in self.paint_operations.iter().rev() {
+                match operation {
+                    PaintOperation::EndLayer => closed += 1,
+                    PaintOperation::StartLayer(_) if closed > 0 => closed -= 1,
+                    PaintOperation::StartLayer(layer) => {
+                        open_layers.push(layer.bounds);
+                        if open_layers.len() == self.layer_stack.len() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            debug_assert_eq!(open_layers.len(), self.layer_stack.len());
+            for (order, bounds) in self.layer_stack.iter_mut().zip(open_layers.iter().rev()) {
+                *order = self.primitive_bounds.insert(bounds.union(&clipped_bounds));
+            }
+        }
+        self.native_views.push(native_view);
+        self.paint_operations
+            .push(PaintOperation::NativeView(native_view));
+    }
+
     /// The draw order of the first primitive in `batch`.
     pub fn batch_order(&self, batch: &PrimitiveBatch) -> DrawOrder {
         match batch {
@@ -578,6 +632,10 @@ impl Scene {
         let reach = match &primitive {
             Primitive::MonochromeSprite(sprite) => monochrome_sprite_extent(sprite),
             Primitive::Quad(quad) => self.quad_extent(quad),
+            // An inset shadow's bounds are the hole it leaves, and it is drawn
+            // over the element around that: one whose spread closes the hole
+            // still shades the whole element.
+            Primitive::Shadow(shadow) if shadow.inset != 0 => shadow.element_bounds,
             primitive => *primitive.bounds(),
         };
         let clipped_bounds = reach.intersect(&primitive.content_mask().bounds);
@@ -871,6 +929,9 @@ impl Scene {
                 clipped(&sprite.bounds, &sprite.content_mask)
             }
             PaintOperation::BackdropBlur(blur) => clipped(&blur.bounds, &blur.content_mask),
+            PaintOperation::NativeView(native_view) => {
+                clipped(&native_view.bounds, &native_view.content_mask)
+            }
             // A layer is clipped again where it is drawn moved (see
             // `replay_inside`).
             PaintOperation::StartLayer(_) | PaintOperation::EndLayer => true,
@@ -900,6 +961,7 @@ impl Scene {
                 inside(&self.painted_subpixel_sprites[*index as usize].bounds)
             }
             PaintOperation::BackdropBlur(blur) => inside(&blur.bounds),
+            PaintOperation::NativeView(native_view) => inside(&native_view.bounds),
             PaintOperation::StartLayer(layer) => inside(&layer.extent),
             PaintOperation::EndLayer => true,
         })
@@ -950,6 +1012,7 @@ impl Scene {
                         ),
                         PaintOperation::Primitive(primitive) => primitive.clone(),
                         PaintOperation::BackdropBlur(_)
+                        | PaintOperation::NativeView(_)
                         | PaintOperation::StartLayer(_)
                         | PaintOperation::EndLayer => continue,
                     };
@@ -1012,6 +1075,14 @@ impl Scene {
                         blur.content_mask = moved.mask(&blur.content_mask);
                     }
                     self.insert_backdrop_blur(blur);
+                }
+                PaintOperation::NativeView(native_view) => {
+                    let mut native_view = *native_view;
+                    if let Some(moved) = moved {
+                        native_view.bounds = moved.bounds(native_view.bounds);
+                        native_view.content_mask = moved.mask(&native_view.content_mask);
+                    }
+                    self.insert_native_view(native_view);
                 }
                 PaintOperation::StartLayer(layer) => match moved {
                     Some(moved) => {
@@ -1077,6 +1148,9 @@ impl Scene {
             (sprite.order, sprite.tile.texture_id.index, sprite.tile.tile_id.0)
         });
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.native_views
+            .sort_by_key(|native_view| native_view.order);
+        self.keep_first_painted_native_views();
         self.partition_quads();
         self.animated_monochrome_sprites.clear();
         self.rotating_monochrome_sprites.clear();
@@ -1116,6 +1190,34 @@ impl Scene {
         self.gather_transitioned();
         self.content_id = NEXT_SCENE_CONTENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.last_advanced_at = None;
+    }
+
+    /// Drops every occurrence of a native view but the one painted first,
+    /// because a platform view can only be in one place.
+    ///
+    /// That is the occurrence whose hitbox takes the view's mouse input. It
+    /// isn't always the first in the drawing order, which depends on what each
+    /// occurrence overlaps.
+    fn keep_first_painted_native_views(&mut self) {
+        let native_views = &self.native_views;
+        let is_repeated = native_views.iter().enumerate().any(|(index, native_view)| {
+            native_views[..index]
+                .iter()
+                .any(|earlier| earlier.id == native_view.id)
+        });
+        if !is_repeated {
+            return;
+        }
+        let mut first_painted: Vec<(NativeViewId, HitboxId)> = Vec::new();
+        for operation in &self.paint_operations {
+            if let PaintOperation::NativeView(native_view) = operation
+                && !first_painted.iter().any(|(id, _)| *id == native_view.id)
+            {
+                first_painted.push((native_view.id, native_view.hitbox_id));
+            }
+        }
+        self.native_views
+            .retain(|native_view| first_painted.contains(&(native_view.id, native_view.hitbox_id)));
     }
 
     fn gather_transitioned(&mut self) {
@@ -1702,6 +1804,7 @@ impl Scene {
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
+            native_views_iter: self.native_views.iter().peekable(),
         }
     }
 }
@@ -2414,6 +2517,103 @@ mod tests {
         scene.insert_primitive(opaque_quad());
         scene.pop_layer();
         scene
+    }
+
+    fn unit_native_view(hitbox_id: HitboxId, x: f32) -> PaintNativeView {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: unit_bounds().size,
+        };
+        PaintNativeView {
+            order: 0,
+            id: NativeViewId::for_test(1),
+            hitbox_id,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Hsla::default(),
+        }
+    }
+
+    #[test]
+    fn a_native_view_is_erased_between_what_was_painted_before_and_after_it() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(opaque_quad());
+        scene.insert_native_view(unit_native_view(HitboxId::placeholder(), 0.));
+        scene.insert_primitive(opaque_quad());
+        scene.finish();
+
+        let view_order = scene.native_views[0].order;
+        let orders: Vec<_> = scene
+            .batches()
+            .map(|batch| scene.batch_order(&batch))
+            .collect();
+        assert_eq!(orders.len(), 2, "one quad batch either side of the view");
+        assert!(orders[0] < view_order);
+        assert!(orders[1] > view_order);
+        // Neither quad gives up the opaque prepass: the view is erased at the
+        // depth of the quads painted before it, so the one painted after it,
+        // drawn first by the prepass, keeps its pixels.
+        assert_eq!(scene.opaque_quad_indices.len(), 2);
+        assert!(!scene.is_empty());
+    }
+
+    #[test]
+    fn a_native_view_in_a_layer_is_covered_by_what_the_layers_paint_after_it() {
+        let mut scene = Scene::default();
+        scene.push_layer(unit_bounds());
+        scene.insert_primitive(opaque_quad());
+        scene.push_layer(unit_bounds());
+        scene.insert_native_view(unit_native_view(HitboxId::placeholder(), 0.));
+        scene.insert_primitive(opaque_quad());
+        scene.pop_layer();
+        scene.insert_primitive(opaque_quad());
+        scene.pop_layer();
+        scene.finish();
+
+        let view_order = scene.native_views[0].order;
+        let quad_orders: Vec<_> = scene.quads.iter().map(|quad| quad.order).collect();
+        assert!(quad_orders[0] < view_order, "painted before the view");
+        assert!(quad_orders[1] > view_order, "painted after it in the outer layer");
+        assert!(quad_orders[2] > view_order, "painted after it in the inner layer");
+    }
+
+    #[test]
+    fn a_native_view_painted_twice_is_kept_where_it_was_painted_first() {
+        let first_hitbox = HitboxId::placeholder();
+        let second_hitbox = first_hitbox.next();
+        let mut scene = Scene::default();
+        // The first occurrence is painted over two quads, so it is drawn
+        // after the second, which overlaps nothing.
+        scene.insert_primitive(opaque_quad());
+        scene.insert_primitive(opaque_quad());
+        scene.insert_native_view(unit_native_view(first_hitbox, 0.));
+        scene.insert_native_view(unit_native_view(second_hitbox, 20.));
+        assert!(scene.native_views[0].order > scene.native_views[1].order);
+        scene.finish();
+
+        let shown: Vec<_> = scene
+            .native_views
+            .iter()
+            .map(|native_view| native_view.hitbox_id)
+            .collect();
+        assert_eq!(shown, [first_hitbox]);
+    }
+
+    #[test]
+    fn replay_keeps_a_native_view_under_what_was_painted_over_it() {
+        let mut source = Scene::default();
+        source.insert_primitive(opaque_quad());
+        source.insert_native_view(unit_native_view(HitboxId::placeholder(), 0.));
+        source.insert_primitive(opaque_quad());
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..source.len(), &source);
+        replayed.finish();
+
+        assert_eq!(replayed.native_views.len(), 1);
+        let view_order = replayed.native_views[0].order;
+        assert!(replayed.quads[0].order < view_order);
+        assert!(replayed.quads[1].order > view_order);
     }
 
     #[test]
@@ -4127,10 +4327,11 @@ impl SceneMove {
     }
 }
 
-/// The box a primitive can draw into: its bounds, and for a shadow the blur
-/// around them.
+/// The box a primitive can draw into: its bounds, for a drop shadow the blur
+/// around them, and for an inset shadow the element it shades.
 pub(crate) fn primitive_extent(primitive: &Primitive) -> Bounds<ScaledPixels> {
     match primitive {
+        Primitive::Shadow(shadow) if shadow.inset != 0 => shadow.element_bounds,
         Primitive::Shadow(shadow) => {
             let margin = shadow.blur_radius * 3.;
             shadow.bounds.dilate(margin)
@@ -4236,6 +4437,7 @@ pub(crate) enum PaintOperation {
     MonochromeSprite(u32),
     SubpixelSprite(u32),
     BackdropBlur(BackdropBlur),
+    NativeView(PaintNativeView),
     StartLayer(Layer),
     EndLayer,
 }
@@ -4335,6 +4537,7 @@ struct BatchIterator<'a> {
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
+    native_views_iter: Peekable<slice::Iter<'a, PaintNativeView>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -4382,12 +4585,23 @@ impl<'a> Iterator for BatchIterator<'a> {
                 .next_if(|blur| blur.order <= first_order)
                 .is_some()
             {}
+            // A native view is erased at its order in the same way, so it
+            // ends the batch beneath it too.
+            while self
+                .native_views_iter
+                .next_if(|native_view| native_view.order <= first_order)
+                .is_some()
+            {}
             (first.1, (second.0.unwrap_or(u32::MAX), second.1))
         } else {
             return None;
         };
         if let Some(blur) = self.backdrop_blurs_iter.peek() {
             max_order_and_kind = max_order_and_kind.min((blur.order, PrimitiveKind::Shadow));
+        }
+        if let Some(native_view) = self.native_views_iter.peek() {
+            max_order_and_kind =
+                max_order_and_kind.min((native_view.order, PrimitiveKind::Shadow));
         }
 
         match batch_kind {
@@ -4721,6 +4935,31 @@ pub struct BackdropBlur {
     pub content_mask: ContentMask<ScaledPixels>,
     /// The rect's rounding, matching the surface painted over it.
     pub corner_radii: Corners<ScaledPixels>,
+}
+
+/// Where a platform view shows through the scene. Painted by
+/// [`crate::NativeView`] as an element.
+///
+/// The view sits beneath the window's rendered content, so the renderer
+/// erases everything painted earlier within these bounds, and everything
+/// painted later covers the view. The view is therefore treated as opaque.
+/// The opening is the rect itself: rounded clips, element opacity and
+/// transitions around the element don't apply to it.
+#[derive(Clone, Copy, Debug)]
+pub struct PaintNativeView {
+    /// The view's position among the scene's other primitives.
+    pub order: DrawOrder,
+    /// The view these bounds belong to.
+    pub id: NativeViewId,
+    /// The hitbox that decides whether a mouse position reaches the view.
+    pub hitbox_id: HitboxId,
+    /// Where the view is laid out, before clipping.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip applied to the view.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The color to show where the view has not caught up with these bounds,
+    /// or a transparent color for none.
+    pub background: Hsla,
 }
 
 #[derive(Debug, Copy, Clone)]

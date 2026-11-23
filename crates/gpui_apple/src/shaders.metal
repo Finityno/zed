@@ -1440,11 +1440,12 @@ struct NativeViewVertexOutput {
 };
 
 vertex NativeViewVertexOutput native_view_vertex(
-    uint vertex_id [[vertex_id]], uint native_view_id [[instance_id]],
+    uint unit_vertex_id [[vertex_id]], uint native_view_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
     constant SurfaceBounds *native_views [[buffer(SurfaceInputIndex_Surfaces)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(GlobalInputIndex_ViewportSize)]]) {
-  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    [[buffer(SurfaceInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds native_view = native_views[native_view_id];
   ClippedVertex clipped = clip_to_mask(unit_vertex, native_view.bounds,
                                        native_view.content_mask.bounds);
