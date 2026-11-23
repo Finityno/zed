@@ -1016,7 +1016,6 @@ pub(crate) struct WindowUpdateEntry {
 }
 
 impl App {
-    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
         asset_source: Arc<dyn AssetSource>,

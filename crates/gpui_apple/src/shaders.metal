@@ -472,11 +472,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       }
     }
 
-    // Blend the border on top of the background and then linearly interpolate
-    // between the two as we slide inside the background.
-    float4 blended_border = over(background_color, border_color);
-    color = mix(background_color, blended_border,
-                saturate(antialias_threshold - inner_sdf));
+    border_color.a *= saturate(antialias_threshold - inner_sdf);
+    color = over(background_color, border_color);
   }
 
   return (color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf))) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
@@ -1438,6 +1435,28 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return (ycbcrToRGBTransform * ycbcr) * float4(1.0, 1.0, 1.0, rounded_clip_coverage(input.rounded_clip, input.position.xy, rounded_masks));
 }
 
+struct NativeViewVertexOutput {
+  float4 position [[position]];
+};
+
+vertex NativeViewVertexOutput native_view_vertex(
+    uint vertex_id [[vertex_id]], uint native_view_id [[instance_id]],
+    constant SurfaceBounds *native_views [[buffer(SurfaceInputIndex_Surfaces)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(GlobalInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+  SurfaceBounds native_view = native_views[native_view_id];
+  ClippedVertex clipped = clip_to_mask(unit_vertex, native_view.bounds,
+                                       native_view.content_mask.bounds);
+  return NativeViewVertexOutput{
+      to_device_position_impl(clipped.position, viewport_size)};
+}
+
+// The pipeline does not blend, so this erases what was drawn beneath the view.
+fragment float4 native_view_fragment(NativeViewVertexOutput input [[stage_in]]) {
+  return float4(0.);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
@@ -1674,12 +1693,10 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
 }
 
 float4 over(float4 below, float4 above) {
-  float4 result;
   float alpha = above.a + below.a * (1.0 - above.a);
-  result.rgb =
-      (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
-  result.a = alpha;
-  return result;
+  float3 premultiplied =
+      above.rgb * above.a + below.rgb * below.a * (1.0 - above.a);
+  return float4(premultiplied / (alpha == 0.0 ? 1.0 : alpha), alpha);
 }
 
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,

@@ -1259,7 +1259,6 @@ impl X11WindowStatePtr {
         let state = self.state.borrow();
         state.printing.close();
         let client = state.client.clone();
-        #[allow(clippy::mutable_key_type)]
         let children = state.children.clone();
         drop(state);
 
