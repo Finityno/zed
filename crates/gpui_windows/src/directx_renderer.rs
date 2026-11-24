@@ -1999,16 +1999,20 @@ impl DirectComposition {
             .collect();
         if stacking != self.stacking {
             changed = true;
+            let mut stacked = true;
             for id in &stacking {
                 if let Some((_, portal)) = attached.iter().find(|(attached_id, _)| attached_id == id)
                 {
-                    portal
+                    stacked &= portal
                         .raise()
                         .context("stacking a native view's portal")
-                        .log_err();
+                        .log_err()
+                        .is_some();
                 }
             }
-            self.stacking = stacking;
+            // A portal that could not be raised leaves the order unknown, so
+            // the next scene stacks them all again.
+            self.stacking = if stacked { stacking } else { Vec::new() };
         }
         changed
     }
