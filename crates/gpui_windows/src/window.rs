@@ -1256,6 +1256,15 @@ impl PlatformWindow for WindowsWindow {
     /// portal's own `set_bounds` and `set_visible` are ignored meanwhile.
     /// Dropping the attachment detaches the portal and hides it.
     ///
+    /// An opaque window keeps the background of the frontmost view beneath
+    /// the portals, so a hole the portal has not caught up with shows that
+    /// colour, and a backdrop blur over a view frosts that colour.
+    ///
+    /// Subpixel text painted straight over the hole, with no fill beneath it,
+    /// comes out wrong: its blend does not write alpha, so the hole stays
+    /// transparent and the compositor adds the text's colour to the view's
+    /// pixels instead of covering them. Paint a fill behind such text.
+    ///
     /// Focus, hit testing and key routing keep the trait's defaults:
     /// composition-hosted content gets no window input of its own, so the
     /// embedder forwards pointer input from its own hitbox and follows the

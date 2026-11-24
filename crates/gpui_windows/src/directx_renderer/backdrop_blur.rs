@@ -20,9 +20,14 @@ const MAX_BACKDROP_BLUR_SIGMA: f32 = 64.;
 /// for the 3-sigma reach of [`MAX_BACKDROP_BLUR_SIGMA`].
 const BACKDROP_TAP_VECTORS: usize = 48;
 
+/// Native views one blur composites its copy over at most; past this many
+/// beneath one blur, the ones painted last are kept, since they are in front.
+const MAX_BACKDROP_UNDERLAYS: usize = 4;
+
 /// `cbuffer BackdropBlurParams` (b2) in shaders.hlsl. The first three fields
 /// each fill a 16-byte register, the paired fields after them two registers
-/// each and the four scalars one more, so no field straddles a register.
+/// each, the four scalars one more and the underlay count one of its own, as
+/// HLSL starts every array on a register, so no field straddles a register.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct BackdropBlurParams {
@@ -39,10 +44,22 @@ struct BackdropBlurParams {
     opacity: f32,
     center_weight: f32,
     tap_pair_count: u32,
+    /// How many of `underlay_bounds` the first pass composites its samples
+    /// over; zero for the passes after it, which sample opaque texels there.
+    underlay_count: u32,
+    _padding: [u32; 3],
+    /// The visible rects of the native views painted before the blur, in
+    /// device pixels as x, y, width, height, in paint order.
+    underlay_bounds: [[f32; 4]; MAX_BACKDROP_UNDERLAYS],
+    /// Each view's background, opaque.
+    underlay_colors: [[f32; 4]; MAX_BACKDROP_UNDERLAYS],
     taps: [[f32; 4]; BACKDROP_TAP_VECTORS],
 }
 
-const _: () = assert!(std::mem::size_of::<BackdropBlurParams>() == (7 + BACKDROP_TAP_VECTORS) * 16);
+const _: () = assert!(
+    std::mem::size_of::<BackdropBlurParams>()
+        == (8 + 2 * MAX_BACKDROP_UNDERLAYS + BACKDROP_TAP_VECTORS) * 16
+);
 
 fn bounds_to_array(bounds: &Bounds<ScaledPixels>) -> [f32; 4] {
     [
@@ -335,7 +352,17 @@ impl DirectXRenderer {
     /// Runs `blur` between two batches: copies the region it samples out of
     /// the render target, blurs the copy, and paints the result back inside
     /// the blur's rounded rect. A blur that is entirely clipped draws nothing.
-    pub(super) fn draw_backdrop_blur(&mut self, blur: &BackdropBlur) -> Result<()> {
+    ///
+    /// `native_views` are the views drawn before the blur. Their rects are
+    /// transparent holes in the copy, so the frost is taken from the copy
+    /// composited over each view's background instead: a frosted surface
+    /// over a native view is frost over a solid colour, and nothing of the
+    /// view, which is not in the render target, shows through it sharp.
+    pub(super) fn draw_backdrop_blur(
+        &mut self,
+        blur: &BackdropBlur,
+        native_views: &[PaintNativeView],
+    ) -> Result<()> {
         let target_bounds = Bounds::new(
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(
@@ -409,9 +436,33 @@ impl DirectXRenderer {
             opacity: blur.opacity,
             center_weight: 1.,
             tap_pair_count: 0,
+            underlay_count: 0,
+            _padding: [0; 3],
+            underlay_bounds: [[0.; 4]; MAX_BACKDROP_UNDERLAYS],
+            underlay_colors: [[0.; 4]; MAX_BACKDROP_UNDERLAYS],
             taps: [[0.; 4]; BACKDROP_TAP_VECTORS],
         };
         let (center_weight, tap_pair_count) = gaussian_tap_pairs(sigma, &mut params.taps);
+        // Frontmost first, which is the one the shader takes where views
+        // overlap.
+        let underlays = native_views
+            .iter()
+            .rev()
+            .filter_map(|native_view| {
+                let Rgba { r, g, b, a } = Rgba::from(native_view.background);
+                let opening = native_view
+                    .bounds
+                    .intersect(&native_view.content_mask.bounds)
+                    .intersect(&visible);
+                (a > 0. && !opening.is_empty()).then(|| (bounds_to_array(&opening), [r, g, b, 1.]))
+            })
+            .take(MAX_BACKDROP_UNDERLAYS);
+        let mut underlay_count = 0;
+        for (index, (bounds, color)) in underlays.enumerate() {
+            params.underlay_bounds[index] = bounds;
+            params.underlay_colors[index] = color;
+            underlay_count = index as u32 + 1;
+        }
 
         let region = D3D11_BOX {
             left,
@@ -455,6 +506,7 @@ impl DirectXRenderer {
             params.source_extent = [width as f32, height as f32];
             params.direction = [1., 0.];
             params.scale = [downsample as f32, 1.];
+            params.underlay_count = underlay_count;
             pipeline.draw_pass(
                 device_context,
                 &textures.horizontal,
@@ -469,6 +521,7 @@ impl DirectXRenderer {
                 textures.horizontal.height as f32,
             ];
             params.source_extent = [blurred_width as f32, height as f32];
+            params.underlay_count = 0;
             params.direction = [0., 1.];
             params.scale = [1., downsample as f32];
             pipeline.draw_pass(
@@ -531,8 +584,8 @@ impl DirectXRenderer {
 mod tests {
     use crate::{DirectXDevices, DirectXRenderer};
     use gpui::{
-        BackdropBlur, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, Point,
-        Quad, ScaledPixels, Scene, Size,
+        BackdropBlur, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, HitboxId,
+        Hsla, NativeViewId, PaintNativeView, Point, Quad, ScaledPixels, Scene, Size,
     };
     use gpui_util::ResultExt as _;
 
@@ -615,6 +668,68 @@ mod tests {
                 [red, green, blue]
             );
         }
+    }
+
+    /// A native view is a transparent hole in the render target, so a blur
+    /// over it frosts the view's background instead: the frost reads back
+    /// opaque, and the hole beside the blur stays open.
+    #[test]
+    fn a_blur_over_a_native_view_frosts_its_background_opaque() {
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("SKIPPED: no D3D11 adapter or headless renderer");
+            return;
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 200., 100.), gpui::hsla(0., 1., 0.5, 1.)));
+        let view = rect(0., 0., 100., 100.);
+        scene.insert_native_view(PaintNativeView {
+            order: 0,
+            id: NativeViewId::for_test(1),
+            hitbox_id: HitboxId::placeholder(),
+            bounds: view,
+            content_mask: ContentMask { bounds: view },
+            background: gpui::hsla(1. / 3., 1., 0.5, 1.),
+        });
+        let frosted = rect(50., 0., 100., 100.);
+        scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(4.),
+            saturation: 1.,
+            opacity: 1.,
+            bounds: frosted,
+            content_mask: ContentMask { bounds: frosted },
+            corner_radii: Corners::default(),
+        });
+        scene.finish();
+
+        renderer
+            .resize(gpui::size(DevicePixels(200), DevicePixels(100)))
+            .expect("resizing the headless target succeeds");
+        let image = renderer
+            .render_to_image(&scene, [0.0, 0.0, 0.0, 1.0])
+            .expect("headless render succeeds");
+        let pixel = |x: u32| image.get_pixel(x, 50).0;
+        assert_eq!(pixel(25), [0, 0, 0, 0], "beside the blur the view's hole is open");
+        for x in 50..100 {
+            let [red, green, blue, alpha] = pixel(x);
+            assert_eq!(
+                alpha, 255,
+                "the frost over the view at x={x} is opaque, got {:?}",
+                [red, green, blue, alpha]
+            );
+        }
+        let [red, green, _, _] = pixel(70);
+        assert!(
+            green > 240 && red < 15,
+            "well inside the view the frost is its green background, got {:?}",
+            pixel(70)
+        );
+        let [red, green, _, alpha] = pixel(130);
+        assert!(
+            red > 240 && green < 15 && alpha == 255,
+            "beside the view the frost is the red beneath it, got {:?}",
+            pixel(130)
+        );
     }
 
     const TARGET: Size<DevicePixels> = Size {

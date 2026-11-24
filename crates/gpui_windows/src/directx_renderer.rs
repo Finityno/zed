@@ -202,6 +202,80 @@ struct DirectComposition {
     portals: Vec<Weak<DirectCompositionPortal>>,
     /// The attached native views the last placed scene showed, back to front.
     stacking: Vec<NativeViewId>,
+    background: NativeViewBackground,
+}
+
+/// A solid colour beneath the portals of an opaque window that shows native
+/// views. The window has no redirection bitmap, so wherever a hole in the
+/// scene is ahead of or behind its portal (a view moving or resizing, or not
+/// painted yet) the desktop would show through instead.
+enum NativeViewBackground {
+    Absent,
+    Shown {
+        /// A child of the root visual beneath the portal container, scaled
+        /// from its one-pixel surface past any client area, so it needs no
+        /// work when the window resizes.
+        visual: IDCompositionVisual,
+        surface: IDCompositionSurface,
+        /// BGRA, as the surface stores it.
+        color: [u8; 4],
+    },
+}
+
+/// What [`NativeViewBackground`]'s one-pixel surface is scaled to: larger
+/// than the client area of a window spanning several 8K displays.
+const NATIVE_VIEW_BACKGROUND_EXTENT: f32 = 32768.;
+
+/// The colour an opaque window keeps beneath its native views while it draws
+/// `scene`, as BGRA bytes: the background of the last painted view that has
+/// one, as macOS uses for its window background. A translucent window gets
+/// none, since its backdrop is meant to show.
+fn native_view_background(scene: &Scene, opaque: bool) -> Option<[u8; 4]> {
+    if !opaque {
+        return None;
+    }
+    let to_byte = |channel: f32| (channel.clamp(0., 1.) * 255.).round() as u8;
+    scene
+        .native_views
+        .iter()
+        .rev()
+        .map(|native_view| Rgba::from(native_view.background))
+        .find(|background| background.a > 0.)
+        .map(|Rgba { r, g, b, .. }| [to_byte(b), to_byte(g), to_byte(r), u8::MAX])
+}
+
+fn fill_native_view_background(
+    surface: &IDCompositionSurface,
+    device_context: &ID3D11DeviceContext,
+    color: [u8; 4],
+) -> Result<()> {
+    let mut offset = windows::Win32::Foundation::POINT::default();
+    let texture: ID3D11Texture2D = unsafe { surface.BeginDraw(None, &mut offset) }?;
+    // The surface may be a tile of a shared texture, so only its own texel is
+    // written, at the offset BeginDraw hands out.
+    let written = u32::try_from(offset.x)
+        .ok()
+        .zip(u32::try_from(offset.y).ok())
+        .context("DirectComposition surface at a negative offset")
+        .map(|(left, top)| unsafe {
+            device_context.UpdateSubresource(
+                &texture,
+                0,
+                Some(&D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right: left + 1,
+                    bottom: top + 1,
+                    back: 1,
+                }),
+                color.as_ptr().cast(),
+                4,
+                4,
+            );
+        });
+    let ended = unsafe { surface.EndDraw() }.context("ending a draw into a DirectComposition surface");
+    written.and(ended)
 }
 
 struct DirectCompositionPortal {
@@ -712,10 +786,17 @@ impl DirectXRenderer {
         self.render(scene, clear_color)?;
         self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
         self.atlas.on_frame_drawn(scene);
-        let placed = self
-            .direct_composition
-            .as_mut()
-            .is_some_and(|composition| composition.place_native_views(scene));
+        // An opaque clear colour is what makes the window opaque here: a
+        // translucent window renders opaque too while it is inactive.
+        let background = native_view_background(scene, clear_color[3] >= 1.);
+        let placed = match (self.direct_composition.as_mut(), self.devices.as_ref()) {
+            (Some(composition), Some(devices)) => {
+                let placed = composition.place_native_views(scene);
+                composition.show_native_view_background(&devices.device_context, background)
+                    || placed
+            }
+            _ => false,
+        };
         let presented = self.present();
         // Committed right after the present, so the compositor takes the
         // moved portals and the frame with their holes moved together.
@@ -815,6 +896,7 @@ impl DirectXRenderer {
         let mut path_tile_cursor = 0;
         let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
         let mut pending_native_views = scene.native_views.iter().enumerate().peekable();
+        let mut native_views_drawn = 0;
         // The pass after the last batch is for a blur or a native view above
         // everything else: the one still frosts what is beneath it, and the
         // other still shows through.
@@ -839,7 +921,8 @@ impl DirectXRenderer {
                     let _annotation = annotation.as_ref().map(|annotation| {
                         Annotation::new(annotation, HSTRING::from("backdrop blur"))
                     });
-                    self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
+                    self.draw_backdrop_blur(blur, &scene.native_views[..native_views_drawn])
+                        .context("drawing a backdrop blur")?;
                     continue;
                 }
                 let Some((index, _)) = pending_native_views
@@ -847,6 +930,7 @@ impl DirectXRenderer {
                 else {
                     break;
                 };
+                native_views_drawn = index + 1;
                 let _annotation = annotation
                     .as_ref()
                     .map(|annotation| Annotation::new(annotation, HSTRING::from("native view")));
@@ -1714,7 +1798,90 @@ impl DirectComposition {
             portal_container,
             portals: Vec::new(),
             stacking: Vec::new(),
+            background: NativeViewBackground::Absent,
         })
+    }
+
+    /// Shows `color` beneath the portals, or nothing for `None`, without
+    /// committing. Returns whether the tree changed. A failure leaves no
+    /// colour, so the next scene tries again.
+    fn show_native_view_background(
+        &mut self,
+        device_context: &ID3D11DeviceContext,
+        color: Option<[u8; 4]>,
+    ) -> bool {
+        let shown = match &self.background {
+            NativeViewBackground::Absent => None,
+            NativeViewBackground::Shown { color, .. } => Some(*color),
+        };
+        if shown == color {
+            return false;
+        }
+        if let Err(error) = self.apply_native_view_background(device_context, color) {
+            log::error!("showing the colour beneath native views: {error:#}");
+            if let NativeViewBackground::Shown { visual, .. } =
+                std::mem::replace(&mut self.background, NativeViewBackground::Absent)
+            {
+                unsafe { self.root_visual.RemoveVisual(&visual) }
+                    .context("removing the colour beneath native views")
+                    .log_err();
+            }
+        }
+        true
+    }
+
+    fn apply_native_view_background(
+        &mut self,
+        device_context: &ID3D11DeviceContext,
+        color: Option<[u8; 4]>,
+    ) -> Result<()> {
+        let Some(color) = color else {
+            if let NativeViewBackground::Shown { visual, .. } =
+                std::mem::replace(&mut self.background, NativeViewBackground::Absent)
+            {
+                unsafe { self.root_visual.RemoveVisual(&visual) }?;
+            }
+            return Ok(());
+        };
+        if let NativeViewBackground::Shown {
+            surface,
+            color: shown,
+            ..
+        } = &mut self.background
+        {
+            fill_native_view_background(surface, device_context, color)?;
+            *shown = color;
+            return Ok(());
+        }
+        let surface = unsafe {
+            self.comp_device.CreateSurface(
+                1,
+                1,
+                RENDER_TARGET_FORMAT,
+                DXGI_ALPHA_MODE_IGNORE,
+            )
+        }?;
+        fill_native_view_background(&surface, device_context, color)?;
+        let visual = unsafe { self.comp_device.CreateVisual() }?;
+        let scale = unsafe { self.comp_device.CreateScaleTransform() }?;
+        unsafe {
+            scale.SetScaleX2(NATIVE_VIEW_BACKGROUND_EXTENT)?;
+            scale.SetScaleY2(NATIVE_VIEW_BACKGROUND_EXTENT)?;
+            visual.SetTransform(&scale)?;
+            // Hard edges and no filtering, so the one texel fills every pixel
+            // instead of fading out towards the scaled surface's edges.
+            visual.SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR)?;
+            visual.SetBorderMode(DCOMPOSITION_BORDER_MODE_HARD)?;
+            visual.SetContent(&surface)?;
+            self.root_visual
+                .AddVisual(&visual, false, &self.portal_container)?;
+        }
+        self.background = NativeViewBackground::Shown {
+            visual,
+            surface,
+            color,
+        };
+        Ok(())
     }
 
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
@@ -3545,6 +3712,48 @@ mod native_view_tests {
             PortalPlacement::new(rect(10., 20., 100., 50.), rect(200., 0., 10., 10.)),
             None,
             "a view its content mask hides entirely is not shown"
+        );
+    }
+
+    fn native_view(id: u64, order: u32, background: Hsla) -> PaintNativeView {
+        let bounds = rect(0., 0., EXTENT, EXTENT);
+        PaintNativeView {
+            order,
+            id: NativeViewId::for_test(id),
+            hitbox_id: HitboxId::placeholder(),
+            bounds,
+            content_mask: ContentMask { bounds },
+            background,
+        }
+    }
+
+    /// An opaque window keeps the background of the last painted view that
+    /// has one beneath its portals; a translucent window, or a scene without
+    /// a view asking for one, keeps nothing.
+    #[test]
+    fn an_opaque_window_keeps_the_frontmost_view_background_beneath_its_portals() {
+        let mut scene = Scene::default();
+        scene.insert_native_view(native_view(1, 0, gpui::red()));
+        scene.insert_primitive(quad(rect(0., 0., 8., 8.), gpui::blue()));
+        scene.insert_native_view(native_view(2, 0, gpui::blue()));
+        scene.insert_primitive(quad(rect(0., 0., 8., 8.), gpui::red()));
+        scene.insert_native_view(native_view(3, 0, Hsla::transparent_black()));
+        scene.finish();
+        assert_eq!(
+            super::native_view_background(&scene, true),
+            Some([255, 0, 0, 255]),
+            "blue, in BGRA, from the last view with a background"
+        );
+        assert_eq!(super::native_view_background(&scene, false), None);
+
+        let mut scene = Scene::default();
+        scene.insert_native_view(native_view(1, 0, Hsla::transparent_black()));
+        scene.finish();
+        assert_eq!(super::native_view_background(&scene, true), None);
+        assert_eq!(
+            super::native_view_background(&Scene::default(), true),
+            None,
+            "a scene without native views takes the colour away"
         );
     }
 }

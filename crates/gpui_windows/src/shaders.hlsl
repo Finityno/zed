@@ -1698,11 +1698,17 @@ cbuffer BackdropBlurParams: register(b2) {
     float backdrop_opacity;
     float backdrop_center_weight;
     uint backdrop_tap_pair_count;
+    uint backdrop_underlay_count;
+    // Native views drawn before the blur, frontmost first: each one's visible
+    // rect in device pixels, and its opaque background.
+    float4 backdrop_underlay_bounds[4];
+    float4 backdrop_underlay_colors[4];
     // xy and zw are each one (offset, weight) pair of folded taps.
     float4 backdrop_taps[48];
 };
 
 static const uint BACKDROP_MAX_TAP_PAIRS = 96u;
+static const uint BACKDROP_MAX_UNDERLAYS = 4u;
 
 SamplerState s_backdrop: register(s1);
 Texture2D<float4> t_backdrop_blurred: register(t4);
@@ -1713,6 +1719,22 @@ Texture2D<float4> t_backdrop_blurred: register(t4);
 float4 sample_backdrop(Texture2D<float4> source, float2 texel) {
     texel = clamp(texel, 0.5, backdrop_source_extent - 0.5);
     return source.SampleLevel(s_backdrop, texel / backdrop_source_size, 0.);
+}
+
+// A native view's rect is a transparent hole in the copied region, since the
+// view is not in the render target. The first pass composites what it samples
+// there over the view's background, so the frost is frost over that colour.
+float4 sample_backdrop_underlaid(Texture2D<float4> source, float2 texel) {
+    float4 color = sample_backdrop(source, texel);
+    float2 position = backdrop_region_origin + clamp(texel, 0.5, backdrop_source_extent - 0.5);
+    uint underlay_count = min(backdrop_underlay_count, BACKDROP_MAX_UNDERLAYS);
+    for (uint index = 0u; index < underlay_count; index++) {
+        float4 rect = backdrop_underlay_bounds[index];
+        if (all(position >= rect.xy) && all(position < rect.xy + rect.zw)) {
+            return color + backdrop_underlay_colors[index] * (1. - color.a);
+        }
+    }
+    return color;
 }
 
 struct BackdropBlurPassVertexOutput {
@@ -1732,15 +1754,15 @@ BackdropBlurPassVertexOutput backdrop_blur_pass_vertex(uint vertex_id: SV_Vertex
 // sample.
 float4 backdrop_blur_pass_fragment(BackdropBlurPassVertexOutput input): SV_Target {
     float2 center = floor(input.position.xy) * backdrop_scale + 0.5;
-    float4 sum = sample_backdrop(t_sprite, center) * backdrop_center_weight;
+    float4 sum = sample_backdrop_underlaid(t_sprite, center) * backdrop_center_weight;
     uint pair_count = min(backdrop_tap_pair_count, BACKDROP_MAX_TAP_PAIRS);
     [loop]
     for (uint pair = 0u; pair < pair_count; pair++) {
         float4 packed = backdrop_taps[pair >> 1u];
         float2 tap = (pair & 1u) != 0u ? packed.zw : packed.xy;
         float2 offset = tap.x * backdrop_direction;
-        sum += (sample_backdrop(t_sprite, center + offset)
-            + sample_backdrop(t_sprite, center - offset)) * tap.y;
+        sum += (sample_backdrop_underlaid(t_sprite, center + offset)
+            + sample_backdrop_underlaid(t_sprite, center - offset)) * tap.y;
     }
     return sum;
 }
