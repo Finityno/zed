@@ -78,12 +78,17 @@ use std::{
     sync::Arc,
 };
 
-/// A platform-native surface inserted between GPUI's base and overlay scene
-/// planes.
+/// A slot for native content beneath a window's rendered scene, made by the
+/// window on platforms whose native content is a compositor visual. Its
+/// handle is what [`NativeView::new`](crate::NativeView::new) takes there.
 pub trait PlatformNativeSurface {
-    /// Updates the native surface geometry in device pixels.
+    /// Updates the native surface geometry in device pixels. A surface that
+    /// is attached as a native view is placed from the scene, and ignores
+    /// this.
     fn set_bounds(&self, bounds: Bounds<DevicePixels>) -> Result<()>;
-    /// Updates whether the native surface participates in composition.
+    /// Updates whether the native surface participates in composition. A
+    /// surface that is attached as a native view is shown where the scene
+    /// paints it, and ignores this.
     fn set_visible(&self, visible: bool) -> Result<()>;
     /// Returns the platform attachment object. On Windows it is the portal's
     /// `IDCompositionVisual` as a raw `IUnknown` pointer (`*mut c_void`),
@@ -1216,7 +1221,7 @@ impl PlatformFrameSignal {
     }
 }
 
-/// What became of a frame handed to [`PlatformWindow::draw_layered`].
+/// What became of a frame handed to [`PlatformWindow::present`].
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum PresentOutcome {
     /// The frame was submitted for display.
@@ -1249,13 +1254,12 @@ impl PresentOutcome {
 /// Where the time of one present went, for platforms that measure it.
 ///
 /// A platform that reports no breakdown leaves every field zero, so
-/// `layers == 0` means "not measured" rather than "free". With an overlay
-/// surface the durations are summed across both layers.
+/// `layers == 0` means "not measured" rather than "free".
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct PresentBreakdown {
     /// Waiting for a surface to render into (macOS: `nextDrawable`).
     pub acquire: Duration,
-    /// Encoding the scene's GPU work, including splitting it across layers.
+    /// Encoding the scene's GPU work.
     pub encode: Duration,
     /// Handing the encoded work and the surface to the GPU and compositor,
     /// including any wait the synchronous (in-transaction) path makes.
@@ -1273,28 +1277,9 @@ pub struct PresentBreakdown {
     /// removes only the excess, it may overstate what the compositor holds
     /// for as long as this is set.
     pub drawables_in_flight_clamped: bool,
-    /// What became of the overlay surface's half of the frame, for a window
-    /// that splits its scene across a base and an overlay surface and drew
-    /// the overlay. The present's own outcome is the base surface's, which
-    /// holds the window's content, so an overlay that failed is reported
-    /// here rather than counting a frame whose base landed as lost.
-    pub overlay_outcome: Option<PresentOutcome>,
 }
 
-impl PresentBreakdown {
-    /// Adds another layer's present to this one.
-    pub fn accumulate(&mut self, other: PresentBreakdown) {
-        self.acquire += other.acquire;
-        self.encode += other.encode;
-        self.commit += other.commit;
-        self.layers = self.layers.saturating_add(other.layers);
-        self.drawables_in_flight = self.drawables_in_flight.max(other.drawables_in_flight);
-        self.drawables_in_flight_clamped |= other.drawables_in_flight_clamped;
-        self.overlay_outcome = self.overlay_outcome.or(other.overlay_outcome);
-    }
-}
-
-/// The result of one [`PlatformWindow::draw_layered`] call.
+/// The result of one [`PlatformWindow::present`] call.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct PresentReport {
     /// What became of the frame.
@@ -1620,40 +1605,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// system to draw them sooner. Frames after it are left on the system's
     /// default scheduling. The default does nothing.
     fn set_interactive_until(&self, _until: Instant) {}
-    /// Draws a scene with primitives at and after `overlay_start` on a platform
-    /// overlay surface when one has been enabled.
-    ///
-    /// Platforms without layered scene support fall back to drawing the complete
-    /// scene on their primary surface.
+    /// Draws a scene and says what became of the frame.
     ///
     /// Every present goes through here, so this is where a platform reports
     /// what became of the frame and, when it measures it, where the time
-    /// went. The fallback reports a presented frame with no breakdown.
-    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) -> PresentReport {
+    /// went. The fallback draws with [`Self::draw`] and reports a presented
+    /// frame with no breakdown.
+    fn present(&self, scene: &Scene) -> PresentReport {
         self.draw(scene);
         PresentReport::default()
     }
-    /// Tells the platform where the frame about to be presented puts
-    /// input-taking content on the overlay plane: the clipped bounds of its
-    /// hitboxes, in window coordinates. A platform whose overlay sits above
-    /// native child views takes pointer input there and leaves the rest to
-    /// the views beneath. It keeps the regions until that frame's overlay
-    /// presents and applies them then, so input follows the overlay on
-    /// screen. Only called when the regions change. The default does
-    /// nothing.
-    fn set_overlay_hit_regions(&self, _regions: &[Bounds<Pixels>]) {}
-    /// Enables a transparent GPUI surface above native child views.
-    ///
-    /// This is currently an experimental capability for embedding native
-    /// surfaces between GPUI's base and deferred-overlay paint planes.
-    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
-        anyhow::bail!("layered GPUI scenes are not supported on this platform")
-    }
-    /// Tears down the surface [`Self::enable_scene_overlay`] created and
-    /// releases its GPU memory; subsequent [`Self::draw_layered`] calls draw
-    /// the whole scene on the primary surface. A no-op when no overlay exists.
-    fn disable_scene_overlay(&self) {}
-    /// Creates a native surface slot between GPUI's base and overlay planes.
+    /// Creates a slot for native content beneath the window's rendered scene.
     fn create_native_surface(&self) -> Result<Rc<dyn PlatformNativeSurface>> {
         anyhow::bail!("native surface portals are not supported on this platform")
     }

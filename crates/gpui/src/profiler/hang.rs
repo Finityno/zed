@@ -480,10 +480,6 @@ pub enum SerializedHangContributor {
         /// notice was lost, so `drawables_in_flight` may overstate what the
         /// compositor holds.
         drawables_in_flight_clamped: bool,
-        /// For a window that splits its frame across a base and an overlay
-        /// surface, what became of the overlay's half, named like `outcome`;
-        /// `outcome` itself is the base surface's. Absent without an overlay.
-        overlay_outcome: Option<&'static str>,
         /// How many other events in the interval contain this one.
         depth: usize,
     },
@@ -692,7 +688,6 @@ impl SerializedHangContributor {
                     layers: breakdown.layers,
                     drawables_in_flight: breakdown.drawables_in_flight,
                     drawables_in_flight_clamped: breakdown.drawables_in_flight_clamped,
-                    overlay_outcome: breakdown.overlay_outcome.map(crate::PresentOutcome::name),
                     depth,
                 }
             }
@@ -1216,7 +1211,6 @@ mod tests {
                     layers: 2,
                     drawables_in_flight: 2,
                     drawables_in_flight_clamped: false,
-                    overlay_outcome: Some(crate::PresentOutcome::Dropped),
                 },
             },
         };
@@ -1242,7 +1236,6 @@ mod tests {
                 layers,
                 drawables_in_flight,
                 drawables_in_flight_clamped,
-                overlay_outcome,
                 ..
             },
         ] = serialized.contributors.as_slice()
@@ -1257,7 +1250,6 @@ mod tests {
         assert_eq!(*layers, 2);
         assert_eq!(*drawables_in_flight, 2);
         assert!(!*drawables_in_flight_clamped);
-        assert_eq!(*overlay_outcome, Some("dropped"));
     }
 
     /// A slow draw says which phase was slow, whether the thread was on the

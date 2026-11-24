@@ -1313,7 +1313,7 @@ impl PlatformWindow for WindowsWindow {
     /// The whole scene goes to the one swap chain: native surfaces sit beneath
     /// it and show through the holes the renderer erases where their native
     /// views are, so there is no plane above them to split off.
-    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) -> PresentReport {
+    fn present(&self, scene: &Scene) -> PresentReport {
         let clear_color = self.effective_clear_color();
         let mut renderer = self.state.renderer.borrow_mut();
         let outcome = match renderer.draw(scene, clear_color).log_err() {

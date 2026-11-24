@@ -2782,7 +2782,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw(&self, scene: &gpui::Scene) {
-        self.draw_layered(scene, scene.len());
+        self.present(scene);
     }
 
     unsafe fn attach_native_view(
@@ -2814,7 +2814,7 @@ impl PlatformWindow for MacWindow {
         self.0.lock().native_views.key_down_before_callback = Some(callback);
     }
 
-    fn draw_layered(&self, scene: &gpui::Scene, _overlay_start: usize) -> PresentReport {
+    fn present(&self, scene: &gpui::Scene) -> PresentReport {
         let mut this = self.0.lock();
         let native_view_layout = native_views::plan_layout(&this, scene);
         let backdrops = native_view_backdrops::plan(&this, scene);

@@ -1740,52 +1740,6 @@ fn a_view_under_another_image_cache_is_built_again() {
     assert!(renders.get() > settled, "under another cache the child is built");
 }
 
-/// A view holding a draw deferred beneath native surfaces, drawn again,
-/// keeps it on the base plane: the overlay stays empty.
-#[test]
-fn a_view_drawn_again_keeps_its_deferred_draw_beneath_native_surfaces() {
-    struct Holder;
-    impl Render for Holder {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(
-                deferred(div().w(px(30.)).h(px(30.)).bg(PALETTE[1])).beneath_native_surfaces(),
-            )
-        }
-    }
-    struct Host {
-        holder: Entity<Holder>,
-    }
-    impl Render for Host {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.holder.clone())
-        }
-    }
-    let mut cx = TestAppContext::single();
-    cx.update(|cx| cx.set_view_retention(true));
-    let window = cx.add_window(|_, cx| Host {
-        holder: cx.new(|_| Holder),
-    });
-    let overlay = |cx: &mut TestAppContext| {
-        cx.update_window(window.into(), |_, window, cx| {
-            window.reset_frame_work_stats(false);
-            window.draw(cx).clear(cx);
-            let frame = &window.rendered_frame;
-            (
-                frame.scene.len() - frame.overlay_scene_start,
-                frame.deferred_draws.iter().all(|draw| draw.beneath_native_surfaces),
-                window.frame_work_stats().views_reused,
-            )
-        })
-        .unwrap()
-    };
-    assert_eq!(overlay(&mut cx).0, 0);
-    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
-    let (overlay_primitives, beneath, reused) = overlay(&mut cx);
-    assert_eq!(reused, 1);
-    assert!(beneath);
-    assert_eq!(overlay_primitives, 0);
-}
-
 /// A view drawn again keeps its window-control areas and its hitboxes' ids,
 /// which hover and pointer capture are keyed by.
 #[test]

@@ -452,7 +452,6 @@ impl Window {
                 rounded_clip: deferred_draw.rounded_clip.clone(),
                 rem_size: deferred_draw.rem_size,
                 priority: deferred_draw.priority,
-                beneath_native_surfaces: deferred_draw.beneath_native_surfaces,
                 element: None,
                 absolute_offset: deferred_draw.absolute_offset,
                 prepaint_range: deferred_draw.prepaint_range.clone(),

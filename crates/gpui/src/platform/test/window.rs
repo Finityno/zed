@@ -827,7 +827,7 @@ impl PlatformWindow for TestWindow {
         }
     }
 
-    fn draw_layered(&self, scene: &Scene, _overlay_start: usize) -> PresentReport {
+    fn present(&self, scene: &Scene) -> PresentReport {
         let outcome = self
             .0
             .lock()

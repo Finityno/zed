@@ -2340,7 +2340,6 @@ pub(crate) fn describe_frame(window: &Window) -> Vec<String> {
     lines.extend(frame.window_control_hitboxes.iter().map(|(area, hitbox)| {
         format!("window control {area:?} {:?}", rounded_pixels(hitbox.bounds))
     }));
-    lines.push(format!("overlay starts at {}", frame.overlay_scene_start));
     if window.a11y.is_active() {
         lines.extend(super::a11y::replay::describe_a11y_tree(window));
     }

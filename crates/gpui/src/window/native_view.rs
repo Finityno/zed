@@ -29,13 +29,21 @@ impl NativeViewId {
 
 /// A view owned by the platform's UI toolkit, shown inside a GPUI window.
 ///
-/// Only macOS shows native views so far, where the view is an `NSView`.
-/// [`NativeView::new`] fails on every other platform.
+/// macOS and Windows show native views. On macOS the view is an `NSView`. On
+/// Windows it is the composition visual of a surface the window made with
+/// [`Window::create_native_surface`], and only a window that composites
+/// through DirectComposition can show one. [`NativeView::new`] fails
+/// everywhere else.
 ///
 /// The view is composited beneath the window's GPUI content and shows through
 /// wherever this handle is used as an element, so elements painted after it
 /// cover it like they would cover any other element. The view is treated as
 /// opaque, and is not affected by element opacity or transformations.
+///
+/// What follows about input is how macOS behaves, where the platform hands
+/// input to the view. A Windows composition visual gets no input of its own:
+/// the embedder forwards pointer input from a hitbox it puts over the view,
+/// and gives its content keyboard input when the view's handle is focused.
 ///
 /// Mouse input over the view goes to the view, and to nothing behind it,
 /// wherever no element painted after the view takes mouse input. An element
@@ -85,14 +93,16 @@ impl NativeView {
     ///
     /// # Errors
     ///
-    /// Fails on platforms that cannot composite native views, which is every
-    /// platform but macOS for now.
+    /// Fails where the window cannot composite native views: on every
+    /// platform but macOS and Windows, and on Windows for a window that does
+    /// not composite through DirectComposition or a visual it did not make.
     ///
     /// # Safety
     ///
     /// `view` must point to a live view of the kind the window's platform
-    /// embeds, which is an `NSView` on macOS, and that view must not be in
-    /// another view hierarchy.
+    /// embeds: on macOS an `NSView` that is in no other view hierarchy, on
+    /// Windows the `IDCompositionVisual` handed out by a surface from this
+    /// window's [`Window::create_native_surface`].
     ///
     /// GPUI retains the view and puts it inside a view of its own, until the
     /// last clone of the returned handle is dropped. Until then GPUI decides the
